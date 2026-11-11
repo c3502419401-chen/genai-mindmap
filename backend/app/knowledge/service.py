@@ -289,9 +289,11 @@ def _too_short(span: list[int]) -> bool:
 def _merge_short(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
     """自左向右把过短的块并进后一块；末块过短则并进前一块。
 
-    只动 start/end，不重排文本。贪心切点产出的块长天然 ≥ MIN，所以这条规则
-    在当前参数下基本是防御性的：参数被调成 MIN > MAX、或将来把重叠调大时
-    才会真正触发。
+    只动 start/end，不重排文本。贪心切点产出的块长天然 ≥ MIN，所以向左合并
+    这条在当前参数下基本是防御性的。真正会触发的是**末块**：切块循环的前提是
+    "剩余 > MAX"，于是 `"字"*701` 会切出 `(0,700) + (700,701)`，末块只剩一个字。
+    那种块占掉一个 top_k 位置却什么信息都没有，所以末块合并允许结果略超 MAX
+    （上限放宽到 MAX+MIN）：宁可最后一块多出几百字符，也不要留一个碎块。
     """
     merged: list[list[int]] = []
     for start, end in spans:
@@ -304,7 +306,7 @@ def _merge_short(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
             continue
         merged.append([start, end])
     if len(merged) > 1 and _too_short(merged[-1]):
-        if merged[-1][1] - merged[-2][0] <= CHUNK_MAX_CHARS:
+        if merged[-1][1] - merged[-2][0] <= CHUNK_MAX_CHARS + CHUNK_MIN_CHARS:
             merged[-2][1] = merged[-1][1]
             merged.pop()
     return [(span[0], span[1]) for span in merged]
@@ -344,8 +346,8 @@ def _chunks(text: str) -> Iterator[tuple[int, int, str]]:
 def _near_duplicate(left: EvidenceHit, right: EvidenceHit) -> bool:
     """同一来源里，两条命中区间重叠超过较短者 50% 就算近重复。
 
-    相邻块有 60 码点重叠，同一句话常能同时命中前后两块；不去重的话
-    top_k=5 会被同一条证据的副本占掉两格，真正不同的证据反而挤不进来。
+    相邻块有 `CHUNK_OVERLAP_CHARS` 码点重叠，同一句话常能同时命中前后两块；
+    不去重的话 top_k=5 会被同一条证据的副本占掉两格，真正不同的证据反而挤不进来。
     跨来源的区间是不同文档的坐标，不能拿来比。
     """
     if left.source_id != right.source_id:

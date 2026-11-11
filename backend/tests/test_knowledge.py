@@ -78,7 +78,14 @@ def test_chunk_lengths_stay_within_bounds():
     chunks = list(_chunks(_document()))
     for _, end, quote in chunks[:-1]:
         assert CHUNK_MIN_CHARS <= len(quote) <= CHUNK_MAX_CHARS
-    assert 0 < len(chunks[-1][2]) <= CHUNK_MAX_CHARS
+    # 末块允许略超上限：切块前提是"剩余 > MAX"，701 字会切出 1 字末块，
+    # 宁可让末块多出几百字符，也不要留一个没有任何信息的碎块。
+    assert 0 < len(chunks[-1][2]) <= CHUNK_MAX_CHARS + CHUNK_MIN_CHARS
+
+
+def test_tiny_tail_is_absorbed():
+    """`"字"*701` 只切出 1 字末块 —— 那块必须并回去，否则它会独占一个 top_k。"""
+    assert _chunk_spans("字" * 701) == [(0, 701)]
 
 
 def test_chunks_end_on_sentence_boundary():
@@ -138,7 +145,8 @@ def test_short_neighbour_is_merged():
     chunks = list(_chunks(text))
     assert [(start, end) for start, end, _ in chunks] == [(0, 480)]
     assert _merge_short([(0, 80), (80, 480)]) == [(0, 480)]
-    assert _merge_short([(0, 700), (700, 750)]) == [(0, 700), (700, 750)]
+    # 末块合并的上限放宽到 MAX+MIN；900 已越过它，不许硬并。
+    assert _merge_short([(0, 700), (700, 900)]) == [(0, 700), (700, 900)]
 
 
 def test_markdown_heading_starts_chunk():

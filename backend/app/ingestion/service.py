@@ -50,6 +50,7 @@
 """
 from __future__ import annotations
 
+import html
 import re
 import threading
 
@@ -117,7 +118,7 @@ def _suffix_of(filename: str | None) -> str:
     return filename[dot:].lower() if dot >= 0 else ""
 
 
-def _parse_pdf(raw: bytes) -> tuple[str, int, int]:
+def _parse_pdf(raw: bytes) -> tuple[list[str], int]:
     """PyMuPDF 抽文本，返回 (正文, 总页数, 实际解析页数)。
 
     只读文本层，不碰版面：实测 15 页英文双栏论文 0.19 秒 / 55MB，
@@ -261,7 +262,11 @@ def _normalize_markdown(markdown: str) -> str:
             return ""
         return f"[图: {alt}]"
 
-    text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", alt_of, markdown)
+    # Docling 与视觉识别都会把 `&lt;` `&amp;` 这类实体原样留在 Markdown 里。
+    # 不反转义的话，检索 `<` 永远匹配不到它，而块长还按 4 个字符算——实测一份
+    # 中文 docx 里有 158 处。`\xa0` 是非断行空格，检索与切块都当它是普通空白。
+    text = html.unescape(markdown).replace("\xa0", " ")
+    text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", alt_of, text)
     text = re.sub(r"[ \t]+$", "", text, flags=re.MULTILINE)       # 行尾空白
     text = re.sub(r"\n{3,}", "\n\n", text)                        # 连续空行
     return text.strip()
