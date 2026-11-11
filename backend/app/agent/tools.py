@@ -1740,10 +1740,17 @@ async def _rag(args: RagArgs, ctx: RunContext) -> ToolResult:
         )
 
     # 回给模型的是结构化 JSON：它要能拿到 source_id 与偏移，才能在引用里指准。
+    # `method` 由每条命中的实际取值汇总，不再写死 lexical——混合检索生效时写死
+    # 会让模型以为这批片段只做了关键词匹配。只要有任意一条走了向量路，本轮就是
+    # hybrid（那条路贡献了候选，排序已被它影响）。
+    hits_data = [hit.model_dump() for hit in hits]
     return ToolResult(
         ok=True,
-        content=json.dumps([hit.model_dump() for hit in hits], ensure_ascii=False),
-        data={"hits": [hit.model_dump() for hit in hits], "method": "lexical"},
+        content=json.dumps(hits_data, ensure_ascii=False),
+        data={
+            "hits": hits_data,
+            "method": "hybrid" if any(hit.method == "hybrid" for hit in hits) else "lexical",
+        },
     )
 
 

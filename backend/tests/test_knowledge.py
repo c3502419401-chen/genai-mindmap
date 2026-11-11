@@ -6,6 +6,8 @@
 """
 import re
 
+import pytest
+
 from app.contracts.source import Source, SourceKind
 from app.knowledge.service import (
     CHUNK_MAX_CHARS,
@@ -13,13 +15,24 @@ from app.knowledge.service import (
     CHUNK_OVERLAP_CHARS,
     CHUNK_TARGET_CHARS,
     EvidenceHit,
-    _bigrams,
+    _bm25_scores,
     _chunk_spans,
     _chunks,
     _merge_short,
     _near_duplicate,
     search_sources,
 )
+
+
+@pytest.fixture(autouse=True)
+def _lexical_only(monkeypatch):
+    """这些断言全部关于切块与**词面**排序，不该被向量路影响。
+
+    混合检索会在配了 `DASHSCOPE_API_KEY` 的机器上真的去调 embedding 接口：
+    既让结果带上网络的不确定性，也让单元测试变成计费的外部调用。删掉凭证
+    固定走 `method="lexical"`，融合逻辑由 `test_hybrid_search.py` 用 mock 覆盖。
+    """
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
 
 PARAGRAPH = (
     "今天上午，我去“秘密基地”了。那里堆着三箱旧书（详见附录 A），"
@@ -227,16 +240,24 @@ def test_search_results_carry_no_near_duplicates():
     assert len(search_sources([source], "秘密基地的旧书", top_k=1)) == 1
 
 
-def test_score_formula_unchanged():
-    """分数仍是 bigram 交集占比，逐块可复算。"""
+def test_score_is_bm25():
+    """分数是 BM25 分，可按同一次检索的块集逐块复算。
+
+    旧断言核对的是 `bigram 交集 / 查询词数`；换成 BM25 之后这个公式不再成立，
+    但"分数必须能从块本身复算出来"这条要求没变——分数一旦不可复算，排序就
+    只能靠观察结果倒推，回归时无从判断哪一步变了。
+    """
     source = Source(
         kind=SourceKind.text, status="parsed", text="会议决定十月发布二点零版本。")
     hits = search_sources([source], "十月发布")
     assert hits
-    question = _bigrams("十月发布")
+    quotes = [quote for _, _, quote in _chunks(source.text or "")]
+    expected = _bm25_scores("十月发布", quotes)
     for hit in hits:
-        overlap = question & _bigrams(hit.quote)
-        assert hit.score == round(len(overlap) / len(question), 4)
+        assert hit.method == "lexical"          # 没配凭证时只走词面路
+        assert hit.score_vector is None
+        assert hit.score == round(hit.score_bm25, 6)
+        assert hit.score == round(expected[quotes.index(hit.quote)], 6)
     assert source.id == hits[0].source_id
     assert source.text[hits[0].start:hits[0].end] == hits[0].quote
 

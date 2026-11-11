@@ -1325,6 +1325,14 @@ class ExpandToolTest(unittest.TestCase):
 
 
 class RagToolTest(unittest.TestCase):
+    def setUp(self):
+        # 检索现在带向量路：这个类只验证工具的接线，不该因为宿主机恰好配了
+        # DASHSCOPE_API_KEY 就去调真实 embedding 接口——那会让单测变慢、计费，
+        # 结果还带网络的不确定性。融合与降级由 test_hybrid_search.py 覆盖。
+        env = patch.dict("os.environ", {"MINDMAP_HYBRID_SEARCH": "0"})
+        env.start()
+        self.addCleanup(env.stop)
+
     def test_returns_hits_from_attached_sources(self):
         source = Source(kind=SourceKind.text, status="parsed",
                         text="会议决定在十月十七日发布二点零版本，请提前准备上线材料。")
@@ -1353,6 +1361,25 @@ class RagToolTest(unittest.TestCase):
             _call("rag_query", question="量子色动力学的渐近自由"), ctx))
         self.assertTrue(result.ok)
         self.assertEqual(result.data["hits"], [])
+
+    def test_method_reflects_hit_method(self):
+        """混合检索生效时请求级 method 不能还写死 lexical：那会让模型以为这批
+        片段只做过关键词匹配。真值在每条 hit 上，这里只做汇总。"""
+        from app.knowledge.service import EvidenceHit
+
+        def hit(method):
+            return EvidenceHit(source_id="s1", start=0, end=3, quote="abc",
+                               score=0.02, score_bm25=1.0, score_vector=0.8,
+                               method=method)
+
+        source = Source(kind=SourceKind.text, status="parsed", text="abc")
+        for expected, hits in (("hybrid", [hit("hybrid")]), ("lexical", [hit("lexical")])):
+            ctx = _ctx(intent="expand", sources=[source])
+            with patch("app.agent.tools.search_sources", return_value=hits):
+                result = _run(build_registry("expand", has_sources=True).execute(
+                    _call("rag_query", question="abc"), ctx))
+            self.assertEqual(result.data["method"], expected)
+            self.assertEqual(result.data["hits"][0]["method"], expected)
 
 
 class EditToolTest(unittest.TestCase):
