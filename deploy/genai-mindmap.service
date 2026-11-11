@@ -10,8 +10,11 @@ User=genai
 Group=genai
 WorkingDirectory=/opt/genai-mindmap/backend
 
-# 密钥等运行时配置放在这里，仓库里不存（install.sh 会创建，权限 0640 root:genai）
-EnvironmentFile=-/etc/genai-mindmap/env
+# 密钥等运行时配置放在这里，仓库里不存（install.sh 会创建，权限 0640 root:genai）。
+# 前缀 `-` 会让文件缺失时照常启动：MINDMAP_DB_PATH 随之丢失、回落到代码目录下的
+# 默认路径，而 ProtectSystem=strict 让那里只读，保存与读取会全 500 而启动日志正常。
+# 宁可起不来，也不要带病运行。
+EnvironmentFile=/etc/genai-mindmap/env
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 # 下面这条不只是整洁：docling 第一次解析 docx/pptx 会下载版面模型到
@@ -27,18 +30,26 @@ Environment=HOME=/var/lib/genai-mindmap
 ExecStart=/opt/genai-mindmap/.venv/bin/uvicorn app.main:app \
     --host 127.0.0.1 --port 8000 --workers 1 \
     --proxy-headers --forwarded-allow-ips=127.0.0.1 \
-    --no-server-header --timeout-keep-alive 65
+    --no-server-header --timeout-keep-alive 65 \
+    --timeout-graceful-shutdown 15
 Restart=always
 RestartSec=3
-TimeoutStopSec=20
+# 生成预算 600 秒（RunBudget.max_seconds）。20 秒会让任何一次 systemctl restart
+# 把正在跑的生成硬断掉，用户看到的是流突然结束、候选丢失。90 秒留给它收尾，
+# 真正的优雅关闭窗口由 uvicorn 的 --timeout-graceful-shutdown 15 控制。
+TimeoutStopSec=90
 KillSignal=SIGINT
 
-# 只允许写数据目录与临时目录；代码目录只读
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/genai-mindmap /var/log/genai-mindmap
+
+# 只允许写数据目录（原先还列了 /var/log/genai-mindmap，但没有任何代码往那里写
+# ——日志走 journal，备份日志是 /var/log/genai-mindmap-backup.log 这个文件，
+# 而 install.sh 也从不创建那个目录——systemd 为缺失的 ReadWritePaths 建 namespace
+# 会失败，单元直接起不来（226/NAMESPACE）。多写一条路径就是多一个启动条件。
+ReadWritePaths=/var/lib/genai-mindmap
 
 StandardOutput=journal
 StandardError=journal

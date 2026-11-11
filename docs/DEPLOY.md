@@ -197,7 +197,7 @@ sudo dnf install -y git
 git clone https://github.com/RPeGio/genai-mindmap.git   # 默认就是 main
 cd genai-mindmap
 ls deploy/          # 能看到 install.sh / nginx.conf 才算对
-git describe --tags # 应该看到 v0.4.0-deploy 或更新的 tag
+git describe --tags # 本方案第一次上线后才会打第一个部署 tag；现在还看不到别当成失败
 ```
 
 想先把还没进 `main` 的改动放上去试用，再显式 `-b dev`（或某个特性分支）；试完记得切回 `main`，别让机器长期停在集成分支上——否则"线上跑的是什么"会说不清。
@@ -322,8 +322,14 @@ sudo systemctl status genai-mindmap --no-pager
 回滚到上一个 tag：
 
 ```bash
-git switch --detach v0.3.0-contract-v2     # 换成要回退到的版本
+git fetch --tags
+git switch --detach <要回退到的 tag>
+# 关键一步：systemd 跑的是 /opt/genai-mindmap 里的代码，而只有 install.sh 会
+# 把当前工作区同步过去（见脚本第 3 步的 tar）。只 switch + restart 的话，
+# `git describe` 会显示旧 tag、机器上跑的却还是新代码——演练时会误判"回滚成功"。
+sudo bash deploy/install.sh --domain mindmap.example.com
 sudo systemctl restart genai-mindmap
+sudo systemctl status genai-mindmap --no-pager
 ```
 
 ⚠️ 契约回滚有数据风险：库里一旦有 v2 记录（`schema_version: 2`），退回 v1 的读入路径会被 `extra="forbid"` 拒掉。真要回滚，先备份 `mindmaps.db`，并确认该版本能读现有数据。

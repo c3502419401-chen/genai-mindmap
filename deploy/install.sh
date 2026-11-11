@@ -122,22 +122,44 @@ systemctl enable --now genai-mindmap
 
 say "6/6 nginx"
 mkdir -p /etc/nginx/conf.d /var/www/html
+NGINX_SITE=/etc/nginx/conf.d/genai-mindmap.conf
+# certbot --nginx 会把 443 与证书指令写进同一个文件。无条件覆盖的话，一次"更新版本"
+# 就会把证书段和 80→443 跳转一起抹掉，站点点回明文 HTTP——而 Basic Auth 的凭据
+# 会跟着明文传输。检测到 TLS 配置就备份，并明确告诉运维证书段要重跑。
+if [[ -f "$NGINX_SITE" ]] && grep -q 'listen[[:space:]]\+443' "$NGINX_SITE"; then
+  backup_conf="$NGINX_SITE.tls-backup.$(date +%s)"
+  cp -a "$NGINX_SITE" "$backup_conf"
+  echo "检测到已有 TLS 配置，已备份到 $backup_conf；站点文件会被重写成仅 80，证书段需重跑 certbot --nginx" >&2
+fi
 sed -e "s|__DOMAIN__|$DOMAIN|g" -e "s|__WEB_ROOT__|$WEB_ROOT|g" \
-  "$REPO_DIR/deploy/nginx.conf" > /etc/nginx/conf.d/genai-mindmap.conf
+  "$REPO_DIR/deploy/nginx.conf" > "$NGINX_SITE"
 
 # 默认账号 demo，密码随机打印一次；重复执行不会改已有密码
 if [[ ! -f /etc/nginx/.htpasswd-mindmap ]]; then
   PASS="$(openssl rand -base64 12)"
   htpasswd -cb /etc/nginx/.htpasswd-mindmap demo "$PASS"
   chmod 640 /etc/nginx/.htpasswd-mindmap
-  chown root:nginx /etc/nginx/.htpasswd-mindmap 2>/dev/null || true
+  # 不吞错：AL3 上 nginx 的运行用户就叫 nginx，chown 失败说明这台机器的用户组
+  # 与假设不符——留成 root:root 640 的话 nginx 读不到，表现是全站 500 而不是启动报错。
+  chown root:nginx /etc/nginx/.htpasswd-mindmap
   echo "已创建 Basic Auth 账号：demo / $PASS   （只显示这一次）"
 else
   echo "已有 /etc/nginx/.htpasswd-mindmap，保留不动；要加账号用 htpasswd -b <文件> <用户名> <密码>"
 fi
 
-# SELinux 默认不允许 nginx 反代到本地 socket/端口；AL3 默认 enforcing
-setsebool -P httpd_can_network_connect 1 2>/dev/null || true
+# SELinux（AL3 默认 enforcing）要放行两件事，缺一条就有一半功能不可用：
+#   1) 反代到 127.0.0.1:8000 —— setsebool，否则接口一律 502
+#   2) nginx 读 /opt 下的前端静态文件 —— /opt 默认标签是 usr_t，httpd_t 读不到，
+#      表现是首页 403 而 nginx 配置、权限看起来全对。chmod a+rX 只是 DAC，管不了它。
+# 这里不用 `|| true` 兜：失败就要看得见，静默放过等于埋伏一个线上 403。
+if [[ "$(getenforce 2>/dev/null || echo Disabled)" != "Disabled" ]]; then
+  setsebool -P httpd_can_network_connect 1
+  semanage fcontext -a -t httpd_sys_content_t "${WEB_ROOT}(/.*)?" 2>/dev/null \
+    || semanage fcontext -m -t httpd_sys_content_t "${WEB_ROOT}(/.*)?" 2>/dev/null
+  restorecon -Rv "$WEB_ROOT"
+else
+  echo "SELinux 未启用，跳过上下文设置"
+fi
 
 nginx -t
 systemctl enable --now nginx
