@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
+from dataclasses import dataclass
 
 from app.contracts.diagnostic import Diagnostic, DiagnosticLevel
 from app.contracts.mindmap import MindMapContent
@@ -13,6 +15,70 @@ logger = logging.getLogger(__name__)
 # 每条引用都跑一遍能拖到几十秒，而用户只是点了「生成导图」。超出预算的
 # 引用静默跳过——它们是可选的附加评分，不是功能的必要条件。
 MAX_NLI_CHECKS = 100
+
+
+@dataclass(frozen=True)
+class EvidenceSpan:
+    """一条检索命中的两级区间：返回给模型的父块 + 真正匹配上的子块。
+
+    单独一个小类型而不是直接收 `EvidenceHit`：这一层是**后处理**，不该为了两个
+    整数去 import 整个检索模块（`app.knowledge.service` 有 60KB，还牵着 embedding
+    与向量缓存）。接入时一行转换：
+
+        [EvidenceSpan(h.source_id, h.start, h.end, h.leaf_start, h.leaf_end)
+         for h in hits]
+
+    `leaf_start/leaf_end` 允许缺省：`search_sources` 的命中没有子块这一级，
+    那时校验退化成现在这样（只用 `start/end` 收范围、用 `quote` 逐字比对）。
+    """
+
+    source_id: str
+    start: int
+    end: int
+    leaf_start: int | None = None
+    leaf_end: int | None = None
+
+
+def _evidence_problem(
+    ref: SourceRef, evidence: Sequence[EvidenceSpan],
+) -> tuple[str, str] | None:
+    """引用是否落进了"父块里与查询无关的那部分"。
+
+    为什么需要这一层：父块返回模式下 `quote` 是 450–700 字的上下文，命中的
+    只有其中 200 字。模型从父块里挑一句与查询无关的话当引用，`quote` 逐字比对
+    照样通过——校验就从"证据核验"退化成"格式检查"。这条约束问的是更细的问题：
+    **你引的这句，在命中的那段里吗**。
+
+    三条判定规则，都是为了让误伤最小：
+
+    1. 引用没有字符区间（只有 `quote`）时不施加约束：这类引用由逐字比对管，
+       本来就没有可比对的区间。
+    2. 引用**完全落在所有命中之外**时不施加约束。材料整份在 prompt 里，模型
+       引用没被这次检索命中的段落是合法且常见的，那种情况由逐字校验负责。
+    3. 引用与多条命中都重叠时，只要**有一条**命中的子块区间与它有交集就通过。
+       不同父块之间会重叠（`CHUNK_OVERLAP_CHARS`），一条引用同时落进两个父块
+       是正常形态，不能因为其中一个的命中区不在交集里就判失败。
+    """
+    if ref.start is None or ref.end is None:
+        return None
+
+    covering = [
+        span for span in evidence
+        if span.source_id == ref.source_id
+        and span.leaf_start is not None and span.leaf_end is not None
+        # 引用的 [start, end) 与命中的父块区间有交集
+        and ref.end > span.start and ref.start < span.end
+    ]
+    if not covering:
+        return None
+    if any(ref.end > span.leaf_start and ref.start < span.leaf_end
+           for span in covering):
+        return None
+    return (
+        "SOURCE_REF_OUTSIDE_EVIDENCE",
+        "引用区间与本次命中的证据子块没有交集：引文确实在原文里，但落在父块中"
+        "与查询无关的部分",
+    )
 
 
 def _reference_problem(ref: SourceRef, source: Source | None) -> tuple[str, str] | None:
@@ -42,11 +108,20 @@ def _reference_problem(ref: SourceRef, source: Source | None) -> tuple[str, str]
 
 
 def verify_source_refs(content: MindMapContent, sources: list[Source], *,
-                       remove_invalid: bool = False) -> list[Diagnostic]:
+                       remove_invalid: bool = False,
+                       evidence: Sequence[EvidenceSpan] | None = None,
+                       ) -> list[Diagnostic]:
     """只检查指定来源；生成时可剔除无效引用，诊断接口始终只读。
 
     没有原文时不能凭 source_usage 推断已验证。未找到依据的节点只给出提示，
     不删除节点，也不据此生成自动删除建议。
+
+    `evidence` 是**可选**的两级命中区间，用于父块返回模式（`search_parent`）：
+    给了它，落在命中父块里、但与子块区间没有交集的引用会被判为
+    `SOURCE_REF_OUTSIDE_EVIDENCE`（判定规则见 `_evidence_problem`）。不给时
+    逐字节等同于加这个参数之前的行为——现在没有调用方传它：hits 还只活在
+    `rag_query` 的返回里，没有进到这条校验链上。等 `search_parent` 接入
+    `_rag` 时，调用方把 hits 转成 `EvidenceSpan` 传进来即可，不需要再动这里。
     """
     by_id = {source.id: source for source in sources}
     if len(by_id) != len(sources):
@@ -65,6 +140,17 @@ def verify_source_refs(content: MindMapContent, sources: list[Source], *,
                     message=f"来源 {ref.source_id}：{message}", evidence=ref.quote,
                 ))
                 continue
+            # 逐字校验通过之后才问"落在命中的那段里吗"：顺序反过来会对一条
+            # 本来就对不上原文的引用再报一次位置问题，两条诊断里只有前一条有意义。
+            if evidence is not None:
+                off_evidence = _evidence_problem(ref, evidence)
+                if off_evidence is not None:
+                    code, message = off_evidence
+                    diagnostics.append(Diagnostic(
+                        level=DiagnosticLevel.warn, code=code, node_id=node.id,
+                        message=f"来源 {ref.source_id}：{message}", evidence=ref.quote,
+                    ))
+                    continue
             verified.append(ref)
             if ref.page is not None:
                 diagnostics.append(Diagnostic(

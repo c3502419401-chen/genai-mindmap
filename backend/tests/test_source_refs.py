@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 import pytest
 
+from app.contracts.diagnostic import DiagnosticLevel
 from app.contracts.mindmap import MindMapContent, Node
 from app.contracts.source import Source, SourceRef, SourceUsage
 from app.generation.service import (
@@ -18,7 +19,7 @@ from app.generation.service import (
 from app.main import app
 from app.mindmaps import repository
 from app.optimization.service import check
-from app.optimization.source_refs import verify_source_refs
+from app.optimization.source_refs import EvidenceSpan, verify_source_refs
 
 
 @pytest.fixture(autouse=True)
@@ -325,3 +326,129 @@ def test_existing_database_records_load_without_migration(client):
     assert content["root"]["source_refs"] == content["root"]["children"][0]["source_refs"] == []
     assert content["source_usage"] == []
     assert client.put("/api/mindmaps/legacy", json={"version": 1, "content": content}).status_code == 200
+
+
+# ---------------------------------------------------------------- 父块返回模式
+#
+# `search_parent` 把 `quote` 从"命中的那一块"换成了 500 字的父块，于是"引文逐字
+# 在原文里"不再等于"引在证据上"：模型从父块里挑一句与查询无关的话，逐字校验照样
+# 通过。下面这组用例钉的是补上那半条约束（`EvidenceSpan`）之后的行为，以及它
+# **不能**顺带破坏原来的逐字校验。
+
+# 三段互不重叠的话，手工指定「父块 / 命中子块 / 父块之外」三种位置：
+#   [0, 命中起点)          父块里与查询无关的前半段
+#   [命中起点, 父块结束)    这次真正匹配上的子块
+#   [父块结束, 结尾)        检索没命中、但材料整份在 prompt 里的部分
+_UNRELATED = "预算审批由部门负责人签核，超过额度上报总经理复审。"
+_HIT = "费用报销需要附发票，时限三十个自然日，逾期不再受理。"
+_ELSEWHERE = "团队建设活动安排在季度末，预算另行列支。"
+_EVIDENCE_TEXT = _UNRELATED + _HIT + _ELSEWHERE
+
+_HIT_START = len(_UNRELATED)
+_HIT_END = _HIT_START + len(_HIT)
+
+
+def _evidence_span() -> EvidenceSpan:
+    """一个父块 [0, 命中结束) 与它里面命中的子块 [命中起点, 命中结束)。"""
+    return EvidenceSpan("s1", 0, _HIT_END, _HIT_START, _HIT_END)
+
+
+def _ref_of(quote: str) -> dict:
+    start = _EVIDENCE_TEXT.index(quote)
+    return {"source_id": "s1", "start": start, "end": start + len(quote), "quote": quote}
+
+
+def _content_with(*refs: dict) -> MindMapContent:
+    # `source_usage` 必须带上 s1：`MindMapContent` 有模型级校验，节点引用的
+    # source_id 一旦不在用法清单里就整棵树构造失败。
+    return MindMapContent.model_validate({
+        "title": "证据核验",
+        "root": {"id": "r", "label": "根", "source_refs": list(refs)},
+        "source_usage": [
+            {"source_id": "s1", "kind": "text", "char_count": len(_EVIDENCE_TEXT)},
+        ],
+    })
+
+
+def _the_source() -> Source:
+    return Source(id="s1", kind="text", text=_EVIDENCE_TEXT, status="parsed")
+
+
+def test_ref_inside_hit_span_passes():
+    """引用落在命中的子块里：一条诊断都没有。"""
+    content = _content_with(_ref_of(_HIT))
+    assert verify_source_refs(content, [_the_source()],
+                              evidence=[_evidence_span()]) == []
+
+
+def test_ref_in_parent_but_outside_hit_is_flagged():
+    """引用在父块里、但不在命中的子块里：这才是新约束要抓的那种引用。
+
+    同一条引用在不给 `evidence` 时完全合法——这不是作废逐字校验，而是把
+    "逐字在原文里"与"落在证据上"分成两条，两条都要过。
+    """
+    content = _content_with(_ref_of(_UNRELATED))
+
+    assert verify_source_refs(content, [_the_source()]) == []
+
+    diagnostics = verify_source_refs(content, [_the_source()],
+                                     evidence=[_evidence_span()])
+    # 唯一一条引用被判掉之后，节点自然变成"没有可核验引用"，所以还会跟一条
+    # `UNSOURCED_NODE`——那是既有语义，不是这次改动引入的。
+    assert [d.code for d in diagnostics] == [
+        "SOURCE_REF_OUTSIDE_EVIDENCE", "UNSOURCED_NODE"]
+    assert diagnostics[0].level == DiagnosticLevel.warn
+    assert diagnostics[0].node_id == "r"
+
+
+def test_ref_outside_all_hits_is_left_alone():
+    """引用完全不在这条命中里：不施加约束。
+
+    材料整份在 prompt 里，模型引用一次检索没命中的段落是合法且常见的形态；
+    那种引用由逐字校验负责，这条新约束管不到它。
+    """
+    content = _content_with(_ref_of(_ELSEWHERE))
+    assert verify_source_refs(content, [_the_source()],
+                              evidence=[_evidence_span()]) == []
+
+
+def test_ref_passes_when_any_covering_hit_contains_it():
+    """一条引用落在两个父块的重叠区、只有第二个的命中区含它：仍然通过。
+
+    父块之间有 `CHUNK_OVERLAP_CHARS` 的重叠，一条引用同时被两条命中覆盖是正常
+    形态。按"任一条通过即通过"判定，否则重叠区里的合法引用会被系统性地判失败。
+    """
+    reference = _ref_of(_HIT)
+    evidence = [
+        # 覆盖整篇，但命中区在前面那段（不含这条引用）
+        EvidenceSpan("s1", 0, len(_EVIDENCE_TEXT), 0, _HIT_START),
+        # 第二个父块从命中区末尾前 5 字开始，命中区覆盖到结尾
+        EvidenceSpan("s1", _HIT_END - 5, len(_EVIDENCE_TEXT),
+                     _HIT_END - 5, len(_EVIDENCE_TEXT)),
+    ]
+    assert verify_source_refs(_content_with(reference), [_the_source()],
+                              evidence=evidence) == []
+
+
+def test_quote_mismatch_wins_over_span_check():
+    """顺序不可换：逐字对不上时只报 `SOURCE_QUOTE_MISMATCH`。
+
+    先查区间的话，一条本来就对不上原文的引用会同时得到"位置不对"的提示，
+    两条诊断里只有前一条有信息量，后一条是噪声。
+    """
+    reference = _ref_of(_UNRELATED)
+    reference["quote"] = "换了引文"
+    codes = {d.code for d in verify_source_refs(
+        _content_with(reference), [_the_source()], evidence=[_evidence_span()])}
+    # 引用被判掉 → 节点无来源，`UNSOURCED_NODE` 是既有语义的连带结果
+    assert codes == {"SOURCE_QUOTE_MISMATCH", "UNSOURCED_NODE"}
+
+
+def test_remove_invalid_drops_refs_outside_hit():
+    """`remove_invalid=True` 时新码的引用被剔除，通过的引用留下。"""
+    content = _content_with(_ref_of(_HIT), _ref_of(_UNRELATED))
+    diagnostics = verify_source_refs(content, [_the_source()],
+                                     evidence=[_evidence_span()],
+                                     remove_invalid=True)
+    assert [ref.quote for ref in content.root.source_refs] == [_HIT]
+    assert {d.code for d in diagnostics} == {"SOURCE_REF_OUTSIDE_EVIDENCE"}

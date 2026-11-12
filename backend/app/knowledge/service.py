@@ -28,6 +28,7 @@ import os
 import re
 import time
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
@@ -104,6 +105,18 @@ class EvidenceHit(BaseModel):
     # 这条结果实际由哪条路支撑。`_rag` 的 data["method"] 是请求级的旧字段，
     # 逐条标注才能看出"这条是纯语义捞回来的、字面一个词都不沾"。
     method: Literal["lexical", "hybrid"] = "lexical"
+    # 这次命中**真正匹配上**的子块区间。只有父块返回模式（`search_parent`）才有
+    # 值：那里 `start/end` 是父块、`leaf_start/leaf_end` 是子块。`search_sources`
+    # 与 `search_multi` 恒为 None——它们的 `start/end` 就是匹配单元，再记一遍是
+    # 同一个数。
+    #
+    # 这两个字段不是给人看的，是给引用校验用的：`quote` 变成 500 字的父块之后，
+    # 模型从父块里引一句与查询无关的话也照样通过逐字校验，`verify_source_refs`
+    # 会从"证据核验"退化成"格式检查"。有了子块区间，校验才能问出那句
+    # "这条引用落在命中的那 200 字里吗"（见 `optimization/source_refs.py`
+    # 的 `EvidenceSpan`）。没接入校验链之前它们只是两个可读的数字。
+    leaf_start: int | None = None
+    leaf_end: int | None = None
 
 
 # ---------------------------------------------------------------- 检索前置过滤
@@ -381,17 +394,27 @@ def _scan_cut(
     return 0
 
 
-def _pick_cut(text: str, pos: int, mask: bytearray) -> int:
+def _pick_cut(
+    text: str, pos: int, mask: bytearray, *,
+    target_chars: int = CHUNK_TARGET_CHARS,
+    max_chars: int = CHUNK_MAX_CHARS,
+    min_chars: int = CHUNK_MIN_CHARS,
+) -> int:
     """挑切点：先在 [TARGET, MAX] 里取最靠前的，退一步在 [MIN, TARGET) 里取最靠后的。
 
     两个窗口的顺序就是"块长优先"的意思：目标窗口里有边界时用最靠前的那个，
     块长落在 TARGET 附近；只有 TARGET 之后整段都没有可切之处（一个 300 字的
     长句），才允许在 TARGET 之前收尾，把块压到 MIN 与 TARGET 之间。
     反过来先找"最靠后"会让每块都贴着 MAX——那样 TARGET 就是一句空话。
+
+    三个长度参数默认就是父块的那一组常量。之所以参数化而不是另写一份：子块要
+    换的只是长度，分隔符优先级、安全回退、"先靠前再靠后"这两段窗口的顺序**一个
+    都不能变**——复制一份就等于埋下两份会各自漂移的切点逻辑，而那种漂移除了
+    回归用例没有任何信号（本文件 `_single_search` 的注释讲的是同一件事）。
     """
-    target = min(pos + CHUNK_TARGET_CHARS, len(text))
-    high = min(pos + CHUNK_MAX_CHARS, len(text))
-    low = pos + CHUNK_MIN_CHARS
+    target = min(pos + target_chars, len(text))
+    high = min(pos + max_chars, len(text))
+    low = pos + min_chars
 
     cut = _scan_cut(text, pos, target, high, mask, prefer="first")
     if cut:
@@ -436,11 +459,15 @@ def _overlap_start(text: str, start: int, end: int, mask: bytearray) -> int:
     return end
 
 
-def _too_short(span: list[int]) -> bool:
-    return span[1] - span[0] < CHUNK_MIN_CHARS
+def _too_short(span: list[int], minimum: int = CHUNK_MIN_CHARS) -> bool:
+    return span[1] - span[0] < minimum
 
 
-def _merge_short(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+def _merge_short(
+    spans: list[tuple[int, int]], *,
+    minimum: int = CHUNK_MIN_CHARS,
+    ceiling: int = CHUNK_MAX_CHARS,
+) -> list[tuple[int, int]]:
     """自左向右把过短的块并进后一块；末块过短则并进前一块。
 
     只动 start/end，不重排文本。贪心切点产出的块长天然 ≥ MIN，所以向左合并
@@ -448,19 +475,22 @@ def _merge_short(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
     "剩余 > MAX"，于是 `"字"*701` 会切出 `(0,700) + (700,701)`，末块只剩一个字。
     那种块占掉一个 top_k 位置却什么信息都没有，所以末块合并允许结果略超 MAX
     （上限放宽到 MAX+MIN）：宁可最后一块多出几百字符，也不要留一个碎块。
+
+    `minimum` / `ceiling` 参数化是为了子块复用同一套合并规则（见 `_leaf_spans`）：
+    合并的**判据**（短了就并、并完不许超上限）与父块完全一样，只是阈值不同。
     """
     merged: list[list[int]] = []
     for start, end in spans:
         if (
             merged
-            and _too_short(merged[-1])
-            and end - merged[-1][0] <= CHUNK_MAX_CHARS
+            and _too_short(merged[-1], minimum)
+            and end - merged[-1][0] <= ceiling
         ):
             merged[-1][1] = end
             continue
         merged.append([start, end])
-    if len(merged) > 1 and _too_short(merged[-1]):
-        if merged[-1][1] - merged[-2][0] <= CHUNK_MAX_CHARS + CHUNK_MIN_CHARS:
+    if len(merged) > 1 and _too_short(merged[-1], minimum):
+        if merged[-1][1] - merged[-2][0] <= ceiling + minimum:
             merged[-2][1] = merged[-1][1]
             merged.pop()
     return [(span[0], span[1]) for span in merged]
@@ -495,6 +525,106 @@ def _chunks(text: str) -> Iterator[tuple[int, int, str]]:
     """
     for start, end in _chunk_spans(text):
         yield start, end, text[start:end]
+
+
+# ---------------------------------------------------------------- 两级切块
+#
+# 单级切块把"匹配粒度"与"返回粒度"绑死在同一批块上：块大（450–700）时匹配带
+# 噪声、长块在 BM25 的长度归一化里吃亏；块小（150–250）时匹配准，但回给模型的
+# 上下文只有一句话，读起来没头没尾。
+#
+# 两级切块把这两件事拆开：**子块负责匹配**（短，词面与向量都不被无关内容稀释），
+# **父块负责返回**（长，读得懂前因后果）。子块不是独立文本，它就是父块里的一段，
+# 所以偏移仍落在原文上，`text[start:end]` 对父子两级都逐字成立。
+#
+# 父块参数直接用上面那组 `CHUNK_*`，一个都不改：`_chunk_spans` 是别的调用方与
+# 测试的基础，它的块边界同时是父块的边界——两套边界一旦不同，"父块"就会变成
+# 一个与 `search_sources` 返回的块无法对齐的概念，将来接落库时要多一份映射。
+LEAF_TARGET_CHARS = 200    # 子块目标长度：一句话群，足够判定"讲的是这件事"
+LEAF_MAX_CHARS = 320       # 子块硬上限：再长就会把两三个话题混进同一次匹配
+LEAF_MIN_CHARS = 100       # 低于它向后合并：一百字以下的子块匹配时区分度不足
+
+
+@dataclass(frozen=True)
+class ChunkSpan:
+    """两级切块树上的一个节点。
+
+    `start` / `end` 是**原文码点**偏移，与 `EvidenceHit` / `SourceRef` 同口径，
+    父子两级一视同仁：父块 `text[start:end]` 是完整上下文，子块 `text[start:end]`
+    是父块里的一段，两者都能直接切片高亮。
+
+    `parent` 存的是**本列表里的下标**而不是区间：同一段原文可能被切成重叠的两块，
+    区间反查会有歧义，下标不会。`level=0`（父）的 `parent` 恒为 None。
+    """
+
+    start: int
+    end: int
+    level: int
+    parent: int | None
+
+
+def _leaf_spans(text: str, start: int, end: int, mask: bytearray) -> list[tuple[int, int]]:
+    """把一个父块 `[start, end)` 内部切成子块，结果严格落在父块内。
+
+    切点完全复用父块的机制（`_pick_cut` 的分隔符优先级、安全回退、`_overlap_start`
+    的句首吸附），只换长度参数。重叠沿用 `CHUNK_OVERLAP_CHARS`（100）：子块只有
+    200 上下，100 的重叠约占一半，看起来偏大，但它是**句子级**的重叠——吸附不
+    到句首时直接不重叠，所以真实语料里远不是每一对都重叠一半。
+
+    与父块唯一的机制差别是长度参数；合并规则也是同一套（`_merge_short`），只是
+    末块的上限放宽到 `LEAF_MAX + LEAF_MIN`——理由与父块一致：宁可末块多出一点，
+    也不要留一个几十字的碎块去占一个匹配位。
+    """
+    if end - start <= LEAF_MAX_CHARS:
+        # 父块本身还没到子块上限：它就是自己的子块。此时长度可能低于 LEAF_MIN
+        # （末父块常见），这是"父块太短"造成的，不是切分失败——不拿 MIN 去反推，
+        # 那会逼着切块器把短父块补长，等于凭空造原文。
+        return [(start, end)]
+
+    spans: list[tuple[int, int]] = []
+    position = start
+    while end - position > LEAF_MAX_CHARS:
+        cut = _pick_cut(
+            text, position, mask,
+            target_chars=LEAF_TARGET_CHARS,
+            max_chars=LEAF_MAX_CHARS,
+            min_chars=LEAF_MIN_CHARS,
+        )
+        spans.append((position, cut))
+        overlap = _overlap_start(text, position, cut, mask)
+        # `_overlap_start` 保证返回值 ≥ position+1，这里的兜底是给"循环必须前进"
+        # 这条不变量兜底：真进了死循环，代价是整次请求挂住，而不是慢一点。
+        position = overlap if overlap > position else cut
+    spans.append((position, end))
+    return _merge_short(spans, minimum=LEAF_MIN_CHARS, ceiling=LEAF_MAX_CHARS)
+
+
+def _chunk_tree(text: str) -> list[ChunkSpan]:
+    """先按现有参数切出父块，再把每个父块内部切成子块。
+
+    返回顺序就是原文顺序，每个父块后面紧跟它的子块——所以子块的 `parent` 下标
+    `i` 满足 `i < 自己在列表里的下标`，一次正序遍历就能拿到父块区间。
+
+    父块直接取自 `_chunk_spans`，不是"再写一遍同样的贪心"：`_chunk_spans` 的
+    覆盖性（首块从 0 起、末块到 `len(text)`、相邻块相接或重叠）与全部既有的边界
+    测试都由它保证，父块借这层就等于借到了那些约束。代价是 `_unsafe_boundaries`
+    被算两遍（一次在里面、一次在这里给子块用）——它是 O(n) 的差分数组，五万字
+    材料上是微秒级，不值得为省它去动 `_chunk_spans` 的签名。
+
+    空文本返回单个零宽父块、没有子块：`start < end` 是子块的存在前提，零宽区间
+    不产子块，也就不会被下游当成"命中了一个空片段"。
+    """
+    mask = _unsafe_boundaries(text)
+    spans: list[ChunkSpan] = []
+    for start, end in _chunk_spans(text):
+        parent = len(spans)
+        spans.append(ChunkSpan(start=start, end=end, level=0, parent=None))
+        if end <= start:
+            continue
+        for leaf_start, leaf_end in _leaf_spans(text, start, end, mask):
+            spans.append(ChunkSpan(
+                start=leaf_start, end=leaf_end, level=1, parent=parent))
+    return spans
 
 
 # ---------------------------------------------------------------- 混合检索参数
@@ -557,6 +687,23 @@ def _token_list(text: str) -> list[str]:
 
 def _hybrid_enabled() -> bool:
     return os.getenv(HYBRID_ENV, "1").strip().lower() not in {"0", "off", "false", "no"}
+
+
+# `MINDMAP_PARENT_RETRIEVAL=1` 打开"子块匹配、父块召回"（`search_parent`）。
+# 默认**关**，理由见 `docs/RAG-DECISIONS.md` 第 3 节：现在每次检索都把材料整份
+# 交给模型，父块只是"把模型已经读过的内容再贴一遍"，收益抵不上多一层的复杂度；
+# 这个开关是为建库之后的"只给片段"形态准备的——那时返回的块就是模型能看到
+# 的全部上下文，粒度不够就真的读不懂。
+PARENT_RETRIEVAL_ENV = "MINDMAP_PARENT_RETRIEVAL"
+
+# 注意这里的判定方向与 `_hybrid_enabled` 相反：那个默认开，所以"不在假值集合里"
+# 就是开；这个默认关，必须**正列举**真值——否则不设变量时默认值会变成开，而
+# "默认关"正是这个开关存在的理由（宿主机的环境变量不该改变默认行为）。
+_PARENT_RETRIEVAL_TRUTHY = {"1", "on", "true", "yes"}
+
+
+def _parent_retrieval_enabled() -> bool:
+    return os.getenv(PARENT_RETRIEVAL_ENV, "0").strip().lower() in _PARENT_RETRIEVAL_TRUTHY
 
 
 def _bm25_scores(query: str, quotes: list[str]) -> list[float]:
@@ -804,14 +951,18 @@ def _to_hit(
     )
 
 
-def _single_search(
+def _fuse(
     collected: list[tuple[str, int, int, str]], question: str, top_k: int,
 ) -> list[EvidenceHit]:
-    """单路检索（BM25 + 向量，RRF 融合）——`search_sources` 的全部打分逻辑。
+    """对一批块打分（BM25 + 向量，RRF 融合），按分数降序返回**未去重、未截断**的命中。
 
-    抽成独立函数只为一件事：`search_multi` 在只有一路时必须与 `search_sources`
-    **逐字段相同**。两份实现各写一遍排序/截断/去重，迟早会分叉，而那种分叉
-    除了回归用例没有别的信号。
+    这个函数不关心坐标是父块还是子块，它只认 `collected` 里的区间；排序键与
+    `_pick_top` 完全一致（同分时短块优先）。
+
+    拆出来是给 `search_parent` 用的：那条路要先把命中折到父块上，再在**父块
+    坐标**上去重。如果沿用 `_single_search`（它在传入坐标上就去重了），相邻子块
+    那 100 码点的重叠会让两个**不同父块**的命中被当成重复证据丢掉一条——去重的
+    顺序在这里不是风格问题，是会少给证据。
     """
     quotes = [item[3] for item in collected]
     lengths = [item[2] - item[1] for item in collected]
@@ -844,10 +995,27 @@ def _single_search(
     bm25_values = {index: lexical[index] for index in fused}
     hits = [_to_hit(index, score, collected, bm25_values, similarity, method)
             for index, score in fused.items()]
+    # 同分时短的块优先：整块命中率相同的情况下，短块的信息密度更高。
+    # RRF 下这条仍然必要——两路名次互换的组合（1+2 与 2+1）分数完全相同。
+    return sorted(hits, key=lambda hit: (-hit.score, hit.end - hit.start))
 
+
+def _single_search(
+    collected: list[tuple[str, int, int, str]], question: str, top_k: int,
+) -> list[EvidenceHit]:
+    """单路检索（BM25 + 向量，RRF 融合）——`search_sources` 的全部打分逻辑。
+
+    抽成独立函数只为一件事：`search_multi` 在只有一路时必须与 `search_sources`
+    **逐字段相同**。两份实现各写一遍排序/截断/去重，迟早会分叉，而那种分叉
+    除了回归用例没有别的信号。
+
+    打分融合在 `_fuse` 里，这里只剩"排序 → 去重 → 截断"（`_pick_ordered` 就是
+    后两步，排序已在 `_fuse` 里做完）。与拆分之前逐字段相同，`tests/
+    test_search_multi.py` 拿 `41dda8e` 的旧模块钉着这条。
+    """
     # 排序之后再去重：重叠块会把同一段原文重复推进 top_k，真正不同的证据
     # 反而挤不进来。只在截断前多这一道筛，不改前面任何一步。
-    return _pick_top(hits, top_k)
+    return _pick_ordered(_fuse(collected, question, top_k), top_k)
 
 
 def search_sources(sources: list[Source], query: str, top_k: int = 5, *,
@@ -913,6 +1081,175 @@ def search_sources(sources: list[Source], query: str, top_k: int = 5, *,
     # 打分与融合在 `_single_search` 里：`search_multi` 只有一路时也走它。
     # 两条路径共用同一份实现，"没有扩展"与"只多了一路纠错"才可能逐字段相同。
     return _single_search(collected, question, top_k)
+
+
+# ---------------------------------------------------------------- 小块检索、大块召回
+
+
+@dataclass(frozen=True)
+class _LeafCorpus:
+    """一次两级切块的产物：喂给打分的子块 + 子块到父块区间的对照表。
+
+    `items` 与 `parents` **按下标对齐**：`items[i]` 是第 i 个子块的
+    `(source_id, start, end, quote)`（形状与 `_collect_chunks` 一致，好让同一个
+    `_fuse` 直接吃），`parents[i]` 是它的父块区间。
+
+    `texts` 留着原文是为了折父块时切片——`quote` 必须是 `text[父.start:父.end]`
+    逐字，不能拿几个子块的文本拼出来：拼接会在重叠处重复、在无重叠处留下接缝，
+    而 `quote` 的**唯一**用途就是"给模型读的连续上下文 + 给界面做高亮"。
+    """
+
+    items: list[tuple[str, int, int, str]]
+    parents: list[tuple[int, int]]
+    texts: dict[str, str]
+
+
+def _collect_leaves(sources: list[Source]) -> _LeafCorpus:
+    """切一遍两级树，只留下子块——父块的原样保留由 `_fold_to_parents` 负责。
+
+    空判断与 `_collect_chunks` 一致（`strip` 判空、切块用原文），否则一份只有
+    空白的来源会产出一个零宽父块，进而在打分时变成"一个什么都没匹配到的块"，
+    抬高 N 却没有任何召回价值。
+    """
+    items: list[tuple[str, int, int, str]] = []
+    parents: list[tuple[int, int]] = []
+    texts: dict[str, str] = {}
+    for source in sources:
+        text = source.text or ""
+        if not text.strip():
+            continue
+        texts[source.id] = text
+        tree = _chunk_tree(text)
+        for node in tree:
+            # level=0 的父块不参与匹配：它存在的意义只有"被子块找到之后被返回"。
+            if node.parent is None:
+                continue
+            parent = tree[node.parent]
+            items.append((source.id, node.start, node.end, text[node.start:node.end]))
+            parents.append((parent.start, parent.end))
+    return _LeafCorpus(items=items, parents=parents, texts=texts)
+
+
+def _fold_to_parents(ranked: list[EvidenceHit], corpus: _LeafCorpus) -> list[EvidenceHit]:
+    """把子块命中折成父块命中：区间换父块、quote 取父块全文、分数留在子块。
+
+    `ranked` 必须**按分数降序**（`_fuse` 的输出就是这样）：同一父块的第一条
+    就是它分数最高的那条子块，所以"多个子块命中同一父块时只保留分数最高的"
+    由遍历顺序保证，不需要比较、也不会被后面更低的分数覆盖。
+
+    去重的键是**父块区间**而不是子块下标：一个父块通常有 2–4 个子块，按子块下标
+    去重等于没去重（每个子块都是不同的下标），而"同一父块只留一条"正是这一步的
+    目的。也**不能**指望后面 `_pick_ordered` 的近重复判定兜住——那一层按重叠率
+    筛，父块很短时会把两个不同父块误判成重复，两种错法的方向正好相反。
+
+    为什么必须合并：父块是 450–700 字，子块只有 200 上下，一个父块通常有 2–4
+    个子块。不合并的话，`top_k=5` 会被同一个父块的三四条子命中占满，模型看到
+    的五条"不同证据"其实是同一段上下文的三次摘录——这比块大导致的噪声更糟，
+    因为它让"去重后的多样性"这个 top_k 的隐含承诺直接失效。
+
+    分数的口径**不跟着区间变**：`score` / `score_bm25` / `score_vector` 都是
+    子块匹配的结果，父块本身没有参与打分。父块是"返回窗口"，不是"评分单元"。
+
+    `leaf_start` / `leaf_end` 记下真正命中的子块区间。它和 `start`/`end` 一起
+    构成"证据的两级坐标"：外层是给模型读的上下文，内层是这次匹配成立的范围。
+    引用校验要靠它区分"引用落在命中的那一段"与"引用落在父块里与查询无关的
+    另一半"（详见 `optimization/source_refs.py`）。
+    """
+    position = {(item[0], item[1], item[2]): index
+                for index, item in enumerate(corpus.items)}
+    folded: list[EvidenceHit] = []
+    seen: set[tuple[str, int, int]] = set()
+    for hit in ranked:
+        index = position[(hit.source_id, hit.start, hit.end)]
+        start, end = corpus.parents[index]
+        key = (hit.source_id, start, end)
+        if key in seen:
+            continue
+        seen.add(key)
+        folded.append(hit.model_copy(update={
+            "start": start,
+            "end": end,
+            "quote": corpus.texts[hit.source_id][start:end],
+            "leaf_start": hit.start,
+            "leaf_end": hit.end,
+        }))
+    return folded
+
+
+def search_parent(sources: list[Source], query: str, top_k: int = 5, *,
+                  filters: SourceFilter | None = None) -> list[EvidenceHit]:
+    """**用子块匹配、把父块回给调用方**（small-to-big / parent-document retrieval）。
+
+    与 `search_sources` 的差别只有粒度，不是另一套检索：
+
+      - 匹配发生在**子块**上（`LEAF_*`，约 200 字）。子块短，查询词在块内的
+        占比高、长度归一化的惩罚小，同一段原文不会因为有半页无关内容而掉名次；
+        向量路的余弦也不会被跑题段落稀释。
+      - 返回的是**父块**（`CHUNK_*`，450–700 字），`start`/`end`/`quote` 都取
+        父块区间——命中之后模型读到的是完整的前因后果，而不是半句话。
+
+    **分数来自子块匹配，区间来自父块**。`score` 是命中子块的 RRF 分（或单路
+    BM25 分），`score_bm25` / `score_vector` 同理；父块区间只是返回口径。两者
+    不要混着读：分数高说明"这段原文里有一小段精准命中"，不代表整个父块都相关。
+    `score` 仍然是**只在本次检索内可比**（IDF 与名次都依赖这次请求切出的子块
+    集合），跨请求比较看 `method` 与两路原始分。
+
+    **`start/end/quote` 是父块，`leaf_start/leaf_end` 是命中的子块**。两级坐标
+    一起给出，"这句话为什么被找出来"才可核验：只给父块时，从 500 字里随手引一句
+    也能通过逐字校验，引用校验会退化成格式检查。给调用方的建议写在
+    `optimization/source_refs.py::EvidenceSpan` 上。
+
+    三条与 `search_sources` 对齐的约定：
+      - `filters` 依旧是**检索前置**过滤（先筛来源再切块），语义见 `SourceFilter`；
+        筛光时返回 `[]` 并记 info，不抛错。
+      - 返回条数 `<= top_k`，且每条对应**不同的父块**。去重只做"同一父块并一条"
+        （`_fold_to_parents`），**不做**基于重叠率的近重复筛：那一道在父块坐标上
+        会把两个不同父块误判成重复（父块短于 `2×CHUNK_OVERLAP_CHARS` 即 200 字时
+        必然触发），净效果是静默少给一条。
+      - **不要把返回条数当成证据充分性**。父块合并是减法：子块/父块比实测 2.4–2.7，
+        材料越同质（长合同、连续制度），`top_k` 条子块命中越可能只覆盖两三个父块，
+        于是折完 `len(hits) < top_k`。这是合并的固有代价，不是"材料里没东西"——
+        判断材料够不够，看 `score` 与 `score_bm25` 是否为正、以及命中的父块之间
+        是否真的换了话题，不要看条数。
+
+    开关 `MINDMAP_PARENT_RETRIEVAL` 默认 **0**。关着时**直接返回
+    `search_sources(...)` 的结果**——不是"照着它再实现一遍"，是同一个函数，
+    所以逐字段相同由构造保证（`tests/test_parent_retrieval.py` 拿 `f72c14c`
+    的旧模块钉着这条）。默认关的理由见 `docs/RAG-DECISIONS.md` 第 3 节：当前
+    材料整份进 prompt，父块只是把模型读过的内容再贴一遍；这个能力是为建库之后
+    "只给片段"的形态准备的。
+    """
+    if not _parent_retrieval_enabled():
+        return search_sources(sources, query, top_k, filters=filters)
+
+    question = query.strip()
+    if not _token_list(question):
+        return []
+
+    # 过滤必须在切块与向量化之前，理由与 `search_sources` 完全一致：被筛掉的
+    # 来源不该污染 BM25 的 N/df，也不该产生 embedding 调用与缓存写入。
+    if filters is not None:
+        selected = filter_sources(sources, filters)
+        if not selected:
+            logger.info("过滤条件筛掉了全部来源（%d→0）", len(sources))
+            return []
+        if len(selected) != len(sources):
+            logger.debug("检索前过滤：来源 %d→%d", len(sources), len(selected))
+        sources = selected
+
+    corpus = _collect_leaves(sources)
+    if not corpus.items:
+        return []
+
+    # 候选池放大：子块级别多取一些，是因为折父块时同一父块的多条会并成一条。
+    # 只取 top_k 条子块时，它们很可能全落在两三个父块里，折完凑不满 top_k。
+    # 放大**不改**已在候选集里的分数（RRF 只吃名次），只是让更多子块有名字可排。
+    ranked = _fuse(corpus.items, question, top_k * CANDIDATE_FACTOR)
+    # 折父块 → 截断。折完就不再跑 `_pick_ordered` 的近重复筛：`_fold_to_parents`
+    # 已经保证每条对应不同的父块，再按"重叠 > 较短者一半"筛一遍，只会在父块短于
+    # 2×`CHUNK_OVERLAP_CHARS`（200 字）时把两个**不同**父块判成重复，净效果是
+    # 静默少给一条证据。截断就是这里需要的全部裁剪。
+    return _fold_to_parents(ranked, corpus)[:top_k]
 
 
 # ---------------------------------------------------------------- 多路并行检索

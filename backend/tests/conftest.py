@@ -9,9 +9,9 @@
 
   - **没有凭证**：embedding 与 LLM 的 key/base/model 一律清空，`configured()`
     恒为假，`search_sources` 稳定走纯 BM25。
-  - **开关显式关**：`MINDMAP_HYBRID_SEARCH=0`、`MINDMAP_QUERY_EXPANSION=0`。
-    需要它们的用例自己 `monkeypatch.setenv(..., "1")`，那会覆盖这里的值；
-    反过来，忘记开的用例只会"少测"一条路，不会偷偷发出真实请求。
+  - **开关显式关**：`MINDMAP_HYBRID_SEARCH=0`、`MINDMAP_QUERY_EXPANSION=0`、
+    `MINDMAP_PARENT_RETRIEVAL=0`、`MINDMAP_GRAPH_EXTRACTION=0`。需要它们的用例自己 `monkeypatch.setenv(..., "1")`，
+    那会覆盖这里的值；反过来，忘记开的用例只会"少测"一条路，不会偷偷发出真实请求。
   - **数据库落 tmp**：`MINDMAP_DB_PATH` 指向本次测试的 `tmp_path`，仓库里的
     `backend/data/mindmaps.db` 不会被任何测试碰到。
 
@@ -48,7 +48,8 @@ BEHAVIOUR = (
     "MINDMAP_SOFFICE_CMD",
 )
 
-SWITCHES = ("MINDMAP_HYBRID_SEARCH", "MINDMAP_QUERY_EXPANSION")
+SWITCHES = ("MINDMAP_HYBRID_SEARCH", "MINDMAP_QUERY_EXPANSION", "MINDMAP_PARENT_RETRIEVAL",
+            "MINDMAP_GRAPH_EXTRACTION")
 
 
 @pytest.fixture(autouse=True)
