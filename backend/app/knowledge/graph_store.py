@@ -29,13 +29,15 @@ NULL)` 认为两个 NULL 互不相等），解法也一样：`None` → `''`（`
 说成"写好了"会让材料入库静默缺边，而这种缺失没有任何信号能发现：图不会报错，它
 只是少了一条路。
 
-**异常类型是 `OSError` 的子类**（`GraphStoreError`）。这不是风格问题：调用方
-`graph_ingest` 的降级分支写的是 `except (sqlite3.Error, OSError, ValueError)`，
-它按"块"计 `failed`。换存储引擎时把这层换成 Neo4j 专有异常，`failed` 就会从"这块
-没写进去"变成"整份材料抛到上传接口"，语义静默改变而测试看不出来。`OSError` 恰好
-也是"连不上 7687"最准确的归类（连接被拒、超时都是 I/O 失败），所以这不是迁就，
-是正确归类；`GraphStoreNotConfigured` 是它的子类，表示"密码没配"，与 unconfigured
-语义一致。
+**异常类型是 `OSError` 的子类**（`GraphStoreError`）。理由换过一次，两次都成立：
+换引擎那一刻，调用方 `graph_ingest` 的降级分支写的是
+`except (sqlite3.Error, OSError, ValueError)`，它按"块"计 `failed`；把这层换成
+Neo4j 专有异常，`failed` 就会从"这块没写进去"变成"整份材料抛到上传接口"，语义
+静默改变而测试看不出来。后来 `graph_ingest` 收敛成 `except (GraphStoreError,
+ValueError)` 并加上了失败熔断，直接依赖这里的类型——`OSError` 仍然保留，因为它本来
+就准确（连接被拒、超时都是 I/O 失败），而且仍在按 `except OSError` 兜底的调用方不会
+因为换引擎而失守。`GraphStoreNotConfigured` 是它的子类，表示"密码没配"，与
+unconfigured 语义一致。
 
 **驱动是模块级惰性单例**：`Driver` 自己就是连接池，官方推荐进程内长期持有、退出时
 `close()`。`close_driver()` 供测试（每个用例换一套环境变量）与进程退出调用。惰性
@@ -278,11 +280,15 @@ CYPHER_COUNT_ISOLATED = (
 class GraphStoreError(OSError):
     """图存储不可用。**继承 `OSError` 是设计，不是巧合**。
 
-    调用方（`graph_ingest`）的降级分支按 `except (sqlite3.Error, OSError,
-    ValueError)` 计 `failed`，它服务的是"这一块写库失败、下一块继续"。换引擎时
-    若抛 Neo4j 专有异常，这条分支就接不住了：`failed` 从"这块没落库"变成"整份
-    材料抛到上传接口"，而两种结果在测试里都可能看起来正常。`OSError` 同时也是
-    "连不上 7687"最准确的归类——连接被拒与超时本来就是 I/O 失败。
+    换引擎时选它的理由是：调用方（`graph_ingest`）的降级分支写着
+    `except (sqlite3.Error, OSError, ValueError)`，按块计 `failed`。若抛 Neo4j
+    专有异常，那条分支就接不住了——`failed` 从"这块没落库"变成"整份材料抛到上传
+    接口"，而两种结果在测试里都可能看起来正常。
+
+    现在 `graph_ingest` 已经收敛成 `except (GraphStoreError, ValueError)` 并按失败
+    类型熔断，继承关系不再是"唯一让上游活下来的办法"。保留它的两个理由仍然成立：
+    "连不上 7687"本来就是 I/O 失败，`OSError` 是最准确的归类；而按 `except
+    OSError` 兜底的第三方调用方不会因为换引擎而失守。
 
     `str()` 里只有异常类名，**不带 Neo4j 的原始消息**：那条消息可能回显属性值
     （实体名、关系短语），而这一层的日志原则是"只有形状，没有内容"——材料可能是

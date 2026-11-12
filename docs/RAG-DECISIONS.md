@@ -241,3 +241,56 @@
 ### 测量局限
 
 Windows 没有 cgroup，Job Object 限的是 commit 不是物理页；JVM 的默认 auto 读宿主 15.7GB 而非 2GB，所以「MaxRAM=2g」那一组才是 2G 机器的真实代表。Linux 上 RSS 会更接近 Private 列。CPU 侧（2 vCPU）未测。
+
+---
+
+## 9 图数据库落地时踩到的三件事
+
+第 8 节是选型时的实测对比（当时的结论是 SQLite 更划算）。这一节是**换掉之后**才知道的事——上游后来决定用 Neo4j，`knowledge/graph_store.py` 从 SQLite 重写为 Cypher。三个坑各花了一次排查，共同点是**症状离根因很远**：报错的地方不是写错的地方。
+
+### 9.1 `CREATE CONSTRAINT` 不能与数据写同事务
+
+**症状**：建图的第一句就炸，`ForbiddenDueToTransactionType`，消息是 `Tried to execute Write query after executing Schema modification`。看着像权限问题，但账号有全部权限。
+
+**根因**：Neo4j 把语句分成四类（read / write / schema modification / administration），**同一事务里不允许混**。`CREATE CONSTRAINT ... IF NOT EXISTS` 是 schema modification，哪怕它什么都没改；跟在后面的 `MERGE` 是 write，两条一撞就报错。SQLite 那边 `CREATE TABLE IF NOT EXISTS` 与 `INSERT` 同连接同事务是合法的，所以这个直觉是从上一版移植过来的——正是它错的地方。
+
+**处理**：约束走独立事务（`driver.execute_query`），不挂在任何写事务里；失败只记 warning 不抛。约束是"并发下的加固"，不是"能不能用"的前提——单线程的 `MERGE` 没有约束也幂等，而"一次建不上就整层不可用"是更差的交换。
+
+### 9.2 driver 6.x 的 `ServiceUnavailable` 不在 `Neo4jError` 树下
+
+**症状**："连不上 7687"，但降级分支没接住，异常一路抛到接口层——而同一段代码在 driver 5 上是好的。
+
+**根因**：6.0 把异常树重排成 `GqlError` → (`DriverError` | `Neo4jError`)，而 `ServiceUnavailable`（连接失败、认证失败、连接池耗尽）挂在 `DriverError` 那一支。5.x 里 `DriverError` 是 `Neo4jError` 的子类，所以 `except Neo4jError` 兜得住；6.x 里两者是兄弟，只捕获 `Neo4jError` 会漏掉最常发生的那一类。
+
+**处理**：捕获 `(Neo4jError, DriverError, OSError)`。两个名字一起写还有个好处：driver 5.x 里这套写法同样成立，`requirements.txt` 的 `neo4j>=5.14,<7` 才有意义。测试里有一条指向 1 号端口（连接被拒，立即失败）的用例专门钉这条路径：读接口返回空、写接口抛 `GraphStoreError`。
+
+### 9.3 `id()` 弃用与 `elementId()` 的类型冲突
+
+**症状**：日志被 WARNING 刷爆——每写一个实体一条 `id is deprecated and will be removed without a replacement`，一次入库上千个实体就是上千条，把真正要看的东西埋掉。
+
+**根因**：Neo4j 5.26 起 `id()` 被弃用，推荐 `elementId()`，但后者返回**字符串**（`4:66399144-...:4100`），而 `upsert_entity` 的返回类型是 `int`（对着 SQLite 版的自增主键）。换掉就是改接口，而接口在这轮里是硬约束：调用方拿它做"两次 upsert 是不是同一个节点"的比较。
+
+**处理**：保留 `id()`，在 driver 上**只关这一类通知**（`notifications_disabled_classifications=["DEPRECATION"]`），不整体关——别的通知（性能警告之类）还有价值。这条写进了 `_driver()` 的注释，因为下一个看见 `id()` 的人第一反应会是"为什么不用 elementId"。
+
+> 顺带一个必须知道的差异：**Neo4j 的内部 id 会被复用**（节点删掉之后新节点可能拿到同一个 id），SQLite 的 `AUTOINCREMENT` 不会。所以这个返回值只能当"这次是不是同一个节点"的比较键，不能持久化、不能跨重建假设不变。
+
+### 9.4 附带：`failed` 的语义没变，代价变了
+
+这一条不是 bug，是图库与嵌入式库在失败路径上的本质差别，但它决定了编排层要不要加熔断。
+
+换引擎时为了让 `graph_ingest` 原有的 `except (sqlite3.Error, OSError, ValueError)` 原样接住，`GraphStoreError` 被做成 **`OSError` 的子类**。这不是"异常类该继承谁"的风格问题：`failed` 的语义（"这一块没写进去"）与块级原子性都保持不变，一块坏掉只丢那一块。
+
+（那一层后来收敛成了 `except (GraphStoreError, ValueError)`，`sqlite3.Error` 那条死分支删掉了。`OSError` 的继承留着：它本来就准确，而且按 `except OSError` 兜底的调用方不会因为换引擎而失守。）
+
+变的是**失败一次要付多少钱**。SQLite 库不可写是毫秒级失败——它就是一次函数返回；Neo4j 连不上要付连接超时 + 重试（默认各 3 秒），20 块就是两分钟，而调用方（上传接口）在那里等着。
+
+所以后来给 `graph_ingest` 加了熔断，并按失败类型分开：
+
+| 失败类型 | 处理 | 理由 |
+|---|---|---|
+| `GraphStoreNotConfigured`（没配密码） | **第 1 块就停** | 配置错误不是偶发抖动，等 3 块只是多花两次 LLM 调用 |
+| 其余 `GraphStoreError` | 连续 3 块停 | 偶发一次不该让整份材料作废，连续三次说明引擎确实不在了 |
+| `ValueError`（区间倒置、空名） | 只算这一块 | 一块数据坏不代表引擎坏了；熔断它等于让一条坏数据终止整份材料 |
+
+统计里加 `aborted` 而不是把 `failed` 数字改大：调用方要能分清"跑完了但有 3 块失败"与"停在第 3 块、后面 17 块没试过"。成本闸（`max_chunks`）造成的截断**不**置 `aborted`——那是配置好的行为，不是故障。
+

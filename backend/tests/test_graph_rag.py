@@ -5,11 +5,12 @@
   - **纯函数**：`normalize_name` 的三条折叠规则、`GraphPath` / `EdgeInput` 的构造契约；
   - **未配置时的降级**：`conftest.py` 把 `MINDMAP_NEO4J_*` 全清了，所以"图存储没
     配置"是这里的默认前提——写接口抛 `GraphStoreError`（`OSError` 子类），读接口
-    返回空。这几条钉的正是 `graph_ingest` 那条 `except (sqlite3.Error, OSError,
-    ValueError)` 还接得住新引擎的异常；
+    返回空。这几条钉的是 `graph_ingest` 能接住的异常树：它现在按
+    `except (GraphStoreError, ValueError)` 计 `failed`；
   - **抽取**（`graph_extract`）全部用例：它不碰存储；
   - **编排**（`graph_ingest`）里凡是能把 store 换掉的：块数、成本闸、`failed` 计数、
-    孤立实体只对没边的实体 upsert；
+    孤立实体只对没边的实体 upsert、失败熔断（连续 3 块停 / 未配置第 1 块停 /
+    `ValueError` 不累计 / 成功清零）；
   - **Cypher 的静态校验**：占位符与传参键一致、唯一一处内插只能来自 int、路径解析
     的方向判定（用假 Path 对象，不连库）。
 
@@ -147,8 +148,9 @@ def test_edge_input_keeps_field_order_by_name():
 def test_unconfigured_writes_raise_graph_store_error():
     """没配密码 → 写接口抛专用异常，且它必须是 `OSError` 的子类。
 
-    后一条是接口契约：`graph_ingest` 按 `except (sqlite3.Error, OSError,
-    ValueError)` 计 `failed`，异常类型换了却没进这棵树的话，`failed` 会静默失效。
+    后一条是接口契约：`OSError` 是"连不上"最准确的归类，也是任何仍按
+    `except OSError` 兜底的调用方不至于因为换引擎而失守的原因。`graph_ingest`
+    现在直接捕获 `GraphStoreError`（更紧），但那不改变这里的对外承诺。
     """
     with pytest.raises(GraphStoreNotConfigured):
         upsert_entity("甲", "人物")
@@ -477,14 +479,20 @@ def fake_store(monkeypatch, *, bulk_raises=None, upsert_raises=None):
     编排层要断言的是"调了谁、拿了几次、失败怎么记"，不是"数据最后在哪"——后者是
     `tests/test_graph_neo4j.py` 的事。换掉 store 之后这一层的用例与有没有 Neo4j
     完全无关，也不再需要每个用例都起一遍库。
+
+    `bulk_raises` 可以是单个异常（每次都抛），也可以是一个列表：按第几次调用取，
+    `None` 表示这一次成功。熔断的用例需要"失败-失败-成功-失败"这种序列。
     """
     calls = {"bulk": [], "upsert": []}
 
     def bulk(edges):
         batch = list(edges)
         calls["bulk"].append(batch)
-        if bulk_raises is not None:
-            raise bulk_raises
+        failure = bulk_raises
+        if isinstance(bulk_raises, (list, tuple)):
+            failure = bulk_raises[min(len(calls["bulk"]) - 1, len(bulk_raises) - 1)]
+        if failure is not None:
+            raise failure
         return len(batch)
 
     def upsert(name, kind=None):
@@ -555,7 +563,7 @@ def test_ingest_counts_chunk_failed_when_store_raises(monkeypatch):
     """写库失败只影响这一块：`failed` +1，异常不冒泡。
 
     `GraphStoreError` 在这里被当成 `OSError` 接住——这条断言就是"换引擎不能换
-    异常树"的现场证明。
+    异常树"的现场证明。两块连败还没到熔断线（3 块），所以 `aborted` 仍是假。
     """
     enable(monkeypatch)
     one_chunk(monkeypatch, [(0, 4), (4, 8)])
@@ -569,6 +577,7 @@ def test_ingest_counts_chunk_failed_when_store_raises(monkeypatch):
     assert result["chunks"] == 2
     assert result["failed"] == 2      # 两块都写失败
     assert result["edges"] == 0
+    assert result["aborted"] is False
 
 
 def test_ingest_skips_blank_text(monkeypatch):
@@ -577,7 +586,8 @@ def test_ingest_skips_blank_text(monkeypatch):
     calls = fake_extract(monkeypatch, [extraction([("甲", "人物")])])
     store = fake_store(monkeypatch)
     assert run(ingest_graph(make_source("   "))) == {
-        "chunks": 0, "entities": 0, "edges": 0, "failed": 0, "elapsed_ms": 0,
+        "chunks": 0, "entities": 0, "edges": 0, "failed": 0, "aborted": False,
+        "elapsed_ms": 0,
     }
     assert calls == [] and store["bulk"] == [] and store["upsert"] == []
 
@@ -627,6 +637,102 @@ def test_ingest_isolated_upsert_failure_does_not_fail_chunk(monkeypatch):
 
     assert result["failed"] == 0
     assert result["edges"] == 1
+
+
+# ------------------------------------------------------- 7. 失败熔断
+
+
+def five_chunks(monkeypatch):
+    """固定成 5 块、每块 2 字，让"停在第几块"可以精确断言。"""
+    one_chunk(monkeypatch, [(index * 2, index * 2 + 2) for index in range(5)])
+
+
+def one_edge(monkeypatch):
+    """每块都抽到同一条边：写库失败与数据无关，纯粹是引擎的问题。"""
+    return fake_extract(monkeypatch, [
+        extraction([("甲", "人物"), ("乙", "组织")], [("甲", "乙", "任职于")]),
+    ])
+
+
+def test_ingest_aborts_after_consecutive_store_failures(monkeypatch):
+    """连续 3 块写库失败 → 停，剩下的块连抽取都不做。
+
+    熔断省的是**LLM 调用**：第 4、5 块即使抽出来也落不了库。所以断言的不只是
+    `aborted`，还有"抽取只被调了 3 次"。
+    """
+    enable(monkeypatch)
+    five_chunks(monkeypatch)
+    calls = one_edge(monkeypatch)
+    store = fake_store(monkeypatch, bulk_raises=GraphStoreError("模拟引擎挂了"))
+
+    result = run(ingest_graph(make_source("甲乙" * 5)))
+
+    assert result["aborted"] is True
+    assert result["chunks"] == 3          # 停在第 3 块，不是跑完 5 块
+    assert result["failed"] == 3
+    assert len(calls) == 3                # 后两块没有被抽取
+    assert len(store["bulk"]) == 3
+
+
+def test_ingest_aborts_on_first_chunk_when_store_unconfigured(monkeypatch):
+    """没配密码是配置错误，不是偶发抖动：第 1 块就停，不等 3 块。
+
+    这条**不 mock store**：`conftest.py` 已经把 `MINDMAP_NEO4J_*` 清空，所以真
+    `graph_store` 会在第一块写库时抛 `GraphStoreNotConfigured`，`_driver()` 里的
+    密码检查在拿连接之前就返回，零网络开销。断言的是"整条链路在这个前提下第 1 块
+    就停"，比构造一个假异常强。
+
+    等满 3 块的代价是两次白花的 LLM 调用——而"没配置"这件事第一块就已经确定了。
+    """
+    enable(monkeypatch)
+    five_chunks(monkeypatch)
+    calls = one_edge(monkeypatch)
+
+    result = run(ingest_graph(make_source("甲乙" * 5)))
+
+    assert result["aborted"] is True
+    assert result["chunks"] == 1
+    assert result["failed"] == 1
+    assert len(calls) == 1
+
+
+def test_value_error_does_not_trip_the_breaker(monkeypatch):
+    """数据问题只算单块：5 块全部区间倒置也不熔断，每块都试。
+
+    一块数据坏不代表引擎坏了。把它算进熔断等于让一条坏数据终止整份材料——而重跑
+    一次入库本来就是修数据的手段，前提是它得跑完。
+    """
+    enable(monkeypatch)
+    five_chunks(monkeypatch)
+    one_edge(monkeypatch)
+    store = fake_store(monkeypatch, bulk_raises=ValueError("证据区间倒置"))
+
+    result = run(ingest_graph(make_source("甲乙" * 5)))
+
+    assert result["aborted"] is False
+    assert result["chunks"] == 5
+    assert result["failed"] == 5
+    assert len(store["bulk"]) == 5
+
+
+def test_breaker_resets_after_a_successful_chunk(monkeypatch):
+    """失败 2 次 → 成功 1 次 → 再失败 2 次：计数被清零，所以不熔断。
+
+    "连续"是这条规则的全部：不重置的话，一份 20 块的材料里零散的 3 次失败会把它
+    从头掐断，而那正是引擎只是偶尔抖一下的典型形态。
+    """
+    enable(monkeypatch)
+    five_chunks(monkeypatch)
+    one_edge(monkeypatch)
+    boom = GraphStoreError("引擎抖动")
+    fake_store(monkeypatch, bulk_raises=[boom, boom, None, boom, boom])
+
+    result = run(ingest_graph(make_source("甲乙" * 5)))
+
+    assert result["aborted"] is False
+    assert result["chunks"] == 5
+    assert result["failed"] == 4
+    assert result["edges"] == 1           # 中间那块成功写进去的边还在
 
 
 # ------------------------------------------------------- 7. Cypher 的静态校验

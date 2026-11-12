@@ -519,3 +519,38 @@ def test_ingest_writes_the_graph_end_to_end(graph, monkeypatch):
     again = asyncio.run(graph_ingest.ingest_graph(source))
     assert again["edges"] == 0
     assert stats() == {"entities": 4, "edges": 2, "isolated_entities": 1}
+
+
+def test_ingest_breaker_trips_on_real_store_failure(graph, monkeypatch):
+    """真库上制造写库失败：连续 3 块熔断，后两块连抽取都不做。
+
+    第一层（`tests/test_graph_rag.py`）用假 store 抛异常验证的是编排逻辑；这一条
+    验证的是**真链路**：Cypher 语法错 → `CypherSyntaxError` → `_transaction` 包装成
+    `GraphStoreError` → 熔断计数器 +1。中间任何一环没接住，这里都会变成"5 块跑完、
+    `aborted` 为假"。
+    """
+    import asyncio
+
+    # 坏语句：只要有边要写就失败。`ingest_graph` 不知道这件事，它只看见异常。
+    monkeypatch.setattr(graph_store, "CYPHER_ADD_EDGES_BULK",
+                        "UNWIND $rows AS row\nRETURN this_is_not_cypher")
+    payload = _extraction([("甲", "人物"), ("乙", "组织")], [("甲", "乙", "任职于")])
+    calls = []
+
+    async def fake_extract(text, *, source_id, chunk_start=0):
+        calls.append(chunk_start)
+        return payload
+
+    monkeypatch.setattr(graph_ingest, "extract_graph", fake_extract)
+    monkeypatch.setattr(graph_ingest, "_chunk_spans",
+                        lambda text: [(index * 2, index * 2 + 2) for index in range(5)])
+
+    source = Source(id="doc-breaker", kind="text", text="甲乙" * 5)
+    result = asyncio.run(graph_ingest.ingest_graph(source))
+
+    assert result["aborted"] is True
+    assert result["chunks"] == 3          # 停在第 3 块
+    assert result["failed"] == 3
+    assert len(calls) == 3                # 第 4、5 块没有被抽取
+    # 整批都回滚了：库里没有任何实体或边。
+    assert stats() == {"entities": 0, "edges": 0, "isolated_entities": 0}

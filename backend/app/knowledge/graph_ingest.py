@@ -19,19 +19,40 @@
 
 ## 每块一次事务
 
-落库走 `graph_store.add_edges_bulk`：一个块的所有边在**一个连接一个事务**里写完。
-逐条 `add_edge` 每条边一次 fsync，实测 12000 行要 136 秒，单事务只要 34 毫秒。
+落库走 `graph_store.add_edges_bulk`：一个块的所有边在**一个事务**里写完。
 块级（而不是整份材料一次）是有意的：失败粒度与 `failed` 的语义保持一致，一块
 坏掉只丢那一块。
 
 没有出现在任何关系里的实体另走 `upsert_entity`——它们本来就没有边，跟着批量
 写进去也没东西可写；数量通常在个位数，不值得为此多加一个批量接口。
 
+## 失败熔断
+
+每块一次事务带来一个副作用：**写库失败要按块付钱**。图库不可用时一次写入要付
+连接超时 + 重试（默认各 3 秒），20 块就是两分钟，而调用方（上传接口）在那儿等着。
+所以连续 `MAX_CONSECUTIVE_FAILURES` 块写库失败就停止，不再抽后面的块——那些块
+的 LLM 调用本来就是白花的（抽出来也落不了库）。
+
+三种失败要分开处理，因为它们的"可恢复性"完全不同：
+
+  - `GraphStoreNotConfigured`（没配密码）：**第一块就停**。这是配置错误，不是偶发
+    抖动，等三块只是多花两次 LLM 调用。
+  - 其余 `GraphStoreError`：**累计**，连续 3 块才停。偶发的一次锁冲突不该让整份
+    材料作废，而连续三次说明引擎确实不在了。
+  - `ValueError`（区间倒置、空名这类数据问题）：**只算这一块**，既不累计也不清零。
+    一块数据坏不代表引擎坏了，熔断它等于把"数据的错"当成"引擎的错"。
+
+熔断后 `chunks` 小于总块数，`aborted` 为真——**不要**用 `failed` 变大来暗示中止，
+那样调用方分不清"跑完了但有 3 块失败"与"停在第 3 块、后面 17 块没试过"。
+成本闸（`max_chunks`）造成的截断不置 `aborted`：那是配置好的行为，不是故障。
+
 ## 统计口径
 
-  - `chunks`：**尝试抽过的块数**（含失败的），不是成功的块数。
+  - `chunks`：**尝试抽过的块数**（含失败的），不是成功的块数。熔断后它就是"停在
+    第几块"。
   - `failed`：其中返回 `None`（降级）或写库时抛错的块数。`chunks - failed`
     就是真正贡献了东西的块数。
+  - `aborted`：是否因为存储不可用而**提前停止**（还有块没试过）。成本闸截断不算。
   - `entities`：本次成功落库的去重实体数（按 `(name, type)`），包含没有边的孤立实体。
     落库失败的块不计入。
   - `edges`：**新写进库**的边数。重复的边不计入——`add_edges_bulk` 只统计被
@@ -40,7 +61,6 @@
 from __future__ import annotations
 
 import logging
-import sqlite3
 import time
 
 from app.contracts.source import Source
@@ -53,10 +73,15 @@ logger = logging.getLogger(__name__)
 # 一次入库最多抽多少块。见模块 docstring 的「成本闸」。
 DEFAULT_MAX_CHUNKS = 20
 
+# 连续多少块写库失败就熔断。3 是"偶发一次不误伤、真挂了也不会等满 20 块"的折中：
+# 引擎真不在时，3 块付的连接超时约 18 秒，20 块是两分钟。
+MAX_CONSECUTIVE_FAILURES = 3
+
 
 def _empty_stats() -> dict:
     """没有任何东西可做时的返回值。键必须齐——调用方不会为"空材料"走另一个分支。"""
-    return {"chunks": 0, "entities": 0, "edges": 0, "failed": 0, "elapsed_ms": 0}
+    return {"chunks": 0, "entities": 0, "edges": 0, "failed": 0, "aborted": False,
+            "elapsed_ms": 0}
 
 
 def _unique_entities(extraction) -> list[tuple[str, str | None]]:
@@ -102,11 +127,14 @@ async def ingest_graph(source: Source, *, max_chunks: int = DEFAULT_MAX_CHUNKS) 
         spans = spans[:max_chunks]
 
     entities: set[tuple[str, str | None]] = set()
+    consecutive_failures = 0
     for start, end in spans:
         chunk = text[start:end]
         extraction = await extract_graph(chunk, source_id=source.id, chunk_start=start)
         stats["chunks"] += 1
         if extraction is None:
+            # 抽取层降级：这个块没碰存储，所以既不算写失败也不重置计数器——
+            # 引擎有没有恢复，这一块回答不了。
             stats["failed"] += 1
             continue
         try:
@@ -132,27 +160,55 @@ async def ingest_graph(source: Source, *, max_chunks: int = DEFAULT_MAX_CHUNKS) 
                     continue
                 try:
                     graph_store.upsert_entity(name, kind)
-                except (sqlite3.Error, OSError) as exc:
+                except graph_store.GraphStoreError as exc:
                     # 边已经落库，图的主体是完整的；缺一个孤立实体不影响任何路径，
                     # 所以只记警告，不把整块算作失败（那会让 `failed` 谎报"边也没了"）。
                     logger.warning(
                         "图谱孤立实体写入失败（材料=%s 位置=%d）：%s",
                         source.id[:8], start, type(exc).__name__,
                     )
-        except (sqlite3.Error, OSError, ValueError) as exc:
-            # 写库失败只影响这一块：之前块落的实体与边留着（它们本身是有效的），
-            # 下一块继续。整批放弃的代价是这份材料从头再来一次。
+        except graph_store.GraphStoreNotConfigured as exc:
+            # 配置错误不是偶发抖动：第一块就停，省掉后面所有块的 LLM 调用。
             stats["failed"] += 1
+            stats["aborted"] = True
+            logger.warning(
+                "图谱存储未配置，停止本次入库（材料=%s 已试 %d/%d 块）：%s",
+                source.id[:8], stats["chunks"], len(spans), type(exc).__name__,
+            )
+            break
+        except graph_store.GraphStoreError as exc:
+            # 引擎级失败：之前块落的实体与边留着（它们本身是有效的），下一块继续；
+            # 但连着失败 MAX_CONSECUTIVE_FAILURES 块就说明引擎不在了，继续抽块
+            # 只是把 LLM 调用白花在落不了库的结果上。
+            stats["failed"] += 1
+            consecutive_failures += 1
             logger.warning(
                 "图谱入库写入失败（材料=%s 位置=%d）：%s",
                 source.id[:8], start, type(exc).__name__,
             )
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                stats["aborted"] = True
+                logger.warning(
+                    "图谱入库熔断：连续 %d 块写库失败，剩余 %d 块不再抽取（材料=%s）",
+                    consecutive_failures, len(spans) - stats["chunks"], source.id[:8],
+                )
+                break
+        except ValueError as exc:
+            # 数据问题只影响这一块：一块数据坏不代表引擎坏了，所以既不累计也不
+            # 清零——把它算进熔断等于让一条坏数据终止整份材料。
+            stats["failed"] += 1
+            logger.warning(
+                "图谱入库写入被拒绝（材料=%s 位置=%d）：%s",
+                source.id[:8], start, type(exc).__name__,
+            )
+        else:
+            consecutive_failures = 0
 
     stats["entities"] = len(entities)
     stats["elapsed_ms"] = int((time.perf_counter() - started) * 1000)
     logger.info(
-        "图谱入库完成 材料=%s 块=%d 失败=%d 实体=%d 边=%d 耗时=%dms",
-        source.id[:8], stats["chunks"], stats["failed"], stats["entities"],
-        stats["edges"], stats["elapsed_ms"],
+        "图谱入库完成 材料=%s 块=%d 失败=%d 中止=%s 实体=%d 边=%d 耗时=%dms",
+        source.id[:8], stats["chunks"], stats["failed"], stats["aborted"],
+        stats["entities"], stats["edges"], stats["elapsed_ms"],
     )
     return stats
