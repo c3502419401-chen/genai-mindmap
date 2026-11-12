@@ -27,6 +27,13 @@
   - 一次调用产出四样 → 2C2G + 5 秒预算下，四路往返不可能
   - 降级彻底（返回 `None`）→ 调用方拿到 `None` 必须与"没有这个功能"逐字节一致
 
+## `corrected` 的三道闸
+
+四个字段里只有 `corrected` 会**替换掉用户的原话**，而它的失败是**哑的**：改写后
+的召回相似度高、命中非空，没有任何信号会报警。所以它比其它三个字段多一道闸
+（`_guard_corrected`）：长度比、疑问焦点守恒、以及"字面或材料"二选一的依据。
+闸是**不对称**的 —— 拿不到依据就退回原话，因为"少一次改进"远好过"问题被换掉"。
+
 ## HyDE 的伪答案
 
 `QueryPlan.hyde` 是模型编的一段"像答案"的文本，**可能整段是幻觉**。它只用来
@@ -82,19 +89,39 @@ MATERIAL_HEAD_CHARS = 200
 # 材料份数上限。60 份材料的开头也能凑出上万字，而计划生成不需要看全 —— 它要
 # 判断的是"这个问题问的是哪种东西"，十份足够定位领域。
 MAX_MATERIALS = 10
-# `corrected` 与原始 query 的 bigram 重合下限。纠错是小改动（错别字、术语写法），
-# 低于这条线说明模型改的是"问题本身"而不是"问题的写法"——那已经不是纠错。
-# 定得松（允许七成变化）是有意的：宁可放过一次糟糕但同题的改写，也不要把
-# 正常的术语统一判成换题。
-MIN_CORRECTED_OVERLAP = 0.30
-# 与原始 query 重合高于这条线时，视为"只改了用词细节"，不再核材料。
-# 纠错本来就会改字面（"批钱"→"批这笔钱"），而材料里未必出现改后的写法；
-# 拿材料去核一个只动了几个字的纠错，只会把正确的纠错误删。
-TRUSTED_OVERLAP = 0.60
-# 材料少于这么多 bigram 时，"与材料无交集"不能当作"没看材料"的证据。
-# 短材料（一个标题、一句摘要）本来就覆盖不了问题的用词，拿它当尺子会把正确的
-# 纠错误删。真实材料每份给 200 字开头，bigram 数在 200 上下，远高于这条线。
+
+# `corrected` 与原始 query 的 bigram **dice** 下限（两边长度都进分母的对称重合率）。
+# 不用"原句被覆盖了几成"那种单边口径：单边口径下"原句全留 + 追加一句限定语"仍是
+# 100%，而这恰恰是最该挡的一种改写（实测：5 字问题被扩到 13-14 字，单边重合
+# 0.67-1.00，对称重合只有 0.24-0.38）。0.40 是从那批样本里切出来的：真纠错的
+# dice 最低 0.24（靠材料闸救回），换题的 dice 最高 0.55（靠疑问焦点闸挡）。
+MIN_CORRECTED_DICE = 0.40
+
+# 纠错后的长度可以变多少倍。纠错是局部改动，长度翻倍就已经不是"改错别字与术语"
+# 而是重写了 —— 实测里所有"追加限定语/收窄成子问题"的样本长度比都在 2.0~4.25，
+# 而全部真纠错都在 1.00~1.50。上限与下限同一条线（1/1.6）：把问题压缩成一半，
+# 通常就是把问句缩成主题词。
+MAX_CORRECTED_GROWTH = 1.6
+
+# 材料少于这么多 bigram 时，它**不能当依据**：一个标题、一句摘要本来就覆盖不了
+# 问题的用词，拿它去"证明"改写有依据只会放行一段无法核实的东西。真实材料每份给
+# 200 字开头，bigram 数在 200 上下，远高于这条线，所以这条只在极端样本上生效。
 MIN_MATERIAL_BIGRAMS = 20
+
+# 与材料的共享 bigram 至少要这么多条才算"有依据"。1 条不算：中文里单条常见
+# bigram（"的预""算审"）在 200 字材料里撞上太容易，实测里跨域材料也能撞到 1-2 条。
+MIN_MATERIAL_HITS = 2
+
+# 疑问焦点词：原问题靠这些词说明它"在问什么"。纠错可以改字面，但不能把问题改成
+# 名词短语 —— 那是让问题悄悄变形的入口（"多久测评一次"→"测评机构的资质要求"，
+# 字面重合 0.55、材料依据 10 条，两道字面闸全放行，只有这一条能挡）。
+# 只收封闭的一小组：疑问代词/副词 + 正反问标记 + 句末语气词。歧义大的（「的」「了」）
+# 一个都不收 —— 收宽了只会漏杀，收窄了才会误杀。
+QUESTION_FOCUS = (
+    "谁", "什么", "怎么", "怎样", "如何", "哪", "为什么", "为何", "多少", "多大",
+    "多久", "何时", "几", "是否", "算不算", "是不是", "能不能", "要不要",
+    "有没有", "会不会", "可不可以", "吗", "呢", "啥",
+)
 
 _TRUTHY = {"1", "true", "yes", "on", "y", "t"}
 
@@ -347,55 +374,109 @@ def _log(outcome: str, started: float, *, prompt_tokens: int,
     )
 
 
+def _dice(left: set[str], right: set[str]) -> float:
+    """对称的 bigram 重合率：`2·|交| / (|左| + |右|)`。
+
+    刻意不做成"原句被覆盖了几成"：单边口径对**变长**免疫——原句每个 bigram 都
+    留着、后面再追加一句限定语，单边重合仍是 1.00，而那种改写正是要挡的东西。
+    两边长度都进分母，追加的部分会把分数拉下来。
+    """
+    if not left and not right:
+        return 1.0
+    return 2 * len(left & right) / (len(left) + len(right))
+
+
+def _lost_question_focus(query: str, corrected: str) -> bool:
+    """原问题在问什么，纠错后还在不在。
+
+    只在两件事同时成立时才判丢失：原问题**带着疑问焦点词**，而纠错后**一个都
+    没有**。原问题本来就没有焦点词时不作要求（陈述式问题照常放行）。
+
+    这条挡的是字面度量根本看不见的一类：问题被改成同域的名词短语。实测反例
+    「等级保护三级系统多久测评一次」→「等级测评机构的资质要求」——dice 0.55、
+    材料依据 10 条，两道字面闸全放行，但问的已经不是一个东西了。
+    """
+    if not any(word in query for word in QUESTION_FOCUS):
+        return False
+    return not any(word in corrected for word in QUESTION_FOCUS)
+
+
 def _guard_corrected(
     corrected: str | None, query: str, snippets: list[str],
-) -> str | None:
-    """`corrected` 的两道闸：换了题就丢、没看材料也丢。
+) -> tuple[str | None, str]:
+    """`corrected` 的三道闸：改长了、改跑了、没依据，任一成立就退回用户原话。
 
     它是四个字段里唯一会**替换用户原话**的一个，而它的失败是**哑的**：模型把
     问题"纠"成一个材料里确实出现的术语，同时悄悄收窄或改向——此时召回相似度高、
     命中非空、`source="llm"`，没有任何一个信号会报警，下游拿它当原问题用，用户
     的原话就消失了。`intents`/`subqueries` 跑偏还有原 query 兜底，它没有。
 
-    两道闸各挡一种失效，都用 bigram 重合度衡量，与当初证伪那次漂移用的是同一把尺子：
+    三道闸各挡一类，缺一条都实测放过样本（22 组真实中文样本：keep 10 / drop 12，
+    关掉任意一条都会漏 4~5 个或误杀 2 个）：
 
-    - 与**原始 query** 的重合率低于 `MIN_CORRECTED_OVERLAP` → 换了题。
-      纠错只该改错别字与术语写法，不该改动问题本身。
-    - 与**材料正文**的 bigram 交集为空 → 没看材料。这正是那次
-      "2-gram 覆盖率恒 0.0" 的签名。
+      1. **长度比**（`MAX_CORRECTED_GROWTH`）挡"追加限定语 / 收窄成子问题"。
+         这条能挡的，字面与材料两道都挡不住 —— 追加的部分让材料依据变得更多。
+      2. **疑问焦点守恒**（`QUESTION_FOCUS`）挡"问题退化成主题词"。
+         这类字面重合高、材料依据也足，只有"它还在问什么吗"能判。
+      3. **字面 or 材料**：`dice ≥ MIN_CORRECTED_DICE`（看得出是同一句）或
+         `与材料共享 ≥ MIN_MATERIAL_HITS 条 bigram`（材料里有依据）。两条是
+         **或**关系，因为两种正常纠错各自只满足一条：错别字型（"碳中合"→"碳中和"）
+         字面高度重合但材料里未必有这个词；指代补全型（"这个项目的钱谁来批"→
+         "该项目的预算由谁审批"）字面重合只有 0.24，全靠材料里有"预算/审批"兜住。
 
-    两条都不成立时原样返回；判不了（短到没有 bigram）时也原样返回——宁可放过，
-    也不要因为度量不适用而误删一个正确的纠错。
+    返回 `(留下的文本, 判据)`。第二项只进日志：query 与材料都不记，那么"被哪道闸
+    拦的"就成了解释"为什么这一路什么都没给"的唯一线索。
+
+    **倾向是不对称的：拿不到依据就退回原话**。误杀的代价是"用用户的原话再检索
+    一次、少一次改进"；漏杀的代价是"用户的问题被换掉，而且没有人知道"。所以
+    "度量不适用"（没有材料、材料太短撞不出依据）的默认动作是**退回首句**，不是
+    放行一段无法核实的改写。把"短材料"反而当放行理由，会让同一套规则里出现
+    "靠字面判不了就删、靠材料判不了就留"两种默认值——那才是真正说不清的地方。
     """
     if not corrected:
-        return None
-    # `_bigram_terms` 给的是 list（保留重复与顺序，服务 BM25 的词频），
-    # 这里要的是重合度，转成集合；重复项对"两个文本共享多少 bigram"没有意义。
+        return None, "empty"
+    if not query:
+        return corrected, "ok"
+    longest, shortest = max(len(corrected), len(query)), min(len(corrected), len(query))
+    if longest > shortest * MAX_CORRECTED_GROWTH:
+        return None, "length"
+    if _lost_question_focus(query, corrected):
+        return None, "focus"
+    # `_bigram_terms` 给的是 list（保留重复以服务 BM25 的词频），这里要的是重合度，
+    # 转成集合：重复项对"两个文本共享多少 bigram"没有意义。
     original = set(_bigram_terms(query))
     candidate = set(_bigram_terms(corrected))
-    if not original or not candidate:
-        return corrected
-    overlap = len(original & candidate) / len(original)
-    if overlap < MIN_CORRECTED_OVERLAP:
-        return None
-    # 只改了用词细节 → 信它，不必再核材料（见 TRUSTED_OVERLAP 的注释）。
-    if overlap >= TRUSTED_OVERLAP:
-        return corrected
-    if snippets:
-        material: set[str] = set()
-        for text in snippets:
-            material |= set(_bigram_terms(text))
-        if len(material) >= MIN_MATERIAL_BIGRAMS and not (candidate & material):
-            return None
-    return corrected
+    if _dice(original, candidate) >= MIN_CORRECTED_DICE:
+        return corrected, "ok"
+    material: set[str] = set()
+    for text in snippets:
+        material |= set(_bigram_terms(text))
+    if (len(material) >= MIN_MATERIAL_BIGRAMS
+            and len(candidate & material) >= MIN_MATERIAL_HITS):
+        return corrected, "ok"
+    return None, "evidence"
 
 
-def _guard_plan(plan: QueryPlan, query: str, snippets: list[str]) -> QueryPlan:
-    """只动 `corrected`，其余字段原样保留——扩展项由提示词与"无材料清空"那道闸管。"""
-    guarded = _guard_corrected(plan.corrected, query, snippets)
+def _guard_plan(
+    plan: QueryPlan, query: str, snippets: list[str],
+) -> tuple[QueryPlan | None, str]:
+    """只动 `corrected`，其余字段原样保留；改空了就整份作废。
+
+    "改空了"是一种真实情况而不是理论边界：没有材料时 `corrected` 是**唯一**可能
+    存在的字段（`_build_plan` 会把扩展项清空），它一旦被闸删掉，剩下的是一份
+    四个字段全空、却仍然不是 `None` 的计划 —— 调用方会以为拿到了东西。契约是
+    "全坏返回 None"，这里补上同一件事。
+
+    重新构造而不是 `model_copy(update=...)`：后者**不跑 validator**，字段约束
+    （去空白、截断、去重）就变成"只对构造路径成立"的摆设。代价是一次五字段
+    校验，微秒级。
+    """
+    guarded, verdict = _guard_corrected(plan.corrected, query, snippets)
     if guarded == plan.corrected:
-        return plan
-    return plan.model_copy(update={"corrected": guarded})
+        return plan, verdict
+    if not (guarded or plan.intents or plan.hyde or plan.subqueries):
+        return None, verdict
+    return QueryPlan.model_validate({**plan.model_dump(), "corrected": guarded}), verdict
 
 
 async def plan_query(
@@ -456,7 +537,14 @@ async def plan_query(
              response_chars=len(json.dumps(payload, ensure_ascii=False, default=str)),
              plan=None)
         return None
-    plan = _guard_plan(plan, text, snippets)
+    plan, verdict = _guard_plan(plan, text, snippets)
+    if plan is None:
+        # 计划被闸删空与"模型什么都没给"是两回事，日志里分开写：query 不记，
+        # 这两者都不在别处可复现。
+        _log(f"guarded:{verdict}", started, prompt_tokens=prompt_tokens,
+             response_chars=len(json.dumps(payload, ensure_ascii=False, default=str)),
+             plan=None)
+        return None
     _log("ok", started, prompt_tokens=prompt_tokens,
          response_chars=len(json.dumps(payload, ensure_ascii=False, default=str)),
          plan=plan)

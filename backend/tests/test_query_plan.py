@@ -23,6 +23,7 @@ from app.knowledge.query_plan import (
     QueryPlan,
     plan_query,
 )
+from app.knowledge.service import _bigram_terms
 
 MODEL_ENV = {
     "MINDMAP_LLM_MODE": "model",
@@ -32,7 +33,7 @@ MODEL_ENV = {
 }
 
 FULL = {
-    "corrected": "审批预算的权限在谁手里",
+    "corrected": "谁能审批预算",
     "intents": ["谁有权批这笔预算", "这笔预算由谁审批", "审批权限在哪一级"],
     "hyde": "预算审批权按金额分级，额度以内由部门负责人批，超出部分上会。",
     "subqueries": ["部门负责人的审批额度上限", "超出额度后的上会流程"],
@@ -173,11 +174,11 @@ class NoMaterialTest(PlanTestBase):
     def test_only_correction_survives(self):
         """模型不听话、照样给了 intents/hyde/subqueries：代码闸把它们清掉。
 
-        corrected 保留（模型确实给了），但 `source` 是 "fallback" —— 这份计划
-        没有资格触发扩展检索。
+        corrected 保留（模型确实给了，而且这次纠错本身就站得住），但 `source`
+        是 "fallback" —— 这份计划没有资格触发扩展检索。
         """
         self.use_model(FULL)
-        plan = run(plan_query("审批预算的权限在谁手理"))    # 故意带错字
+        plan = run(plan_query("谁能审批予算"))    # 故意带错字
         self.assertIsNotNone(plan)
         self.assertEqual(plan.corrected, FULL["corrected"])
         self.assertEqual(plan.intents, [])
@@ -191,7 +192,9 @@ class NoMaterialTest(PlanTestBase):
         否则模板渲染出来会多一段空白材料，模型会以为自己拿到了上下文。
         """
         self.use_model(FULL)
-        plan = run(plan_query("它多少钱", materials=["", "  \n ", None]))
+        plan = run(plan_query("谁能审批予算", materials=["", "  \n ", None]),
+                   )
+        self.assertIsNotNone(plan)
         self.assertEqual(plan.intents, [])
         self.assertEqual(plan.source, "fallback")
 
@@ -460,48 +463,218 @@ def _raise_500():
                                 response=httpx.Response(500, request=request))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-_LONG_MATERIAL = (
-    "预算管理办法 第一章 总则。金额在五万元以内的支出由财务经理核准，"
-    "超过五十万元的需总经理办公会审议。批钱这件事按金额分级，审批留痕。"
+# 真实形态的材料（各约 200 字，与量阈值时用的是同一批）。长度都远超
+# `MIN_MATERIAL_BIGRAMS`，材料闸在这些样本上是真的生效的。
+BUDGET = (
+    "XX集团预算管理办法（试行）第一章 总则 第一条 为规范全面预算管理，明确审批权限，"
+    "依据公司章程制定本办法。第二条 预算分为年度预算与专项预算。单笔五十万元以下的支出"
+    "由部门负责人审批，五十万元至二百万元由分管副总和财务负责人联签，"
+    "二百万元以上报总经理办公会审议后提交董事会。第三条 预算外支出须单独申报，"
+    "不得拆分规避审批权限。第四条 财务部负责预算执行的归口管理与月度分析，超支部分须书面说明。"
+)
+SECURITY = (
+    "信息安全等级保护测评实施指南 定级：信息系统运营使用单位应按照业务信息安全与系统"
+    "服务安全两个维度确定保护等级，二级以上系统须备案。测评：第三级系统每年至少测评一次，"
+    "测评机构须具备资质。整改：高危风险项须在三个月内完成整改并复测，涉及未授权访问、"
+    "弱口令、日志缺失的项列为高危。监督检查：公安机关对第三级以上系统开展定期监督检查。"
+)
+METRICS = (
+    "数据指标口径说明 日活用户（DAU）指自然日内产生至少一次有效行为的去重用户数，"
+    "同一用户跨端只计一次。月活用户（MAU）按自然月去重统计。订单量按支付成功口径统计，"
+    "取消与退款订单不计入，退款率等于退款订单数除以支付成功订单数。"
+    "新增用户指首次注册并完成实名认证的用户。"
 )
 
 
 class CorrectedGuardTest(PlanTestBase):
-    """`corrected` 的双向闸：换了题、或压根没看材料，都退回用户原话。
+    """`corrected` 的三道闸：改长了、改跑了、没依据，任一成立就退回用户原话。
 
-    它是四个字段里唯一会替换用户原话的一个，而失败是哑的——下沉到检索时
-    相似度高、命中非空，没有任何信号会报警。
+    这组用例逐道闸各给一个"必须挡住"和一个"必须放过"，因为三条闸各自都在挡
+    别的闸挡不住的东西（见 `_guard_corrected` 的 docstring）：关掉任意一条，
+    下面的用例就会红。
     """
 
-    def test_off_topic_correction_is_dropped(self):
-        """把口语问题改写成书面语、丢掉原问题的字面——这是换题，不是纠错。"""
-        self.use_model({"corrected": "资金归口管理部门的设置依据", "intents": ["随便一问"]})
-        plan = run(plan_query("谁能批钱", materials=[_LONG_MATERIAL]))
+    def test_off_topic_rewrite_is_dropped_but_other_fields_survive(self):
+        """跨域编造（材料是预算审批，它改写成本领域的术语）→ 丢 corrected。"""
+        self.use_model({"corrected": "资金归口管理部门的设置依据",
+                        "intents": ["随便一问"], "hyde": "编的答案"})
+        plan = run(plan_query("谁能批钱", materials=[BUDGET]))
         self.assertIsNone(plan.corrected)
-        self.assertEqual(plan.intents, ["随便一问"])   # 只丢 corrected，其余保留
+        self.assertEqual(plan.intents, ["随便一问"])       # 其余字段原样
+        self.assertEqual(plan.hyde, "编的答案")
+        self.assertEqual(plan.source, "llm")               # 扩展项还在，仍是 llm
 
-    def test_correction_without_material_evidence_is_dropped(self):
-        """与材料毫无交集 = 没看材料，正是那次覆盖率 0.0 的签名。"""
-        self.use_model({"corrected": "量子退相干时间的一般取值"})
-        plan = run(plan_query("退相干时间是多少", materials=[_LONG_MATERIAL]))
-        self.assertIsNone(plan.corrected)
+    def test_appending_a_second_question_is_dropped(self):
+        """原句全留 + 追加一句 = 旧口径下的"完全重合"，恰恰最该挡。
 
-    def test_normal_correction_survives(self):
+        旧的单边重合口径给这种情况 1.00，`TRUSTED_OVERLAP=0.60` 直接放行；
+        长度比 3.5 倍，这里必须挡下。
+        """
+        self.use_model({"corrected": "谁能批钱？预算外资金怎么审批"})
+        plan = run(plan_query("谁能批钱", materials=[BUDGET]))
+        self.assertIsNone(plan)
+
+    def test_narrowing_to_a_sub_item_is_dropped(self):
+        """把"谁能批钱"收窄成"差旅费用部分"——问题被悄悄改小，字面却几乎全留。"""
+        self.use_model({"corrected": "谁能批这笔预算中的差旅费用部分"})
+        plan = run(plan_query("谁能批钱", materials=[BUDGET]))
+        self.assertIsNone(plan)
+
+    def test_losing_the_question_focus_is_dropped(self):
+        """换成同域名词短语：字面 0.55、材料依据 10 条，两道字面闸都拦不住。"""
+        self.use_model({"corrected": "等级保护三级系统测评机构的资质要求"})
+        plan = run(plan_query("等级保护三级系统多久测评一次", materials=[SECURITY]))
+        self.assertIsNone(plan)
+
+    def test_shrinking_to_a_topic_word_is_dropped(self):
+        """问题退化成主题词（疑问焦点全没了），长度没变也挡。"""
+        self.use_model({"corrected": "预算审批"})
+        plan = run(plan_query("谁能批钱", materials=[BUDGET]))
+        self.assertIsNone(plan)
+
+    def test_focus_words_are_preserved_by_a_normal_correction(self):
+        """「算不算」→「是否」是正常的术语化，不能判成丢焦点。"""
+        self.use_model({"corrected": "未授权访问是否属于高危风险项"})
+        plan = run(plan_query("未授权访问算不算高危", materials=[SECURITY]))
+        self.assertEqual(plan.corrected, "未授权访问是否属于高危风险项")
+
+    def test_typo_correction_survives_on_dice_alone(self):
+        """错别字型纠错：字面高度重合，材料里没有那个词也照留（dice 这条路）。"""
         self.use_model({"corrected": "谁能批这笔钱"})
-        plan = run(plan_query("谁能批钱", materials=[_LONG_MATERIAL]))
+        plan = run(plan_query("谁能批钱", materials=[BUDGET]))
         self.assertEqual(plan.corrected, "谁能批这笔钱")
 
-    def test_short_material_does_not_trip_the_material_gate(self):
-        """材料短到一个标题时，「与材料无交集」不构成没看材料 的证据。"""
-        self.use_model({"corrected": "谁能批钱"})
-        plan = run(plan_query("谁能批钱", materials=["标题"]))
-        self.assertEqual(plan.corrected, "谁能批钱")
+    def test_colloquial_correction_survives_on_material_evidence(self):
+        """指代补全型：字面只剩 0.24，靠材料里的"预算/审批"兜住。"""
+        self.use_model({"corrected": "该项目的预算由谁审批"})
+        plan = run(plan_query("这个项目的钱谁来批", materials=[BUDGET]))
+        self.assertEqual(plan.corrected, "该项目的预算由谁审批")
 
-    def test_correction_survives_when_bigrams_are_absent(self):
-        """短到没有 bigram，度量不适用——宁可放过，也不要误删。"""
+    def test_same_correction_is_dropped_without_material_evidence(self):
+        """同样的指代补全，没有材料就没有依据——字面 0.24 一个人撑不住。"""
+        self.use_model({"corrected": "该项目的预算由谁审批"})
+        plan = run(plan_query("这个项目的钱谁来批"))
+        self.assertIsNone(plan)
+
+    def test_one_material_bigram_is_not_enough(self):
+        """与材料只撞 1 条 bigram 不算依据：200 字材料里撞一条太容易。"""
+        corrected = "报销单据的审批流转"
+        # 先确认这条样本确实只撞 1 条，否则这条用例测不到它要测的东西
+        self.assertEqual(
+            len(set(_bigram_terms(corrected)) & set(_bigram_terms(BUDGET))), 1)
+        self.use_model({"corrected": corrected})
+        plan = run(plan_query("发票报销流程审批", materials=[BUDGET]))
+        self.assertIsNone(plan)
+
+    def test_known_gap_same_shape_different_head_is_kept(self):
+        """已知边界（不是目标）：同句式换中心词，三道闸全过。
+
+        「退款率怎么算的」→「订单量怎么算的」：长度 1.0、疑问焦点「怎么」保留、
+        字面 dice 0.50（在 0.40 以上）、材料里两个词都有。任何 bigram 尺子都判
+        不了它，因为换掉的正是"这条问题问的是哪个东西"。
+
+        要关这个口子得靠语义（对 query 与 corrected 各算一次 embedding 余弦）或
+        实体抽取，两者要么多一次网络调用、要么多一份词典，都不在本轮预算里。
+        留着这条用例是为了让缺口可见：哪天补上了它会红，改的人会先读到这段。
+        """
+        self.use_model({"corrected": "订单量怎么算的"})
+        plan = run(plan_query("退款率怎么算的", materials=[METRICS]))
+        self.assertEqual(plan.corrected, "订单量怎么算的")
+
+    def test_thin_material_cannot_rescue_a_bold_rewrite(self):
+        """材料里一个 bigram 都没有时，它**不能当依据**，改写照样退回原话。
+
+        这条与上一版相反：上一版把"材料太短"当成了放行的理由（材料短 → 不判）。
+        两条闸里只要有一条拿不到证据就该退回原话——"度量不适用"时的默认动作是
+        退回用户的原话，不是放行一段无法核实的改写。
+        """
+        self.use_model({"corrected": "报销单据的审批流转"})
+        plan = run(plan_query("发票报销流程审批", materials=["标题"]))
+        self.assertIsNone(plan)
+
+    def test_one_char_query_with_identical_correction_is_kept(self):
+        """度量退化到单字时，完全相同的"纠错"仍然保留（dice=1.0）。"""
         self.use_model({"corrected": "A"})
         plan = run(plan_query("A"))
         self.assertEqual(plan.corrected, "A")
+
+    def test_guard_rebuilds_through_the_model_instead_of_copying(self):
+        """被闸改写的计划要重新过一遍 validator，不能 `model_copy` 绕过。
+
+        `model_copy(update=...)` **不跑 validator**。这里用 `model_construct` 造
+        一份未校验的计划（hyde 400 字），闸删掉 corrected 之后重建它：如果实现
+        退回 `model_copy`，hyde 会原样留下 400 字，这条就红。
+        """
+        raw = QueryPlan.model_construct(corrected="预算审批", intents=["甲"],
+                                        hyde="答" * 400, subqueries=[], source="llm")
+        guarded, verdict = query_plan._guard_plan(raw, "谁能批钱", [])
+        self.assertEqual(verdict, "focus")
+        self.assertIsNone(guarded.corrected)
+        self.assertEqual(guarded.intents, ["甲"])
+        self.assertEqual(len(guarded.hyde), HYDE_MAX_CHARS)
+
+    def test_plan_is_none_when_the_guard_empties_it(self):
+        """只纠错的计划被闸删空后必须返回 None，不能交出一份空壳。"""
+        self.use_model({"corrected": "预算审批"})    # 没有材料，只有 corrected
+        self.assertIsNone(run(plan_query("谁能批钱")))
+
+    def test_guard_verdict_is_logged_without_the_query(self):
+        """闸拦下时日志要能说出"被哪道闸拦的"，否则关了开关就没法查。"""
+        self.use_model({"corrected": "谁能批钱？预算外资金怎么审批"})
+        with self.assertLogs("app.knowledge.query_plan", level="INFO") as captured:
+            run(plan_query("谁能批钱", materials=[BUDGET]))
+        line = "\n".join(captured.output)
+        self.assertIn("guarded:length", line)
+        self.assertNotIn("谁能批钱", line)
+
+
+class CorrectedGuardTableTest(PlanTestBase):
+    """把量阈值用的那批样本钉在测试里：改任何一条阈值都会在这里红。
+
+    keep 10 / drop 12 是人工标注的期望；当前三条闸在这 22 组上零误杀零漏杀。
+    样本是我自己造的、规则也是看着这批样本定的，所以它**不是**泛化能力的证明，
+    只是"别再悄悄把界线推回去"的回归锁 —— 上一版的 0.30/0.60 在同一批样本上
+    是误杀 1、漏杀 8。
+    """
+
+    MATERIALS = {"预算": BUDGET, "等保": SECURITY, "指标": METRICS}
+
+    CASES = [
+        # (query, corrected, 材料, 期望是否保留)
+        ("谁能批钱", "谁能批这笔钱", "预算", True),
+        ("预算审批权限怎么划", "预算审批权限怎么划分", "预算", True),
+        ("这个项目的钱谁来批", "该项目的预算由谁审批", "预算", True),
+        ("未授权访问算不算高危", "未授权访问是否属于高危风险项", "等保", True),
+        ("等级保护三级系统多久测评一次", "等级保护第三级系统多久测评一次", "等保", True),
+        ("退款率怎么算的", "退款率如何计算", "指标", True),
+        ("它多少钱", "超导量子比特的制备成本", "预算", False),
+        ("谁能批钱", "谁能批这笔预算中的差旅费用部分", "预算", False),
+        ("谁能批钱", "谁能批钱？预算外资金怎么审批", "预算", False),
+        ("谁能批钱", "财务负责人和分管副总谁先签字", "预算", False),
+        ("等级保护三级系统多久测评一次", "等级保护三级系统测评机构的资质要求", "等保", False),
+        ("谁能批钱", "董事会审议超二百万元支出的表决程序", "预算", False),
+        ("退款率怎么算的", "退款率与订单量的统计口径分别是什么", "指标", False),
+        ("未授权访问算不算高危", "未授权访问的整改时限与复测要求", "等保", False),
+        ("订单量怎么算", "订单量按支付成功口径统计，取消与退款订单不计入", "指标", False),
+        ("谁能批钱", "预算审批", "预算", False),
+    ]
+
+    def test_measured_sample(self):
+        current = {"payload": None}
+
+        async def fake(system: str, user: str, **kwargs):
+            return current["payload"]
+
+        with patch.object(query_plan, "chat_async", fake):
+            for query, corrected, material, expect_keep in self.CASES:
+                with self.subTest(query=query, corrected=corrected):
+                    current["payload"] = {"corrected": corrected}
+                    plan = run(plan_query(query, materials=[self.MATERIALS[material]]))
+                    kept = plan is not None and plan.corrected == corrected
+                    self.assertEqual(
+                        kept, expect_keep,
+                        f"「{query}」→「{corrected}」应{'保留' if expect_keep else '丢弃'}")
+
+
+if __name__ == "__main__":
+    unittest.main()
