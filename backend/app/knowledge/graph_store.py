@@ -1,33 +1,85 @@
-"""图存储：实体与边落在 SQLite，游走靠递归 CTE。
+"""图存储：实体与边落在 Neo4j，游走靠变长 Cypher 路径。
 
-**为什么不用 Neo4j**：部署目标是 2C2G 单机（`docs/DEPLOY.md` 7.9、`docs/PLAN.md`
-的部署口径），Neo4j 的 JVM 堆起步就是 1G+，机器上装不下第二个服务。这一层的
-规模是"几千实体、上万条边"，正好在 SQLite 的舒适区：带索引的查找是微秒级，
-两跳游走是毫秒级。代价是放弃 Cypher——所有遍历都写成 `WITH RECURSIVE`，
-见 `neighbors`。这个替代在多层游走上的真实上限写在 `MAX_HOPS` 的注释里。
+**为什么是 Neo4j**：上游定的，选型论据与当年 SQLite 版的实测数据留在
+`docs/RAG-DECISIONS.md` 第 8 节（那一节是历史记录，不随实现改动）。这一层要的
+是三样 SQLite 得自己攒的东西：变长路径（`neighbors` 里一条 `[*1..n]` 替掉整段
+递归 CTE）、关系唯一性保证（同一条关系不会在一条路径里重复出现）、以及一个
+天生带连接的存储（`add_edge` 的"两端 + 边"在一个事务里，不需要手写 upsert 顺序）。
 
-**为什么和导图共库**（`mindmaps.repository.connect()`）：省一个文件、一套备份、
-一条 `MINDMAP_DB_PATH`。表名带 `graph_` 前缀，与 `mindmaps` / `chunk_vectors`
-互不相干，`CREATE TABLE IF NOT EXISTS` 不会碰它们。
+**数据模型**：一个标签、一种关系类型，名字都写在常量里（`ENTITY_LABEL` /
+`EDGE_TYPE`），因为它们会出现在每一条 Cypher 里，改一处就该改全部。
 
-**游走是无向的**（`neighbors`）。抽取模型没有稳定依据判断关系方向——"甲依赖乙"
-与"乙被甲依赖"在自然语言里都成立，而方向判反之后**图不会断，只是路径反向**：
-从错误的那一端出发就走进死胡同，`neighbors` 返回 `[]`，与"这两个实体确实无关"
-完全无法区分。哑失败在图上比在文本上更贵：文本还能 grep，图上你连"该不该有边"
-都不知道。所以边按无向走，但**方向必须留在路径里**——`GraphPath.directions`
-逐跳记录这条边原本是 `nodes[i] → nodes[i+1]` 还是反过来，否则读路径的人看不出
-谁依赖谁。
+  - 约束 `entity_key`：`(e.name, e.type) IS UNIQUE`——同名同类型只有一个节点。
+  - 节点 `(:Entity {name, type, created_at})`。
+  - 边 `(:Entity)-[:REL {relation, source_id, chunk_start, chunk_end, created_at}]->
+    (:Entity)`。`source_id` / `chunk_start` / `chunk_end` 是证据三件套，下一轮回填
+    高亮全靠它们，落库后一个字节都不改。
 
-**写与读的降级不对称**：读接口（`neighbors` / `stats`）在库不可用时返回空值——
-"查不到"与"库坏了"在检索层是同一种结果，为一次查询崩掉整条链路没有收益。
-写接口（`upsert_entity` / `add_edge` / `add_edges_bulk`）**照常抛 `sqlite3.Error`**
-——把"没写进去"说成"写好了"会让材料入库静默缺边，而这种缺失没有任何信号能发现：
-图不会报错，它只是少了一条路。
+**`type` 为什么折成空串而不是 null**：Cypher 里 `null = null` 求值为 `null`（不是
+`true`），而 `MERGE` 靠属性相等来匹配既有节点——所以 `MERGE (e:Entity {name:'甲',
+type:null})` **永远匹配不到上一行**，每写一次就多一个节点，幂等当场失效。唯一约束
+也帮不上：Neo4j 把值为 null 的属性当作"属性不存在"，唯一约束对缺失属性不生效，
+多个 `{name:'甲'}` 可以共存。SQLite 版撞的是同一个坑的另一种形态（`UNIQUE(name,
+NULL)` 认为两个 NULL 互不相等），解法也一样：`None` → `''`（`_fold_type`）。`type`
+不出现在任何返回结构里，所以不需要反向还原。
 
-**写入有两条路**：单条 `add_edge`（一次连接一个事务，适合零星补写）与
-`add_edges_bulk`（一个连接一个事务，适合入库）。两者差的是 fsync 的次数，不是
-逻辑：实测 12000 行逐条写 136 秒、单事务 34 毫秒，差 4000 倍。`graph_ingest`
-走批量那条路。
+**写与读的降级不对称**：读接口（`neighbors` / `stats`）在库不可用或没配置时返回
+空值——"查不到"与"库坏了"在检索层是同一种结果，为一次查询崩掉整条链路没有收益。
+写接口（`upsert_entity` / `add_edge` / `add_edges_bulk`）**照常抛错**——把"没写进去"
+说成"写好了"会让材料入库静默缺边，而这种缺失没有任何信号能发现：图不会报错，它
+只是少了一条路。
+
+**异常类型是 `OSError` 的子类**（`GraphStoreError`）。这不是风格问题：调用方
+`graph_ingest` 的降级分支写的是 `except (sqlite3.Error, OSError, ValueError)`，
+它按"块"计 `failed`。换存储引擎时把这层换成 Neo4j 专有异常，`failed` 就会从"这块
+没写进去"变成"整份材料抛到上传接口"，语义静默改变而测试看不出来。`OSError` 恰好
+也是"连不上 7687"最准确的归类（连接被拒、超时都是 I/O 失败），所以这不是迁就，
+是正确归类；`GraphStoreNotConfigured` 是它的子类，表示"密码没配"，与 unconfigured
+语义一致。
+
+**驱动是模块级惰性单例**：`Driver` 自己就是连接池，官方推荐进程内长期持有、退出时
+`close()`。`close_driver()` 供测试（每个用例换一套环境变量）与进程退出调用。惰性
+的意思是"第一次真正要连库时才建"，所以没配 Neo4j 的部署里 `import graph_store`
+不会尝试连接。
+
+**连接与查询都要有上限**：一次不可达的 7687 不能让整个请求挂住。连接超时
+`CONNECT_TIMEOUT_SECONDS`、池等待 `ACQUISITION_TIMEOUT_SECONDS`、事务超时
+`QUERY_TIMEOUT_SECONDS`（服务端执行超时，整批 `UNWIND` 也受它约束）、驱动重试
+`RETRY_TIME_SECONDS`。全部是"秒级失败"，不是默认的 60 秒。
+
+## 空类型实体的复用（`_pick_existing`）
+
+`add_edge` 的 `src_type` / `dst_type` 是可选的，调用方（尤其是只关心"谁连着谁"
+的下游）不会为了写一条边先去查类型。若直接把空类型当键去 `MERGE`，同一个"甲公司"
+会在库里变成两个节点——一个 `type='组织'`（抽取时建的）、一个 `type=''`（写边时
+建的），边全挂在后者上，前者成了孤立实体。实测 3000 个实体按 3 条边连完，`stats()`
+报出 6000 个实体、3000 个孤立——图看着建成了，一半节点是死的。
+
+所以类型为空时**先复用同名里最早的节点（任意类型）**，复用不到才建空类型的。这需
+一次额外的 `MATCH`（`CYPHER_FIRST_KIND`）。SQLite 版这里同样是"一次 SELECT + 一次
+INSERT"，不是往返次数退化；而且只有 `type` 为空时才多这一次。
+
+## 游走是无向的（`neighbors`）
+
+抽取模型没有稳定依据判断关系方向——"甲依赖乙"与"乙被甲依赖"在自然语言里都成立，
+而方向判反之后**图不会断，只是路径反向**：从错误的那一端出发就走进死胡同，
+`neighbors` 返回 `[]`，与"这两个实体确实无关"完全无法区分。哑失败在图上比在文本上
+更贵：文本还能 grep，图上你连"该不该有边"都不知道。所以边按无向走，但**方向必须
+留在路径里**——`GraphPath.directions` 逐跳记录这条边原本是 `nodes[i] → nodes[i+1]`
+还是反过来，否则读路径的人看不出谁依赖谁。无向在 Cypher 里就是不给关系加箭头。
+
+**环**：Neo4j 的变长模式枚举的是 *trail*（关系不重复），**节点可以重复**——所以
+`甲-[e1]-乙-[e2]-甲` 是一条合法路径，而 SQLite 版枚举的是简单路径（节点不重复）。
+为了保持返回结构一致（每条路径都是简单路径），语句里用
+`all(n IN nodes(p) WHERE single(m IN nodes(p) WHERE m = n))` 过滤。这条谓词对每条
+候选路径求值，深度上限 5 时最多 6 个节点、36 次比较，代价可以忽略；换来的是
+"路径里的节点一定不重复"这个下游可以直接依赖的性质。
+
+**`hops` 与 `limit` 都收在硬上限内**（`MAX_HOPS` / `MAX_LIMIT`）：变长路径的枚举量
+随深度组合增长，一个手滑传进来的 `hops=12` 会在稠密子图上跑出指数级的中间行。
+另外 Cypher 的变长关系长度**不接受参数**（`[*1..$hops]` 是语法错误），只能内插，
+所以 `_walk_query` 是全文唯一一处语句拼接——内插的值来自 `_clamp_hops` 的 int，
+不是用户字符串，测试钉住这一点。
 
 ## 归一化规则
 
@@ -49,142 +101,197 @@
 代价是同一实体在不同块里被判成不同类型时会出现两行；抽取层用类型白名单
 （`graph_extract.ENTITY_TYPES`）把这种分裂压到"有类型 vs 无类型"这一种。
 
-**NULL 那个坑**：SQLite 的 `UNIQUE` 认为两个 NULL 互不相等，所以 `(name, NULL)`
-可以重复插入任意多次，`upsert_entity` 的幂等会当场失效。落库时把 `None` 折成
-空串（`_fold_type`）；`type` 不出现在任何返回结构里，所以不需要反向还原。
-
 ## 没有做的：实体消解（这是能力边界，不是待办事项）
 
 上面三条归一化只折全角、空白、大小写，**不做别名归并**，也没有同义词表。于是
-材料里的「国家市场监督管理总局」与「市场监管总局」在库里是**两个实体**，各带
-各的边；简称、缩写、旧称、中英对照全部落在这一刀之外。
+材料里的「国家市场监督管理总局」与「市场监管总局」在库里是**两个实体**，各带各
+的边；简称、缩写、旧称、中英对照全部落在这一刀之外。
 
 后果不是"少连了几条边"，而是**孤岛与"确实无关"无法区分**：`neighbors` 在两份
 材料之间找不到路径时返回 `[]`，与两份材料真的没关系时返回的 `[]` 逐字节相同。
 下一个读这段代码的人会以为图是完整的——它不是。
 
-由此可以给出这套东西当前的真实能力：**跨文档关联只在专有名词级成立**（机构
-全称、人名、标准号、文号这类写法稳定的对象），**概念级关联不成立**（「数字化
-转型」对「数字化改革」）。而跨文档长程关联的价值恰好集中在概念层——所以这层的
-形态是对的（路径与证据严格对齐、幂等、毫秒级），召回是缺的。
+由此可以给出这套东西当前的真实能力：**跨文档关联只在专有名词级成立**（机构全称、
+人名、标准号、文号这类写法稳定的对象），**概念级关联不成立**（「数字化转型」对
+「数字化改革」）。而跨文档长程关联的价值恰好集中在概念层——所以这层的形态是对的
+（路径与证据严格对齐、幂等、毫秒级），召回是缺的。
 
-补齐它要的不是调参数，而是一层实体消解（别名表、简称抽取、规则或模型归并），
-以及随之而来的"合并错了比没合并更贵"的判定标准。在那之前，把图上的"没路径"
-当成"不确定"，不要当成"无关"。
+补齐它要的不是调参数，而是一层实体消解（别名表、简称抽取、规则或模型归并），以及
+随之而来的"合并错了比没合并更贵"的判定标准。在那之前，把图上的"没路径"当成
+"不确定"，不要当成"无关"。
 """
 from __future__ import annotations
 
 import logging
-import sqlite3
+import os
+import threading
 import unicodedata
-from contextlib import closing
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Iterator
 
-from app.mindmaps import repository
+from neo4j import READ_ACCESS as _READ, WRITE_ACCESS as _WRITE
+from neo4j import Driver, GraphDatabase
+from neo4j.exceptions import DriverError, Neo4jError
 
 logger = logging.getLogger(__name__)
 
-ENTITY_TABLE = "graph_entities"
-EDGE_TABLE = "graph_edges"
+# 数据模型的名字。写成常量是因为它们出现在每一条 Cypher 里：改标签却漏改某一条
+# 语句的结果是"写入看不见、查询永远空"，而那种错查起来最费时间。
+ENTITY_LABEL = "Entity"
+EDGE_TYPE = "REL"
+CONSTRAINT_NAME = "entity_key"
 
-# 路径序列化成一条字符串穿过递归 CTE：实体名与关系短语是中文自由文本，引号、
-# 竖线、顿号都可能出现，只有控制字符能保证 split 无歧义。`normalize_name` 会
-# 剔掉控制字符，所以这两个分隔符一定不会来自数据本身。
-_SEP = "\x1f"        # 条目之间
-_FIELD_SEP = "\x1e"  # 一条证据的字段之间
+# 配置一律走环境变量，不写死。密码**没有默认值**：一个默认密码意味着"忘了配"
+# 会连到一个碰巧存在的实例上，那比连不上更危险。
+URI_ENV = "MINDMAP_NEO4J_URI"
+USER_ENV = "MINDMAP_NEO4J_USER"
+PASSWORD_ENV = "MINDMAP_NEO4J_PASSWORD"
+DATABASE_ENV = "MINDMAP_NEO4J_DATABASE"
+
+DEFAULT_URI = "bolt://127.0.0.1:7687"
+DEFAULT_USER = "neo4j"
+DEFAULT_DATABASE = "neo4j"
+
+# 四个超时见模块 docstring 的「连接与查询都要有上限」。
+CONNECT_TIMEOUT_SECONDS = 3.0
+ACQUISITION_TIMEOUT_SECONDS = 5.0
+QUERY_TIMEOUT_SECONDS = 10.0
+RETRY_TIME_SECONDS = 3.0
 
 # 路径里每一跳的方向。留成两个字符串而不是布尔，是因为它会进 `GraphPath` 的
 # 返回结构、会被日志与将来的融合层读到：`"reverse"` 比 `False` 更难被误读。
 FORWARD = "forward"   # 这一跳顺着边的原方向：nodes[i] 是 relation 的 src
 REVERSE = "reverse"   # 这一跳逆着边的原方向：nodes[i] 是 relation 的 dst
 
-# 游走深度的硬上限。递归 CTE 枚举的是**简单路径**（节点不重复），路径条数随
-# 深度组合增长：一个 10 度节点的三层完全图能炸出上千条路径，而 2C2G 上一条
-# 这样的查询会把 CPU 占到百毫秒级。无向游走把这个增长又放大一倍（平均度翻倍），
-# 所以这个上限比有向时更必要。5 跳是"够用且不会失控"的界——真需要跨 5 跳以上
-# 才能连上的两件事，靠这条边找回来的可信度也已经很低了。
+# 游走深度的硬上限。变长路径的枚举量随深度组合增长：一个 10 度节点的三层完全图
+# 能炸出上千条路径。无向游走把这个增长又放大一倍（平均度翻倍），所以这个上限比
+# 有向时更必要。5 跳是"够用且不会失控"的界——真需要跨 5 跳以上才能连上的两件事，
+# 靠这条边找回来的可信度也已经很低了。
 MAX_HOPS = 5
 
 # 单次游走的路径条数上限。检索阶段一次只拿几十条证据，多的用不上。
 MAX_LIMIT = 200
 
-# SQLite 单条语句的变量上限是 999（老版本），一次 IN 查询按 400 分批留足余量。
-_QUERY_BATCH = 400
-
-# 一次连接里要确保存在的东西。索引与表同批建：`CREATE ... IF NOT EXISTS` 重复
-# 执行是纯 schema 查找，比"先探测再建"少一次往返。
-_SCHEMA = (
-    f"""CREATE TABLE IF NOT EXISTS {ENTITY_TABLE} (
-        id         INTEGER PRIMARY KEY AUTOINCREMENT,
-        name       TEXT NOT NULL,
-        type       TEXT,
-        created_at TEXT NOT NULL,
-        UNIQUE(name, type)
-    )""",
-    f"""CREATE TABLE IF NOT EXISTS {EDGE_TABLE} (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        src_id      INTEGER NOT NULL REFERENCES {ENTITY_TABLE}(id),
-        dst_id      INTEGER NOT NULL REFERENCES {ENTITY_TABLE}(id),
-        relation    TEXT NOT NULL,
-        source_id   TEXT NOT NULL,
-        chunk_start INTEGER NOT NULL,
-        chunk_end   INTEGER NOT NULL,
-        created_at  TEXT NOT NULL,
-        UNIQUE(src_id, dst_id, relation, source_id, chunk_start)
-    )""",
-    # 三条索引各服务一类查询：`src_id` 与 `dst_id` 是无向游走的两条腿（`neighbors`
-    # 里的 `OR` 会被 SQLite 拆成 MULTI-INDEX OR，两条腿各走一次索引），
-    # `source_id` 是"这份材料贡献了哪些边"。少了 `dst_id` 这一条，无向游走会退化成
-    # 整表扫描——实测同样的 3000 实体 / 9000 边，带索引 0.2ms，不带是 3ms 量级。
-    f"CREATE INDEX IF NOT EXISTS idx_{EDGE_TABLE}_src ON {EDGE_TABLE}(src_id)",
-    f"CREATE INDEX IF NOT EXISTS idx_{EDGE_TABLE}_dst ON {EDGE_TABLE}(dst_id)",
-    f"CREATE INDEX IF NOT EXISTS idx_{EDGE_TABLE}_source ON {EDGE_TABLE}(source_id)",
-)
-
-# 递归 CTE：从 `name` 对应的所有实体出发，**无向**走 `hops` 跳（见模块 docstring
-# 的「游走是无向的」）。四件事各自有理由：
+# ---------------------------------------------------------------- Cypher 语句
 #
-#   - 起点用 `= name` 而不是 `LIKE`：实体名是归一化后的精确键，模糊匹配会把
-#     "张三"与"张三丰"混起来，那是两个东西。
-#   - 无向靠 `edge.src_id = cur OR edge.dst_id = cur`：SQLite 会把这一条拆成
-#     `MULTI-INDEX OR`，两条腿分别走 `idx_graph_edges_src` 与 `_dst`。试过用
-#     "邻接视图（UNION ALL 两个方向）+ join 视图"的写法，更漂亮，但计划里两张表
-#     都变成 `SCAN graph_edges`（视图的谓词不下推），9000 条边慢 15 倍，弃用。
-#   - `next_id`（下一跳的节点 id）写成同一个 `CASE` 表达式三次：SQLite 不能在
-#     SELECT 里定义让 WHERE 复用的别名，而 CTE 套一层子查询就会把上面的索引计划
-#     破坏掉。同一表达式出现三处是这里唯一能接受的重复——它由测试钉住。
-#   - 环靠 `visited` 里记 id 挡：无向之后一条边就能来回，没有这一条 A→B 会把
-#     递归跑到语句被取消。有了它，枚举的是简单路径，天然终止。
-#   - 递归部分**没有 ORDER BY / LIMIT**：SQLite 不允许（递归 SELECT 有限制），
-#     而且也不需要——SQLite 实现递归 CTE 用的是 FIFO 队列，短路径本来就先出，
-#     外层 `LIMIT` 能在物化完之前就停下。加一个 ORDER BY 反而会把整个路径集合
-#     先算出来再排序，正好抵消掉这个短路。
-_WALK = f"""
-WITH RECURSIVE walk(cur, depth, names, rels, dirs, evid, visited) AS (
-    SELECT e.id, 0, e.name || :sep, '', '', '', :sep || e.id || :sep
-      FROM {ENTITY_TABLE} e
-     WHERE e.name = :name
-    UNION ALL
-    SELECT CASE WHEN edge.src_id = walk.cur THEN edge.dst_id ELSE edge.src_id END,
-           walk.depth + 1,
-           walk.names || target.name || :sep,
-           walk.rels || edge.relation || :sep,
-           walk.dirs || (CASE WHEN edge.src_id = walk.cur THEN '{FORWARD}'
-                              ELSE '{REVERSE}' END) || :sep,
-           walk.evid || edge.source_id || :fsep || edge.chunk_start
-                     || :fsep || edge.chunk_end || :sep,
-           walk.visited || (CASE WHEN edge.src_id = walk.cur THEN edge.dst_id
-                                 ELSE edge.src_id END) || :sep
-      FROM walk
-      JOIN {EDGE_TABLE} edge ON edge.src_id = walk.cur OR edge.dst_id = walk.cur
-      JOIN {ENTITY_TABLE} target ON target.id =
-           (CASE WHEN edge.src_id = walk.cur THEN edge.dst_id ELSE edge.src_id END)
-     WHERE walk.depth < :depth
-       AND instr(walk.visited, :sep || (CASE WHEN edge.src_id = walk.cur THEN edge.dst_id
-                                             ELSE edge.src_id END) || :sep) = 0
+# 全部抽成模块级常量，有两个理由：一是测试能静态断言"占位符与传参键一致"与
+# "语句里没有拼进来的用户输入"；二是 `add_edges_bulk` 的回滚用例要靠替换某一条
+# 常量来制造事务中途失败（见 tests/test_graph_neo4j.py）。
+#
+# 参数一律用 `$name` 风格，值只走 driver 的参数绑定——Cypher 注入之所以常见，
+# 是因为把值格式化进了语句；这里没有任何一处这么做（唯一的拼接是 `hops`，见
+# `_walk_query`）。
+
+# 约束：同名同类型唯一。`IF NOT EXISTS` 让它可以每次连接都跑一遍而无副作用。
+CYPHER_CONSTRAINT = (
+    f"CREATE CONSTRAINT {CONSTRAINT_NAME} IF NOT EXISTS "
+    f"FOR (e:{ENTITY_LABEL}) REQUIRE (e.name, e.type) IS UNIQUE"
 )
-SELECT depth, names, rels, dirs, evid FROM walk WHERE depth > 0 LIMIT :limit
-"""
+
+# 建（或取回）一个精确的 (name, type) 节点。`$type` 一定是 `_resolve_kind` 算过的
+# 落库形态，不会是 null（理由见模块 docstring）。
+CYPHER_UPSERT_ENTITY = (
+    f"MERGE (e:{ENTITY_LABEL} {{name: $name, type: $type}})\n"
+    "ON CREATE SET e.created_at = $now\n"
+    "RETURN id(e) AS id"
+)
+
+# 同名节点里最早的那个（任意类型）。给"类型不明"的调用方挑复用目标，与 SQLite 版
+# `_pick_existing` 的"取 id 最小那行"一一对应。`created_at` 是同一批次里也唯一的
+# 毫秒时间戳，再以内部 id 兜底，保证同一次入库的两次调用挑到同一个节点。
+CYPHER_FIRST_KIND = (
+    f"MATCH (e:{ENTITY_LABEL} {{name: $name}})\n"
+    "RETURN e.type AS type\n"
+    "ORDER BY e.created_at, id(e)\n"
+    "LIMIT 1"
+)
+
+# 批量取候选（一次 UNWIND）。分组顺序在 Cypher 里定死，Python 侧不再排——
+# 两处各排一次迟早分叉。
+CYPHER_ENTITY_CANDIDATES = (
+    f"UNWIND $names AS name\n"
+    f"MATCH (e:{ENTITY_LABEL} {{name: name}})\n"
+    "RETURN name, id(e) AS id, e.type AS type, e.created_at AS created_at\n"
+    "ORDER BY name, created_at, id"
+)
+
+# 一条语句写完两端与边：`MERGE` 两端保证"边写进去了、实体没写进去"这种中间态
+# 不存在。返回新建条数靠 `summary.counters.relationships_created`——比在边上打
+# 时间戳标记可靠（同一毫秒内重复写不会误判），也不会在边上留下一次性属性。
+CYPHER_ADD_EDGE = (
+    f"MERGE (a:{ENTITY_LABEL} {{name: $src, type: $src_type}})\n"
+    "ON CREATE SET a.created_at = $now\n"
+    f"MERGE (b:{ENTITY_LABEL} {{name: $dst, type: $dst_type}})\n"
+    "ON CREATE SET b.created_at = $now\n"
+    f"MERGE (a)-[r:{EDGE_TYPE} {{relation: $relation, source_id: $source_id, "
+    "chunk_start: $chunk_start}]->(b)\n"
+    "ON CREATE SET r.chunk_end = $chunk_end, r.created_at = $now"
+)
+
+# 批量建实体。一次 UNWIND，不循环发语句——这是 Neo4j 的批量模式。
+CYPHER_UPSERT_ENTITIES_BULK = (
+    f"UNWIND $rows AS row\n"
+    f"MERGE (e:{ENTITY_LABEL} {{name: row.name, type: row.type}})\n"
+    "ON CREATE SET e.created_at = row.created_at"
+)
+
+# 批量建边。两端的类型是**解析后**的类型（`row.src_type` / `row.dst_type`），所以
+# `MATCH` 一定命中上一条语句保证存在的节点；不需要再 MERGE 一次，也就不会因为
+# 类型对不上而悄悄多建节点。
+CYPHER_ADD_EDGES_BULK = (
+    f"UNWIND $rows AS row\n"
+    f"MATCH (a:{ENTITY_LABEL} {{name: row.src, type: row.src_type}})\n"
+    f"MATCH (b:{ENTITY_LABEL} {{name: row.dst, type: row.dst_type}})\n"
+    f"MERGE (a)-[r:{EDGE_TYPE} {{relation: row.relation, "
+    "source_id: row.source_id, chunk_start: row.chunk_start}]->(b)\n"
+    "ON CREATE SET r.chunk_end = row.chunk_end, r.created_at = row.created_at"
+)
+
+# 无向游走。四件事各自有理由：
+#
+#   - 起点用 `{name: $name}` 而不是 `CONTAINS`：实体名是归一化后的精确键，模糊
+#     匹配会把"张三"与"张三丰"混起来，那是两个东西。
+#   - 无向靠不给关系加箭头。Cypher 的 `-[*1..n]-` 两个方向都会走。
+#   - `{hops}` 由 `_walk_query` 内插（变长长度不接受参数，见模块 docstring）。
+#   - `all(... single(...))` 把 trail 收成简单路径（Neo4j 默认允许节点重复）。
+#   - `ORDER BY length(p)` 让短路径先出：调用方拿到的前几条就是最近的邻居，
+#     `LIMIT` 截断时不会截掉整条近路而留下一堆远路。
+CYPHER_WALK = (
+    f"MATCH p = (start:{ENTITY_LABEL} {{name: $name}})-[*1..{{hops}}]-(other:{ENTITY_LABEL})\n"
+    "WHERE all(n IN nodes(p) WHERE single(m IN nodes(p) WHERE m = n))\n"
+    "RETURN p\n"
+    "ORDER BY length(p)\n"
+    "LIMIT $limit"
+)
+
+CYPHER_COUNT_ENTITIES = f"MATCH (e:{ENTITY_LABEL}) RETURN count(e) AS n"
+CYPHER_COUNT_EDGES = f"MATCH ()-[r:{EDGE_TYPE}]->() RETURN count(r) AS n"
+# 孤立实体：一条关系都没挂的节点。`NOT (e)--()` 是"没有任何方向的关系"，比
+# `NOT (e)-[]-()` 更直白，语义一样。
+CYPHER_COUNT_ISOLATED = (
+    f"MATCH (e:{ENTITY_LABEL}) WHERE NOT (e)--() RETURN count(e) AS n"
+)
+
+
+class GraphStoreError(OSError):
+    """图存储不可用。**继承 `OSError` 是设计，不是巧合**。
+
+    调用方（`graph_ingest`）的降级分支按 `except (sqlite3.Error, OSError,
+    ValueError)` 计 `failed`，它服务的是"这一块写库失败、下一块继续"。换引擎时
+    若抛 Neo4j 专有异常，这条分支就接不住了：`failed` 从"这块没落库"变成"整份
+    材料抛到上传接口"，而两种结果在测试里都可能看起来正常。`OSError` 同时也是
+    "连不上 7687"最准确的归类——连接被拒与超时本来就是 I/O 失败。
+
+    `str()` 里只有异常类名，**不带 Neo4j 的原始消息**：那条消息可能回显属性值
+    （实体名、关系短语），而这一层的日志原则是"只有形状，没有内容"——材料可能是
+    合同、病历、内部制度。
+    """
+
+
+class GraphStoreNotConfigured(GraphStoreError):
+    """没配 `MINDMAP_NEO4J_PASSWORD`。写接口抛它，读接口当作"什么都没查到"。"""
 
 
 @dataclass(frozen=True)
@@ -227,7 +334,8 @@ class GraphPath:
 def normalize_name(name: str | None) -> str:
     """实体名/关系短语的归一化键（规则见模块 docstring 第「归一化规则」节）。
 
-    控制字符一并剔除：它们既会破坏路径序列化的分隔符，也会在日志里当控制序列用。
+    控制字符一并剔除：它们既会破坏日志与终端输出，也可能被 Cypher 当作属性值里的
+    怪字符带进查询（参数绑定是安全的，但读的人会被它搞晕）。
     非字符串输入先转成字符串——抽取层的模型输出什么都可能给，与其在上游逐字段
     断言类型，不如让"`1` 归一化成 '1' 再因为太短被丢掉"这一条规则统一收尾。
     """
@@ -239,99 +347,234 @@ def normalize_name(name: str | None) -> str:
 
 
 def _fold_type(kind: str | None) -> str:
-    """类型的落库形态：`None` → 空串。理由见模块 docstring 的「NULL 那个坑」。"""
+    """类型的落库形态：`None` → 空串。理由见模块 docstring 的「`type` 为什么折成空串」。"""
     return normalize_name(kind)
 
 
-def _pick_existing(candidates: list[tuple[int, str]], kind: str) -> int | None:
-    """从同名实体的若干行里挑一行复用；挑不出来就 `None`（该新建）。
+def _pick_existing(candidates: list[tuple[int, str]], kind: str) -> tuple[int, str] | None:
+    """从同名节点的若干候选里挑一个复用；挑不出来就 `None`（该新建）。
 
-    规则只有两条：**类型明确就精确匹配；类型不明就取最早那行**（`candidates`
-    按 id 升序）。第二条不是"随便挑一个"——调用方说不出类型时（只写一条边的
-    下游、批量写边），复用任意一行都比新建一行强，新建会把一个实体劈成"有类型
-    的"和"空类型的"两半，而边只挂在后一半上（实测 3000 实体被记成 6000）。
+    返回 `(内部 id, 实际类型)`——批量路径需要那个类型：边的 `MATCH` 是按
+    `(name, type)` 定位节点的，用调用方传来的空类型会找不到复用出来的节点。
 
-    单条写入（`_upsert`）与批量写入（`add_edges_bulk`）都走这一个函数：两处各写
-    一份判断，迟早出现"先建实体再写边"与"批量写"给出两套实体归属。
+    规则只有两条：**类型明确就精确匹配；类型不明就取最早那个**（`candidates`
+    按 `created_at`、id 升序）。第二条不是"随便挑一个"——理由见模块 docstring 的
+    「空类型实体的复用」。
+
+    单条写入（`_resolve_kind`）与批量写入（`add_edges_bulk`）共用这一个判断：两处
+    各写一份，迟早出现"先建实体再写边"与"批量写"给出两套实体归属。
     """
     if not candidates:
         return None
     if not kind:
-        return candidates[0][0]
+        return candidates[0]
     for entity_id, existing in candidates:
         if existing == kind:
-            return entity_id
+            return (entity_id, existing)
     return None
 
 
-def _open() -> sqlite3.Connection:
-    """开连接并确保表与索引存在。失败就抛——写接口不该假装写成功。"""
-    conn = repository.connect()
-    try:
-        for statement in _SCHEMA:
-            conn.execute(statement)
-    except sqlite3.Error:
-        conn.close()
-        raise
-    return conn
+def _now() -> str:
+    """落库用的时间戳，格式与 SQLite 版的 `strftime('%Y-%m-%dT%H:%M:%fZ')` 同形。
 
-
-def _upsert(conn: sqlite3.Connection, entity_name: str, entity_type: str) -> int:
-    """在**已有连接**内取回实体 id，没有就插入。
-
-    不走 `INSERT OR REPLACE`：替换会先把行删掉再插，`AUTOINCREMENT` 换一个新 id，
-    已经指向旧 id 的边全部变成孤儿（外键在 SQLite 默认不强制，所以不会报错，
-    只会静默指错）。`OR IGNORE` + `SELECT` 两步换来的是 id 稳定。
-
-    **类型为空时先复用同名实体（任意类型）**。这一条不是优化，是正确性：`add_edge`
-    的 `src_type` / `dst_type` 是可选的，调用方（尤其是只关心"谁连着谁"的下游）
-    不会为了写一条边先去查类型。若这里直接拿空类型去 `INSERT OR IGNORE`，同一个
-    "甲公司"会在库里变成两行——一行 `type='组织'`（抽取时建的）、一行 `type=''`
-    （写边时建的），边全挂在后面那行，前者成了孤立实体。实测 3000 个实体按 3 条边
-    连完，`stats()` 报出 6000 个实体、3000 个孤立——图看着建成了，一半节点是死的。
-    判定规则与批量路径共用 `_pick_existing`。
+    同形不是为了好看：`created_at` 参与排序（`CYPHER_FIRST_KIND` 用"最早"决定复用
+    哪个节点），换一种格式就得换一处排序键。毫秒精度用整数拼出来，`strftime` 的
+    `%f` 是微秒，直接截断会差三个数量级。
     """
-    rows = conn.execute(
-        f"SELECT id, type FROM {ENTITY_TABLE} WHERE name = ? ORDER BY id",
-        (entity_name,),
-    ).fetchall()
-    picked = _pick_existing([(int(row["id"]), row["type"] or "") for row in rows],
-                            entity_type)
-    if picked is not None:
-        return picked
-    conn.execute(
-        f"INSERT OR IGNORE INTO {ENTITY_TABLE} (name, type, created_at) "
-        f"VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-        (entity_name, entity_type),
-    )
-    row = conn.execute(
-        f"SELECT id FROM {ENTITY_TABLE} WHERE name = ? AND type = ?",
-        (entity_name, entity_type),
-    ).fetchone()
-    # 走到这里还拿不到 id 只能是并发下别的写入方把行删了，属于不可恢复的错误。
-    if row is None:
-        raise sqlite3.IntegrityError("实体写入后读不到 id")
-    return int(row["id"])
+    moment = datetime.now(timezone.utc)
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond // 1000:03d}Z"
+
+
+def _clamp_hops(hops: int) -> int:
+    """深度夹取。**返回值一定是 int**——它会被内插进 Cypher（见 `_walk_query`）。"""
+    return min(max(int(hops), 0), MAX_HOPS)
+
+
+def _clamp_limit(limit: int) -> int:
+    """条数夹取。下限 1：`LIMIT 0` 会安静地返回空，比报错难查。"""
+    return min(max(int(limit), 1), MAX_LIMIT)
+
+
+def _walk_query(depth: int) -> str:
+    """把夹过的深度内插进变长模式。
+
+    Cypher 的变长关系长度**不接受参数**（`[*1..$hops]` 是语法错误），所以深度只能
+    内插。这是本模块唯一一处语句拼接，拼接值是 `_clamp_hops` 返回的 int（0~5），
+    不是调用方给的字符串——`tests/test_graph_rag.py` 有一条静态用例钉住这一点。
+    `replace` 而不是 `format`：Cypher 里的 `{name: $name}` 花括号不该被当成占位符。
+    """
+    return CYPHER_WALK.replace("{hops}", str(_clamp_hops(depth)))
+
+
+def _config() -> tuple[str, str, str, str]:
+    """(uri, user, password, database)。密码没有默认值，见模块 docstring。"""
+    uri = os.getenv(URI_ENV, "").strip() or DEFAULT_URI
+    user = os.getenv(USER_ENV, "").strip() or DEFAULT_USER
+    password = os.getenv(PASSWORD_ENV, "").strip()
+    database = os.getenv(DATABASE_ENV, "").strip() or DEFAULT_DATABASE
+    return uri, user, password, database
+
+
+_DRIVER: Driver | None = None
+_DRIVER_LOCK = threading.Lock()
+_CONSTRAINT_READY = False
+
+
+def _ensure_constraint(driver: Driver, database: str) -> None:
+    """建唯一约束。**必须独立事务**：Neo4j 不允许 schema 修改与数据写在同一事务里
+    （`ForbiddenDueToTransactionType`），所以它不能挂在任何一个写事务里顺手做。
+
+    失败只记 warning、不抛：约束是"并发下的加固"，不是"能不能用"的前提——单线程
+    的 `MERGE` 没有约束也是幂等的，而一次建不上就整层不可用是更差的交换。warning
+    里也不带 Neo4j 的原始消息（可能有属性值），只带异常类名。
+    """
+    global _CONSTRAINT_READY
+    if _CONSTRAINT_READY:
+        return
+    try:
+        driver.execute_query(CYPHER_CONSTRAINT, database_=database)
+    except (Neo4jError, DriverError, OSError) as exc:
+        logger.warning("图谱约束创建失败（继续运行）：%s", type(exc).__name__)
+    _CONSTRAINT_READY = True
+
+
+def _driver() -> Driver:
+    """惰性建池。没配密码就抛 `GraphStoreNotConfigured`，连不上由 driver 抛。
+
+    约束的创建也在这把锁里：它只在第一次建池时真发语句（之后被 `_CONSTRAINT_READY`
+    挡住），而放在锁外会让并发的首批请求各发一遍 `CREATE CONSTRAINT`。
+    """
+    global _DRIVER
+    uri, user, password, database = _config()
+    if not password:
+        raise GraphStoreNotConfigured(
+            f"未配置 {PASSWORD_ENV}：图存储视为未启用")
+    with _DRIVER_LOCK:
+        if _DRIVER is None:
+            _DRIVER = GraphDatabase.driver(
+                uri,
+                auth=(user, password),
+                connection_timeout=CONNECT_TIMEOUT_SECONDS,
+                connection_acquisition_timeout=ACQUISITION_TIMEOUT_SECONDS,
+                max_transaction_retry_time=RETRY_TIME_SECONDS,
+                # `id()` 在 Neo4j 5.26 起被标成弃用（"will be removed without a
+                # replacement"），而我们**故意**用它：`upsert_entity` 的返回类型是
+                # int，`elementId()` 是字符串，换掉就是改接口。不关这一类通知的
+                # 后果是每写一个实体刷一条 WARNING——一次入库上千个实体就是上千条
+                # 日志，把真正要看的东西埋掉。只关 DEPRECATION 一类，别的通知照旧。
+                notifications_disabled_classifications=["DEPRECATION"],
+            )
+        driver = _DRIVER
+        _ensure_constraint(driver, database)
+    return driver
+
+
+def close_driver() -> None:
+    """关掉单例并允许下次重建。测试用它切换环境变量，进程退出也调它。"""
+    global _DRIVER, _CONSTRAINT_READY
+    with _DRIVER_LOCK:
+        driver, _DRIVER = _DRIVER, None
+        _CONSTRAINT_READY = False
+    if driver is None:
+        return
+    try:
+        driver.close()
+    except (Neo4jError, DriverError, OSError) as exc:
+        # 关不掉的连接池不该让退出流程失败；进程结束时内核会收回来。
+        logger.debug("图谱驱动关闭失败：%s", type(exc).__name__)
+
+
+@contextmanager
+def _session(read_only: bool = False) -> Iterator[Any]:
+    """一个 session（= 一条连接 + 一个 database）。异常折成 `GraphStoreError`。
+
+    `read_only` 只在集群里真正起作用（读请求可以被路由到 follower），单机 bolt
+    直连下两种模式的代价一样；区别是语义：`neighbors` / `stats` 不该占着写路由。
+
+    **两个异常基类都要捕获，少一个就漏**：driver 6.x 把异常树重排成
+    `GqlError` → (`DriverError` | `Neo4jError`)，而 `ServiceUnavailable`（连不上、
+    认证失败、连接池耗尽）挂在 `DriverError` 那一支下——它**不是** `Neo4jError` 的
+    子类。只按 `Neo4jError` 捕获会漏掉"连不上 7687"，而那正是这里最需要接住的一类。
+    两个名字一起写还有一个好处：driver 5.x 里 `DriverError` 是 `Neo4jError` 的子
+    类，这套写法跨两个大版本都成立，`requirements.txt` 的范围才有意义。
+    """
+    driver = _driver()
+    _, _, _, database = _config()
+    mode = _READ if read_only else _WRITE
+    try:
+        with driver.session(database=database, default_access_mode=mode) as session:
+            yield session
+    except GraphStoreError:
+        raise
+    except (Neo4jError, DriverError) as exc:
+        raise GraphStoreError(f"图存储不可用：{type(exc).__name__}") from exc
+    except OSError as exc:
+        raise GraphStoreError(f"图存储连接失败：{type(exc).__name__}") from exc
+
+
+@contextmanager
+def _transaction(read_only: bool = False) -> Iterator[Any]:
+    """一个事务：整块要么全成功要么全失败。
+
+    `with session.begin_transaction(...)` 正常退出时提交、异常时回滚，所以
+    `add_edges_bulk` 里"先建实体、再建边"的两条语句天然是一个原子单位——第二条
+    失败时第一条建的节点也退回去，不会留下一批"看起来只是没连上"的孤立实体。
+
+    事务超时设在服务端（`timeout=`），所以整批 `UNWIND` 也受 `QUERY_TIMEOUT_SECONDS`
+    约束：一次稠密图上的失控游走不会把请求挂到天荒地老。
+    """
+    with _session(read_only) as session:
+        with session.begin_transaction(timeout=QUERY_TIMEOUT_SECONDS) as transaction:
+            yield transaction
+
+
+def _resolve_kind(transaction: Any, name: str, kind: str) -> str:
+    """算出这个实体的**实际落库类型**（见模块 docstring 的「空类型实体的复用」）。
+
+    类型明确就直接用：`(name, type)` 是唯一键，精确 MERGE 不可能撞到别的类型。
+    类型不明时先看同名节点最早那个的类型——复用它的类型，`MERGE` 才会命中同一个
+    节点，而不是造一个空类型分身。
+    """
+    if kind:
+        return kind
+    record = transaction.run(CYPHER_FIRST_KIND, {"name": name}).single()
+    if record is None:
+        return ""
+    return str(record["type"] or "")
+
+
+def _upsert(transaction: Any, name: str, kind: str) -> int:
+    """在**已有事务**内取回实体 id，没有就建。规则与 `_resolve_kind` 同一套。"""
+    resolved = _resolve_kind(transaction, name, kind)
+    record = transaction.run(
+        CYPHER_UPSERT_ENTITY,
+        {"name": name, "type": resolved, "now": _now()},
+    ).single()
+    # 走到这里还拿不到 id 只能是并发下节点被删了，属于不可恢复的错误。
+    if record is None:
+        raise GraphStoreError("实体 MERGE 之后读不到 id")
+    return int(record["id"])
 
 
 def upsert_entity(name: str, type: str | None = None) -> int:
-    """写入（或取回）一个实体，返回它的 id。同名同类型幂等。
+    """写入（或取回）一个实体，返回它的**内部节点 id**。同名同类型幂等。
 
     `type` 为空**不等于**"新建一个无类型实体"：库里已有同名实体时直接复用它
-    （理由见 `_upsert`）。反过来，`type` 明确给出时按 `(name, type)` 精确匹配，
-    所以 `("甲", "人物")` 与 `("甲", "组织")` 仍是两行——这是 `UNIQUE(name, type)`
-    的契约，也是"苹果公司 vs 苹果"能被区分开的原因。
+    （理由见模块 docstring 的「空类型实体的复用」）。反过来，`type` 明确给出时按
+    `(name, type)` 精确匹配，所以 `("甲", "人物")` 与 `("甲", "组织")` 仍是两个
+    节点——这是唯一约束的契约，也是"苹果公司 vs 苹果"能被区分开的原因。
 
-    `name` 归一化后为空时抛 `ValueError`：空名字落库后所有空名字的实体都会被
-    `UNIQUE` 撞成一行，那是比"这次没抽到实体"严重得多的静默错误。
+    `name` 归一化后为空时抛 `ValueError`：空名字落库后所有空名字的实体都会被唯一
+    约束撞成一行，那是比"这次没抽到实体"严重得多的静默错误。
+
+    返回值是 Neo4j 的内部 id（`id(e)`），`int`，可直接比较相等——调用方拿它做
+    "两次 upsert 是不是同一个节点"的判断，与 SQLite 版的自增主键用途相同。
     """
     entity_name = normalize_name(name)
     if not entity_name:
         raise ValueError("实体名为空")
-    entity_type = _fold_type(type)
-    conn = _open()
-    with closing(conn), conn:
-        return _upsert(conn, entity_name, entity_type)
+    with _transaction() as transaction:
+        return _upsert(transaction, entity_name, _fold_type(type))
 
 
 def add_edge(
@@ -348,15 +591,15 @@ def add_edge(
     """写一条边；**没有落库就返回 `False`**（已在库里，或这条边本身没意义）。
 
     两种 `False` 都不是错误：同一份材料重跑入库、相邻块因重叠再抽到同一条边，
-    都是正常情况，重复写不该让整次入库算失败。真正的错误（库不可写）照常抛
-    `sqlite3.Error`，让调用方计入 `failed`。
+    都是正常情况，重复写不该让整次入库算失败。真正的错误（库不可写、连不上）照常
+    抛 `GraphStoreError`（`OSError` 子类），让调用方计入 `failed`。
 
-    自环（`src == dst`）直接不写：它在游走里永远走不到（`visited` 一开始就含
-    起点 id），落库只会让"边数"虚高，而边数是判断图建得怎么样的唯一总量指标。
+    自环（`src == dst`）直接不写：它在游走里永远走不到（路径里节点唯一，回到起点
+    就被过滤掉了），落库只会让"边数"虚高，而边数是判断图建得怎么样的唯一总量指标。
 
-    `src` / `dst` 是**实体名**而不是 id：调用方（抽取层）手上只有名字，逼它先
-    查 id 只会把一次事务拆成三次。两个实体的 upsert 与这条边的插入在同一个连接
-    同一个事务里完成，不会出现"边写进去了、实体没写进去"的中间态。
+    `src` / `dst` 是**实体名**而不是 id：调用方（抽取层）手上只有名字，逼它先查
+    id 只会把一次事务拆成两次。两端 `MERGE` 与边的 `MERGE` 在同一条语句、同一个
+    事务里完成，不会出现"边写进去了、实体没写进去"的中间态。
 
     `chunk_start` / `chunk_end` 原样落库——它们是下一轮回填证据高亮的唯一依据，
     在这里做任何"修正"（比如把 end 拉到句末）都会让高亮标错字。
@@ -369,17 +612,24 @@ def add_edge(
         return False
     if int(chunk_end) < int(chunk_start):
         raise ValueError("证据区间倒置：chunk_end < chunk_start")
-    conn = _open()
-    with closing(conn), conn:
-        src_id = _upsert(conn, src_name, _fold_type(src_type))
-        dst_id = _upsert(conn, dst_name, _fold_type(dst_type))
-        cursor = conn.execute(
-            f"INSERT OR IGNORE INTO {EDGE_TABLE} "
-            f"(src_id, dst_id, relation, source_id, chunk_start, chunk_end, created_at) "
-            f"VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-            (src_id, dst_id, phrase, str(source_id), int(chunk_start), int(chunk_end)),
-        )
-        return cursor.rowcount > 0
+    now = _now()
+    with _transaction() as transaction:
+        params = {
+            "src": src_name,
+            "dst": dst_name,
+            # 空类型要先解析成实际类型，否则会造出一个空类型分身。
+            "src_type": _resolve_kind(transaction, src_name, _fold_type(src_type)),
+            "dst_type": _resolve_kind(transaction, dst_name, _fold_type(dst_type)),
+            "relation": phrase,
+            "source_id": str(source_id),
+            "chunk_start": int(chunk_start),
+            "chunk_end": int(chunk_end),
+            "now": now,
+        }
+        summary = transaction.run(CYPHER_ADD_EDGE, params).consume()
+    # 新建条数是 driver 从服务端计数拿的：比"在边上打标记"可靠，重复写时不会
+    # 因为标记残留而误报 True，也不会在边上留下一次性属性。
+    return summary.counters.relationships_created > 0
 
 
 @dataclass(frozen=True)
@@ -404,8 +654,9 @@ class EdgeInput:
 def _prepare_edge(item: EdgeInput) -> tuple[str, str, str, str, int, int, str, str] | None:
     """归一化 + 校验一条边；无意义（空名 / 自环 / 空关系）返回 `None`。
 
-    与 `add_edge` 走同一套判断。两处不一致的结局是"单条写得进去、批量写不进去"
-    或者反过来——这是排查成本最高的一类不一致。
+    返回的 8 元组顺序固定：`(src, dst, relation, source_id, start, end, src_type,
+    dst_type)`。与 `add_edge` 走同一套判断。两处不一致的结局是"单条写得进去、
+    批量写不进去"或者反过来——这是排查成本最高的一类不一致。
     """
     src_name, dst_name = normalize_name(item.src), normalize_name(item.dst)
     phrase = normalize_name(item.relation)
@@ -418,43 +669,40 @@ def _prepare_edge(item: EdgeInput) -> tuple[str, str, str, str, int, int, str, s
             _fold_type(item.src_type), _fold_type(item.dst_type))
 
 
-def _load_existing(conn: sqlite3.Connection, names: list[str]) -> dict[str, list[tuple[int, str]]]:
-    """一次查出这批名字已有的实体行，按名字分组、组内按 id 升序。
+def _load_candidates(transaction: Any, names: list[str]) -> dict[str, list[tuple[int, str]]]:
+    """一次查出这批名字已有的节点，按名字分组、组内按时间与 id 升序。
 
-    分批（`_QUERY_BATCH`）是因为 SQLite 单条语句的变量上限在 999，而一次入库的
-    实体数没有上限。`ORDER BY id` 不是排序洁癖：`_pick_existing` 在类型不明时取
-    第一行，这里必须保证"第一行"是 id 最小的那一行，否则同一次入库的两次调用
-    可能挑到不同的行。
+    一次 `UNWIND` 代替 SQLite 版的"分批 IN（每批 400 个变量）"：Neo4j 的列表参数
+    没有变量个数上限，一次入库的实体数没有上限也不需要分批。组内顺序由 Cypher 的
+    `ORDER BY name, created_at, id` 定死——`_pick_existing` 在类型不明时取第一个，
+    这里必须保证"第一个"就是最早那个。
     """
     found: dict[str, list[tuple[int, str]]] = {}
-    for start in range(0, len(names), _QUERY_BATCH):
-        window = names[start:start + _QUERY_BATCH]
-        marks = ",".join("?" * len(window))
-        rows = conn.execute(
-            f"SELECT id, name, type FROM {ENTITY_TABLE} "
-            f"WHERE name IN ({marks}) ORDER BY id",
-            tuple(window),
-        ).fetchall()
-        for row in rows:
-            found.setdefault(row["name"], []).append((int(row["id"]), row["type"] or ""))
+    if not names:
+        return found
+    for record in transaction.run(CYPHER_ENTITY_CANDIDATES, {"names": names}):
+        found.setdefault(str(record["name"]), []).append(
+            (int(record["id"]), str(record["type"] or "")))
     return found
 
 
 def add_edges_bulk(edges: list[EdgeInput]) -> int:
-    """一个连接、一个事务写完一批边，返回**真正落库**的条数。
+    """一个事务写完一批边，返回**真正落库**的条数。
 
-    存在的理由只有一个，但足够：`add_edge` 每条边一次连接一次事务，而 SQLite
-    每次提交都要 fsync。实测 12000 行逐条写 136 秒、单事务 34 毫秒——差 4000 倍。
-    单份材料 20 块时差的是 3 秒（能忍），整库重建时差的是分钟级（不能忍），而
-    "重建整库"是这条路径迟早要干的事。
+    Neo4j 的批量模式是 `UNWIND`：一次提交把整批行喂给一条语句，而不是循环发
+    语句。这里一共三条语句（取候选 → 建缺失实体 → 建边），全部在同一个事务里，
+    所以整批要么全成功要么全失败。
 
     **失败不留半张图**：整批先在事务外校验（空名 / 自环 / 区间倒置），任何一条
-    倒置直接抛 `ValueError` 且一条都不写；进了事务之后任何异常都由 `with conn`
-    回滚，实体与边一起退回去。批量写入的原子性以"这一批"为界，不以"整份材料"
-    为界——调用方（`graph_ingest`）按块调用，所以失败粒度仍是块。
+    倒置直接抛 `ValueError` 且一条都不写；进了事务之后任何异常都由
+    `begin_transaction` 的上下文回滚，实体与边一起退回去。批量写入的原子性以
+    "这一批"为界，不以"整份材料"为界——调用方（`graph_ingest`）按块调用，所以
+    失败粒度仍是块。
 
-    返回值与 `add_edge` 同口径：被 `UNIQUE` 忽略的重复边不计入，但它们**不是
-    错误**（重跑入库、相邻块重叠都会产生重复）。
+    返回值与 `add_edge` 同口径：重复的边（`MERGE` 命中的）不计入，但它们**不是
+    错误**（重跑入库、相邻块重叠都会产生重复）。条数来自
+    `summary.counters.relationships_created`，与 SQLite 版 `executemany` 的
+    `rowcount` 语义一致。
     """
     if not edges:
         return 0
@@ -467,84 +715,97 @@ def add_edges_bulk(edges: list[EdgeInput]) -> int:
         return 0
 
     # 先把这批边涉及的所有 (名字, 类型) 收齐，实体才能一次写完——不然"先建实体
-    # 再建边"就又是两次往返。
+    # 再建边"就又是一批往返。
     wanted: dict[str, set[str]] = {}
     for src_name, dst_name, _phrase, _sid, _s, _e, src_kind, dst_kind in prepared:
         wanted.setdefault(src_name, set()).add(src_kind)
         wanted.setdefault(dst_name, set()).add(dst_kind)
 
-    conn = _open()
-    with closing(conn), conn:
-        names = list(wanted)
-        existing = _load_existing(conn, names)
-        missing = [
-            (name, kind)
-            for name, kinds in wanted.items()
-            for kind in kinds
-            if _pick_existing(existing.get(name, []), kind) is None
-        ]
-        if missing:
-            conn.executemany(
-                f"INSERT OR IGNORE INTO {ENTITY_TABLE} (name, type, created_at) "
-                f"VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-                missing,
-            )
-            # 重新读一次才拿得到新行的 id：`executemany` 不返回逐行 lastrowid。
-            existing = _load_existing(conn, names)
-        ids: dict[tuple[str, str], int] = {}
+    now = _now()
+    with _transaction() as transaction:
+        existing = _load_candidates(transaction, list(wanted))
+        # (名字, 调用方传的类型) → 实际落库类型。类型不明的走复用，其余原样。
+        resolved: dict[tuple[str, str], str] = {}
+        missing: list[dict] = []
         for name, kinds in wanted.items():
             for kind in kinds:
                 picked = _pick_existing(existing.get(name, []), kind)
                 if picked is None:
-                    raise sqlite3.IntegrityError("实体写入后读不到 id")
-                ids[(name, kind)] = picked
-        cursor = conn.executemany(
-            f"INSERT OR IGNORE INTO {EDGE_TABLE} "
-            f"(src_id, dst_id, relation, source_id, chunk_start, chunk_end, created_at) "
-            f"VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-            [
-                (ids[(src_name, src_kind)], ids[(dst_name, dst_kind)], phrase,
-                 sid, start, end)
-                for src_name, dst_name, phrase, sid, start, end, src_kind, dst_kind
-                in prepared
-            ],
-        )
-        return cursor.rowcount
+                    resolved[(name, kind)] = kind
+                    missing.append({"name": name, "type": kind, "created_at": now})
+                else:
+                    resolved[(name, kind)] = picked[1]
+        if missing:
+            transaction.run(CYPHER_UPSERT_ENTITIES_BULK, {"rows": missing}).consume()
+        rows = [
+            {
+                "src": src_name,
+                "dst": dst_name,
+                # 用解析后的类型定位节点：`MATCH` 一定命中上一条语句保证存在的
+                # 那个节点，不会因为类型为空而漏掉复用出来的实体。
+                "src_type": resolved[(src_name, src_kind)],
+                "dst_type": resolved[(dst_name, dst_kind)],
+                "relation": phrase,
+                "source_id": sid,
+                "chunk_start": start,
+                "chunk_end": end,
+                "created_at": now,
+            }
+            for src_name, dst_name, phrase, sid, start, end, src_kind, dst_kind in prepared
+        ]
+        summary = transaction.run(CYPHER_ADD_EDGES_BULK, {"rows": rows}).consume()
+    return int(summary.counters.relationships_created)
 
 
-def _parse_path(row: sqlite3.Row) -> GraphPath | None:
-    """拆一条路径；形状不对就整条丢掉。
+def _parse_path(record: Any) -> GraphPath | None:
+    """把一条 Cypher 路径拆成 `GraphPath`；形状不对就整条丢掉。
 
     宁可少一条路径，也不返回一条 `relations` / `directions` / `evidence` 错位的
     路径：错位的后果是证据指向错误的关系、方向标到错误的跳，而且这种错误在界面
     上一眼看不出来。
+
+    方向靠**起止点比对**读出来：`path.nodes[i]` 是 `path.relationships[i]` 的起点
+    就是 `FORWARD`，是终点就是 `REVERSE`。无向游走会把关系反过来走，所以这一步
+    不能省；比对用 `element_id` 而不是 `name`——同名不同类型的实体是两个节点，
+    按名字比会把方向判成"总是正向"。
     """
-    nodes = row["names"].split(_SEP)[:-1]  # 末尾一定多一个分隔符
-    relations = row["rels"].split(_SEP)[:-1] if row["rels"] else []
-    directions = row["dirs"].split(_SEP)[:-1] if row["dirs"] else []
-    evidence: list[tuple[str, int, int]] = []
-    for item in row["evid"].split(_SEP):
-        if not item:
-            continue
-        parts = item.split(_FIELD_SEP)
-        if len(parts) != 3:
-            logger.warning("图谱证据格式异常，跳过该路径（长度 %d）", len(parts))
-            return None
-        try:
-            evidence.append((parts[0], int(parts[1]), int(parts[2])))
-        except ValueError:
-            logger.warning("图谱证据偏移不是整数，跳过该路径")
-            return None
+    try:
+        path = record["p"]
+        nodes = [str(node["name"]) for node in path.nodes]
+        relations: list[str] = []
+        evidence: list[tuple[str, int, int]] = []
+        directions: list[str] = []
+        for index, relation in enumerate(path.relationships):
+            relations.append(str(relation["relation"]))
+            evidence.append((str(relation["source_id"]),
+                             int(relation["chunk_start"]),
+                             int(relation["chunk_end"])))
+            starts_here = (relation.start_node.element_id
+                           == path.nodes[index].element_id)
+            directions.append(FORWARD if starts_here else REVERSE)
+    except (KeyError, TypeError, ValueError):
+        logger.warning("图谱路径格式异常，跳过该路径")
+        return None
     if not nodes or len(nodes) - 1 != len(relations) or len(relations) != len(evidence):
         return None
     if len(directions) != len(relations):
         return None
     if any(direction not in (FORWARD, REVERSE) for direction in directions):
-        # 只可能来自 SQL 写错，但方向读错比路径少一条危险得多。
+        # 只可能来自 `_parse_path` 自己的逻辑写错，但方向读错比路径少一条危险得多。
         logger.warning("图谱路径方向取值异常，跳过该路径")
         return None
     return GraphPath(nodes=nodes, relations=relations, evidence=evidence,
                      directions=directions)
+
+
+def _path_key(path: GraphPath) -> tuple:
+    """路径去重键：四项全等才算同一条。
+
+    只看 `nodes` 会把"甲依赖乙"与"乙依赖甲"合成一条，那是两个不同的断言；只看
+    `relations` 会把同名不同类型的两个起点合成一条，那就丢掉一条独立的证据。
+    """
+    return (tuple(path.nodes), tuple(path.relations),
+            tuple(path.directions), tuple(path.evidence))
 
 
 def neighbors(name: str, *, hops: int = 2, limit: int = 50) -> list[GraphPath]:
@@ -553,47 +814,45 @@ def neighbors(name: str, *, hops: int = 2, limit: int = 50) -> list[GraphPath]:
     为什么无向见模块 docstring；方向没有丢，`GraphPath.directions` 逐跳记着这条
     边原本是顺着还是逆着走的，所以"从 B 出发走到 A"仍然能读出"原本是 A→B"。
 
-    `hops` 与 `limit` 都**收在硬上限内**（`MAX_HOPS` / `MAX_LIMIT`）：这不是洁癖，
-    是 2C2G 上的可用性——一个手滑传进来的 `hops=12` 会让递归 CTE 在稠密子图上
-    跑出指数级的中间行。截断只发生在超限时，正常取值不受影响。
+    `hops` 与 `limit` 都**收在硬上限内**（`MAX_HOPS` / `MAX_LIMIT`）：不是洁癖，
+    是可用性——变长路径在稠密子图上会跑出指数级的中间行。截断只发生在超限时，
+    正常取值不受影响。
 
-    环检测在无向之后比有向时更吃紧：一条边就能来回走，`visited` 必须挡住
-    "甲→乙→甲"。它挡的是**节点重复**，所以返回的每条路径都是简单路径。
+    返回的每条路径都是**简单路径**（节点不重复）。Neo4j 的变长模式默认允许节点
+    重复（只保证关系不重复），所以语句里额外用 `all(... single(...))` 过滤——详见
+    模块 docstring 的「环」。
 
-    同名不同类型的实体（"苹果"公司 / 水果）会被各自当作起点，若两行挂着内容
-    完全相同的边，会拿到两条一模一样的路径——三项（节点、关系、方向）与证据全等
-    的重复在这一层合并掉；只差方向的两条**不合并**，它们是"甲依赖乙"与"乙依赖甲"
+    同名不同类型的实体（"苹果"公司 / 水果）会各自当作起点，若两者挂着内容完全
+    相同的边，会拿到两条一模一样的路径——四项（节点、关系、方向、证据）全等的
+    重复在这一层合并掉；只差方向的两条**不合并**，它们是"甲依赖乙"与"乙依赖甲"
     两个不同的断言。
 
-    库不可用时返回 `[]`——查询侧不需要为"图没建好"准备第二个分支。
+    库不可用（没配密码 / 连不上 / 超时）时返回 `[]`——查询侧不需要为"图没建好"
+    准备第二个分支。
     """
     entity = normalize_name(name)
     if not entity:
         return []
-    depth = min(max(int(hops), 0), MAX_HOPS)
+    depth = _clamp_hops(hops)
     if depth == 0:
         # 0 跳的语义是"没有走任何边"，那就没有路径。返回起点本身会让调用方
         # 拿到一条零证据的"命中"，比返回空更糟。
         return []
-    cap = min(max(int(limit), 1), MAX_LIMIT)
+    cap = _clamp_limit(limit)
+    query = _walk_query(depth)
     try:
-        conn = _open()
-    except (sqlite3.Error, OSError) as exc:
+        with _transaction(read_only=True) as transaction:
+            records = list(transaction.run(query, {"name": entity, "limit": cap}))
+    except (GraphStoreError, OSError) as exc:
         logger.warning("图谱游走不可用：%s", type(exc).__name__)
         return []
-    with closing(conn):
-        rows = conn.execute(
-            _WALK,
-            {"name": entity, "depth": depth, "limit": cap, "sep": _SEP, "fsep": _FIELD_SEP},
-        ).fetchall()
     paths: list[GraphPath] = []
     seen: set[tuple] = set()
-    for row in rows:
-        path = _parse_path(row)
+    for record in records:
+        path = _parse_path(record)
         if path is None:
             continue
-        key = (tuple(path.nodes), tuple(path.relations),
-               tuple(path.directions), tuple(path.evidence))
+        key = _path_key(path)
         if key in seen:
             continue
         seen.add(key)
@@ -608,20 +867,20 @@ def stats() -> dict:
     回答"这次抽取到底连上了没有"。全是孤立实体，说明关系抽取一路空转，图建了
     等于没建——这个信号比"实体数"本身有用。
 
-    读不到库时返回三个 0，与"空图"同形：调用方看到的都是"还没有图"。
+    读不到库（没配密码 / 连不上 / 超时）时返回三个 0，与"空图"同形：调用方看到
+    的都是"还没有图"。
     """
     zero = {"entities": 0, "edges": 0, "isolated_entities": 0}
     try:
-        conn = _open()
-    except (sqlite3.Error, OSError) as exc:
+        with _transaction(read_only=True) as transaction:
+            entities = transaction.run(CYPHER_COUNT_ENTITIES).single()
+            edges = transaction.run(CYPHER_COUNT_EDGES).single()
+            isolated = transaction.run(CYPHER_COUNT_ISOLATED).single()
+    except (GraphStoreError, OSError) as exc:
         logger.warning("图谱统计不可用：%s", type(exc).__name__)
         return zero
-    with closing(conn):
-        entities = conn.execute(f"SELECT COUNT(*) FROM {ENTITY_TABLE}").fetchone()[0]
-        edges = conn.execute(f"SELECT COUNT(*) FROM {EDGE_TABLE}").fetchone()[0]
-        isolated = conn.execute(
-            f"SELECT COUNT(*) FROM {ENTITY_TABLE} e WHERE NOT EXISTS ("
-            f"SELECT 1 FROM {EDGE_TABLE} x WHERE x.src_id = e.id OR x.dst_id = e.id)"
-        ).fetchone()[0]
-    return {"entities": int(entities), "edges": int(edges),
-            "isolated_entities": int(isolated)}
+    return {
+        "entities": int(entities["n"]) if entities else 0,
+        "edges": int(edges["n"]) if edges else 0,
+        "isolated_entities": int(isolated["n"]) if isolated else 0,
+    }

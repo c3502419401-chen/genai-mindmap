@@ -14,6 +14,14 @@
     那会覆盖这里的值；反过来，忘记开的用例只会"少测"一条路，不会偷偷发出真实请求。
   - **数据库落 tmp**：`MINDMAP_DB_PATH` 指向本次测试的 `tmp_path`，仓库里的
     `backend/data/mindmaps.db` 不会被任何测试碰到。
+  - **`MINDMAP_NEO4J_*` 一律清空**：宿主机上可能正好跑着一个 Neo4j（开发机上很
+    常见），不清空的话图存储的用例会去连它、写它、然后断在别人的数据上。清空之后
+    "没配置图存储"是每个用例的默认前提，需要真 Neo4j 的用例自己 `setenv` 进去
+    （见 `tests/test_graph_neo4j.py` 的 `graph` fixture）。
+
+图存储的驱动是模块级单例，`monkeypatch` 只撤环境变量、撤不掉已经建好的连接池，
+所以再加一条 `reset_graph_driver`：每个用例前后都断开，谁知道上一个用例把单例
+指到哪个实例上去了。
 
 另有一道网络闸：真走到 `httpx` 传输层的请求直接抛断言。所有需要 HTTP 的用例
 都在更外层替换了 `httpx.Client` / `httpx.AsyncClient`（或用 `MockTransport`），
@@ -51,16 +59,40 @@ BEHAVIOUR = (
 SWITCHES = ("MINDMAP_HYBRID_SEARCH", "MINDMAP_QUERY_EXPANSION", "MINDMAP_PARENT_RETRIEVAL",
             "MINDMAP_GRAPH_EXTRACTION")
 
+# 图存储的连接参数。清空而不是设默认值：URI/USER/DATABASE 有代码默认，PASSWORD
+# 没有——"没配"必须是可见的未配置状态，否则宿主机上跑着的 Neo4j 会被单测连上。
+NEO4J = (
+    "MINDMAP_NEO4J_URI",
+    "MINDMAP_NEO4J_USER",
+    "MINDMAP_NEO4J_PASSWORD",
+    "MINDMAP_NEO4J_DATABASE",
+)
+
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch, tmp_path):
-    """每个测试的起点：没凭证、开关全关、数据库在 tmp。"""
-    for name in (*CREDENTIALS, *BEHAVIOUR):
+    """每个测试的起点：没凭证、开关全关、数据库在 tmp、图存储未配置。"""
+    for name in (*CREDENTIALS, *BEHAVIOUR, *NEO4J):
         monkeypatch.delenv(name, raising=False)
     for name in SWITCHES:
         monkeypatch.setenv(name, "0")
     monkeypatch.setenv("MINDMAP_DB_PATH", str(tmp_path / "mindmaps.db"))
     yield
+
+
+@pytest.fixture(autouse=True)
+def reset_graph_driver():
+    """图存储的驱动单例在每个用例前后都关掉。
+
+    不关的后果不是"慢"，是"错"：上一个用例把单例指到某个实例上，下一个用例改了
+    `MINDMAP_NEO4J_*` 却拿到旧连接池，于是它在写上一个用例的库——这种错在测试里
+    表现为"偶尔失败"，最难查。
+    """
+    from app.knowledge import graph_store
+
+    graph_store.close_driver()
+    yield
+    graph_store.close_driver()
 
 
 @pytest.fixture(autouse=True)

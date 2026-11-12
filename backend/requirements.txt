@@ -10,3 +10,7 @@ xlrd>=2,<3
 # 语音输入（F07）走阿里云百炼的 HTTP 接口，用 httpx 发请求即可，
 # 不需要额外 SDK 也不需要 websockets 客户端
 # 注意：.doc / .ppt 需要系统级的 LibreOffice，不是 pip 依赖，见 docs/DEPLOY.md
+
+# 图存储（app/knowledge/graph_store.py）。5.x 与 6.x 的异常树不一样（6.0 起
+# ServiceUnavailable 不再属于 Neo4jError），代码两边都兼容，见 _session 的 docstring
+neo4j>=5.14,<7

@@ -1,19 +1,32 @@
-"""图存储 / 抽取 / 编排三层的用例。
+"""图存储 / 抽取 / 编排三层的用例——**不需要 Neo4j 的那一半**。
+
+这一层跑在默认 `pytest` 里，不碰任何服务：
+
+  - **纯函数**：`normalize_name` 的三条折叠规则、`GraphPath` / `EdgeInput` 的构造契约；
+  - **未配置时的降级**：`conftest.py` 把 `MINDMAP_NEO4J_*` 全清了，所以"图存储没
+    配置"是这里的默认前提——写接口抛 `GraphStoreError`（`OSError` 子类），读接口
+    返回空。这几条钉的正是 `graph_ingest` 那条 `except (sqlite3.Error, OSError,
+    ValueError)` 还接得住新引擎的异常；
+  - **抽取**（`graph_extract`）全部用例：它不碰存储；
+  - **编排**（`graph_ingest`）里凡是能把 store 换掉的：块数、成本闸、`failed` 计数、
+    孤立实体只对没边的实体 upsert；
+  - **Cypher 的静态校验**：占位符与传参键一致、唯一一处内插只能来自 int、路径解析
+    的方向判定（用假 Path 对象，不连库）。
+
+需要真 Neo4j 的那一半在 `tests/test_graph_neo4j.py`，带 `integration` 标记，连不上
+就 skip。两边的分界不是"好不好测"，而是"这条断言的原因是否在存储引擎里"：比如
+"同名同类型幂等"必须真写一次才知道，"归一化把全角折平"跟引擎无关。
 
 这里一律不联网：`chat_async` 在用例里被替换，`conftest.py` 又把 LLM 凭证清空、
 把真实传输层封死，所以"该降级却发了请求"会当场变成断言失败而不是悄悄成功。
-
-数据库由 `conftest.py` 的 `MINDMAP_DB_PATH` 指到每个用例自己的 `tmp_path`，
-用例之间不共享库；`test_ingest_leaves_other_tables_alone` 会显式检查这一点，
-而不是相信它。
-
 项目没装 pytest-asyncio，异步入口统一用 `asyncio.run` 在同步用例里跑。
 """
 import asyncio
+import inspect
 import json
-import sqlite3
-import time
-from contextlib import closing
+import re
+from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 
@@ -22,7 +35,12 @@ from app.knowledge import graph_extract, graph_ingest, graph_store
 from app.knowledge.graph_extract import extract_graph
 from app.knowledge.graph_ingest import ingest_graph
 from app.knowledge.graph_store import (
+    FORWARD,
+    REVERSE,
     EdgeInput,
+    GraphPath,
+    GraphStoreError,
+    GraphStoreNotConfigured,
     add_edge,
     add_edges_bulk,
     neighbors,
@@ -31,26 +49,10 @@ from app.knowledge.graph_store import (
     upsert_entity,
 )
 from app.knowledge.service import _chunk_spans
-from app.mindmaps import repository
 
 
 def run(coro):
     return asyncio.run(coro)
-
-
-def rows_in(table: str) -> int:
-    """某个表当前的行数；表还不存在时算 0。
-
-    `chunk_vectors` 是被动建的（第一次写向量时才 `CREATE`），所以"不存在"是
-    常态，不是异常。
-    """
-    with closing(sqlite3.connect(repository.db_path())) as conn:
-        exists = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
-        ).fetchone()
-        if not exists:
-            return 0
-        return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
 
 def fake_chat(monkeypatch, result):
@@ -77,269 +79,168 @@ def enable(monkeypatch):
     monkeypatch.setenv("MINDMAP_GRAPH_EXTRACTION", "1")
 
 
-# --------------------------------------------------------------- 1. 实体幂等
-
-
-def test_upsert_is_idempotent(monkeypatch):
-    """同名同类型两次必须是同一个 id，否则每条边都会挂到一个新节点上。"""
-    first = upsert_entity("甲", "人物")
-    second = upsert_entity("甲", "人物")
-    assert first == second
-    assert stats()["entities"] == 1
-
-
-def test_same_name_different_type_is_two_entities(monkeypatch):
-    """"苹果"是公司还是水果，是两张不同的实体行 —— 合并会造出假边。"""
-    company = upsert_entity("苹果", "组织")
-    fruit = upsert_entity("苹果", "概念")
-    assert company != fruit
-    assert stats()["entities"] == 2
-
-
-def test_entity_without_type_stays_idempotent(monkeypatch):
-    """`type=None` 也要幂等。
-
-    SQLite 的 `UNIQUE` 认为两个 NULL 互不相等，直接把 NULL 落库会让同名实体
-    每写一次就多一行——这条用例钉的是那个坑。
-    """
-    first = upsert_entity("乙", None)
-    second = upsert_entity("乙", None)
-    assert first == second
-    assert stats()["entities"] == 1
-
-
-def test_edge_without_type_reuses_typed_entity(monkeypatch):
-    """写边时不带类型，不能给已有实体再造一个空类型分身。
-
-    这是实测踩到的：3000 个实体按 3 条边连完，`stats()` 报出 6000 个实体、
-    3000 个孤立——边全挂在 `type=''` 的那一行上，带类型的那一半从未被走过。
-    """
-    typed = upsert_entity("甲", "人物")
-    assert add_edge("甲", "乙", "依赖", source_id="s1", chunk_start=0, chunk_end=10) is True
-    # 甲（人物，被复用）+ 乙（无类型，新建）= 2 个实体、0 个孤立。
-    assert stats() == {"entities": 2, "edges": 1, "isolated_entities": 0}
-    assert [path.nodes for path in neighbors("甲", hops=1)] == [["甲", "乙"]]
-    # 边挂的正是那一行带类型的实体，而不是一个空壳副本。
-    with closing(sqlite3.connect(repository.db_path())) as conn:
-        src_id = conn.execute("SELECT src_id FROM graph_edges").fetchone()[0]
-    assert src_id == typed
-
-
-def test_empty_name_is_rejected():
-    """空名字落库会让所有空名字撞成同一行，必须当场拒绝。"""
-    with pytest.raises(ValueError):
-        upsert_entity("   ", "人物")
-
-
-# ---------------------------------------------------------------- 2. 归一化
+# ---------------------------------------------------------------- 1. 归一化
 
 
 def test_normalize_whitespace_and_fullwidth():
-    """空白与全角必须折叠到同一个键。"""
+    """空白与全角必须折叠到同一个键，否则抽取层的轻微差异每次都造一个新节点。"""
     assert normalize_name("  张三 ") == "张三"
     assert normalize_name("张三") == "张三"
     assert normalize_name("ＡＢＣ") == "abc"
     assert normalize_name("\u3000张三\u3000") == "张三"
-    padded = upsert_entity("  张三 ", "人物")
-    assert padded == upsert_entity("张三", "人物")
 
 
 def test_normalize_english_case():
     """英文大小写折叠；中文原样保留，不拆词。"""
     assert normalize_name("Transformer") == normalize_name("transformer")
     assert normalize_name("张三丰") == "张三丰"
-    first = upsert_entity("Transformer", "概念")
-    assert first == upsert_entity("transformer", "概念")
 
 
-# ------------------------------------------------------------- 3. 边去重
+def test_normalize_drops_control_chars_and_handles_empty():
+    """控制字符一并剔除（日志与终端会被它搞乱）；空输入的出口只有一个空串。"""
+    assert normalize_name("甲\x00乙\x1f丙") == "甲乙丙"
+    assert normalize_name("") == ""
+    assert normalize_name(None) == ""
+    # 非字符串先转字符串：模型输出什么都可能给，不想在上游逐字段断言类型。
+    assert normalize_name(1) == "1"
 
 
-def test_duplicate_edge_returns_false():
-    """同一条边重复写返回 False，且不抛错、不重复计行。"""
-    first = add_edge("甲", "乙", "提出", source_id="s1", chunk_start=0, chunk_end=10)
-    second = add_edge("甲", "乙", "提出", source_id="s1", chunk_start=0, chunk_end=10)
-    assert first is True
-    assert second is False
-    assert stats()["edges"] == 1
+# ------------------------------------------------------- 2. GraphPath / EdgeInput
 
 
-def test_same_edge_from_another_source_is_a_new_row():
-    """同一条边出自另一份材料是**另一条证据**，不能被 UNIQUE 吃掉。"""
-    add_edge("甲", "乙", "提出", source_id="s1", chunk_start=0, chunk_end=10)
-    again = add_edge("甲", "乙", "提出", source_id="s2", chunk_start=50, chunk_end=60)
-    assert again is True
-    assert stats()["edges"] == 2
+def test_graph_path_hops_counts_relations():
+    """`hops` 是关系条数，不是节点数——差一条就会让"走了几步"读错。"""
+    path = GraphPath(nodes=["甲", "乙", "丙"], relations=["提出", "依赖"],
+                     evidence=[("s1", 0, 10), ("s1", 10, 20)],
+                     directions=[FORWARD, REVERSE])
+    assert path.hops == 2
+    assert len(path.directions) == path.hops
+    assert len(path.evidence) == path.hops
 
 
-# ------------------------------------------------------------- 4. 边带证据
+def test_graph_path_fills_missing_directions_as_forward():
+    """手工构造时漏写 `directions` 兜成"全正向"：静默补齐长度会掩盖存储层 bug，
+    所以只兜空列表这一种。"""
+    path = GraphPath(nodes=["甲", "乙"], relations=["依赖"])
+    assert path.directions == [FORWARD]
 
 
-def test_edge_keeps_evidence_offsets():
-    """chunk_start / chunk_end 原样存回：下一轮高亮全靠它，偏一位就标错字。"""
-    add_edge("甲", "乙", "依赖", source_id="doc-7", chunk_start=17, chunk_end=233)
-    paths = neighbors("甲", hops=1)
-    assert len(paths) == 1
-    assert paths[0].evidence == [("doc-7", 17, 233)]
-    # 直接查库再确认一次：读接口可能自己做过变换，这里要的是存储事实。
-    with closing(sqlite3.connect(repository.db_path())) as conn:
-        row = conn.execute(
-            "SELECT source_id, chunk_start, chunk_end FROM graph_edges"
-        ).fetchone()
-    assert row == ("doc-7", 17, 233)
+def test_graph_path_without_relations_has_no_hops():
+    """0 跳路径不存在；真构造出来时 `hops` 是 0，不是 1。"""
+    path = GraphPath(nodes=["甲"])
+    assert path.hops == 0
+    assert path.directions == [] and path.relations == [] and path.evidence == []
 
 
-def test_edge_rejects_inverted_offsets():
-    """区间倒置是调用方的 bug，落库前就要炸——留到高亮时才发现会沉默很久。"""
+def test_edge_input_keeps_field_order_by_name():
+    """`EdgeInput` 存在的理由就是"字段名可见"：位置参数调换不该被无声接受。"""
+    item = EdgeInput(src="甲", dst="乙", relation="依赖", source_id="doc-1",
+                     chunk_start=17, chunk_end=233, src_type="人物")
+    assert (item.src, item.dst, item.relation) == ("甲", "乙", "依赖")
+    assert (item.chunk_start, item.chunk_end) == (17, 233)
+    assert item.src_type == "人物" and item.dst_type is None
+
+
+# ------------------------------------------------- 3. 未配置时的降级契约
+
+
+def test_unconfigured_writes_raise_graph_store_error():
+    """没配密码 → 写接口抛专用异常，且它必须是 `OSError` 的子类。
+
+    后一条是接口契约：`graph_ingest` 按 `except (sqlite3.Error, OSError,
+    ValueError)` 计 `failed`，异常类型换了却没进这棵树的话，`failed` 会静默失效。
+    """
+    with pytest.raises(GraphStoreNotConfigured):
+        upsert_entity("甲", "人物")
+    with pytest.raises(GraphStoreError):
+        add_edge("甲", "乙", "依赖", source_id="s1", chunk_start=0, chunk_end=10)
+    with pytest.raises(GraphStoreError):
+        add_edges_bulk([EdgeInput(src="甲", dst="乙", relation="依赖", source_id="s1",
+                                  chunk_start=0, chunk_end=10)])
+    assert issubclass(GraphStoreError, OSError)
+    assert issubclass(GraphStoreNotConfigured, GraphStoreError)
+
+
+def test_unconfigured_reads_return_empty():
+    """读接口降级成空值：查询侧不该为"图没建好"准备第二个分支。"""
+    assert neighbors("甲", hops=2) == []
+    assert stats() == {"entities": 0, "edges": 0, "isolated_entities": 0}
+
+
+def test_empty_name_is_rejected_before_any_connection():
+    """空名字落库会让所有空名字撞成同一行，必须在拿连接之前就拒绝。"""
+    with pytest.raises(ValueError):
+        upsert_entity("   ", "人物")
+
+
+def test_self_loop_and_blank_fields_are_not_written():
+    """自环与空字段返回 False，不是错误——它们不该让整次入库算失败。"""
+    assert add_edge("甲", "甲", "依赖", source_id="s1", chunk_start=0,
+                    chunk_end=10) is False
+    assert add_edge("甲", "  ", "依赖", source_id="s1", chunk_start=0,
+                    chunk_end=10) is False
+    assert add_edge("甲", "乙", "   ", source_id="s1", chunk_start=0,
+                    chunk_end=10) is False
+
+
+def test_inverted_offsets_are_rejected_before_writing():
+    """区间倒置是调用方的 bug：落库前就炸，别等回填高亮时才发现标错字。"""
     with pytest.raises(ValueError):
         add_edge("甲", "乙", "依赖", source_id="s1", chunk_start=100, chunk_end=10)
+    with pytest.raises(ValueError):
+        add_edges_bulk([EdgeInput(src="甲", dst="乙", relation="依赖", source_id="s1",
+                                  chunk_start=100, chunk_end=10)])
 
 
-# ------------------------------------------------------- 5. 一跳 / 两跳游走
+def test_bulk_sends_one_statement_per_role(monkeypatch):
+    """批量写是 `UNWIND`，不是循环：50 条边只发三条语句。
 
-
-def test_neighbors_one_and_two_hops():
-    """A→B→C：两跳能到 C，且路径里的关系与证据逐条对齐。"""
-    add_edge("甲", "乙", "提出", source_id="s1", chunk_start=0, chunk_end=100)
-    add_edge("乙", "丙", "依赖", source_id="s1", chunk_start=100, chunk_end=200)
-
-    one = neighbors("甲", hops=1)
-    assert [path.nodes for path in one] == [["甲", "乙"]]
-    assert one[0].relations == ["提出"]
-    assert one[0].directions == ["forward"]
-    assert one[0].evidence == [("s1", 0, 100)]
-
-    two = neighbors("甲", hops=2)
-    assert [path.nodes for path in two] == [["甲", "乙"], ["甲", "乙", "丙"]]
-    deep = two[-1]
-    assert deep.hops == 2
-    assert deep.relations == ["提出", "依赖"]
-    assert deep.evidence == [("s1", 0, 100), ("s1", 100, 200)]
-    # 无向之后丙能走回乙——这正是"方向判反也不断路"的意思。
-    back = neighbors("丙", hops=1)
-    assert [path.nodes for path in back] == [["丙", "乙"]]
-    assert back[0].directions == ["reverse"]
-
-
-def test_neighbors_walks_against_edge_direction():
-    """边是 A→B，从 B 出发一跳必须能到 A，且方向要能读出来。
-
-    这是无向游走的全部意义：模型把方向判反时，从错误那一端出发仍然走得到，
-    并且调用方还看得出"这条边原本是 A→B"。
+    这条比"批量比逐条快"可靠得多——时间比在共享机器上会被 JVM 预热与调度噪声吃掉，
+    而"语句条数"是确定的。退化成 `for row in rows: tx.run(...)` 时这里立刻变成 50。
     """
-    add_edge("甲", "乙", "依赖", source_id="s1", chunk_start=0, chunk_end=10)
+    transaction = install_fake_transaction(
+        monkeypatch,
+        RecordingTransaction(answers={"ORDER BY name, created_at": []}),
+    )
+    edges = [EdgeInput(src=f"批甲{index:03d}", dst=f"批乙{index:03d}", relation="依赖",
+                       source_id="doc-bulk", chunk_start=index, chunk_end=index + 10)
+             for index in range(50)]
+    add_edges_bulk(edges)
 
-    forward = neighbors("甲", hops=1)
-    assert [path.nodes for path in forward] == [["甲", "乙"]]
-    assert forward[0].directions == ["forward"]
-
-    reverse = neighbors("乙", hops=1)
-    assert [path.nodes for path in reverse] == [["乙", "甲"]]
-    assert reverse[0].directions == ["reverse"]
-    # 方向不同、关系短语相同：只看 relations 会读成"乙依赖甲"，方向位才是判据。
-    assert reverse[0].relations == ["依赖"]
-    assert reverse[0].evidence == [("s1", 0, 10)]
-
-
-def test_neighbors_two_hops_can_mix_directions():
-    """一条路径可以一跳顺、一跳逆：甲→乙 就是乙←丙。"""
-    add_edge("甲", "乙", "提出", source_id="s1", chunk_start=0, chunk_end=10)
-    add_edge("丙", "乙", "使用", source_id="s1", chunk_start=10, chunk_end=20)
-
-    paths = neighbors("甲", hops=2)
-    mixed = [path for path in paths if path.nodes == ["甲", "乙", "丙"]]
-    assert len(mixed) == 1
-    assert mixed[0].relations == ["提出", "使用"]
-    # 第一跳顺着"甲→乙"，第二跳逆着"丙→乙"（从乙走到丙）。
-    assert mixed[0].directions == ["forward", "reverse"]
-    assert mixed[0].evidence == [("s1", 0, 10), ("s1", 10, 20)]
+    assert len(transaction.calls) == 3
+    picked, entities, relations = transaction.calls
+    # 取候选：一次带上全部名字（100 个，去重后）
+    assert len(picked[1]["names"]) == 100
+    # 建实体：一次带上全部缺失的 (name, type)
+    assert len(entities[1]["rows"]) == 100
+    # 建边：一次带上全部 50 行，每行自带解析后的类型
+    assert len(relations[1]["rows"]) == 50
+    assert relations[1]["rows"][0]["src_type"] == ""
 
 
-def test_neighbors_returns_empty_for_unknown_entity():
-    assert neighbors("不存在的东西", hops=2) == []
-    assert neighbors("", hops=2) == []
+def test_empty_bulk_input_is_a_noop():
+    """空批次直接返回 0，一次往返都不发。"""
+    assert add_edges_bulk([]) == 0
 
 
-# ------------------------------------------------ 6. limit / hops / 环安全
+def test_unreachable_server_degrades_like_unconfigured(monkeypatch):
+    """配了密码但连不上：读接口仍然返回空，写接口抛 `GraphStoreError`。
 
-
-def test_neighbors_respects_limit_and_hops():
-    """limit 截条数（短路优先），hops 截深度。"""
-    for target in ("乙", "丙", "丁", "戊"):
-        add_edge("甲", target, "包含", source_id="s1", chunk_start=0, chunk_end=9)
-    add_edge("乙", "己", "包含", source_id="s1", chunk_start=0, chunk_end=9)
-
-    assert len(neighbors("甲", hops=1)) == 4
-    capped = neighbors("甲", hops=1, limit=2)
-    assert len(capped) == 2
-    # 上限收在 MAX_LIMIT 内：传一个离谱的值不会把整张图拖出来。
-    assert len(neighbors("甲", hops=1, limit=9999)) == 4
-    # 0 跳返回空：0 跳的路径是"只有起点、没有证据"，那不该算一次命中。
-    assert neighbors("甲", hops=0) == []
-    # 两跳才够到己。
-    assert len(neighbors("甲", hops=2)) == 5
-    assert [path.nodes[-1] for path in neighbors("甲", hops=1)].count("己") == 0
-
-
-def test_cycle_does_not_loop_forever():
-    """一条边就够来回，无向游走必须靠 `visited` 挡住无限往返。"""
-    add_edge("甲", "乙", "依赖", source_id="s1", chunk_start=0, chunk_end=10)
-    add_edge("乙", "甲", "依赖", source_id="s1", chunk_start=10, chunk_end=20)
-
-    paths = neighbors("甲", hops=4)
-    # 两条边各走得通一条路，都停在乙：再往前会把甲重复一次，被 visited 挡住。
-    assert {tuple(path.nodes) for path in paths} == {("甲", "乙")}
-    assert all(path.nodes[0] == "甲" for path in paths)
-    assert all(len(path.nodes) == len(set(path.nodes)) for path in paths)
-    assert sorted(path.directions[0] for path in paths) == ["forward", "reverse"]
-
-
-def test_self_loop_is_not_written():
-    """自环落库只会让边数虚高：游走里它永远走不到，写它没有意义。"""
-    assert add_edge("甲", "甲", "依赖", source_id="s1", chunk_start=0, chunk_end=10) is False
-    assert stats()["edges"] == 0
-    assert add_edge("甲", "乙", "依赖", source_id="s1", chunk_start=0, chunk_end=10) is True
-
-
-# ------------------------------------------------------------ 7. 跨文档关联
-
-
-def test_neighbors_returns_evidence_from_both_documents():
-    """同一实体出现在两份材料里，两条证据都要能取回来 —— 这是这一层的目标。"""
-    add_edge("甲", "乙", "提出", source_id="doc-a", chunk_start=0, chunk_end=50)
-    add_edge("甲", "丙", "提出", source_id="doc-b", chunk_start=400, chunk_end=460)
-
-    paths = neighbors("甲", hops=1)
-    assert len(paths) == 2
-    assert [path.nodes for path in paths] == [["甲", "乙"], ["甲", "丙"]]
-    sources = sorted(path.evidence[0][0] for path in paths)
-    assert sources == ["doc-a", "doc-b"]
-
-
-def test_duplicate_paths_from_same_name_are_collapsed():
-    """同名不同类型的实体同时当起点时，内容相同的路径只返回一次。
-
-    `neighbors` 的起点条件是 `name = ?`，两行（"甲"人物 / "甲"组织）都会出发；
-    若两行上挂着同一条边，不去重就会给出两条一模一样的路径——调用方会把它们
-    当成两份独立证据。
+    指向 1 号端口（被拒）而不是一个黑洞地址，连接会立刻失败；三个超时也压到 0.2 秒
+    ——真实默认值是秒级，这里要的是"降级路径通"，不是测驱动的重试时长。
     """
-    add_edge("甲", "乙", "依赖", source_id="s1", chunk_start=0, chunk_end=10,
-             src_type="人物")
-    add_edge("甲", "乙", "依赖", source_id="s1", chunk_start=0, chunk_end=10,
-             src_type="组织")
-    assert stats()["entities"] == 3          # 甲×2 + 乙
-    assert len(neighbors("甲", hops=1)) == 1
+    monkeypatch.setenv("MINDMAP_NEO4J_URI", "bolt://127.0.0.1:1")
+    monkeypatch.setenv("MINDMAP_NEO4J_PASSWORD", "not-a-real-password")
+    monkeypatch.setattr(graph_store, "CONNECT_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(graph_store, "ACQUISITION_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(graph_store, "RETRY_TIME_SECONDS", 0.2)
+    assert neighbors("甲", hops=1) == []
+    assert stats() == {"entities": 0, "edges": 0, "isolated_entities": 0}
+    with pytest.raises(GraphStoreError):
+        upsert_entity("甲", "人物")
 
 
-def test_stats_counts_isolated_entities():
-    """孤立实体数回答的是"抽出来有没有连上"，不是"抽了多少"。"""
-    upsert_entity("孤", "概念")
-    add_edge("甲", "乙", "依赖", source_id="s1", chunk_start=0, chunk_end=10)
-    result = stats()
-    assert result == {"entities": 3, "edges": 1, "isolated_entities": 1}
-
-
-# ------------------------------------------------------------- 8. 抽取解析
+# ------------------------------------------------------------- 4. 抽取解析
 
 
 GOOD_JSON = {
@@ -418,7 +319,7 @@ def test_extract_drops_information_free_relations(monkeypatch):
 
 
 def test_extract_folds_unknown_type_to_none(monkeypatch):
-    """白名单外的类型折成 None，不猜同义词 —— 猜错会让同一实体分裂成两行。"""
+    """白名单外的类型折成 None，不猜同义词 —— 猜错会让同一实体分裂成两个节点。"""
     enable(monkeypatch)
     fake_chat(monkeypatch, {"entities": [
         {"name": "监管机构", "type": "机构"},
@@ -464,7 +365,7 @@ def test_extract_logs_shape_not_content(monkeypatch, caplog):
         assert secret not in logged
 
 
-# ------------------------------------------------------------- 9. 抽取降级
+# ------------------------------------------------------------- 5. 抽取降级
 
 
 def test_extract_returns_none_when_switch_off(monkeypatch):
@@ -537,7 +438,7 @@ def test_extract_returns_none_when_everything_is_filtered(monkeypatch):
     assert run(extract_graph("材料", source_id="doc-1")) is None
 
 
-# ------------------------------------------------------------- 10. 编排入库
+# --------------------------------------------------- 6. 编排入库（store 被换掉）
 
 
 def make_source(text: str, source_id: str = "doc-1") -> Source:
@@ -570,6 +471,33 @@ def extraction(entities, relations=()):
     )
 
 
+def fake_store(monkeypatch, *, bulk_raises=None, upsert_raises=None):
+    """把 `graph_ingest` 真正会调的两件套换掉，返回调用记录。
+
+    编排层要断言的是"调了谁、拿了几次、失败怎么记"，不是"数据最后在哪"——后者是
+    `tests/test_graph_neo4j.py` 的事。换掉 store 之后这一层的用例与有没有 Neo4j
+    完全无关，也不再需要每个用例都起一遍库。
+    """
+    calls = {"bulk": [], "upsert": []}
+
+    def bulk(edges):
+        batch = list(edges)
+        calls["bulk"].append(batch)
+        if bulk_raises is not None:
+            raise bulk_raises
+        return len(batch)
+
+    def upsert(name, kind=None):
+        calls["upsert"].append((name, kind))
+        if upsert_raises is not None:
+            raise upsert_raises
+        return 1
+
+    monkeypatch.setattr(graph_ingest.graph_store, "add_edges_bulk", bulk)
+    monkeypatch.setattr(graph_ingest.graph_store, "upsert_entity", upsert)
+    return calls
+
+
 def test_ingest_counts_chunks_entities_and_edges(monkeypatch):
     enable(monkeypatch)
     one_chunk(monkeypatch, [(0, 5), (5, 10), (10, 15)])
@@ -579,6 +507,7 @@ def test_ingest_counts_chunks_entities_and_edges(monkeypatch):
         extraction([("甲", "人物")]),
     ]
     calls = fake_extract(monkeypatch, payloads)
+    store = fake_store(monkeypatch)
 
     result = run(ingest_graph(make_source("甲在乙任职，乙包含丙。" + "填充" * 3)))
 
@@ -588,8 +517,12 @@ def test_ingest_counts_chunks_entities_and_edges(monkeypatch):
     assert result["edges"] == 2
     assert result["elapsed_ms"] >= 0
     assert [call["chunk_start"] for call in calls] == [0, 5, 10]
-    # 三个实体都连上了，所以没有孤立实体 —— 这是"一块一块接起来"的成功形状。
-    assert stats() == {"entities": 3, "edges": 2, "isolated_entities": 0}
+    # 每块一次批量写入，块内的证据区间就是切点本身 —— 偏一位高亮就标错字。
+    assert len(store["bulk"]) == 3
+    first = store["bulk"][0][0]
+    assert (first.src, first.dst, first.relation) == ("甲", "乙", "任职于")
+    assert (first.chunk_start, first.chunk_end) == (0, 5)
+    assert (first.src_type, first.dst_type) == ("人物", "组织")
 
 
 def test_ingest_max_chunks_truncates(monkeypatch, caplog):
@@ -597,6 +530,7 @@ def test_ingest_max_chunks_truncates(monkeypatch, caplog):
     enable(monkeypatch)
     one_chunk(monkeypatch, [(0, 2), (2, 4), (4, 6), (6, 8), (8, 10)])
     calls = fake_extract(monkeypatch, [extraction([("甲", "人物")])])
+    fake_store(monkeypatch)
     with caplog.at_level("INFO"):
         result = run(ingest_graph(make_source("0123456789"), max_chunks=2))
 
@@ -610,34 +544,42 @@ def test_ingest_counts_failed_chunks(monkeypatch):
     enable(monkeypatch)
     one_chunk(monkeypatch, [(0, 4), (4, 8)])
     fake_extract(monkeypatch, [None, extraction([("甲", "人物")])])
+    fake_store(monkeypatch)
     result = run(ingest_graph(make_source("甲甲乙乙甲甲乙乙")))
     assert result["chunks"] == 2
     assert result["failed"] == 1
     assert result["entities"] == 1
 
 
-def test_ingest_is_idempotent_across_reruns(monkeypatch):
-    """同一份材料重跑入库不产生重复实体或重复边。"""
+def test_ingest_counts_chunk_failed_when_store_raises(monkeypatch):
+    """写库失败只影响这一块：`failed` +1，异常不冒泡。
+
+    `GraphStoreError` 在这里被当成 `OSError` 接住——这条断言就是"换引擎不能换
+    异常树"的现场证明。
+    """
     enable(monkeypatch)
-    one_chunk(monkeypatch, [(0, 10)])
-    fake_extract(monkeypatch, [extraction([("甲", "人物"), ("乙", "组织")],
-                                          [("甲", "乙", "任职于")])])
-    source = make_source("甲在乙任职。甲乙丙丁戊己庚辛")
-    first = run(ingest_graph(source))
-    second = run(ingest_graph(source))
-    assert first["edges"] == 1
-    assert second["edges"] == 0     # 第二次没有新边，不是失败
-    assert stats() == {"entities": 2, "edges": 1, "isolated_entities": 0}
+    one_chunk(monkeypatch, [(0, 4), (4, 8)])
+    fake_extract(monkeypatch, [
+        extraction([("甲", "人物"), ("乙", "组织")], [("甲", "乙", "任职于")]),
+        extraction([("丙", "概念"), ("丁", "概念")], [("丙", "丁", "包含")]),
+    ])
+    fake_store(monkeypatch, bulk_raises=GraphStoreError("模拟写库中断"))
+    result = run(ingest_graph(make_source("甲在乙任职，丙丁相关。填充填充")))
+
+    assert result["chunks"] == 2
+    assert result["failed"] == 2      # 两块都写失败
+    assert result["edges"] == 0
 
 
 def test_ingest_skips_blank_text(monkeypatch):
     """没有正文的材料返回全 0，不是异常。"""
     enable(monkeypatch)
     calls = fake_extract(monkeypatch, [extraction([("甲", "人物")])])
+    store = fake_store(monkeypatch)
     assert run(ingest_graph(make_source("   "))) == {
         "chunks": 0, "entities": 0, "edges": 0, "failed": 0, "elapsed_ms": 0,
     }
-    assert calls == []
+    assert calls == [] and store["bulk"] == [] and store["upsert"] == []
 
 
 def test_ingest_uses_real_chunking(monkeypatch):
@@ -645,6 +587,7 @@ def test_ingest_uses_real_chunking(monkeypatch):
     enable(monkeypatch)
     payloads = [extraction([(f"实体{index:02d}", "概念")]) for index in range(10)]
     fake_extract(monkeypatch, payloads)
+    fake_store(monkeypatch)
     text = "甲" * 1800
     spans = _chunk_spans(text)
     assert len(spans) >= 2
@@ -653,154 +596,241 @@ def test_ingest_uses_real_chunking(monkeypatch):
     assert spans[0][0] == 0 and spans[-1][1] == len(text)
 
 
-# ------------------------------------------------------------ 11. 批量写入
+def test_ingest_upserts_only_entities_without_edges(monkeypatch):
+    """批量入口已经把两端实体写进去了，孤立实体才需要单独 upsert。
 
-
-def bulk_edges(count: int, *, prefix: str = "批") -> list[EdgeInput]:
-    """一批互不重复的边：src/dst 都不同，chunk_start 递进。"""
-    return [
-        EdgeInput(src=f"{prefix}甲{index:03d}", dst=f"{prefix}乙{index:03d}",
-                  relation="依赖", source_id="doc-bulk",
-                  chunk_start=index, chunk_end=index + 10)
-        for index in range(count)
-    ]
-
-
-class FlakyConnection:
-    """第 N 次 `executemany` 抛错的连接代理，用来验证事务回滚。
-
-    只包住真正需要观察的那一个方法，其余全部转发——这样被测代码拿到的仍然是一个
-    行为正确的 sqlite3 连接（`with` 的提交/回滚、`close`、`execute` 都还是真的）。
+    对每个实体都再 upsert 一遍是几十次多余往返；漏掉孤立实体则会让"抽出来没连上"
+    的那一半彻底消失（`stats` 里的孤立实体数永远是 0，那个信号就废了）。
     """
-
-    def __init__(self, conn: sqlite3.Connection, *, fail_on: int = 2) -> None:
-        self._conn = conn
-        self._calls = 0
-        self._fail_on = fail_on
-
-    def executemany(self, sql, rows):
-        self._calls += 1
-        if self._calls == self._fail_on:
-            raise sqlite3.OperationalError("模拟写库中断")
-        return self._conn.executemany(sql, rows)
-
-    def __getattr__(self, name):
-        return getattr(self._conn, name)
-
-    def __enter__(self):
-        self._conn.__enter__()
-        return self
-
-    def __exit__(self, *exc_info):
-        return self._conn.__exit__(*exc_info)
-
-
-def test_bulk_writes_500_edges_quickly():
-    """500 条边一次事务写完，返回条数正确、耗时远低于逐条。"""
-    edges = bulk_edges(500)
-    started = time.perf_counter()
-    written = add_edges_bulk(edges)
-    elapsed = time.perf_counter() - started
-
-    assert written == 500
-    # 宽松阈值：逐条写 500 条在同样机械盘上约 5 秒，这里给 2 秒只用来兜"退化成
-    # 逐条"这种回归，不测绝对性能。
-    assert elapsed < 2.0
-    assert stats() == {"entities": 1000, "edges": 500, "isolated_entities": 0}
-
-
-def test_bulk_is_much_faster_than_one_by_one():
-    """同一批边：批量事务必须比逐条快一个量级（差异来自 fsync 次数）。"""
-    count = 50
-    started = time.perf_counter()
-    add_edges_bulk(bulk_edges(count, prefix="快"))
-    bulk = time.perf_counter() - started
-
-    started = time.perf_counter()
-    for index in range(count):
-        add_edge(f"慢甲{index:03d}", f"慢乙{index:03d}", "依赖",
-                 source_id="doc-slow", chunk_start=index, chunk_end=index + 10)
-    single = time.perf_counter() - started
-
-    assert bulk * 5 < single
-
-
-def test_bulk_rolls_back_entirely_on_midway_failure(monkeypatch):
-    """事务中途抛错时，先写进去的实体必须跟边一起退回。
-
-    批量入口里 `executemany` 有两次（实体、边），让第二次失败——如果实体那次
-    的写入被单独提交了，库里就会留下一批没有边的实体，而它们看起来"只是没连上"。
-    """
-    upsert_entity("种子", "概念")
-    monkeypatch.setattr(
-        graph_store, "_open",
-        lambda: FlakyConnection(repository.connect(), fail_on=2),
-    )
-    with pytest.raises(sqlite3.Error):
-        add_edges_bulk(bulk_edges(10))
-    assert stats() == {"entities": 1, "edges": 0, "isolated_entities": 1}
-
-
-def test_bulk_rejects_inverted_offsets_before_writing():
-    """整批在事务外校验：一条坏数据不该让前面几条先进库。"""
-    edges = bulk_edges(3)
-    edges.append(EdgeInput(src="坏甲", dst="坏乙", relation="依赖", source_id="doc-bulk",
-                           chunk_start=100, chunk_end=10))
-    with pytest.raises(ValueError):
-        add_edges_bulk(edges)
-    assert stats() == {"entities": 0, "edges": 0, "isolated_entities": 0}
-
-
-def test_bulk_skips_self_loops_and_blank_and_counts_written():
-    """与 `add_edge` 同一套判断：自环与空字段不写，返回值只数真正落库的。"""
-    written = add_edges_bulk([
-        EdgeInput(src="甲", dst="乙", relation="依赖", source_id="s1",
-                  chunk_start=0, chunk_end=10),
-        EdgeInput(src="甲", dst="甲", relation="依赖", source_id="s1",
-                  chunk_start=0, chunk_end=10),
-        EdgeInput(src="甲", dst="乙", relation="依赖", source_id="s1",
-                  chunk_start=0, chunk_end=10),   # 与第一条完全重复
-        EdgeInput(src="丙", dst="  ", relation="依赖", source_id="s1",
-                  chunk_start=0, chunk_end=10),
-    ])
-    assert written == 1
-    assert stats() == {"entities": 2, "edges": 1, "isolated_entities": 0}
-
-
-def test_bulk_reuses_typed_entity_without_duplicating():
-    """批量写边不传类型时也不能造分身（与 `add_edge` 同一条规则）。"""
-    typed = upsert_entity("甲", "人物")
-    add_edges_bulk([EdgeInput(src="甲", dst="乙", relation="依赖",
-                              source_id="s1", chunk_start=0, chunk_end=10)])
-    assert stats() == {"entities": 2, "edges": 1, "isolated_entities": 0}
-    with closing(sqlite3.connect(repository.db_path())) as conn:
-        assert conn.execute("SELECT src_id FROM graph_edges").fetchone()[0] == typed
-
-
-def test_bulk_empty_input_is_a_noop():
-    assert add_edges_bulk([]) == 0
-    assert stats() == {"entities": 0, "edges": 0, "isolated_entities": 0}
-
-
-# ----------------------------------------------------- 12. 不污染现有表
-
-
-def test_ingest_leaves_other_tables_alone(monkeypatch):
-    """图存储只写 `graph_*` 两张表；`chunk_vectors` 与 `mindmaps` 行数不变。"""
     enable(monkeypatch)
     one_chunk(monkeypatch, [(0, 10)])
-    fake_extract(monkeypatch, [extraction([("甲", "人物"), ("乙", "组织")],
-                                          [("甲", "乙", "任职于")])])
-
-    before = {"mindmaps": rows_in("mindmaps"), "chunk_vectors": rows_in("chunk_vectors")}
+    fake_extract(monkeypatch, [
+        extraction([("甲", "人物"), ("乙", "组织"), ("孤", "概念")],
+                   [("甲", "乙", "任职于")]),
+    ])
+    store = fake_store(monkeypatch)
     run(ingest_graph(make_source("甲在乙任职。甲乙丙丁戊己庚辛")))
-    after = {"mindmaps": rows_in("mindmaps"), "chunk_vectors": rows_in("chunk_vectors")}
-    assert before == after
-    # 顺便证明图确实写进去了，否则上面的"不变"可能只是什么都没做。
-    assert stats()["edges"] == 1
+
+    assert store["upsert"] == [("孤", "概念")]
 
 
-def test_graph_tables_are_prefixed():
-    """表名前缀是硬约束：共库意味着任何同名都可能是别人的表。"""
-    assert graph_store.ENTITY_TABLE.startswith("graph_")
-    assert graph_store.EDGE_TABLE.startswith("graph_")
+def test_ingest_isolated_upsert_failure_does_not_fail_chunk(monkeypatch):
+    """孤立实体写失败只记警告：图的主体（边）已经落库了，把它算作失败会谎报。"""
+    enable(monkeypatch)
+    one_chunk(monkeypatch, [(0, 10)])
+    fake_extract(monkeypatch, [
+        extraction([("甲", "人物"), ("乙", "组织"), ("孤", "概念")],
+                   [("甲", "乙", "任职于")]),
+    ])
+    fake_store(monkeypatch, upsert_raises=GraphStoreError("模拟孤立实体写入失败"))
+    result = run(ingest_graph(make_source("甲在乙任职。甲乙丙丁戊己庚辛")))
+
+    assert result["failed"] == 0
+    assert result["edges"] == 1
+
+
+# ------------------------------------------------------- 7. Cypher 的静态校验
+
+
+class FakeCounters:
+    def __init__(self, created: int = 0) -> None:
+        self.relationships_created = created
+        self.nodes_created = 0
+
+
+class FakeResult:
+    def __init__(self, records=(), created: int = 0) -> None:
+        self._records = list(records)
+        self._summary = SimpleNamespace(counters=FakeCounters(created))
+
+    def single(self):
+        return self._records[0] if self._records else None
+
+    def consume(self):
+        return self._summary
+
+    def __iter__(self):
+        return iter(self._records)
+
+
+class RecordingTransaction:
+    """记下每条 Cypher 与它的参数，并按语句内容返回预先安排的结果。
+
+    用它就能在没有 Neo4j 的机器上跑完 `upsert_entity` / `add_edge` /
+    `add_edges_bulk` / `stats` / `neighbors` 的**语句层**，从而断言"每个 `$占位符`
+    都有对应参数"——这条断言在真库上只会以"参数缺失异常"的形式出现，排查成本高
+    得多。
+    """
+
+    def __init__(self, answers=None) -> None:
+        self.calls: list[tuple[str, dict]] = []
+        self.answers = answers or {}
+
+    def run(self, query: str, params=None, **_kwargs):
+        params = dict(params or {})
+        self.calls.append((query, params))
+        for needle, payload in self.answers.items():
+            if needle in query:
+                if isinstance(payload, int):
+                    return FakeResult(created=payload)
+                return FakeResult(records=payload)
+        return FakeResult()
+
+
+@contextmanager
+def _pass_through(transaction):
+    yield transaction
+
+
+def install_fake_transaction(monkeypatch, transaction):
+    monkeypatch.setattr(
+        graph_store, "_transaction",
+        lambda read_only=False: _pass_through(transaction),
+    )
+    return transaction
+
+
+def test_every_cypher_placeholder_is_bound(monkeypatch):
+    """每条语句里的 `$x` 都必须出现在传参里，且传参里没有多余键。
+
+    Neo4j 对缺失参数报错、对多余参数沉默——两边都会让"改了语句却忘了改传参"这类
+    错误活到运行时。这条用例把两侧钉死在一起。
+    """
+    transaction = install_fake_transaction(
+        monkeypatch,
+        RecordingTransaction(answers={
+            # 三条 needle 各自唯一，按插入顺序匹配：建实体 → 批量取候选 → 单条取候选。
+            "RETURN id(e) AS id": [{"id": 1}],
+            "ORDER BY name, created_at": [],
+            "RETURN e.type AS type": [{"type": "人物"}],
+        }),
+    )
+    upsert_entity("甲", "人物")
+    add_edge("甲", "乙", "依赖", source_id="s1", chunk_start=0, chunk_end=10)
+    add_edges_bulk([EdgeInput(src="甲", dst="乙", relation="依赖", source_id="s1",
+                              chunk_start=0, chunk_end=10)])
+    stats()
+    neighbors("甲", hops=2)
+
+    assert transaction.calls, "一条语句都没发，用例本身失效了"
+    for query, params in transaction.calls:
+        placeholders = set(re.findall(r"\$([A-Za-z_]\w*)", query))
+        assert placeholders <= set(params), f"参数缺失：{placeholders - set(params)}\n{query}"
+        assert set(params) <= placeholders, f"多余参数：{set(params) - placeholders}\n{query}"
+
+
+def test_walk_query_interpolates_only_clamped_ints():
+    """变长路径的唯一一处内插：值只能是 0~MAX_HOPS 的 int。
+
+    这是防注入的正面证据——Cypher 的 `[*1..$hops]` 不接受参数，只能拼字符串，所以
+    "拼进去的东西是什么"必须被钉住。非整数进不去（`int()` 会先抛），超上限也会被夹。
+    """
+    assert "[*1..5]-(other" in graph_store._walk_query(999)
+    assert "[*1..3]-(other" in graph_store._walk_query("3")
+    assert graph_store._walk_query(0) == graph_store.CYPHER_WALK.replace("{hops}", "0")
+    for hostile in ("1]-(x) DETACH DELETE x //", "2 MATCH (n) DELETE n", None):
+        with pytest.raises((TypeError, ValueError)):
+            graph_store._walk_query(hostile)
+    assert graph_store._clamp_hops(-3) == 0
+    assert graph_store._clamp_limit(0) == 1
+
+
+def test_labels_are_module_constants_used_by_every_statement():
+    """标签、关系类型、约束名都在常量里，且每条语句都从常量取。
+
+    改标签却漏改某一条语句的结果是"写入看不见、查询永远空"——这种错在测试里表现为
+    某条用例偶然失败，在线上表现为整层静默失效。
+    """
+    queries = [value for name, value in vars(graph_store).items()
+               if name.startswith("CYPHER_") and isinstance(value, str)]
+    assert len(queries) >= 9, "CYPHER_* 常量少了几条？"
+    assert f":{graph_store.ENTITY_LABEL}" in graph_store.CYPHER_WALK
+    assert f":{graph_store.EDGE_TYPE}" in graph_store.CYPHER_ADD_EDGE
+    assert graph_store.CONSTRAINT_NAME in graph_store.CYPHER_CONSTRAINT
+    for query in queries:
+        # 旧 SQLite 版的表名不该以任何形式残留。
+        assert "graph_entities" not in query and "graph_edges" not in query
+
+
+def test_no_user_value_is_interpolated_into_cypher():
+    """语句常量里没有 `%s` / `%(name)s`，内插占位只有一个且只出现在游走语句里。
+
+    这条是静态的、粗糙的，但它挡住的是最容易复发的一类改动：有人为了"少一次往返"
+    把实体名格式化进语句。值只能走参数绑定；唯一的例外是变长路径的长度，因为
+    Cypher 的 `[*1..$hops]` 不接受参数（见上一条用例）。
+    """
+    for name, value in vars(graph_store).items():
+        if not (name.startswith("CYPHER_") and isinstance(value, str)):
+            continue
+        assert "%s" not in value, name
+        assert "%(" not in value, name
+        if "{hops}" in value:
+            assert name == "CYPHER_WALK", name
+    # 唯一的替换点：整个模块里只有一处把 {hops} 换成值。
+    source = inspect.getsource(graph_store)
+    assert source.count('replace("{hops}"') == 1
+
+
+class FakeNode:
+    def __init__(self, name: str, element_id: str) -> None:
+        self._props = {"name": name}
+        self.element_id = element_id
+
+    def __getitem__(self, key):
+        return self._props[key]
+
+
+class FakeRelationship:
+    def __init__(self, props, start, end) -> None:
+        self._props = props
+        self.start_node = start
+        self.end_node = end
+
+    def __getitem__(self, key):
+        return self._props[key]
+
+
+class FakePath:
+    def __init__(self, nodes, relationships) -> None:
+        self.nodes = nodes
+        self.relationships = relationships
+
+
+def test_path_parser_reads_directions_from_relationship_ends():
+    """方向靠起止点比对读出来：`nodes[i]` 是关系起点即 FORWARD，是终点即 REVERSE。
+
+    用假 Path 对象测——这是纯逻辑，不该为了它起一个库。真库上的同一条断言在
+    `tests/test_graph_neo4j.py`，那一条证明的是"Neo4j 返回的 Path 形状与这里假设
+    的一致"。
+    """
+    first, second = FakeNode("甲", "n1"), FakeNode("乙", "n2")
+    forward_edge = FakeRelationship(
+        {"relation": "提出", "source_id": "s1", "chunk_start": 0, "chunk_end": 10},
+        first, second)
+    path = graph_store._parse_path({"p": FakePath([first, second], [forward_edge])})
+    assert path is not None
+    assert path.nodes == ["甲", "乙"]
+    assert path.relations == ["提出"]
+    assert path.directions == [FORWARD]
+    assert path.evidence == [("s1", 0, 10)]
+
+    # 同一条边，但路径从乙出发：起止点没变，位置反了 → REVERSE。
+    reverse_edge = FakeRelationship(
+        {"relation": "提出", "source_id": "s1", "chunk_start": 0, "chunk_end": 10},
+        first, second)
+    path = graph_store._parse_path({"p": FakePath([second, first], [reverse_edge])})
+    assert path is not None
+    assert path.directions == [REVERSE]
+
+
+def test_path_parser_drops_malformed_paths():
+    """形状不对整条丢掉：错位的路径会让证据指向错误的关系，界面上看不出来。"""
+    first, second = FakeNode("甲", "n1"), FakeNode("乙", "n2")
+    missing_props = FakeRelationship({"relation": "提出"}, first, second)
+    assert graph_store._parse_path({"p": FakePath([first, second],
+                                                  [missing_props])}) is None
+    # 关系数与节点数对不上（少一条边）也算坏路径。
+    good = FakeRelationship(
+        {"relation": "提出", "source_id": "s1", "chunk_start": 0, "chunk_end": 10},
+        first, second)
+    assert graph_store._parse_path({"p": FakePath([first, second, second], [good])}) is None
