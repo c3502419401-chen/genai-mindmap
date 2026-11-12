@@ -55,6 +55,7 @@ import re
 import threading
 
 from app.contracts.source import Source, SourceKind, SourceSpan
+from app.ingestion import metadata as source_metadata
 from app.ingestion.asr import AsrError, transcribe_audio
 
 # 单份文档最多交给 Docling 解析的页数。
@@ -160,6 +161,11 @@ def _parse_pdf_source(filename: str | None, raw: bytes) -> Source:
     """
     from app.ingestion import vision_pdf
 
+    # 元数据先取：它与正文解析完全独立，视觉那条路失败要回退文本层时也不用重取。
+    # 传的是 raw 而不是 filename 判断格式——.doc/.ppt 转成 PDF 后也走这个函数，
+    # 那时后缀还是旧格式，但内容已经是 PDF 信息字典了。
+    metadata = source_metadata.from_pdf(raw)
+
     # 兜底用，同时也是"这份文档到底有没有文字"的判断依据
     try:
         text_pages, page_count = _parse_pdf(raw)
@@ -186,6 +192,7 @@ def _parse_pdf_source(filename: str | None, raw: bytes) -> Source:
                       parsed_pages=len(text_pages),
                       truncated=len(text_pages) < page_count,
                       failed_pages=empty,
+                      metadata=metadata,
                       status="parsed")
 
     try:
@@ -227,6 +234,7 @@ def _parse_pdf_source(filename: str | None, raw: bytes) -> Source:
                   parsed_pages=limit,
                   truncated=limit < total,
                   failed_pages=unrecovered,
+                  metadata=metadata,
                   status="parsed")
 
 
@@ -305,6 +313,7 @@ def _parse_office_source(filename: str | None, raw: bytes) -> Source:
     page_count = len(result.pages) if getattr(result, "pages", None) else None
     return Source(kind=SourceKind.document, filename=filename, text=text,
                   span=SourceSpan(page=page_count) if page_count else None,
+                  metadata=source_metadata.extract(filename, raw),
                   status="parsed")
 
 
@@ -338,8 +347,12 @@ def _parse_xls_source(filename: str | None, raw: bytes) -> Source:
         raise NotSupportedSource("这份 .xls 里没有可读的单元格内容")
 
     # 表格没有"页"的概念，span 留空；行数放 parsed_pages 也不合适，一并留空。
+    # 元数据同样走 extract：.xls 是 OLE 复合文档，不在 OOXML 集合里，这里会
+    # 老老实实返回空元数据——留着这一行是为了"所有文档分支都过同一个入口"，
+    # 将来补 xlrd 的属性集读取时不用再回来找哪里漏了。
     return Source(kind=SourceKind.document, filename=filename, text=text,
                   span=None, parsed_pages=None, truncated=False,
+                  metadata=source_metadata.extract(filename, raw),
                   status="parsed")
 
 

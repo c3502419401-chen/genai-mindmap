@@ -29,9 +29,9 @@ import time
 from collections.abc import Iterator
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
 
-from app.contracts.source import Source
+from app.contracts.source import Source, SourceMetadata, blank_to_none, clean_tags, to_utc_iso
 from app.knowledge import vector_cache
 from app.knowledge.embedding import (
     EmbeddingError,
@@ -102,6 +102,136 @@ class EvidenceHit(BaseModel):
     # 这条结果实际由哪条路支撑。`_rag` 的 data["method"] 是请求级的旧字段，
     # 逐条标注才能看出"这条是纯语义捞回来的、字面一个词都不沾"。
     method: Literal["lexical", "hybrid"] = "lexical"
+
+
+# ---------------------------------------------------------------- 检索前置过滤
+
+# 只写日期不带时间（`2024-01-15`）。这类输入按"整天"解释：
+# since 取当天零点、until 取当天最后一秒——不然 `until=2024-01-15` 会把
+# `2024-01-15T09:00:00Z` 排除在外（字典序上它比纯日期长且更大），
+# 用户说的"截至 1 月 15 日"显然是**包含**当天的。
+_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+class SourceFilter(BaseModel):
+    """检索前的来源过滤条件。每一项都可以不给；不给就不参与筛选。
+
+    语义写死在这里，调用方不必猜：
+
+    1. `author`：去首尾空白 + 大小写折叠（`casefold`）后**精确匹配**。
+       `"  Zhang San "` 命中 `"zhang san"`，但不做子串匹配——`"Zhang"` 不命中
+       `"Zhang San"`。子串匹配会让"张三"命中"张三丰"，在只有 1–5 份材料的
+       场景里一次误命中就等于没过滤。
+    2. `since` / `until`：比较的是**文档时间**——先取 `created_at`，它为 None
+       时退回 `modified_at`；两者都为 None 的来源被排除。
+       **闭区间**：两端的等号都算命中（`since<=t<=until`）。
+       `until` 只写日期时取到当天 `23:59:59Z`，见 `_DATE_ONLY_RE` 的注释。
+       只用一个字段（而不是"两个字段任一命中"）是为了可预测：一份 2020 年创建、
+       昨天又改过的文档，在 `since=2026-01-01` 下不该出现——用户问的是
+       "这段时期的文档"，不是"这段时期碰过的文档"。
+    3. `category`：去首尾空白后精确匹配，**大小写敏感**。分类是调用方自定的
+       受控枚举，大小写折叠可能把两个本意不同的类别悄悄合并。
+    4. `tags`：**全部命中（AND）**，大小写不敏感、去空白。选 AND 是因为过滤是
+       收紧漏斗的动作，OR 只会让漏斗变宽、更容易放进不相关来源；真要"任一
+       标签"就分两次请求，语义还更清楚。
+
+    **元数据缺失怎么办**（最容易出错的地方）：某一项条件给了值，而来源在那一
+    项上是 None → **排除**（宁缺毋滥）；某一项条件是 None → 这一项根本不参与
+    筛选，缺元数据的来源照常通过。两条合起来的效果是"缺什么就筛不了什么"，
+    而不是"缺就一律出局"。
+
+    时间值接受纯日期（`2024-01-15`）或 ISO8601 时间戳（`2024-01-15T10:30:00Z`、
+    `+08:00` 偏移都行），内部统一归一化成 UTC。解析不了直接抛校验错误、不静默
+    忽略：调用方写了 `2024-13-01` 却拿到 2019 年的文档，比报错难查得多。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    author: str | None = None
+    since: str | None = None
+    until: str | None = None
+    category: str | None = None
+    tags: list[str] = Field(default_factory=list)
+
+    @field_validator("author", "category")
+    @classmethod
+    def _blank_text_is_none(cls, value: str | None) -> str | None:
+        # 空串与 None 同义。不折平的话 `author=""` 会去匹配"作者是空串"的来源
+        # ——那个集合永远是空，等于把全部来源筛掉，而调用方本意是"不筛"。
+        return blank_to_none(value)
+
+    @field_validator("since", "until")
+    @classmethod
+    def _normalize_bound(cls, value: str | None, info: ValidationInfo) -> str | None:
+        if value is None:
+            return None
+        text = value.strip()
+        if not text:
+            return None
+        normalized = to_utc_iso(text)
+        if normalized is None:
+            raise ValueError(f"{info.field_name} 不是可解析的时间：{value!r}")
+        if _DATE_ONLY_RE.match(text):
+            # 纯日期：since 落在当天 00:00:00，until 落在当天 23:59:59。
+            # 上界这一步不能省——`until=2024-01-15` 的字面值比
+            # `2024-01-15T09:00:00Z` 小，直接用会把当天的文档全部排除。
+            return f"{text}T23:59:59Z" if info.field_name == "until" \
+                else f"{text}T00:00:00Z"
+        return normalized
+
+    @field_validator("tags")
+    @classmethod
+    def _clean_tags(cls, value: list[str]) -> list[str]:
+        # 与 `SourceMetadata` 共用同一份清洗：任何一边多做或漏做，
+        # "预算" 与 " 预算 " 就比不上，过滤会静默失效。
+        return clean_tags(value)
+
+
+def _document_time(metadata: SourceMetadata) -> str | None:
+    """来源的"文档时间"：创建时间优先，缺失时退回修改时间。"""
+    return metadata.created_at or metadata.modified_at
+
+
+def _matches(source: Source, filters: SourceFilter) -> bool:
+    """单个来源是否通过全部条件。条件为 None 的项直接跳过（不参与筛选）。"""
+    metadata = source.metadata
+
+    if filters.author is not None:
+        author = (metadata.author or "").strip()
+        # 没有作者就过不了作者过滤：宁可少给，不给错的。
+        if not author or author.casefold() != filters.author.casefold():
+            return False
+
+    if filters.since is not None or filters.until is not None:
+        stamp = _document_time(metadata)
+        # 同上：要按时间筛，却没有时间可筛的来源直接出局。
+        if stamp is None:
+            return False
+        # 两端都是归一化后的 UTC 秒级字符串，字典序即时间序，不必再解析
+        if filters.since is not None and stamp < filters.since:
+            return False
+        if filters.until is not None and stamp > filters.until:
+            return False
+
+    if filters.category is not None:
+        if (metadata.category or "").strip() != filters.category:
+            return False
+
+    if filters.tags:
+        owned = {tag.strip().casefold() for tag in metadata.tags if tag and tag.strip()}
+        if not all(tag.casefold() in owned for tag in filters.tags):
+            return False
+
+    return True
+
+
+def filter_sources(sources: list[Source], filters: SourceFilter) -> list[Source]:
+    """按元数据裁剪来源列表。纯内存操作，不碰任何持久化状态。
+
+    公开出来是给调用方判"是不是被筛光了"用的：`search_sources` 返回空列表有两种
+    原因（过滤筛光 / 查询没命中），而这两种该给用户的话完全不同。调用方先自己
+    过一遍这个函数就能区分，不必让 `search_sources` 改签名去回传统计。
+    """
+    return [source for source in sources if _matches(source, filters)]
 
 
 # ---------------------------------------------------------------- 切块参数
@@ -616,7 +746,8 @@ def _pick_top(hits: list[EvidenceHit], top_k: int) -> list[EvidenceHit]:
     return picked
 
 
-def search_sources(sources: list[Source], query: str, top_k: int = 5) -> list[EvidenceHit]:
+def search_sources(sources: list[Source], query: str, top_k: int = 5, *,
+                   filters: SourceFilter | None = None) -> list[EvidenceHit]:
     """在**本次请求带来的来源**里找相关片段（BM25 + 向量，RRF 融合）。
 
     只查参数给的这些，不碰任何持久化索引：agent 一次运行能看到的证据范围必须
@@ -634,10 +765,43 @@ def search_sources(sources: list[Source], query: str, top_k: int = 5) -> list[Ev
     `method` 逐条标明这条路：`hybrid` 表示向量路真的贡献了候选，`lexical`
     表示只有 BM25。命中不证明结论正确，上层不能拿它当事实校验——这也是它与
     `search()` 那个检索桩的区别：那个将来接向量库，这个永远只做"在给定文本里定位"。
+
+    `filters` 是**检索前置**的元数据过滤，语义见 `SourceFilter`。三条硬要求：
+      - 先筛来源、再切块：被筛掉的来源不产生任何块，也就不会有 BM25 分和
+        embedding 调用。反过来（先切块再逐块过滤）会白算一遍再扔掉，
+        向量路还要为这些块真金白银地付费。
+      - 筛完没有来源时返回 `[]` 并记一条 info 日志，**不抛错**。调用方
+        （`_rag`）本来就把它当"没找到"处理，这是可接受的降级。
+      - `filters=None` 时整段跳过，行为与加过滤之前逐字节一致。
+
+    ⚠ **两个阶段的顺序不要读反**（将来做落库的人最容易在这里踩坑）：
+      - **入库期**（预期的形态，本函数不参与）：切块 → 向量化 → 打标。
+        业务分类若要用向量推断（聚类、与类别描述的相似度做 zero-shot），
+        必须等向量算完才判得了，所以**标签是向量化之后的产物**。
+      - **检索期**（本函数）：按标签筛来源 → 切块 → 检索。
+        当前没有"入库"这一步，每次请求都是现切现算；先 embed 再筛，被筛掉
+        那几份的向量就是纯浪费，而且它们的块会被写进 `vector_cache`
+        （按文本哈希缓存，将来就是 `chunk_vectors` 里那些永远查不到的行）。
+    两者不矛盾：标签在**入库期**产生、随 `Source` 一起带到每次请求；过滤在
+    **检索期**执行。同一份标签，不同阶段各用一次。
     """
     question = query.strip()
     if not _token_list(question):
         return []
+
+    # 过滤必须在切块与向量化之前。放在这里还有一个原因：BM25 的 IDF 是在
+    # "本次请求切出的块集合"上算的，被筛掉的来源连 N 和 df 都不该污染——
+    # 否则同一份材料在"筛"与"不筛"两种请求里会得到不同的分数，
+    # 而那个差异没有任何语义。向量侧同理：先筛再算，被筛掉的块连一次缓存
+    # 写入都不会发生。注意这与"标签在入库期向量化之后产生"不冲突，见 docstring。
+    if filters is not None:
+        selected = filter_sources(sources, filters)
+        if not selected:
+            logger.info("过滤条件筛掉了全部来源（%d→0）", len(sources))
+            return []
+        if len(selected) != len(sources):
+            logger.debug("检索前过滤：来源 %d→%d", len(sources), len(selected))
+        sources = selected
 
     collected: list[tuple[str, int, int, str]] = []
     for source in sources:

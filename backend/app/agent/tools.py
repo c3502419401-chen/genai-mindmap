@@ -22,12 +22,13 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Callable, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from app.agent.contracts import RunContext, ToolCall, ToolResult, ToolSpec
 from app.agent.ops import (
@@ -57,9 +58,11 @@ from app.generation.service import (
     validate_generated_content,
 )
 from app.generation.stream_partial import collect_new_nodes, parse_partial
-from app.knowledge.service import search_sources
+from app.knowledge.service import SourceFilter, filter_sources, search_sources
 from app.optimization.service import check
 from app.optimization.source_refs import annotate_nli
+
+logger = logging.getLogger(__name__)
 
 # 与 backend/app/contracts/mindmap.py 的 Node.children max_length 同口径
 MAX_CHILDREN = 50
@@ -235,6 +238,26 @@ class RagArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     question: str = Field(min_length=1, max_length=500)
     top_k: int = Field(default=5, ge=1, le=5)
+    # 检索前置的元数据过滤条件，原样透传给 `search_sources`（形状见
+    # `knowledge.service.SourceFilter`）。用 dict 而不是模型字段，是为了让
+    # "模型乱填过滤条件"这件事在工具入口被吸收成"不过滤"，而不是变成一次
+    # 工具调用失败——检索本身没有错，没必要连带报错。
+    filters: dict[str, Any] | None = None
+
+    @field_validator("filters", mode="before")
+    @classmethod
+    def _non_dict_filters_are_ignored(cls, value: Any) -> Any:
+        """非 dict 的 filters 当成"没给"。
+
+        模型偶尔把条件写成字符串（`"author=张三"`）或者干脆传个数组。让一个
+        可选参数把整次 `rag_query` 判死没有意义：检索本身没错，错的只是这个
+        附加值，降级成"不过滤"更划算。
+        """
+        if value is None or isinstance(value, dict):
+            return value
+        logger.debug("忽略 rag_query 的非法 filters（%s）：%r",
+                     type(value).__name__, value)
+        return None
 
 
 class EditChange(BaseModel):
@@ -1726,13 +1749,56 @@ async def _expand(args: ExpandArgs, ctx: RunContext) -> ToolResult:
     )
 
 
+def _rag_filters(raw: dict[str, Any] | None) -> SourceFilter | None:
+    """把模型给的过滤条件解析成 `SourceFilter`；坏输入一律当成"没给"。
+
+    过滤条件本该由外层给（用户标注 / 界面筛选），模型没有可靠依据判断"这批材料
+    的作者是谁、哪段时间的"——让它编只会凭空缩小检索范围，把本该找到的证据筛掉。
+    所以这里**不做任何推断**，只负责透传与校验。
+
+    校验失败就放弃过滤，不向上抛：降级成"不过滤"永远好过让整次 `rag_query` 失败。
+    空条件也折成 None，省掉一次无意义的过滤分支。
+
+    区分"参数错误"与"没给"这一层只在这里做：`SourceFilter` 自己仍然严格校验
+    （直接调用 `search_sources` 的调用方该被拦住），宽松只发生在模型这一侧。
+    """
+    if not raw:
+        return None
+    try:
+        filters = SourceFilter.model_validate(raw)
+    except ValidationError as exc:
+        logger.debug("忽略 rag_query 的过滤条件（%s）：%s",
+                     type(exc).__name__, str(exc)[:160])
+        return None
+    # 全部字段都是默认值 = 调用方什么都没要求，等价于没有 filters
+    if not filters.model_dump(exclude_defaults=True):
+        return None
+    return filters
+
+
 async def _rag(args: RagArgs, ctx: RunContext) -> ToolResult:
     sources = _pick_sources(ctx, [])
     if not sources:
         return _fail("no_sources", "这次请求没有附带任何资料，无法检索。")
 
-    hits = search_sources(sources, args.question, args.top_k)
+    filters = _rag_filters(args.filters)
+    hits = search_sources(sources, args.question, args.top_k, filters=filters)
     if not hits:
+        # 过滤把来源筛光与查询没命中，返回给模型的必须是两句不同的话。
+        # 都说"没有找到"，模型会以为材料里没有相关内容，进而改用编造或换主题；
+        # 而实际情况是"条件太严，材料还在"。这类信息差靠日志补不上——模型看不到日志。
+        #
+        # 诊断只在空结果这条路径上做一次：正常有命中时不必再算一遍过滤，
+        # 也让 mock 掉 search_sources 的用例仍能走到这里。
+        if filters is not None and not filter_sources(sources, filters):
+            return ToolResult(
+                ok=True,
+                content=(
+                    f"过滤条件筛掉了全部 {len(sources)} 份资料，没有可检索的内容。"
+                    "可以放宽或去掉过滤条件后重试。"
+                ),
+                data={"hits": [], "method": "lexical", "filtered_out": len(sources)},
+            )
         return ToolResult(
             ok=True,
             content="没有在本次资料里找到相关片段。",
