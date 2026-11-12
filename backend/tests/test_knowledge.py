@@ -28,11 +28,13 @@ from app.knowledge.service import (
 def _lexical_only(monkeypatch):
     """这些断言全部关于切块与**词面**排序，不该被向量路影响。
 
-    混合检索会在配了 `DASHSCOPE_API_KEY` 的机器上真的去调 embedding 接口：
-    既让结果带上网络的不确定性，也让单元测试变成计费的外部调用。删掉凭证
-    固定走 `method="lexical"`，融合逻辑由 `test_hybrid_search.py` 用 mock 覆盖。
+    凭证与开关的清理统一在 `conftest.py` 的全局 fixture 里（那里清的是
+    `MINDMAP_EMBEDDING_API_KEY` 与回退的 `DASHSCOPE_API_KEY` 两个，只清后者
+    正是这个文件上一版出问题的地方）。这里再**显式**关一次向量路，是为了把
+    "本文件依赖纯 BM25"写死：哪天 conftest 的默认值变了，这几条会立刻红，
+    而不是悄悄换一种分数口径。融合逻辑由 `test_hybrid_search.py` 用 mock 覆盖。
     """
-    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    monkeypatch.setenv("MINDMAP_HYBRID_SEARCH", "0")
 
 PARAGRAPH = (
     "今天上午，我去“秘密基地”了。那里堆着三箱旧书（详见附录 A），"

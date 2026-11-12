@@ -507,11 +507,9 @@ def _forbidden(*args, **kwargs):
 
 @pytest.fixture(autouse=True)
 def _isolated(monkeypatch, tmp_path):
-    for name in ("MINDMAP_EMBEDDING_API_KEY", "MINDMAP_EMBEDDING_BASE_URL",
-                 "MINDMAP_EMBEDDING_PROTOCOL", "DASHSCOPE_API_KEY",
-                 "MINDMAP_HYBRID_SEARCH", "MINDMAP_EMBEDDING_MODEL",
-                 "MINDMAP_EMBEDDING_DIM"):
-        monkeypatch.delenv(name, raising=False)
+    # conftest 全局默认关掉了向量路；这个文件测的是"先过滤再向量化"，
+    # 需要它真的开，凭证由各用例的 `_keyed()` 配。
+    monkeypatch.setenv("MINDMAP_HYBRID_SEARCH", "1")
     monkeypatch.setenv("MINDMAP_DB_PATH", str(tmp_path / "vectors.db"))
     monkeypatch.setattr(embedding, "RETRY_BACKOFF", 0.0)
 

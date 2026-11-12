@@ -1329,7 +1329,10 @@ class RagToolTest(unittest.TestCase):
         # 检索现在带向量路：这个类只验证工具的接线，不该因为宿主机恰好配了
         # DASHSCOPE_API_KEY 就去调真实 embedding 接口——那会让单测变慢、计费，
         # 结果还带网络的不确定性。融合与降级由 test_hybrid_search.py 覆盖。
-        env = patch.dict("os.environ", {"MINDMAP_HYBRID_SEARCH": "0"})
+        # 查询计划同理：开关写死关，`_rag` 的分支才只取决于 mock，而不是宿主机的
+        # MINDMAP_QUERY_EXPANSION。多路的行为由 test_search_multi.py 覆盖。
+        env = patch.dict("os.environ", {"MINDMAP_HYBRID_SEARCH": "0",
+                                        "MINDMAP_QUERY_EXPANSION": "0"})
         env.start()
         self.addCleanup(env.stop)
 

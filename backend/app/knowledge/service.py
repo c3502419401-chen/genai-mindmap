@@ -21,6 +21,7 @@ F13 的验收不能被等同于事实验证。
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import os
@@ -92,7 +93,8 @@ class EvidenceHit(BaseModel):
     start: int = Field(ge=0)
     end: int = Field(ge=0)
     quote: str
-    # 融合后的最终分。混合检索时是 RRF 分，单路时是 BM25 分（或余弦）。
+    # 融合后的最终分。混合检索时是 RRF 分，单路时是 BM25 分（或余弦），
+    # 多路时是各路 RRF 分累加（见 `search_multi`）。
     # **只在同一次检索内可比**：IDF 与名次都依赖这次请求切出的块集合。
     score: float
     # 两路的原始分，供调试与将来调权。没走那一路时是 None，不是 0——0 是
@@ -725,6 +727,23 @@ def _near_duplicate(left: EvidenceHit, right: EvidenceHit) -> bool:
     return overlap * 2 > min(left.end - left.start, right.end - right.start)
 
 
+def _pick_ordered(hits: list[EvidenceHit], top_k: int) -> list[EvidenceHit]:
+    """按**给定顺序**去掉近似重复并截断 top_k，不再重排。
+
+    与 `_pick_top` 的唯一差别就是不排序。多路融合需要一个"分段拼好的顺序"
+    （保底席位在前、竞争席位在后），再交给 `_pick_top` 会被它按分数重排回去，
+    分段等于没做。
+    """
+    picked: list[EvidenceHit] = []
+    for hit in hits:
+        if any(_near_duplicate(hit, kept) for kept in picked):
+            continue
+        picked.append(hit)
+        if len(picked) >= top_k:
+            break
+    return picked
+
+
 def _pick_top(hits: list[EvidenceHit], top_k: int) -> list[EvidenceHit]:
     """排序 → 去掉近似重复 → 截断 top_k。
 
@@ -736,14 +755,99 @@ def _pick_top(hits: list[EvidenceHit], top_k: int) -> list[EvidenceHit]:
     # 同分时短的块优先：整块命中率相同的情况下，短块的信息密度更高。
     # RRF 下这条仍然必要——两路名次互换的组合（1+2 与 2+1）分数完全相同。
     ordered = sorted(hits, key=lambda hit: (-hit.score, hit.end - hit.start))
-    picked: list[EvidenceHit] = []
-    for hit in ordered:
-        if any(_near_duplicate(hit, kept) for kept in picked):
+    return _pick_ordered(ordered, top_k)
+
+
+def _collect_chunks(sources: list[Source]) -> list[tuple[str, int, int, str]]:
+    """切一遍块，返回 `(source_id, start, end, quote)`。
+
+    `search_sources` 与 `search_multi` 共用这一层：多路检索若每路各切一遍，
+    5 万字材料上就是 6 倍的切块开销——纯 CPU，却也是这条路上最贵的一段。
+    空判断用 `strip`、切块用原文：先 strip 再切块会让偏移整体前移，调用方拿它
+    去切 `Source.text` 得到的就不是 quote 那段文字了。
+    """
+    collected: list[tuple[str, int, int, str]] = []
+    for source in sources:
+        text = source.text or ""
+        if not text.strip():
             continue
-        picked.append(hit)
-        if len(picked) >= top_k:
-            break
-    return picked
+        for start, end, quote in _chunks(text):
+            collected.append((source.id, start, end, quote))
+    return collected
+
+
+def _to_hit(
+    index: int,
+    score: float,
+    collected: list[tuple[str, int, int, str]],
+    bm25_scores: dict[int, float],
+    vector_scores: dict[int, float],
+    method: Literal["lexical", "hybrid"],
+) -> EvidenceHit:
+    """把「块下标 + 融合分」落成一条命中。
+
+    `bm25_scores` / `vector_scores` 只放**候选块**的值：不在这两个字典里的块，
+    对应字段是 None（"这条根本没走那一路"），而不是 0（"走了但得 0 分"）。
+    单路调用时传进去的就是全量 BM25 分表，所以走 BM25 路但一个查询词都没命中
+    的块仍然是 0.0——那是既有的、被回归用例钉住的形状。
+    """
+    source_id, start, end, quote = collected[index]
+    return EvidenceHit(
+        source_id=source_id,
+        start=start,
+        end=end,
+        quote=quote,
+        score=round(score, 6),
+        score_bm25=round(bm25_scores[index], 6) if index in bm25_scores else None,
+        score_vector=round(vector_scores[index], 6) if index in vector_scores else None,
+        method=method,
+    )
+
+
+def _single_search(
+    collected: list[tuple[str, int, int, str]], question: str, top_k: int,
+) -> list[EvidenceHit]:
+    """单路检索（BM25 + 向量，RRF 融合）——`search_sources` 的全部打分逻辑。
+
+    抽成独立函数只为一件事：`search_multi` 在只有一路时必须与 `search_sources`
+    **逐字段相同**。两份实现各写一遍排序/截断/去重，迟早会分叉，而那种分叉
+    除了回归用例没有别的信号。
+    """
+    quotes = [item[3] for item in collected]
+    lengths = [item[2] - item[1] for item in collected]
+    lexical = _bm25_scores(question, quotes)
+    bm25_rank = _bm25_ranking(lexical, lengths)
+
+    similarity: dict[int, float] = {}
+    if _hybrid_enabled() and len(question) >= MIN_VECTOR_QUERY_CHARS:
+        similarity, reason = _vector_scores(quotes, question)
+        if reason and reason != "unconfigured":
+            logger.info("检索走单路 BM25（%s）", reason)
+
+    if similarity:
+        pool = max(top_k * CANDIDATE_FACTOR, top_k)
+        # 两路各留前 pool 名再融合：只在一路靠前的结果不会被另一路的名次拖掉。
+        # 单路时**不**截断——那条路要保住改动前"所有命中块一起排序"的行为。
+        top_bm25 = {index: rank for index, rank in bm25_rank.items() if rank <= pool}
+        top_vector = {index: rank
+                      for index, rank in _vector_ranking(similarity, lengths).items()
+                      if rank <= pool}
+        fused = {index: _rrf_value(index, top_bm25, top_vector)
+                 for index in set(top_bm25) | set(top_vector)}
+        method: Literal["lexical", "hybrid"] = "hybrid"
+    else:
+        fused = {index: lexical[index] for index in bm25_rank}
+        method = "lexical"
+
+    # 只走向量路的块 bm25 分是 0 而不是 None：它确实参与了 BM25 打分，
+    # 只是没命中任何查询词。None 留给"这条根本没走那一路"。
+    bm25_values = {index: lexical[index] for index in fused}
+    hits = [_to_hit(index, score, collected, bm25_values, similarity, method)
+            for index, score in fused.items()]
+
+    # 排序之后再去重：重叠块会把同一段原文重复推进 top_k，真正不同的证据
+    # 反而挤不进来。只在截断前多这一道筛，不改前面任何一步。
+    return _pick_top(hits, top_k)
 
 
 def search_sources(sources: list[Source], query: str, top_k: int = 5, *,
@@ -803,60 +907,359 @@ def search_sources(sources: list[Source], query: str, top_k: int = 5, *,
             logger.debug("检索前过滤：来源 %d→%d", len(sources), len(selected))
         sources = selected
 
-    collected: list[tuple[str, int, int, str]] = []
-    for source in sources:
-        # 不能先 strip 再切块：偏移会整体前移，调用方拿它去切 Source.text
-        # 得到的不是 quote 那段文字。空判断用 strip，切块用原文。
-        text = source.text or ""
-        if not text.strip():
+    collected = _collect_chunks(sources)
+    if not collected:
+        return []
+    # 打分与融合在 `_single_search` 里：`search_multi` 只有一路时也走它。
+    # 两条路径共用同一份实现，"没有扩展"与"只多了一路纠错"才可能逐字段相同。
+    return _single_search(collected, question, top_k)
+
+
+# ---------------------------------------------------------------- 多路并行检索
+
+# 单次检索最多跑几路。2C2G + 5 秒预算：每多一路就多一次 embedding 往返，
+# 6 路是"还等得起"的上限；块集合只有那么大，再多也不会凭空长出候选。
+MAX_ROUTES = 6
+
+
+def _route_queries(queries: list[str], hyde: str | None) -> list[tuple[str, bool]]:
+    """把查询列表理成 `[(文本, 是否走 BM25)]`：去空白、去重保序、截断到 `MAX_ROUTES`。
+
+    三条硬规则：
+
+    1. **原 query 由调用方放在第一位，这里不补**。一个"自己会加一路"的函数会让
+       调用方无法判断实际检索了几次，也会在开关开与关之间留下一个谁也说不清的
+       差集。`queries` 清空就整体返回空——连 `hyde` 都不算一路：没有原问题在
+       场，多路召回就失去了安全网（`docs/RAG-DECISIONS.md` 2.3：改写器会把
+       「退款率怎么算」改成「订单量怎么算」，只有原句在场才拉得回来）。
+    2. **`hyde` 是向量专用路**（`use_bm25=False`）。它是模型编的假答案，字面
+       与材料不沾；拿它当关键词查，BM25 会被长文本里偶然撞上的常用 bigram
+       喂出一堆正分噪声，白占名次。
+    3. **截断时 `hyde` 让位**。真实问法（intents/subqueries）比一段假答案有
+       价值，而 HyDE 本来就是几个方案里收益最低、延迟最高的那个
+       （`docs/RAG-DECISIONS.md` 第 3 节：+2~8 点、+800ms）。
+    """
+    routes: list[tuple[str, bool]] = []
+    seen: set[str] = set()
+    for raw in queries or []:
+        if not isinstance(raw, str):
             continue
-        for start, end, quote in _chunks(text):
-            collected.append((source.id, start, end, quote))
+        text = raw.strip()
+        if not text or text in seen or not _token_list(text):
+            continue
+        seen.add(text)
+        routes.append((text, True))
+    if not routes:
+        return []
+    if hyde:
+        text = hyde.strip()
+        if text and text not in seen:
+            routes.append((text, False))
+    if len(routes) > MAX_ROUTES:
+        logger.debug("多路检索截断：%d→%d 路（hyde 在末尾，先让位）",
+                     len(routes), MAX_ROUTES)
+        routes = routes[:MAX_ROUTES]
+    return routes
+
+
+async def _route_vectors(
+    quotes: list[str], queries: list[str],
+) -> list[tuple[dict[int, float], str]]:
+    """并行算每路查询与所有块的余弦，返回 `[(块下标→相似度, 不可用原因)]`。
+
+    **进线程池的只有 HTTP**。`embed_texts` 是同步的（内部每次自建
+    `httpx.Client`，没有共享状态），它的往返必须离开事件循环。缓存读写留在主
+    线程是**工程选择，不是安全限制**：`vector_cache._open()` 每次新建连接、用完
+    即关，整段操作在同一个线程内完成，放进线程池也不会出错。留在主线程的理由
+    只有两条——它是本地毫秒级操作，调度开销大于收益；并发写会去争 SQLite 的
+    写锁（`timeout=10` 兜底，不会崩，但也没有收益）。把线程池的职责限死在网络
+    往返上，并发度才好推理：六路并行就是六个网络往返，没有隐藏的锁竞争。顺序：
+
+        主线程查缓存 → 线程池并行 embed 缺失项 → 主线程写缓存 → 主线程算余弦
+
+    并行的**实际路数受服务端配额影响**，不受这里控制：`embedding._post` 只对
+    5xx 与超时重试，429 直接抛 `EmbeddingError`，那一路当场退成纯 BM25。配额
+    紧张时六路里可能只有两三路真拿到向量——这是约束 6 说的可接受降级，不是故障。
+
+    每条 query 单独一次调用、并发发起，而不是拼成一大批：多路的价值就在"同一
+    时间窗内拿到几路的候选"，拼成一批等于把它们重新串行化。块文本只 embed
+    一次（多路共享同一份块集合），否则 N 路各付一遍块向量的钱。
+
+    失败按路退化：某一路的查询向量拿不到，只有那一路没有向量名次，其余路照常。
+    """
+    if not embedding_configured():
+        return [({}, "unconfigured") for _ in queries]
+
+    started = time.perf_counter()
+    model = embedding_model()
+    quote_hashes = [vector_cache.text_hash(quote) for quote in quotes]
+    query_hashes = [vector_cache.text_hash(query) for query in queries]
+
+    # 主线程：一次查缓存，覆盖块与所有 query（同一段文本只查一次）
+    cached = vector_cache.get_vectors(
+        list(dict.fromkeys([*quote_hashes, *query_hashes])), model)
+    cached_hits = len(cached)
+
+    pending: set[str] = set(cached)
+    pending_queries: list[tuple[str, str]] = []
+    for hash_value, text in zip(query_hashes, queries):
+        if hash_value not in pending:
+            pending.add(hash_value)
+            pending_queries.append((hash_value, text))
+    pending_chunks: list[tuple[str, str]] = []
+    for hash_value, text in zip(quote_hashes, quotes):
+        if hash_value not in pending:
+            pending.add(hash_value)
+            pending_chunks.append((hash_value, text))
+
+    jobs = [("query", hash_value, asyncio.to_thread(embed_texts, [text]))
+            for hash_value, text in pending_queries]
+    if pending_chunks:
+        jobs.append(("chunk", "", asyncio.to_thread(
+            embed_texts, [text for _, text in pending_chunks])))
+
+    fresh: dict[str, list[float]] = {}
+    failed: set[str] = set()
+    if jobs:
+        results = await asyncio.gather(*(job for _, _, job in jobs),
+                                       return_exceptions=True)
+        for (kind, hash_value, _), result in zip(jobs, results):
+            # 取消是我方被取消（客户端断开），不是 embedding 坏了：吞掉它会让
+            # 上层以为任务正常跑完了。
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            if isinstance(result, BaseException):
+                if not isinstance(result, EmbeddingNotConfigured):
+                    logger.warning("多路向量路降级（%s）：%s：%s",
+                                   "query" if kind == "query" else "chunk",
+                                   type(result).__name__, str(result)[:160])
+                # 预检与调用之间凭证被清掉：并发下真会发生，不算故障，不记日志。
+                if kind == "query":
+                    failed.add(hash_value)
+                continue
+            vectors = result
+            if kind == "query":
+                vector = vectors[0] if vectors else None
+                if vector:
+                    fresh[hash_value] = vector
+                else:
+                    failed.add(hash_value)
+                continue
+            for (chunk_hash, _text), vector in zip(pending_chunks, vectors):
+                if vector:
+                    fresh[chunk_hash] = vector
+
+    # 主线程：写缓存。写在这里而不是线程里，见本函数开头那条顺序。
+    if fresh:
+        cached.update(fresh)
+        vector_cache.put_vectors(list(fresh.items()), model)
+
+    similarity_routes: list[tuple[dict[int, float], str]] = []
+    for query_hash in query_hashes:
+        query_vector = cached.get(query_hash)
+        if not query_vector:
+            similarity_routes.append(
+                ({}, "error" if query_hash in failed else "query_failed"))
+            continue
+        similarity: dict[int, float] = {}
+        for index, hash_value in enumerate(quote_hashes):
+            vector = cached.get(hash_value)
+            if not vector or len(vector) != len(query_vector):
+                # 维度对不上（换了模型但缓存没清）就跳过，绝不截断对齐
+                continue
+            value = sum(left * right for left, right in zip(vector, query_vector))
+            # 余弦 ≤ 0 表示正交或反向：字面无关、语义也无关，不该占一个名次
+            if value > 0:
+                similarity[index] = value
+        similarity_routes.append((similarity, "" if similarity else "no_signal"))
+
+    # 只记条数与耗时。块文本是材料原文，一律不进日志。
+    logger.info("多路向量路：路 %d / 块 %d / 缓存命中 %d / 并发 embed %d / 耗时 %.0fms",
+                len(queries), len(quotes), cached_hits, len(jobs),
+                (time.perf_counter() - started) * 1000)
+    return similarity_routes
+
+
+async def search_multi(
+    sources: list[Source],
+    queries: list[str],
+    top_k: int = 5,
+    *,
+    filters: SourceFilter | None = None,
+    hyde: str | None = None,
+) -> list[EvidenceHit]:
+    """在**同一批来源**上并行跑 N 个 query，按 RRF 名次把各路**累加**后融合。
+
+    与 `search_sources` 的分工：那个是"一个问题查一次"，这个是"一组问法查一次
+    材料"。**它不生成 query**——传哪些问法由调用方（`_rag`）决定，这里只管把
+    它们跑完、融合、去重。
+
+    `queries` 里的每条问法都会各自产出 BM25 与向量两路名次，同一块被多路命中
+    就把 `1/(RRF_K+名次)` 一路一路加起来。这是多路唯一的价值来源：单路里
+    排第二的块，如果在三种问法下都排第二，它比只在一种问法下排第一的块更可能
+    是答案。**但累加只决定"非保底席位"的归属**——原始问题那一路的前几名先占位，
+    否则票数会压过用户原话（约束 6）。`hyde` 是单独的一路，**只算向量**：它是
+    模型编的假答案，字面与材料不沾，拿它当关键词查只会把噪声喂进融合（见
+    `_route_queries`）。
+
+    七条硬约束，逐条对应一个具体的浪费或错误（第 6 条是实测退化之后补的，
+    其余六条是设计时就定下的）：
+
+    1. **切块只做一次**。`_collect_chunks` 在分路之前跑一遍，六路共用这份块
+       集合。这也让每路的 BM25 用同一个 `N` 与 `df`——同一块在不同 query 下的
+       分数才有同一种口径。
+    2. **并行只在 HTTP 上**。`embed_texts` 是同步的，靠 `asyncio.to_thread`
+       离开事件循环；缓存读写留在主线程是工程选择（本地毫秒级操作，扔线程池
+       没有收益还要争写锁），不是 SQLite 的连接限制（详见 `_route_vectors`）。
+       并行的实际上限由**服务端配额**决定：429 不重试，那一路当场退成纯 BM25，
+       所以"六路"是发起上限，不是成功上限。
+    3. **原 query 不补**。`queries` 为空就返回 `[]`。原问题必须由调用方放进
+       第一位，这是 `plan_query` 那道 `corrected` 闸之外的第二层安全网：闸漏了
+       一句同句式换中心词的改写时，只要原句还在，召回整体就不会跑偏。
+    4. **最多 6 路**（`MAX_ROUTES`），超了截断并记一条 debug。
+    5. **融合复用现成的 RRF**：`_bm25_ranking` / `_vector_ranking` /
+       `_rrf_value` / `_pick_ordered` / `_near_duplicate`，不另起一套。每路先按
+       `pool = max(top_k * CANDIDATE_FACTOR, top_k)` 截断再融合，与单路同规则。
+    6. **原 query 那一路的答案有保底席位**。纯累加会把真答案顶掉：五条跑偏的
+       扩展问法各自贡献 1/61，合起来就超过原始问题自己那一路的 RRF。所以
+       「第一位那条问法」的前 `ceil(top_k/2)` 名先占位，其余名额才由累加分竞争
+       （详见下面的"代价"）。去掉这一层时，仓库里有可复现的退化用例。
+    7. **每路都可能只剩 BM25**（没 key、embed 失败、hybrid 关）。这时多路仍然
+       是多路：各路 BM25 名次照样累加，不抛错、不返回空。
+
+    保底席位不是免费的，**代价写在这里**：
+
+      - 扩展路最多只能贡献 `top_k - ceil(top_k/2)` 条（`top_k=5` 时是 2 条，
+        `top_k=1` 时是 0 条）。当原 query 那一路本身找到了足够多的正确片段时，
+        扩展路的价值就只剩"补位"，与"只补不抢"的两阶段方案差别不大。
+      - `score` 是**累加分**，但排序是"保底段 + 竞争段"，所以**分数不单调**：
+        保底段最后一条的 score 可能低于竞争段第一条。`score` 仍然只用于同一次
+        检索内比较大小，不要拿它反推名次。
+      - 保底的只是"位置"，不是"结论"：它保证原始问题的答案**排在前面**，不保证
+        那条答案是对的——`search_sources` 的"命中≠正确"在这里同样成立。
+
+    为什么不做"过滤"：实测那次退化的四条扩展 query 与材料**全都有交集**（材料
+    确实包含蛋白、超导、合同、天文），按"扩展 query 与材料共享 bigram"筛一条
+    都筛不掉。锚定对象必须是"扩展 query 与原问题是不是同一个意思"，而这又不能
+    退回字面——`intents` 的定义就是同题不同问法，字面重合本来就低。所以只能从
+    融合结构上改。
+
+    `score` 的口径比单路多一种，别读错：
+      - 只有一路时：与 `search_sources` **逐字段相同**（走 `_single_search`），
+        所以 score 是 BM25 原始分或单路 RRF 分
+      - 多路且向量路起来：各路的 RRF 分累加，通常落在 0.02–0.08
+      - 多路且只有 BM25：各路 BM25 名次的 RRF 累加（≈1/61 量级），**不是** BM25
+        原始分——不同 query 的 BM25 分口径不同，相加没有意义
+      三种都**只在本次检索内可比**。跨请求比较看 `method` 与
+      `score_bm25`/`score_vector`。
+
+    `score_bm25` 在多路里取"各条走了 BM25 的路中的最高分"，`score_vector` 取
+    "各条向量路中的最高余弦"。取最大而不是相加：不同 query 的 BM25 分与余弦
+    尺度不可加，最大值才对应"最好那次匹配"这个可解释的量。
+    """
+    routes = _route_queries(queries, hyde)
+    if not routes:
+        return []
+
+    # 过滤同样在切块与向量化之前：被筛掉的来源连一次缓存写入都不该发生。
+    if filters is not None:
+        selected = filter_sources(sources, filters)
+        if not selected:
+            logger.info("过滤条件筛掉了全部来源（%d→0）", len(sources))
+            return []
+        if len(selected) != len(sources):
+            logger.debug("检索前过滤：来源 %d→%d", len(sources), len(selected))
+        sources = selected
+
+    # 约束 1：切块只做一次，六路共用同一个块集合。
+    collected = _collect_chunks(sources)
     if not collected:
         return []
 
+    # 约束 3 的另一半：只有一路问法时，结果必须与 `search_sources` 逐字段相同。
+    # 这不是快路径优化，是可观测契约——开关关着与只有纠错时，用户看到的召回
+    # 与没有多路召回时一模一样。
+    if len(routes) == 1 and routes[0][1]:
+        return _single_search(collected, routes[0][0], top_k)
+
     quotes = [item[3] for item in collected]
     lengths = [item[2] - item[1] for item in collected]
-    lexical = _bm25_scores(question, quotes)
-    bm25_rank = _bm25_ranking(lexical, lengths)
 
-    similarity: dict[int, float] = {}
-    if _hybrid_enabled() and len(question) >= MIN_VECTOR_QUERY_CHARS:
-        similarity, reason = _vector_scores(quotes, question)
-        if reason and reason != "unconfigured":
-            logger.info("检索走单路 BM25（%s）", reason)
-
-    if similarity:
-        pool = max(top_k * CANDIDATE_FACTOR, top_k)
-        # 两路各留前 pool 名再融合：只在一路靠前的结果不会被另一路的名次拖掉。
-        # 单路时**不**截断——那条路要保住改动前"所有命中块一起排序"的行为。
-        top_bm25 = {index: rank for index, rank in bm25_rank.items() if rank <= pool}
-        top_vector = {index: rank
-                      for index, rank in _vector_ranking(similarity, lengths).items()
-                      if rank <= pool}
-        fused = {index: _rrf_value(index, top_bm25, top_vector)
-                 for index in set(top_bm25) | set(top_vector)}
-        method: Literal["lexical", "hybrid"] = "hybrid"
-    else:
-        fused = {index: lexical[index] for index in bm25_rank}
-        method = "lexical"
-
-    hits = [
-        EvidenceHit(
-            source_id=collected[index][0],
-            start=collected[index][1],
-            end=collected[index][2],
-            quote=collected[index][3],
-            score=round(score, 6),
-            # 只走向量路的块 bm25 分是 0 而不是 None：它确实参与了 BM25 打分，
-            # 只是没命中任何查询词。None 留给"这条根本没走那一路"。
-            score_bm25=round(lexical[index], 6),
-            score_vector=round(similarity[index], 6) if index in similarity else None,
-            method=method,
-        )
-        for index, score in fused.items()
+    # 每路 BM25：纯 CPU，留在主线程。hyde 路不参与（约束见 `_route_queries`）。
+    lexical_routes: list[list[float] | None] = [
+        _bm25_scores(text, quotes) if use_bm25 else None for text, use_bm25 in routes
     ]
 
-    # 排序之后再去重：重叠块会把同一段原文重复推进 top_k，真正不同的证据
-    # 反而挤不进来。只在截断前多这一道筛，不改前面任何一步。
-    return _pick_top(hits, top_k)
+    # 向量：只对够长且开关打开的路算；一次 await 让所有路的 HTTP 并起来。
+    similarity_routes: list[dict[int, float]] = [{} for _ in routes]
+    hybrid = _hybrid_enabled()
+    eligible = [index for index, (text, _) in enumerate(routes)
+                if hybrid and len(text) >= MIN_VECTOR_QUERY_CHARS]
+    if eligible:
+        found = await _route_vectors(quotes, [routes[index][0] for index in eligible])
+        for index, (similarity, reason) in zip(eligible, found):
+            similarity_routes[index] = similarity
+            if reason and reason != "unconfigured":
+                logger.info("多路检索第 %d 路走单路 BM25（%s）", index + 1, reason)
+
+    # 约束 5：每路各自截断到 pool，再把 RRF 分累加到同一个块上。
+    pool = max(top_k * CANDIDATE_FACTOR, top_k)
+    fused: dict[int, float] = {}
+    primary: dict[int, float] = {}
+    for position, (lexical, similarity) in enumerate(
+            zip(lexical_routes, similarity_routes)):
+        top_bm25: dict[int, int] = {}
+        if lexical:
+            top_bm25 = {index: rank
+                        for index, rank in _bm25_ranking(lexical, lengths).items()
+                        if rank <= pool}
+        top_vector: dict[int, int] = {}
+        if similarity:
+            top_vector = {index: rank
+                          for index, rank in _vector_ranking(similarity, lengths).items()
+                          if rank <= pool}
+        for index in set(top_bm25) | set(top_vector):
+            # 同一块在多个问法下命中就累加，这是多路唯一的价值来源。
+            # 名次是唯一在 BM25 与余弦两种量纲下都同义的量，所以只累加名次。
+            value = _rrf_value(index, top_bm25, top_vector)
+            fused[index] = fused.get(index, 0.0) + value
+            if position == 0:
+                # 第一位是调用方放的原始问题（`_route_queries` 的约定）。单独留一份
+                # 它自己的 RRF，用于下面的保底席位——累加分回答不了"这句话本身
+                # 有多相关"，只回答"多少条问法都碰巧指向它"。
+                primary[index] = value
+    if not fused:
+        return []
+
+    # 只要有一路的向量真给了候选，整批就算 hybrid（与单路 `method` 同语义）。
+    method: Literal["lexical", "hybrid"] = "hybrid" if any(similarity_routes) else "lexical"
+
+    # 展示用的两路原始分：取各路最大值（不同 query 的尺度不可加）。
+    bm25_values: dict[int, float] = {}
+    if any(lexical is not None for lexical in lexical_routes):
+        # 至少有一条路走了 BM25 → 每个候选块都"走过"这一路，未命中记 0.0
+        bm25_values = {
+            index: max(lexical[index] for lexical in lexical_routes
+                       if lexical is not None)
+            for index in fused
+        }
+    vector_values: dict[int, float] = {}
+    for similarity in similarity_routes:
+        for index, value in similarity.items():
+            if index in fused:
+                vector_values[index] = max(vector_values.get(index, value), value)
+
+    # 保底席位：原始问题那一路的前 `reserve` 名先占位，其余名额由所有路的累加分
+    # 竞争。没有这一层时，五条跑偏的扩展路各自贡献的 1/61 会把它顶下去——实测：
+    # 单路时「预算审批」0.0328 排第 1，五路时「蛋白质折叠」0.0653 反超、真答案
+    # 掉到第 2（`tests/test_search_multi.py` 里钉着这个复现）。累加分回答的是
+    # "多少条问法都指向它"，而扩展问法只是猜测，票数不该压过用户原话。
+    reserve = min(max(1, (top_k + 1) // 2), len(primary))
+    reserved = sorted(primary, key=lambda index: (-primary[index], lengths[index]))
+    reserved = reserved[:reserve]
+    taken = set(reserved)
+    rest = sorted((index for index in fused if index not in taken),
+                  key=lambda index: (-fused[index], lengths[index]))
+    hits = [_to_hit(index, fused[index], collected, bm25_values, vector_values, method)
+            for index in [*reserved, *rest]]
+    return _pick_ordered(hits, top_k)

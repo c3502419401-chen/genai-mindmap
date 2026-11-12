@@ -103,11 +103,11 @@ def _forbidden(*args, **kwargs):
 
 @pytest.fixture(autouse=True)
 def _isolated(monkeypatch, tmp_path):
-    for name in ("MINDMAP_EMBEDDING_API_KEY", "MINDMAP_EMBEDDING_BASE_URL",
-                 "MINDMAP_EMBEDDING_PROTOCOL", "DASHSCOPE_API_KEY",
-                 "MINDMAP_HYBRID_SEARCH", "MINDMAP_EMBEDDING_MODEL",
-                 "MINDMAP_EMBEDDING_DIM"):
-        monkeypatch.delenv(name, raising=False)
+    # `conftest.py` 的全局默认是"无凭证 + 开关关"。这个文件测的正是向量路，
+    # 显式打开开关；凭证仍由各用例按需 `_keyed()` 配，否则"没配置"的用例
+    # 会被这里的默认值掩盖掉。
+    monkeypatch.setenv("MINDMAP_HYBRID_SEARCH", "1")
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
     monkeypatch.setenv("MINDMAP_DB_PATH", str(tmp_path / "vectors.db"))
     # 重试退避在测试里没有意义，别真的等 0.5 + 1.0 秒
     monkeypatch.setattr(embedding, "RETRY_BACKOFF", 0.0)

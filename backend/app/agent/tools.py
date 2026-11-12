@@ -58,7 +58,13 @@ from app.generation.service import (
     validate_generated_content,
 )
 from app.generation.stream_partial import collect_new_nodes, parse_partial
-from app.knowledge.service import SourceFilter, filter_sources, search_sources
+from app.knowledge.query_plan import _material_snippets, plan_query
+from app.knowledge.service import (
+    SourceFilter,
+    filter_sources,
+    search_multi,
+    search_sources,
+)
 from app.optimization.service import check
 from app.optimization.source_refs import annotate_nli
 
@@ -1776,13 +1782,44 @@ def _rag_filters(raw: dict[str, Any] | None) -> SourceFilter | None:
     return filters
 
 
+def _material_inputs(sources: list[Source]) -> list[str]:
+    """给 `plan_query` 的材料摘要：每份「标题 + 正文开头」压平成一段。
+
+    截断与份数上限全部交给 `_material_snippets`：两处各写一份"前 200 字、最多
+    10 份"，迟早出现"提示词看到的是 A、检索依据是 B"这种没人查得出来的差集。
+    它已经是幂等的，`plan_query` 内部再跑一次不会二次截断。
+    """
+    return _material_snippets(
+        [f"{source.filename or ''}\n{source.text or ''}" for source in sources])
+
+
 async def _rag(args: RagArgs, ctx: RunContext) -> ToolResult:
     sources = _pick_sources(ctx, [])
     if not sources:
         return _fail("no_sources", "这次请求没有附带任何资料，无法检索。")
 
     filters = _rag_filters(args.filters)
-    hits = search_sources(sources, args.question, args.top_k, filters=filters)
+
+    # 查询计划默认关（`MINDMAP_QUERY_EXPANSION`）。关着时 `plan_query` 在返回
+    # `None` 之前不发任何请求，这里的 `if` 必须让那条路**一个额外调用都没有**：
+    # 开关关着与没有这个功能，召回结果必须逐字段一致。
+    #
+    # 只有 `source == "llm"`（模型真的产出了 intents/hyde/subqueries）才走多路。
+    # `"fallback"` 计划里只有一个 corrected，它是**替换**原问句的东西，不该被
+    # 当成"多一路"——那会把召回从"一个问题的答案"变成"两个问题的并集"。
+    plan = await plan_query(args.question, materials=_material_inputs(sources))
+    if plan is not None and plan.source == "llm":
+        # 原问题**永远**第一位：`corrected` 的四道闸仍可能放过同句式换中心词的
+        # 改写，只要原句在场，召回就不会整体跑偏。去重由 `search_multi` 负责。
+        queries = [args.question]
+        if plan.corrected:
+            queries.append(plan.corrected)
+        queries.extend(plan.intents)
+        queries.extend(plan.subqueries)
+        hits = await search_multi(sources, queries, args.top_k, filters=filters,
+                                  hyde=plan.hyde)
+    else:
+        hits = search_sources(sources, args.question, args.top_k, filters=filters)
     if not hits:
         # 过滤把来源筛光与查询没命中，返回给模型的必须是两句不同的话。
         # 都说"没有找到"，模型会以为材料里没有相关内容，进而改用编造或换主题；
