@@ -23,11 +23,11 @@ type:null})` **永远匹配不到上一行**，每写一次就多一个节点，
 NULL)` 认为两个 NULL 互不相等），解法也一样：`None` → `''`（`_fold_type`）。`type`
 不出现在任何返回结构里，所以不需要反向还原。
 
-**写与读的降级不对称**：读接口（`neighbors` / `stats`）在库不可用或没配置时返回
-空值——"查不到"与"库坏了"在检索层是同一种结果，为一次查询崩掉整条链路没有收益。
-写接口（`upsert_entity` / `add_edge` / `add_edges_bulk`）**照常抛错**——把"没写进去"
-说成"写好了"会让材料入库静默缺边，而这种缺失没有任何信号能发现：图不会报错，它
-只是少了一条路。
+**写与读的降级不对称**：读接口（`neighbors` / `stats` / `resolve` / `entity_degrees`）
+在库不可用或没配置时返回空值——"查不到"与"库坏了"在检索层是同一种结果，为一次查询
+崩掉整条链路没有收益。写接口（`upsert_entity` / `add_edge` / `add_edges_bulk` /
+`add_aliases` / `clear_aliases`）**照常抛错**——把"没写进去"说成"写好了"会让材料入库
+静默缺边，而这种缺失没有任何信号能发现：图不会报错，它只是少了一条路。
 
 **异常类型是 `OSError` 的子类**（`GraphStoreError`）。理由换过一次，两次都成立：
 换引擎那一刻，调用方 `graph_ingest` 的降级分支写的是
@@ -103,24 +103,46 @@ INSERT"，不是往返次数退化；而且只有 `type` 为空时才多这一�
 代价是同一实体在不同块里被判成不同类型时会出现两行；抽取层用类型白名单
 （`graph_extract.ENTITY_TYPES`）把这种分裂压到"有类型 vs 无类型"这一种。
 
-## 没有做的：实体消解（这是能力边界，不是待办事项）
+## 实体消解：别名边（`ALIAS_OF`）
 
-上面三条归一化只折全角、空白、大小写，**不做别名归并**，也没有同义词表。于是
-材料里的「国家市场监督管理总局」与「市场监管总局」在库里是**两个实体**，各带各
-的边；简称、缩写、旧称、中英对照全部落在这一刀之外。
+上面三条归一化只折全角、空白、大小写，不做别名归并——材料里的「国家市场监督管理
+总局」与「市场监管总局」曾经在库里是**两个实体**，各带各的边。后果不是"少连了几
+条边"，而是**孤岛与"确实无关"无法区分**：`neighbors` 在两份材料之间找不到路径时
+返回 `[]`，与两份材料真的没关系时返回的 `[]` 逐字节相同。这一层现在补上存储与
+游走的那一半，判断那一半在 `graph_resolve`。
 
-后果不是"少连了几条边"，而是**孤岛与"确实无关"无法区分**：`neighbors` 在两份
-材料之间找不到路径时返回 `[]`，与两份材料真的没关系时返回的 `[]` 逐字节相同。
-下一个读这段代码的人会以为图是完整的——它不是。
+**模型**：`(:Entity)-[:ALIAS_OF {source, similarity, created_at}]->(:Entity)`，方向是
+**别名 → 主名**（`ALIAS_OF` 读作"我是它的另一个名字"）。别名不是 `REL`：它不进
+`edges`、不进路径、不参与 `hops`，`stats()` 单独计数。混进 `REL` 的后果是别名会在
+游走里变成一条"证据"——而它没有任何 `source_id` / `chunk_start`，恰好是证据三件套
+最不能缺的那三个字段。
 
-由此可以给出这套东西当前的真实能力：**跨文档关联只在专有名词级成立**（机构全称、
-人名、标准号、文号这类写法稳定的对象），**概念级关联不成立**（「数字化转型」对
-「数字化改革」）。而跨文档长程关联的价值恰好集中在概念层——所以这层的形态是对的
-（路径与证据严格对齐、幂等、毫秒级），召回是缺的。
+**为什么加边而不是把边搬到主名上（真合并节点）**：搬边不可逆。两条边并成一条之后，
+"这条证据原本说的是哪个名字"就没了，而 `source_id` / `chunk_start` / `chunk_end`
+的全部意义就是能指回原文。别名边保留两边的**全部**原始边，代价是每次游走多一次
+别名表查询（见下）。
 
-补齐它要的不是调参数，而是一层实体消解（别名表、简称抽取、规则或模型归并），以及
-随之而来的"合并错了比没合并更贵"的判定标准。在那之前，把图上的"没路径"当成
-"不确定"，不要当成"无关"。
+**为什么一次读全表而不是在 Cypher 里做变长别名模式**：`[…:ALIAS_OF*1..10]->` 能把
+十跳上限写在语句里，但"链太长"与"没有别名"在结果上都是"没有行"，两者分不开——而
+这两种情况一个该原样返回、一个该返回主名。别名边是"被合并过的名字对"，数量是实体
+数的零头（人工/半自动挑出来的），一次读进内存之后链的走法（防环、上限、确定性）
+是纯 Python，可以单独测。真实图上一千个实体配上几十条别名边，这条查询的代价与
+`stats()` 同级。
+
+**`neighbors` 怎么把别名纳进来**：起点换成"同一别名组的全部名字"（`$names` 是
+列表，不是单个名字——边可能挂在任何一个别名上），返回前把每个节点名换成主名。
+换完如果路径里出现重复节点，整条丢掉：合并之后那是一个环，而 `GraphPath` 的契约是
+简单路径。**返回结构没变**（`nodes` / `relations` / `evidence` / `directions`），
+只是名字统一成了主名。
+
+**合并错了比没合并更贵**：把「数字化转型」与「数字化改革」并成一个，图上会走出一
+条不存在的路径，而它看起来有证据、有位置、能通过校验。所以阈值偏高（0.92，理由
+写在 `graph_resolve.DEFAULT_THRESHOLD`）、默认 `dry_run`、落库前能先看候选。
+
+**仍然没做**：简称的构词规则（「市场监管总局」这种取首尾几个字的简写，字符层面
+没有足够重叠，本轮的 embedding 阈值能不能捞到它取决于模型，见 `graph_resolve` 的
+实测记录）、概念级的同义归并（需要领域词表或更强的模型）。所以定位没有变：
+图上的"没路径"仍然只说明"不确定"，只是这个缺口比之前小了一圈。
 """
 from __future__ import annotations
 
@@ -131,11 +153,17 @@ import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator
 
 from neo4j import READ_ACCESS as _READ, WRITE_ACCESS as _WRITE
 from neo4j import Driver, GraphDatabase
 from neo4j.exceptions import DriverError, Neo4jError
+
+if TYPE_CHECKING:
+    # 只在类型检查时导入：`graph_resolve` 运行时 import 本模块，这里反向运行时
+    # import 就是环。运行时只用 duck typing 读 `.canonical` / `.aliases` /
+    # `.similarity` 三个属性，所以省掉这次导入不影响任何行为。
+    from app.knowledge.graph_resolve import MergeCandidate
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +203,15 @@ MAX_HOPS = 5
 
 # 单次游走的路径条数上限。检索阶段一次只拿几十条证据，多的用不上。
 MAX_LIMIT = 200
+
+# 别名关系的类型名。与 `EDGE_TYPE` 分开是设计：别名不是证据，见模块 docstring 的
+# 「实体消解」。
+ALIAS_TYPE = "ALIAS_OF"
+
+# 别名链最多追几跳。这是防环的第二道闸：`_resolve_in` 自己有访问集合，但一条被
+# 人手动改坏的长链（A→B→C→…→A 但中间少一环）也会在这里被截住，而不是让一次
+# `resolve` 走出几千步。10 跳远大于任何真实的"简称套简称"层数。
+MAX_ALIAS_HOPS = 10
 
 # ---------------------------------------------------------------- Cypher 语句
 #
@@ -251,29 +288,89 @@ CYPHER_ADD_EDGES_BULK = (
     "ON CREATE SET r.chunk_end = row.chunk_end, r.created_at = row.created_at"
 )
 
-# 无向游走。四件事各自有理由：
+# 无向游走。五件事各自有理由：
 #
-#   - 起点用 `{name: $name}` 而不是 `CONTAINS`：实体名是归一化后的精确键，模糊
-#     匹配会把"张三"与"张三丰"混起来，那是两个东西。
-#   - 无向靠不给关系加箭头。Cypher 的 `-[*1..n]-` 两个方向都会走。
+#   - 起点是 **`$names` 列表**而不是单个名字：同一实体的边可能挂在任何一个别名上，
+#     只按 `name` 出发会让"边在 `甲别名` 上、从 `甲` 问"永远返回 `[]`——那正是这
+#     一层要消掉的那种哑失败。没有任何别名时列表里只有查的那个名字，行为与本轮
+#     之前逐字节一致。
+#   - 名字是归一化后的精确键（`=` / `IN`），不用 `CONTAINS`：模糊匹配会把"张三"
+#     与"张三丰"混起来，那是两个东西。`IN` 仍然走 `name` 上的索引。
+#   - 变长模式限定 `:REL`：不限定类型会把 `ALIAS_OF` 也当成一跳——别名不是证据，
+#     它没有 `source_id` / `chunk_start`，走出来的路径在 `_parse_path` 里会被判成
+#     形状异常（少三个属性）而整条丢掉，等于把真实的近路吃掉。
+#   - 无向靠不给关系加箭头。Cypher 的 `-[:REL*1..n]-` 两个方向都会走。
 #   - `{hops}` 由 `_walk_query` 内插（变长长度不接受参数，见模块 docstring）。
 #   - `all(... single(...))` 把 trail 收成简单路径（Neo4j 默认允许节点重复）。
 #   - `ORDER BY length(p)` 让短路径先出：调用方拿到的前几条就是最近的邻居，
 #     `LIMIT` 截断时不会截掉整条近路而留下一堆远路。
 CYPHER_WALK = (
-    f"MATCH p = (start:{ENTITY_LABEL} {{name: $name}})-[*1..{{hops}}]-(other:{ENTITY_LABEL})\n"
-    "WHERE all(n IN nodes(p) WHERE single(m IN nodes(p) WHERE m = n))\n"
+    f"MATCH p = (start:{ENTITY_LABEL})-[:{EDGE_TYPE}*1..{{hops}}]-(other:{ENTITY_LABEL})\n"
+    "WHERE start.name IN $names\n"
+    "AND all(n IN nodes(p) WHERE single(m IN nodes(p) WHERE m = n))\n"
     "RETURN p\n"
     "ORDER BY length(p)\n"
     "LIMIT $limit"
 )
 
+# ------------------------------------------------------------ 别名（实体消解）
+#
+# 全部原地 `MERGE` / 读，不搬边：理由见模块 docstring 的「实体消解」。
+
+# 全量别名表：`{别名: 主名}` 的来源。一次读完再在 Python 里走链，而不是发一条
+# 变长 Cypher——"链太长"与"没有别名"在 Cypher 里都是"没有行"，分不开。
+# `ORDER BY alias, canonical` 定死同一别名有多行（同名不同型）时谁先到，`resolve`
+# 的返回值才确定。
+CYPHER_LOAD_ALIASES = (
+    f"MATCH (a:{ENTITY_LABEL})-[r:{ALIAS_TYPE}]->(b:{ENTITY_LABEL})\n"
+    "RETURN a.name AS alias, b.name AS canonical\n"
+    "ORDER BY alias, canonical"
+)
+
+# 写别名。`MERGE` 的模式里**只有两端**，属性一律走 `ON CREATE SET`：把 `similarity`
+# 放进 MERGE 模式会让"同一对、换个阈值重算"变成第二条边——别名是关系，不是度量。
+# 两端用 `MATCH` 而不是 `MERGE`：候选来自图里已有的实体，凭空补一个没有类型、没有
+# 任何边的节点只会让"孤立实体"这个指标变脏。
+CYPHER_ADD_ALIASES = (
+    f"UNWIND $rows AS row\n"
+    f"MATCH (a:{ENTITY_LABEL} {{name: row.alias}})\n"
+    f"MATCH (b:{ENTITY_LABEL} {{name: row.canonical}})\n"
+    f"MERGE (a)-[r:{ALIAS_TYPE}]->(b)\n"
+    "ON CREATE SET r.source = row.source, r.similarity = row.similarity, "
+    "r.created_at = row.created_at"
+)
+
+# 清空别名表。条数走 `relationships_deleted`（服务端计数），不是先 COUNT 再 DEL——
+# 两次往返之间别人可能又写了一条，那样返回的数就不等于真删掉的数。
+CYPHER_CLEAR_ALIASES = f"MATCH ()-[r:{ALIAS_TYPE}]->() DELETE r"
+
+CYPHER_COUNT_ALIASES = f"MATCH ()-[r:{ALIAS_TYPE}]->() RETURN count(r) AS n"
+# 有别名指向它的实体数：主名的个数。"合并了几个实体"与"写了几条别名边"是两个
+# 数——一组三个名字写两条边，合并的是两个实体。
+CYPHER_COUNT_MERGED = (
+    f"MATCH (e:{ENTITY_LABEL})<-[:{ALIAS_TYPE}]-() RETURN count(DISTINCT e) AS n"
+)
+
+# 候选源：按边数降序取前 N 个实体名。`OPTIONAL MATCH` 让孤立实体也返回（度数为 0）
+# ——它们参与不了路径，但可能是别人指向的那个名字。`count(r)` 在无向模式里对每条
+# 入射边计一次，正是"这个实体挂着几条证据"。同名不同型的两行在这里按名字聚成
+# 一行（Cypher 的隐式分组键），因为别名模型是名字级的。
+CYPHER_ENTITY_DEGREES = (
+    f"MATCH (e:{ENTITY_LABEL})\n"
+    f"OPTIONAL MATCH (e)-[r:{EDGE_TYPE}]-()\n"
+    "RETURN e.name AS name, count(r) AS degree\n"
+    "ORDER BY degree DESC, name\n"
+    "LIMIT $limit"
+)
+
 CYPHER_COUNT_ENTITIES = f"MATCH (e:{ENTITY_LABEL}) RETURN count(e) AS n"
 CYPHER_COUNT_EDGES = f"MATCH ()-[r:{EDGE_TYPE}]->() RETURN count(r) AS n"
-# 孤立实体：一条关系都没挂的节点。`NOT (e)--()` 是"没有任何方向的关系"，比
-# `NOT (e)-[]-()` 更直白，语义一样。
+# 孤立实体：一条 `REL` 都没挂的节点。**只看 `REL`，不看任何关系类型**——别名边
+# 不是证据，一条 `ALIAS_OF` 也不构成"这个实体参与过任何关系"。写成 `NOT (e)--()`
+# 会让合并过的实体从"孤立"里消失（它挂了一条别名边），于是"这次抽取到底连上了
+# 没有"这个指标开始撒谎，而它恰好是这一层唯一的总量信号。
 CYPHER_COUNT_ISOLATED = (
-    f"MATCH (e:{ENTITY_LABEL}) WHERE NOT (e)--() RETURN count(e) AS n"
+    f"MATCH (e:{ENTITY_LABEL}) WHERE NOT (e)-[:{EDGE_TYPE}]-() RETURN count(e) AS n"
 )
 
 
@@ -763,6 +860,195 @@ def add_edges_bulk(edges: list[EdgeInput]) -> int:
     return int(summary.counters.relationships_created)
 
 
+def entity_degrees(*, limit: int = 500) -> list[tuple[str, int]]:
+    """按边数降序返回前 `limit` 个 `(实体名, 边数)`。`graph_resolve` 的候选源。
+
+    **为什么按边数排序**：边少的实体合并价值低——一个只出现过一次、挂着一条边的
+    名字，即使真的和别的名字同义，合并它给图带来的通路也只有那一条。反过来，这
+    也顺手把 N² 的规模按住：实体上千的图上，真正值得两两比的只有头部那些。
+
+    同名不同类型的两个节点按名字聚成一行（`CYPHER_ENTITY_DEGREES` 的隐式分组）：
+    别名模型是名字级的，按 `(name, type)` 拆开会让同一个名字拿到两个不同的度数，
+    而"该选谁当主名"只该有一个答案。
+
+    读不到库（没配密码 / 连不上 / 超时）时返回 `[]`，与其他读接口一致。
+    """
+    cap = max(int(limit), 1)
+    try:
+        with _transaction(read_only=True) as transaction:
+            records = list(transaction.run(CYPHER_ENTITY_DEGREES, {"limit": cap}))
+    except (GraphStoreError, OSError) as exc:
+        logger.warning("图谱实体度数不可用：%s", type(exc).__name__)
+        return []
+    return [(str(record["name"]), int(record["degree"])) for record in records]
+
+
+def _load_alias_map(transaction: Any) -> dict[str, str]:
+    """读全量别名表：`{别名: 主名}`。同一别名有多行时取 `CYPHER_LOAD_ALIASES` 排好
+    的第一个——不这样做，`resolve` 的返回值会随返回顺序漂移。"""
+    mapping: dict[str, str] = {}
+    for record in transaction.run(CYPHER_LOAD_ALIASES):
+        alias = str(record["alias"])
+        canonical = str(record["canonical"])
+        if alias and canonical and alias != canonical:
+            mapping.setdefault(alias, canonical)
+    return mapping
+
+
+def _resolve_in(alias_map: dict[str, str], name: str) -> str:
+    """在已读入内存的别名表上走链。**纯函数**，因此防环与跳数上限能单独测。
+
+    两种情况返回**原样**而不是"走得最远的那个名字"：
+
+      - 链成环（`甲→乙→甲`，只可能来自人手改库）：环上没有主名，随便挑一个都是在
+        编造一个不存在的等价关系；
+      - 超过 `MAX_ALIAS_HOPS` 跳：同上。
+
+    两种都记 warning 但**不记名字**（这一层的日志原则是"只有形状，没有内容"），
+    返回原样让调用方看到"这个名字没有被合并"，而不是看到一个半路停下的名字。
+    """
+    current = name
+    seen = {name}
+    for _ in range(MAX_ALIAS_HOPS):
+        following = alias_map.get(current)
+        if not following or following == current:
+            return current
+        if following in seen:
+            logger.warning("别名链成环（%d 个名字），按「无主名」处理", len(seen))
+            return name
+        seen.add(following)
+        current = following
+    following = alias_map.get(current)
+    if not following or following == current:
+        return current
+    logger.warning("别名链超过 %d 跳，按「无主名」处理", MAX_ALIAS_HOPS)
+    return name
+
+
+def _alias_group(alias_map: dict[str, str], name: str) -> list[str]:
+    """同一实体的全部名字：`name` 自己、它的主名、以及所有最终指向该主名的名字。
+
+    游走要从**组里每一个名字**出发：边可能挂在任何一个别名上，只从主名出发会漏掉
+    挂在别名上的那些边——那正是"从简称问、返回空"的老毛病换了个位置。
+    """
+    canonical = _resolve_in(alias_map, name)
+    group = {name, canonical}
+    for alias in alias_map:
+        if _resolve_in(alias_map, alias) == canonical:
+            group.add(alias)
+    return sorted(group)
+
+
+def resolve(name: str) -> str:
+    """顺着别名链找到主名；没有别名、链成环、链超长时返回自己（归一化后的）。
+
+    库不可用时也返回自己，与读接口的降级口径一致：`resolve` 的返回值永远是一个
+    可用的实体名，调用方不需要为"图没配"准备第二个分支。空名字返回空串。
+    """
+    entity = normalize_name(name)
+    if not entity:
+        return ""
+    try:
+        with _transaction(read_only=True) as transaction:
+            alias_map = _load_alias_map(transaction)
+    except (GraphStoreError, OSError) as exc:
+        logger.warning("别名解析不可用：%s", type(exc).__name__)
+        return entity
+    return _resolve_in(alias_map, entity)
+
+
+def add_aliases(candidates: list[MergeCandidate], *, source: str = "embedding") -> int:
+    """把候选落成别名边，返回**真正新建**的条数。
+
+    幂等：同一对重复写只留一条（`MERGE` 只认两端）。三件写前拒绝的事，都不抛错：
+
+      - 两端归一化后为空、或两边同名（自环）；
+      - 两端里有名字在库里找不到节点（候选本该来自图里，找不到说明图变过了）；
+      - 会成环——判断是"从主名出发能不能走到别名"，能就说明加了这条边之后别名会
+        绕回自己。同一批里的前一行也算数（`甲→乙` 之后再写 `乙→甲` 被拒）。
+
+    被拒的与本来就存在的都不计入返回值，调用方用 `总对数 - 返回值` 就能得到跳过
+    了多少——这个数比"写成功了几个"更能说明库里的实际情况。
+
+    `source` / `similarity` / `created_at` 只在**新建**时落：改阈值重算一遍不该把
+    上一次的依据覆盖掉（那也是唯一一条能回答"这条边是谁加的"的线索）。`source` 优先
+    取候选自带的 `reason`（`substring` / `embedding`），拿不到才回退到参数——"这条
+    别名凭什么加的"必须能从边上读出来，而不是只能翻日志。
+    """
+    if not candidates:
+        return 0
+    pairs: list[tuple[str, str, float, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for candidate in candidates:
+        canonical = normalize_name(candidate.canonical)
+        if not canonical:
+            continue
+        # 候选自带判定依据就按它落；手工构造（没有 reason）时回退到调用方给的 source。
+        origin = str(getattr(candidate, "reason", "") or source)
+        for raw_alias in candidate.aliases:
+            alias = normalize_name(raw_alias)
+            if not alias or alias == canonical or (alias, canonical) in seen:
+                continue
+            seen.add((alias, canonical))
+            pairs.append((alias, canonical, float(candidate.similarity), origin))
+    if not pairs:
+        return 0
+
+    now = _now()
+    with _transaction() as transaction:
+        alias_map = _load_alias_map(transaction)
+        known = _load_candidates(
+            transaction, sorted({name for pair in pairs for name in pair[:2]}))
+        rows: list[dict] = []
+        for alias, canonical, similarity, origin in pairs:
+            # 两端都得是库里已有的节点：`MATCH` 落空时 Cypher 会安静地少写一条，
+            # 那种"少了一条边"在返回值以外没有任何信号。
+            if alias not in known or canonical not in known:
+                continue
+            if _resolve_in(alias_map, canonical) == alias:
+                # 加了它，别名就能顺着链绕回自己。拒绝后写的那条，先写的那条留下。
+                logger.warning("别名成环，跳过一条（表内 %d 条）", len(alias_map))
+                continue
+            alias_map[alias] = canonical
+            rows.append({"alias": alias, "canonical": canonical, "source": origin,
+                         "similarity": similarity, "created_at": now})
+        if not rows:
+            return 0
+        summary = transaction.run(CYPHER_ADD_ALIASES, {"rows": rows}).consume()
+    return int(summary.counters.relationships_created)
+
+
+def clear_aliases() -> int:
+    """删掉全部别名边，返回删除条数。**只动 `ALIAS_OF`**，实体与 `REL` 一条不碰。
+
+    供"合并错了要退回去"用：别名边是这一层唯一一处"表示两个名字是同一个东西"的
+    断言，清掉它，图就回到合并之前的样子（原始边从来没有被搬动过）。
+    """
+    with _transaction() as transaction:
+        summary = transaction.run(CYPHER_CLEAR_ALIASES).consume()
+    return int(summary.counters.relationships_deleted)
+
+
+def _canonicalize_path(path: GraphPath, alias_map: dict[str, str]) -> GraphPath | None:
+    """把路径里的名字全换成主名；换完出现重复节点就丢掉这条路径。
+
+    合并之后 `甲` 与 `甲'` 是同一个东西，于是 `甲'→乙→甲` 这样一条路径在语义上
+    是一个环；而 `GraphPath` 的契约是简单路径。宁可少返回一条，也不返回一条
+    `nodes` 里有重复的路径——下游会把重复读成"两个不同的东西连着两次"。
+
+    起点也换：调用方拿到的名字一律是主名，做跨材料的名字匹配时不需要再
+    `resolve` 一次。没有任何别名时这个函数根本不会被调用（`neighbors` 里有短路），
+    所以本轮的改动对没合并过的图是零影响。
+    """
+    mapped = [_resolve_in(alias_map, node) for node in path.nodes]
+    if len(set(mapped)) != len(mapped):
+        return None
+    if mapped == path.nodes:
+        return path
+    return GraphPath(nodes=mapped, relations=path.relations, evidence=path.evidence,
+                     directions=path.directions)
+
+
 def _parse_path(record: Any) -> GraphPath | None:
     """把一条 Cypher 路径拆成 `GraphPath`；形状不对就整条丢掉。
 
@@ -833,6 +1119,10 @@ def neighbors(name: str, *, hops: int = 2, limit: int = 50) -> list[GraphPath]:
     重复在这一层合并掉；只差方向的两条**不合并**，它们是"甲依赖乙"与"乙依赖甲"
     两个不同的断言。
 
+    **别名**：起点先 `resolve`，并且从**同一别名组的每个名字**出发（边可能挂在
+    其中任何一个上），返回前把路径里的名字统一换成主名——详见模块 docstring 的
+    「实体消解」。没合并过的图上别名表为空，这条路径与改动前逐字节一致。
+
     库不可用（没配密码 / 连不上 / 超时）时返回 `[]`——查询侧不需要为"图没建好"
     准备第二个分支。
     """
@@ -848,7 +1138,11 @@ def neighbors(name: str, *, hops: int = 2, limit: int = 50) -> list[GraphPath]:
     query = _walk_query(depth)
     try:
         with _transaction(read_only=True) as transaction:
-            records = list(transaction.run(query, {"name": entity, "limit": cap}))
+            # 一次事务里读别名表再游走：别名边可能在两次调用之间被加进来，分两次
+            # 事务会出现"起点组是按旧表算的、路径是按新图走的"这种半数一致。
+            alias_map = _load_alias_map(transaction)
+            starts = _alias_group(alias_map, entity) if alias_map else [entity]
+            records = list(transaction.run(query, {"names": starts, "limit": cap}))
     except (GraphStoreError, OSError) as exc:
         logger.warning("图谱游走不可用：%s", type(exc).__name__)
         return []
@@ -858,6 +1152,10 @@ def neighbors(name: str, *, hops: int = 2, limit: int = 50) -> list[GraphPath]:
         path = _parse_path(record)
         if path is None:
             continue
+        if alias_map:
+            path = _canonicalize_path(path, alias_map)
+            if path is None:
+                continue
         key = _path_key(path)
         if key in seen:
             continue
@@ -867,21 +1165,28 @@ def neighbors(name: str, *, hops: int = 2, limit: int = 50) -> list[GraphPath]:
 
 
 def stats() -> dict:
-    """实体数、边数、孤立实体数。
+    """实体数、边数、孤立实体数、别名边数、被合并的实体数。
 
     孤立实体是**有实体没边**的那些：它单独看没意义，但数量和总数一起看能直接
     回答"这次抽取到底连上了没有"。全是孤立实体，说明关系抽取一路空转，图建了
     等于没建——这个信号比"实体数"本身有用。
 
-    读不到库（没配密码 / 连不上 / 超时）时返回三个 0，与"空图"同形：调用方看到
-    的都是"还没有图"。
+    `aliases` / `merged_entities` 是这一轮加的：前者是 `ALIAS_OF` 的条数，后者是
+    "有别名指向它"的主名个数。两个数一起看才有意义——一组三个名字写两条边，合并
+    的是两个实体；`aliases > 0` 而 `merged_entities == 0` 只可能是库被改坏了。
+
+    读不到库（没配密码 / 连不上 / 超时）时返回全 0，与"空图"同形：调用方看到的
+    都是"还没有图"。
     """
-    zero = {"entities": 0, "edges": 0, "isolated_entities": 0}
+    zero = {"entities": 0, "edges": 0, "isolated_entities": 0,
+            "aliases": 0, "merged_entities": 0}
     try:
         with _transaction(read_only=True) as transaction:
             entities = transaction.run(CYPHER_COUNT_ENTITIES).single()
             edges = transaction.run(CYPHER_COUNT_EDGES).single()
             isolated = transaction.run(CYPHER_COUNT_ISOLATED).single()
+            aliases = transaction.run(CYPHER_COUNT_ALIASES).single()
+            merged = transaction.run(CYPHER_COUNT_MERGED).single()
     except (GraphStoreError, OSError) as exc:
         logger.warning("图谱统计不可用：%s", type(exc).__name__)
         return zero
@@ -889,4 +1194,6 @@ def stats() -> dict:
         "entities": int(entities["n"]) if entities else 0,
         "edges": int(edges["n"]) if edges else 0,
         "isolated_entities": int(isolated["n"]) if isolated else 0,
+        "aliases": int(aliases["n"]) if aliases else 0,
+        "merged_entities": int(merged["n"]) if merged else 0,
     }
