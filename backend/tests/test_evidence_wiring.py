@@ -35,11 +35,13 @@ from app.agent.contracts import (
 )
 from app.agent.service import run
 from app.agent.tools import build_registry
-from app.contracts.source import Source, SourceKind
+from app.contracts.mindmap import MindMapContent, Node
+from app.contracts.source import Source, SourceKind, SourceUsage
 from app.generation.service import SOURCE_MODE_ENV, validate_generated_content
 from app.knowledge.service import (
     PARENT_RETRIEVAL_ENV,
     _PARENT_RETRIEVAL_TRUTHY,
+    _chunk_tree,
     _parent_retrieval_enabled,
     EvidenceHit,
     search_parent,
@@ -230,10 +232,14 @@ def test_rag_hands_the_model_a_citable_leaf_span(monkeypatch):
 def test_citable_hits_omits_span_when_leaf_exceeds_quote_limit():
     """子块超过 300 字时不给 `evidence_*`：给了偏移就只能配一段不符的 quote。
 
-    `LEAF_MAX_CHARS = 320`，比引用字段的 300 上限还大，所以这条边界是真的会碰到
-    的。这时模型退回"只抄 quote 的连续片段、不写偏移"，与父块模式之前一致。
+    这条是**防御性**的，不是正常路径：切块那边已经把 `LEAF_MAX_CHARS` 压到 300
+    且末块合并也不再放宽（`test_leaf_never_exceeds_the_quote_contract`），所以
+    `_chunk_tree` 产不出超过 300 的子块。这里用手工构造的 `EvidenceHit` 守的是
+    另外两件事：参数被改回去，以及库里存着旧参数切出来的块。触发时的行为仍是
+    "宁可没有偏移、也不给一段对不上的 quote"——截断后 `quote != text[start:end]`，
+    逐字校验必挂，那比"没有偏移"更糟。
     """
-    for length, expect in ((300, True), (320, False)):
+    for length, expect in ((300, True), (301, False), (320, False)):
         text = "字" * length
         source = _source(text)
         hit = EvidenceHit(source_id=source.id, start=0, end=length, quote=text,
@@ -241,6 +247,133 @@ def test_citable_hits_omits_span_when_leaf_exceeds_quote_limit():
         entry = agent_tools._citable_hits([hit], [source])[0]
         assert ("evidence_quote" in entry) is expect, length
         assert entry["quote"] == text
+
+
+def test_every_leaf_hit_is_citable_after_the_cap_matches_the_quote_limit():
+    """切块参数与引用上限对齐之后，父块模式下**没有一条命中**是"不可抄"的。
+
+    这是这次改动要堵的那个缝，所以正面钉一次：只要有一条子块超过 `SourceRef.quote`
+    的 300 上限，那条命中就给不出 `evidence_*`，模型退回"只抄 quote、不写偏移"，
+    而 `_evidence_problem` 对没有区间的引用不施加约束——"引的这句在命中的那段里吗"
+    对这批命中整个失效。缝原来只有二十几个字（上限 320，实测最长子块 370），但它
+    正是这条防护要挡的东西。
+
+    用真实材料的真实切块，不手工构造 hit：要证明的是**切块参数与契约对齐**，
+    手工构造只能证明 `_citable_hits` 自己会截。材料连跑 `repeat=1..6` 六档
+    （452–2672 字），覆盖"父块比子块上限短""未切满""已切满"三种形状，实测出
+    66 条命中、最长子块 289 字——正好贴在上限（300）的下方，是这条断言最该压住的
+    那个区间。
+    """
+    broken: list[tuple[int, int]] = []
+    total = 0
+    for repeat in (1, 2, 3, 4, 5, 6):
+        source = _source(_material(repeat))
+        text = source.text or ""
+        tree = _chunk_tree(text)
+        leaves = [node for node in tree if node.level == 1]
+        assert leaves
+        hits = [
+            EvidenceHit(source_id=source.id,
+                        start=tree[node.parent].start, end=tree[node.parent].end,
+                        quote=text[tree[node.parent].start:tree[node.parent].end],
+                        score=0.5, leaf_start=node.start, leaf_end=node.end)
+            for node in leaves
+        ]
+        payload = agent_tools._citable_hits(hits, [source])
+        assert len(payload) == len(hits)
+        for entry in payload:
+            total += 1
+            if "evidence_quote" not in entry:
+                broken.append((repeat, entry["leaf_end"] - entry["leaf_start"]))
+                continue
+            # 给了偏移就必须是一份逐字成立的引文，且不超契约上限
+            assert entry["evidence_quote"] \
+                == text[entry["evidence_start"]:entry["evidence_end"]]
+            assert len(entry["evidence_quote"]) <= QUOTE_LIMIT
+
+    assert total >= 40, f"样本太少（{total} 条命中），这条断言没有说服力"
+    assert broken == [], f"{len(broken)}/{total} 条命中给不出 evidence_*：{broken}"
+
+
+def test_leaf_at_exactly_the_quote_limit_passes_verbatim_verification():
+    """子块恰好 300 字：`quote` 顶到 `SourceRef` 上限，逐字校验仍然通过。
+
+    `_citable_hits` 的判断是 `<=` 而不是 `<`。差一个等号，最长的那批子块会被当成
+    "超限"白丢证据——而它们正是最该给偏移的那批（300 字的上下文里挑错句的空间最大）。
+    """
+    text = "字" * QUOTE_LIMIT
+    source = _source(text)
+    hit = EvidenceHit(source_id=source.id, start=0, end=QUOTE_LIMIT, quote=text,
+                      score=1.0, leaf_start=0, leaf_end=QUOTE_LIMIT)
+    entry = agent_tools._citable_hits([hit], [source])[0]
+    assert entry["evidence_start"] == 0
+    assert entry["evidence_end"] == QUOTE_LIMIT
+    assert len(entry["evidence_quote"]) == QUOTE_LIMIT == len(text)
+
+    # 契约本身也要收下它：`SourceRef.quote` 的 max_length 就是 300
+    ref = {"source_id": source.id, "start": entry["evidence_start"],
+           "end": entry["evidence_end"], "quote": entry["evidence_quote"]}
+    content = MindMapContent(
+        title="t", root=Node(id="r", label="t", children=[
+            Node(id="n", label="恰好到上限", source_refs=[ref])]),
+        source_usage=[SourceUsage(source_id=source.id, kind=source.kind,
+                                  filename=None, char_count=len(text))],
+    )
+    reports = verify_source_refs(
+        content, [source], remove_invalid=True,
+        evidence=[EvidenceSpan(source.id, 0, QUOTE_LIMIT, 0, QUOTE_LIMIT)])
+    codes = [item.code for item in reports
+             if item.code not in ("UNSOURCED_NODE", "SOURCE_PAGE_UNVERIFIED")]
+    assert codes == [], codes
+    assert content.root.children[0].source_refs[0].quote == text
+
+
+def test_verify_sources_matches_the_verifier_on_source_status():
+    """`_verify_sources` 与 `_reference_problem` 的来源判据必须一致。
+
+    校验器拒绝 `status != "parsed"` 的来源（判 `SOURCE_TEXT_UNAVAILABLE`），所以
+    "该认的来源"里也不能收它们。两者口径不同时出现的失败是**静默的**：一份非
+    `parsed` 的来源被收进来，模型照着它的正文写引用、逐字全对，收尾时却全被判
+    `SOURCE_TEXT_UNAVAILABLE` 剔除——用户看不出为什么，日志里也没有一条。
+
+    **这条不是"将来引入 `partial` 才会触发"**：`Source.status` 目前是
+    `Literal["pending", "parsed", "failed"]`，没有 `partial`，而 `pending` 正是
+    **默认值**（`status: Literal[...] = "pending"`）。前端上传时省略 `status`
+    字段，拿到就是一份带正文的 `pending` 来源。`failed` 同理（重解析失败但正文
+    还在）。所以这条现在就有真实触发面。
+
+    将来真加了 `partial`，这个判据（`!= "parsed"`）自动覆盖它，不用再改一次——
+    这正是"两边都用同一个条件"而不是"两边各写一份白名单"的理由。
+    """
+    parsed = _source("正常材料的一段正文。")
+    pending = Source(kind=SourceKind.text, status="pending",
+                     text="上传时省略了 status：默认值，正文齐全。")
+    failed = Source(kind=SourceKind.text, status="failed",
+                    text="重解析失败，但上一轮成功的正文还在。")
+    blank = _source("   \n  ")
+    ctx = _ctx([parsed, pending, failed, blank])
+
+    keep = agent_tools._verify_sources(ctx)
+
+    assert keep == [parsed]
+
+
+def test_verify_sources_drops_non_parsed_library_sources_too():
+    """库来源同样受这条判据管：口径对齐不该只对齐请求内那一半。
+
+    库来源比请求内来源更容易撞上这条——库里存的是历次上传的 PDF 与扫描件，
+    `pending` / `failed` 的残留只会在那边积累。
+    """
+    request_source = _source("请求内材料。")
+    parsed = _source("库里的正常材料。")
+    pending = Source(kind=SourceKind.text, status="pending", text="库里的待解析材料。")
+    ctx = _ctx([request_source])
+    ctx.record_library_sources([parsed, pending])
+
+    keep = agent_tools._verify_sources(ctx)
+
+    # 顺序固定"请求的在前、库的在后"
+    assert [source.id for source in keep] == [request_source.id, parsed.id]
 
 
 # ---------------------------------------------------------------- 二、校验接线

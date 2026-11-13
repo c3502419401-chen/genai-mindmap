@@ -41,6 +41,7 @@ import pytest
 from app.agent import tools as agent_tools
 from app.agent.contracts import (
     MAX_LIBRARY_SOURCES,
+    MAX_SOURCES,
     AgentRunRequest,
     Completion,
     RunBudget,
@@ -416,6 +417,40 @@ def test_library_source_cache_is_capped_and_keeps_request_sources_out():
     ctx.record_library_sources([stolen[-1], request_source])
     assert len(ctx.library_sources) == MAX_LIBRARY_SOURCES
     assert request_source.id not in ctx.library_sources
+
+
+def test_thirty_library_sources_all_survive_the_cache():
+    """30 份库来源全部留在缓存里，且 `_verify_sources` 都能查到正文。
+
+    这是上限从 20 提到 50 的直接理由。20 时这个场景会静默失败：一次检索命中 30 份
+    库来源，FIFO 把最旧的 10 份挤出去，那 10 份上的引用随后被判
+    `SOURCE_TEXT_UNAVAILABLE` 并在 `remove_invalid=True` 那一步剔除——检索成功、
+    引用写对，用户看到的却是"这一支没有证据"，日志里也没有一条说清为什么。
+
+    30 不是随便挑的数：`LIBRARY_PICK=5` 是单次检索最多用几份库来源，问法换几轮
+    （或者一次开六支分片）就到这个量级；它同时落在"20 会丢、50 不该丢"的区间里。
+    """
+    stored = [_stored(f"库来源 {index} 的正文：" + "字" * 30) for index in range(30)]
+    ctx = _ctx([])
+
+    ctx.record_library_sources(stored)
+
+    assert len(ctx.library_sources) == 30
+    keep = agent_tools._verify_sources(ctx)
+    assert [source.id for source in keep] == [source.id for source in stored]
+    # 正文真的在：只留 id 是不够的，校验要按它逐字比对
+    assert all(source.text for source in keep)
+
+
+def test_library_cache_is_not_tighter_than_the_request_limit():
+    """库缓存上限不得小于单次请求的材料上限。
+
+    两者在校验里是同一种东西——`tools._verify_sources` 把 `request.sources` 与
+    `library_sources` 拼成一个列表交给 `verify_source_refs`。库这边更紧，就会在
+    "请求收得下、库收不下"的地方制造静默剔除。这条把"跟着改"变成红，而不是留给
+    下一次靠人记得。
+    """
+    assert MAX_LIBRARY_SOURCES >= MAX_SOURCES
 
 
 # ---------------------------------------------------------------- 6 端到端

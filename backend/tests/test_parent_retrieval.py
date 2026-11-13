@@ -28,7 +28,7 @@ from pathlib import Path
 
 import pytest
 
-from app.contracts.source import Source, SourceKind
+from app.contracts.source import Source, SourceKind, SourceRef
 from app.knowledge import service
 from app.knowledge.service import (
     CHUNK_MAX_CHARS,
@@ -241,12 +241,17 @@ def test_tree_empty_and_short_text():
 
 
 def test_leaf_lengths_stay_within_bounds():
-    """子块长度落在 [LEAF_MIN, LEAF_MAX]，三类例外各有明确来源。
+    """子块长度 **≤ `LEAF_MAX_CHARS`**，且除两类例外外不短于 MIN。
 
     例外清单（写成断言而不是注释，改参数时会红）：
       - **父块本身不足上限**：子块就是父块，长度跟着父块走，可以短于 MIN；
-      - **末块合并后超上限**：`_merge_short` 宁可末块多出一点，也不留碎块；
+      - **末块短于 MIN**：末块上限不再放宽（`last_ceiling=LEAF_MAX_CHARS`），因为
+        子块上限就是引用字段的字数契约——宁可留一个碎块，也不要让一条命中交不出
+        `evidence_*`（见 `LEAF_MAX_CHARS` 那段注释）；
       - **无标点硬切**：整窗没有安全切点，切点被 `_hard_cut` 顶到上限。
+
+    `≤ LEAF_MAX_CHARS` 这条**没有例外**：它是引用证据链的前提，所以单列一条
+    `test_leaf_never_exceeds_the_quote_contract` 拿契约本身当锚点再钉一次。
     """
     assert LEAF_MIN_CHARS < LEAF_TARGET_CHARS < LEAF_MAX_CHARS
     assert LEAF_MAX_CHARS < CHUNK_MAX_CHARS, "子块必须明显短于父块，否则两级没有意义"
@@ -268,10 +273,7 @@ def test_leaf_lengths_stay_within_bounds():
                 continue
             for position, node in enumerate(siblings):
                 length = node.end - node.start
-                assert length <= LEAF_MAX_CHARS + LEAF_MIN_CHARS, "末块合并的上限"
-                if length > LEAF_MAX_CHARS:
-                    # 例外二：只有末块可以超上限（并进了前一块）
-                    assert position == len(siblings) - 1
+                assert length <= LEAF_MAX_CHARS, "子块绝不许超过引用字段的上限"
                 if position < len(siblings) - 1:
                     # 非末块一律 >= MIN：贪心切点的下限就是 LEAF_MIN
                     assert length >= LEAF_MIN_CHARS
@@ -282,16 +284,59 @@ def test_leaf_lengths_stay_within_bounds():
                 assert right.start <= left.end
 
 
+def _quote_contract_limit() -> int:
+    """`SourceRef.quote` 的真实字数上限——从契约字段本身取，不读常量、也不照抄 300。
+
+    pydantic v2 把 `max_length` 放在 `FieldInfo.metadata` 的 `MaxLen` 里，所以不按
+    属性名写死取法：只要 metadata 里有一个对象带 `max_length`，就是它。
+    """
+    field = SourceRef.model_fields["quote"]
+    limits = [item.max_length for item in field.metadata
+              if hasattr(item, "max_length") and item.max_length is not None]
+    assert len(limits) == 1, f"`SourceRef.quote` 的长度约束不是唯一一条：{field.metadata}"
+    return int(limits[0])
+
+
+def test_leaf_never_exceeds_the_quote_contract():
+    """子块上限不得超过 `SourceRef.quote` 的契约上限——引用证据链的前提。
+
+    为什么单独一条、且拿**契约字段自己的 max_length** 当锚点：`tools._citable_hits`
+    把命中的子块整段当 `evidence_quote` 回给模型，而 `SourceRef.quote` 有 300 字
+    上限。子块一超，那条命中就只能不给 `evidence_*`（截断后 quote 与偏移对不上，
+    逐字校验必挂），模型随即退回"只抄 quote、不写偏移"——而
+    `source_refs._evidence_problem` 对没有区间的引用不施加约束，于是"引的这句在
+    命中的那段里吗"对这批命中整个失效。缝原来只有二十几个字（上限 320，实测最长
+    子块 370：末块合并的上限曾是 `MAX + MIN`），但它正是这条防护要挡的那件事。
+
+    用契约而不是 `LEAF_MAX_CHARS` 做锚点，是为了让"契约收紧、这边没跟"也红：
+    拿常量跟自己比是自证，抓不到两处一起走偏。
+    """
+    quote_limit = _quote_contract_limit()
+    assert LEAF_MAX_CHARS <= quote_limit, (
+        f"子块上限 {LEAF_MAX_CHARS} 超过引用字段的 {quote_limit}："
+        "超过它的子块会拿不到 evidence_*")
+
+    for text in (_material(), _needle_material(), "字" * 900, "字" * 3200):
+        leaves = _leaves(_chunk_tree(text))
+        assert leaves
+        for node in leaves:
+            length = node.end - node.start
+            assert length <= quote_limit, f"子块 {length} 字超过引用上限 {quote_limit}"
+
+
 def test_leaf_hard_cut_without_punctuation():
-    """3200 字无标点：只走硬切，切点一律顶到上限，末块允许被合并。"""
+    """3200 字无标点：只走硬切，切点一律顶到上限；末块**可以短**，但绝不超限。"""
     text = "字" * 3200
     leaves = _leaves(_chunk_tree(text))
     assert leaves
     lengths = [node.end - node.start for node in leaves]
     # 硬切没有安全点可选，`_hard_cut` 直接返回 high = pos + LEAF_MAX
     assert lengths[0] == LEAF_MAX_CHARS
+    # 末块不再放宽到 `MAX + MIN`：子块上限就是 `SourceRef.quote` 的 300 字契约，
+    # 超一个字那条命中就交不出 `evidence_*`。所以末块会被留在 MIN 以下（这里切出
+    # 末尾一块 100 字），这是**有意的**代价，不是切分失败。
     for length in lengths:
-        assert LEAF_MAX_CHARS <= length <= LEAF_MAX_CHARS + LEAF_MIN_CHARS
+        assert length <= LEAF_MAX_CHARS, "子块绝不许超过引用字段的上限"
     covered = bytearray(len(text))
     for node in leaves:
         covered[node.start:node.end] = b"\x01" * (node.end - node.start)

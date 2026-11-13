@@ -472,6 +472,7 @@ def _merge_short(
     spans: list[tuple[int, int]], *,
     minimum: int = CHUNK_MIN_CHARS,
     ceiling: int = CHUNK_MAX_CHARS,
+    last_ceiling: int | None = None,
 ) -> list[tuple[int, int]]:
     """自左向右把过短的块并进后一块；末块过短则并进前一块。
 
@@ -479,11 +480,19 @@ def _merge_short(
     这条在当前参数下基本是防御性的。真正会触发的是**末块**：切块循环的前提是
     "剩余 > MAX"，于是 `"字"*701` 会切出 `(0,700) + (700,701)`，末块只剩一个字。
     那种块占掉一个 top_k 位置却什么信息都没有，所以末块合并允许结果略超 MAX
-    （上限放宽到 MAX+MIN）：宁可最后一块多出几百字符，也不要留一个碎块。
+    （上限默认放宽到 MAX+MIN）：宁可最后一块多出几百字符，也不要留一个碎块。
 
     `minimum` / `ceiling` 参数化是为了子块复用同一套合并规则（见 `_leaf_spans`）：
     合并的**判据**（短了就并、并完不许超上限）与父块完全一样，只是阈值不同。
+
+    `last_ceiling` 单独开一个口子，是因为"末块可以超上限"这条放宽**不能无脑复用**：
+    子块的上限是引用字段的字数契约（见 `LEAF_MAX_CHARS`），超一个字那条命中就
+    交不出 `evidence_*`。子块因此传 `last_ceiling=LEAF_MAX_CHARS`，放弃"末块多出
+    一点"，宁愿留一个过短的末块——碎块的代价是匹配区分度低，超限的代价是整条
+    证据区间约束对这批命中失效，两者的方向完全不同。缺省 `None` 时仍按
+    `ceiling + minimum` 放宽，父块行为逐字节不变。
     """
+    limit = ceiling + minimum if last_ceiling is None else last_ceiling
     merged: list[list[int]] = []
     for start, end in spans:
         if (
@@ -495,7 +504,7 @@ def _merge_short(
             continue
         merged.append([start, end])
     if len(merged) > 1 and _too_short(merged[-1], minimum):
-        if merged[-1][1] - merged[-2][0] <= ceiling + minimum:
+        if merged[-1][1] - merged[-2][0] <= limit:
             merged[-2][1] = merged[-1][1]
             merged.pop()
     return [(span[0], span[1]) for span in merged]
@@ -546,8 +555,21 @@ def _chunks(text: str) -> Iterator[tuple[int, int, str]]:
 # 测试的基础，它的块边界同时是父块的边界——两套边界一旦不同，"父块"就会变成
 # 一个与 `search_sources` 返回的块无法对齐的概念，将来接落库时要多一份映射。
 LEAF_TARGET_CHARS = 200    # 子块目标长度：一句话群，足够判定"讲的是这件事"
-LEAF_MAX_CHARS = 320       # 子块硬上限：再长就会把两三个话题混进同一次匹配
+LEAF_MAX_CHARS = 300       # 子块硬上限：不得超过 `SourceRef.quote` 的 300（理由见下）
 LEAF_MIN_CHARS = 100       # 低于它向后合并：一百字以下的子块匹配时区分度不足
+
+# `LEAF_MAX_CHARS` 取 300 不只是"再长会混进两三个话题"：它是**引用证据链**的一段。
+# `tools._citable_hits` 把命中的子块整段当 `evidence_quote` 回给模型，而
+# `SourceRef.quote` 的上限就是 300。子块超过它时那条命中只能不给 `evidence_*`
+# （截断后的 quote 与偏移对不上，逐字校验必挂），模型随即退回"只抄 quote、不写
+# 偏移"——而 `source_refs._evidence_problem` 对没有区间的引用不施加约束，于是
+# "引的这句在命中的那段里吗"这条判定对这批命中整个失效。模型可以从父块里挑任意
+# 一句看着相关的话，逐字校验照样通过。缝原来只有二十几个字，但它正是这条防护要
+# 挡的那件事，所以子块上限与引用上限取同一个数。
+#
+# 压到 300 之后，**末块合并也必须跟着压**（见 `_leaf_spans` 的 `last_ceiling`）：
+# `_merge_short` 默认把末块上限放宽到 `ceiling + minimum`（父块是 700+150），子块
+# 照抄这条规则会让末块并到 400 字——缝不但没堵上，还比原来更宽。
 
 
 @dataclass(frozen=True)
@@ -576,9 +598,13 @@ def _leaf_spans(text: str, start: int, end: int, mask: bytearray) -> list[tuple[
     200 上下，100 的重叠约占一半，看起来偏大，但它是**句子级**的重叠——吸附不
     到句首时直接不重叠，所以真实语料里远不是每一对都重叠一半。
 
-    与父块唯一的机制差别是长度参数；合并规则也是同一套（`_merge_short`），只是
-    末块的上限放宽到 `LEAF_MAX + LEAF_MIN`——理由与父块一致：宁可末块多出一点，
-    也不要留一个几十字的碎块去占一个匹配位。
+    与父块唯一的机制差别是长度参数；合并规则也是同一套（`_merge_short`），但
+    **末块上限不放宽**：`last_ceiling=LEAF_MAX_CHARS`。父块那边"宁可末块多出几百
+    字符，也不留一个碎块"是对的（多出来的是可读的上下文），子块这边不成立——
+    子块长度是引用字段的字数契约（见 `LEAF_MAX_CHARS` 那段注释），超一个字那条
+    命中就交不出 `evidence_*`，模型退回无偏移引用，证据区间约束对整批命中失效。
+    代价是偶尔留一个 60–90 字的末块：它照样能被 BM25/向量匹配到，只是区分度低
+    一点；而超限的代价是一条防护静默失效。这个方向的取舍没有第二种选择。
     """
     if end - start <= LEAF_MAX_CHARS:
         # 父块本身还没到子块上限：它就是自己的子块。此时长度可能低于 LEAF_MIN
@@ -601,7 +627,10 @@ def _leaf_spans(text: str, start: int, end: int, mask: bytearray) -> list[tuple[
         # 这条不变量兜底：真进了死循环，代价是整次请求挂住，而不是慢一点。
         position = overlap if overlap > position else cut
     spans.append((position, end))
-    return _merge_short(spans, minimum=LEAF_MIN_CHARS, ceiling=LEAF_MAX_CHARS)
+    return _merge_short(
+        spans, minimum=LEAF_MIN_CHARS, ceiling=LEAF_MAX_CHARS,
+        last_ceiling=LEAF_MAX_CHARS,
+    )
 
 
 def _chunk_tree(text: str) -> list[ChunkSpan]:

@@ -402,8 +402,11 @@ def run_group(
 
     from app.knowledge.service import search_parent as real_search_parent
 
-    def measuring_search(sources, query, top_k=5, *, filters=None):
-        hits = real_search_parent(sources, query, top_k, filters=filters)
+    def measuring_search(sources, query, top_k=5, *, filters=None, library=False):
+        # `library` 是 `_rag` 后加的一个 kwarg：本脚本只量"请求内材料"的覆盖，
+        # 保持默认关（不碰持久化索引），但签名必须收下它，否则 `_rag` 调用即 TypeError。
+        hits = real_search_parent(sources, query, top_k, filters=filters,
+                                  library=library)
         probes.searches.append((query, top_k))
         probes.search_hits.append((query, hits))
         # B 组：整树生成要"记得"上一轮检索看到了什么

@@ -2770,10 +2770,18 @@ _EVIDENCE_QUOTE_MAX_CHARS = 300
 def _citable_hits(hits: list[EvidenceHit], sources: list[Source]) -> list[dict[str, Any]]:
     """把命中翻成回给模型的结构：单级模式下与原来逐字段相同，父块模式多一组证据。
 
-    子块长度理论上可以到 `LEAF_MAX_CHARS = 320`，超过 300 时**不给** `evidence_*`：
-    给了偏移就只能给一段与其不符的 quote（截断后 `quote != text[start:end]`，
-    逐字校验必挂），那比"没有偏移"更糟。这时模型退回"只抄 quote 的连续片段、
-    不写偏移"，与父块模式之前的行为一致。
+    子块现在**恒不超过** `LEAF_MAX_CHARS = 300`（`knowledge.service` 把它压到与
+    这里同一口径，末块合并也一样压），所以在父块模式下**每一条带叶子区间的命中
+    都会给出** `evidence_*`。这条不变量是引用证据链的前提，不是巧合：一旦某个
+    子块超过 300，那条命中就只能不给 `evidence_*`（截断后的 quote 与偏移对不上，
+    逐字校验必挂），模型随即退回"只抄 quote、不写偏移"——而
+    `source_refs._evidence_problem` 对没有区间的引用不施加约束，于是"引的这句在
+    命中的那段里吗"对这批命中整个失效。缝原来只有二十几个字，但那正是这条防护
+    要挡的那件事。
+
+    下面的 `<= _EVIDENCE_QUOTE_MAX_CHARS` 判断因此是**防御性**的：它守的是
+    "参数被改回去"和"外部构造的 `EvidenceHit`"（比如库里存过旧参数切出的块），
+    不是正常路径。真触发时行为仍然是"宁可没有偏移、也不给一段对不上的 quote"。
 
     `sources` 必须包含**库里来的那些来源**（`_rag` 把 `ctx.library_sources` 拼进来
     再调这里）。库命中的 `source_id` 是持久 id，只传 `request.sources` 时
@@ -2816,16 +2824,28 @@ def _verify_sources(ctx: RunContext) -> list[Source]:
     语义。"能查到 → 就点得到"这条老规则也没有被打破——库来源是持久 id，
     `library.load()` 一定回查得到，这正是允许它进 `by_id` 的前提。
 
-    **没有正文的来源一律剔除**（空白 text）。这不是洁癖：`validate_generated_content`
-    会用这个列表重建 `source_usage`，而契约要求 `char_count >= 1`——把一份还没
-    解析成功的空来源带进去，整次生成会被判 `invalid_tree`，用户只是多勾了一个
-    空文件却得到"模型返回的导图不合法"。`_generate` 里本来就有同一道过滤（只喂
-    真有正文的来源），两处共用这一个函数之后，口径不会再分叉。
+    **两处口径必须与校验器逐条一致，否则会出现"相机收进来、校验又拒绝"的静默
+    剔除**：这里的判据是 `_reference_problem` 的
+    `source is None or source.status != "parsed" or not text.strip()`
+    去掉其中"来源本身不存在"那一半（查不到就不在这里），即
+    `status == "parsed"` **且** 正文非空白。少一个条件就是一类静默失败：
+    今天 `parse_bytes` 的返回一律 `status="parsed"`，所以漏掉 `status` 不会触发；
+    但真引入 `status="partial"`（比如 PDF 部分页失败但有正文）那天，这个函数会
+    把一份校验器拒绝的来源收进来，用户看到引用无缘无故消失，却找不到任何一处
+    说清原因。半份材料不该被当成"已解析"，这条判断的权威在校验器那边。
+
+    正文非空白这条也不是洁癖：`validate_generated_content` 会用这个列表重建
+    `source_usage`，而契约要求 `char_count >= 1`——把一份还没解析成功的空来源
+    带进去，整次生成会被判 `invalid_tree`，用户只是多勾了一个空文件却得到
+    "模型返回的导图不合法"。`_generate` 里本来就有同一道过滤（只喂真有正文的
+    来源），两处共用这一个函数之后，口径不会再分叉。
     """
     return [
         source for source in
         (*ctx.request.sources, *ctx.library_sources.values())
-        if (source.text or "").strip()
+        # `status` 那一条与 `_reference_problem` 对齐，别按"反正现在都是 parsed"
+        # 省略掉：口径分叉的代价是一类没有日志的静默剔除（见 docstring）。
+        if source.status == "parsed" and (source.text or "").strip()
     ]
 
 

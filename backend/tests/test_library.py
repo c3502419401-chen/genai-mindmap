@@ -292,19 +292,44 @@ def test_library_false_matches_baseline_search_sources(tmp_path):
 
 
 def test_library_false_matches_baseline_search_parent(tmp_path, monkeypatch):
-    """父块模式打开时同样逐字段相同：粒度重构没有动召回。"""
+    """父块模式打开时，**父块这一层**与基线逐字段相同：粒度重构没有动召回。
+
+    比的是"返回了哪些父块、按什么顺序"——`source_id` / `start` / `end` / `quote`
+    加列表顺序。刻意不比 `score` 与 `leaf_*`：
+
+      - `leaf_*` 就是子块本身，`score` 则是**子块**的 BM25 分（父块模式的分数来自
+        子块匹配）。两者都随 `LEAF_MAX_CHARS` 走，而那个常量由 `SourceRef.quote`
+        的 300 字契约决定（子块超过它，那条命中就交不出 `evidence_*`），属于引用
+        链的参数，不是召回逻辑。
+      - 更实际的一点：BM25 的 idf 与平均块长在整个块集合上算，切块参数一变、块数
+        一变，**同一段文字的分数必然跟着变**。把 score 钉进基线等于要求"切块参数
+        永不动"，那不是这条用例要守的东西。
+
+    父块边界由 `_chunk_spans` 与 `CHUNK_*` 决定，这一轮一个都没改——"父块层逐字段
+    不变"才是可断言、且真正有意义的那条不变量，它正是"改子块粒度不会挪动父块"
+    这件事的证据。
+    """
     baseline = _load_baseline_module(tmp_path)
     monkeypatch.setenv("MINDMAP_PARENT_RETRIEVAL", "1")
     sources = _corpus()
 
+    def parent_layer(hits):
+        return [(hit.source_id, hit.start, hit.end, hit.quote) for hit in hits]
+
     compared = 0
     for query in ("预算审批", "谁能批钱"):
         for top_k in (2, 5):
-            expected = [hit.model_dump() for hit in
-                        baseline.search_parent(sources, query, top_k)]
-            current = [hit.model_dump() for hit in
-                       search_parent(sources, query, top_k, library=False)]
-            assert current == expected, f"search_parent 变了：{query} / {top_k}"
+            expected = baseline.search_parent(sources, query, top_k)
+            current = search_parent(sources, query, top_k, library=False)
+            assert parent_layer(current) == parent_layer(expected), \
+                f"search_parent 的父块层变了：{query} / {top_k}"
+            # 子块那两级仍然必须是父块里的一段：改了切块参数也不许它跑出父块。
+            for hit in current:
+                assert hit.leaf_start is not None and hit.leaf_end is not None
+                assert hit.start <= hit.leaf_start < hit.leaf_end <= hit.end
+                # `quote` 是父块正文，按 offset 切出来的子块必须非空
+                leaf = hit.quote[hit.leaf_start - hit.start:hit.leaf_end - hit.start]
+                assert leaf.strip(), "子块区间落在父块正文里，切出来不能是空白"
             compared += 1
     assert compared == 4
 
