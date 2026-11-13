@@ -69,6 +69,25 @@
 两者一起看才分得出"命中一段就收工"（recall 高、coverage 低）与"真把整章召回"
 （两者都高）。只看 recall，会把"父块够大、随便沾一点就算命中"的退化当成进步。
 
+## 两套测试集：`--suite title|manual|both`
+
+`title` 套就是上面那套（标题当 query）。它有一个结构性偏差：标题是章节的第一行，
+query 的每个 bigram 都在目标区间里，于是 `R@3/5/10` 全饱和、三列判别力为零。
+
+`manual` 套是 `scripts/eval_cases_manual.py` 里 28 条**手写问法**（人读材料之后写的
+真实提问，按近/中/远三档与章/段/跨章三种粒度标注）。它量的是"真实提问下检索还剩
+多少"，数字比 `title` 套低 20pp 上下——那是难度差，不是检索退步。
+
+**两套分别算指标，绝不混在一起平均**：混算出来的均值既不是"标题查询"的分数，也不是
+"真实提问"的分数，两套 20pp 的难度差会被一个看似合理的中间数掩掉。报告里它们是
+`suites.title` / `suites.manual` 两个并列对象。
+
+`manual` 套的 `source_hash` 对着 `MANUAL_SOURCE_HASHES` 校验：材料正文一变，
+**直接报错退出**，不跳过。跳过会让"标注失效"伪装成"指标掉了 10pp"。
+
+`--check` 只比 `title` 套：`manual` 的绝对分更低、方差更大（28 条里一条翻面就是
+3.6pp），当 CI 门槛会天天误报。它的数字进文档、由人看趋势。
+
 ## 多配置对照
 
 `--source-mode` / `--hybrid` / `--parent` / `--library` 各接受 `0,1` 或 `both`，
@@ -83,10 +102,11 @@
 ## 用法
 
     cd backend
-    python scripts/evaluate_retrieval.py                     # 控制台表格
+    python scripts/evaluate_retrieval.py                     # 两套并列（默认 --suite both）
+    python scripts/evaluate_retrieval.py --suite manual      # 只看手写那套
     python scripts/evaluate_retrieval.py --json out.json     # 报告落盘
     python scripts/evaluate_retrieval.py --markdown -        # 贴进 docs 的表 + 基线块
-    python scripts/evaluate_retrieval.py --check             # 与基线比，掉超 2pp 退出码 1
+    python scripts/evaluate_retrieval.py --check             # 与基线比 title 套，掉超 2pp 退出码 1
     python scripts/evaluate_retrieval.py --ladder            # 量化"标题当 query"的偏差
 
 `--check` 读 `docs/RETRIEVAL-EVAL.md` 里**最后一段** ```json 围栏（`--markdown` 产出
@@ -107,15 +127,21 @@ import tempfile
 import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 BACKEND = Path(__file__).resolve().parents[1]
 REPO = BACKEND.parent
+SCRIPTS = Path(__file__).resolve().parent
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
+# `scripts/` 不是包（没有 `__init__.py`），而 `eval_cases_manual` 就躺在旁边。把目录
+# 本身放上 sys.path 是最短的路：测试按文件路径加载本模块时也照样能 import 到它。
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
 
+import eval_cases_manual as manual_cases  # noqa: E402
 from app.contracts.source import Source, SourceKind  # noqa: E402
 from app.ingestion.service import parse_bytes, parse_text  # noqa: E402
 from app.knowledge import library as knowledge_library  # noqa: E402
@@ -172,7 +198,11 @@ CHECK_TOLERANCE_PP = 2.0
 """`--check` 的容差：绝对百分点。掉超过它算回归（不接 CI，手动跑）。"""
 
 METRIC_NAMES = ("recall", "mrr", "ndcg", "coverage")
-REPORT_SCHEMA = "retrieval-eval/v1"
+REPORT_SCHEMA = "retrieval-eval/v2"
+"""v2：外层多了 `suites`（两套并列）。v1 是单套报告，`baseline_from_markdown` 仍认。"""
+
+SUITE_NAMES = ("title", "manual")
+"""两套的名字与固定顺序。顺序进报告与控制台：先回归那套，再看真实那套。"""
 
 DEFAULT_BASELINE = REPO / "docs" / "RETRIEVAL-EVAL.md"
 
@@ -239,11 +269,17 @@ class Config:
 
 @dataclass(frozen=True)
 class Dataset:
-    """测试集：case 列表 + 材料清单 + 每份材料的结构统计（都进报告）。"""
+    """测试集：case 列表 + 材料清单 + 每份材料的结构统计（都进报告）。
+
+    `suite` 标明这套 case 是怎么来的（`title` / `manual`），`annotations` 放手写套
+    自己的元数据（词面重合统计）：`title` 套是结构派生的，没有可注明的东西。
+    """
 
     cases: list[EvalCase]
     materials: list[Material]
     stats: dict[str, dict]
+    suite: str = "title"
+    annotations: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------- 区间运算
@@ -367,6 +403,173 @@ def build_dataset(
             "cases": len(picked),
         }
     return Dataset(cases=cases, materials=list(materials), stats=stats)
+
+
+# ---------------------------------------------------------------- 手写测试集装载
+
+
+def _manual_spans(case, material: Material, entries) -> list[tuple[int, int]]:
+    """把一条手写 case 的章节/锚点解析成 `relevant` 区间（已合并）。
+
+    任何一步对不上都**抛 `SystemExit`**，不降级、不跳过：手写标注与材料是一对一绑死的，
+    对不上就说明标注过期了，此时唯一正确的动作是让人回去重标。
+    """
+    text = material.text
+    if case.distance not in manual_cases.DISTANCES:
+        raise SystemExit(f"手写用例的距离档不认识：{case.distance}（{case.query}）")
+    if case.granularity not in manual_cases.GRANULARITIES:
+        raise SystemExit(f"手写用例的粒度不认识：{case.granularity}（{case.query}）")
+    if case.granularity == "passage" and not case.focus:
+        raise SystemExit(f"passage 粒度必须给 focus 锚点：{case.query}")
+    if case.granularity == "chapter" and case.focus:
+        raise SystemExit(f"chapter 粒度不该有 focus：{case.query}")
+    if case.granularity == "cross" and len(case.sections) < 2:
+        raise SystemExit(f"cross 粒度至少要两章：{case.query}")
+
+    spans: list[tuple[int, int]] = []
+    for prefix in case.sections:
+        matches = [entry for entry in entries if entry.title.startswith(prefix)]
+        if len(matches) != 1:
+            raise SystemExit(
+                f"手写用例的章节前缀命中 {len(matches)} 个（要恰好 1 个）："
+                f"{case.material} /「{prefix}」\n  用例：{case.query}")
+        entry = matches[0]
+        spans.append((entry.start, min(entry.start + entry.coverage, len(text))))
+
+    if case.focus:
+        found = text.count(case.focus)
+        if found != 1:
+            raise SystemExit(
+                f"手写用例的锚点命中 {found} 次（要恰好 1 次）："
+                f"{case.material} /「{case.focus}」\n  用例：{case.query}")
+        start = text.index(case.focus)
+        owner = next(((low, high) for low, high in spans if low <= start < high), None)
+        if owner is None:
+            raise SystemExit(
+                f"手写用例的锚点不在目标章节内：{case.material} /「{case.focus}」"
+                f"\n  用例：{case.query}")
+        end = start + manual_cases.FOCUS_CHARS
+        if end > owner[1]:
+            raise SystemExit(
+                f"手写用例的锚点离章末太近（{manual_cases.FOCUS_CHARS} 字的标注段会越界）："
+                f"{case.material} /「{case.focus}」\n  用例：{case.query}")
+        spans = [(start, end)]
+    return _merge(spans)
+
+
+def manual_materials_present(materials: Sequence[Material]) -> bool:
+    """本次材料集里有没有手写套需要的那四份 md。
+
+    与"hash 对不对"是两件事：材料**不在**集里说明这次是显式换了材料（`--material`），
+    manual 套无从评；材料**在**但正文变了，说明标注过期了——后者必须报错，前者可以
+    降级成只跑 title（见 `main`）。
+    """
+    present = {material.ref for material in materials}
+    return all(ref in present for ref in manual_cases.MANUAL_SOURCE_HASHES)
+
+
+def build_manual_dataset(materials: Sequence[Material]) -> Dataset:
+    """装载 `eval_cases_manual.py` 那 28 条手写 case。
+
+    三道校验都在最前面做完，任何一道不过就整轮退出：
+
+    1. 四份材料都在本次材料集里（`--material` 换掉材料时，手写套无从标注）；
+    2. 每份材料的 `content_hash` 与 `MANUAL_SOURCE_HASHES` 一致——**材料正文一变就
+       报错**。跳过会让"标注失效"看起来像"检索掉了 10pp"，那是两种完全不同的结论；
+    3. 每条 case 的章节前缀唯一、锚点唯一且落在章节内（`_manual_spans`）。
+
+    顺带算出每条 query 对**目标区间**的词面重合（`overlap_ratio`），进报告：它是这套
+    case 的"离原话多远"的刻度，也是后人往里加 case 时的护栏。
+    """
+    by_ref = {material.ref: material for material in materials}
+    missing = [ref for ref in manual_cases.MANUAL_SOURCE_HASHES if ref not in by_ref]
+    if missing:
+        raise SystemExit(
+            "manual 套需要的材料不在本次材料集里：\n  "
+            + "\n  ".join(missing)
+            + "\n手写 case 只对这四份 md 标注，换材料请先补标注。")
+
+    drifted = [
+        (ref, expected, by_ref[ref].content_hash)
+        for ref, expected in manual_cases.MANUAL_SOURCE_HASHES.items()
+        if by_ref[ref].content_hash != expected
+    ]
+    if drifted:
+        detail = "\n  ".join(
+            f"{ref}\n    登记 {expected[:16]}…  实际 {actual[:16]}…"
+            for ref, expected, actual in drifted)
+        raise SystemExit(
+            "材料正文变了，manual 套的标注已失效（不跳过，直接报错）：\n  "
+            + detail
+            + "\n请重读材料、复核 relevant 区间与问法，再把新指纹写回 "
+              "scripts/eval_cases_manual.py 的 MANUAL_SOURCE_HASHES。")
+
+    entries_by_ref = {
+        ref: heading_outline([material.source], max_items=10 ** 6)
+        for ref, material in by_ref.items()
+    }
+    cases: list[EvalCase] = []
+    overlaps: list[float] = []
+    per_ref: dict[str, list[float]] = {ref: [] for ref in manual_cases.MANUAL_SOURCE_HASHES}
+    for case in manual_cases.CASES:
+        material = by_ref[case.material]
+        relevant = _manual_spans(case, material, entries_by_ref[case.material])
+        ratio = manual_cases.overlap_ratio(
+            case.query, "".join(material.text[start:end] for start, end in relevant))
+        per_ref[case.material].append(ratio)
+        overlaps.append(ratio)
+        cases.append(EvalCase(query=case.query, source_hash=material.content_hash,
+                              relevant=relevant))
+
+    stats: dict[str, dict] = {}
+    for ref, material in by_ref.items():
+        entries = entries_by_ref[ref]
+        owned = len({case.sections[0] for case in manual_cases.CASES if case.material == ref})
+        stats[ref] = {
+            "ref": ref,
+            "content_hash": material.content_hash,
+            "chars": len(material.text),
+            "outline_entries": len(entries),
+            "eligible_sections": owned,
+            "cases": len(per_ref[ref]),
+        }
+
+    by_distance: dict[str, dict] = {}
+    for name in manual_cases.DISTANCES:
+        values = [ratio for case, ratio in zip(manual_cases.CASES, overlaps)
+                  if case.distance == name]
+        if values:
+            by_distance[name] = {
+                "cases": len(values),
+                "mean": round(sum(values) / len(values), 6),
+                "min": round(min(values), 6),
+                "max": round(max(values), 6),
+            }
+    annotations = {
+        "overlap_mean": round(sum(overlaps) / len(overlaps), 6) if overlaps else 0.0,
+        "overlap_by_distance": by_distance,
+        "by_granularity": {
+            name: sum(1 for case in manual_cases.CASES if case.granularity == name)
+            for name in manual_cases.GRANULARITIES
+        },
+        # 逐条明细进报告：它是"这套 case 到底离原话多远"的唯一一手证据，缺了它，
+        # 文档里那张表就只是别人不得不信的一段话。
+        "cases": [
+            {
+                "query": case.query,
+                "material": case.material,
+                "sections": list(case.sections),
+                "focus": case.focus,
+                "distance": case.distance,
+                "granularity": case.granularity,
+                "overlap": round(ratio, 6),
+                "why": case.why,
+            }
+            for case, ratio in zip(manual_cases.CASES, overlaps)
+        ],
+    }
+    return Dataset(cases=cases, materials=list(materials), stats=stats,
+                   suite="manual", annotations=annotations)
 
 
 # ---------------------------------------------------------------- 材料装载
@@ -611,17 +814,36 @@ def run_matrix(
     top_k: Sequence[int],
     *,
     ladder: bool = False,
+    id_map: dict[str, str] | None = None,
 ) -> dict:
-    """跑完所有配置，组装报告（也是 `--json` / 基线块的全部内容）。"""
+    """跑完一个测试集的所有配置，组装成一份单套报告。
+
+    `id_map` 默认自己建（单套跑法）；两套一起跑时由 `run_suites` 传入同一份——库只
+    ingest 一次，两套共用一套身份映射，省掉重复入库与临时目录的反复改动。
+    """
+    if id_map is not None:
+        return _run_matrix(dataset, configs, top_k, ladder=ladder, id_map=id_map)
+    need_library = any(config.library for config in configs)
+    with _id_space(dataset.materials, need_library=need_library) as built:
+        return _run_matrix(dataset, configs, top_k, ladder=ladder, id_map=built)
+
+
+def _run_matrix(
+    dataset: Dataset,
+    configs: Sequence[Config],
+    top_k: Sequence[int],
+    *,
+    ladder: bool,
+    id_map: dict[str, str],
+) -> dict:
     started = time.perf_counter()
-    with _id_space(dataset.materials, need_library=any(c.library for c in configs)) as id_map:
-        rows = [score_config(dataset, config, top_k, id_map) for config in configs]
-        probe = None
-        if ladder:
-            anchor = next((c for c in configs if c.parent and not c.library), configs[0])
-            probe = distance_ladder(dataset, anchor, top_k, id_map)
+    rows = [score_config(dataset, config, top_k, id_map) for config in configs]
+    probe = None
+    if ladder:
+        anchor = next((c for c in configs if c.parent and not c.library), configs[0])
+        probe = distance_ladder(dataset, anchor, top_k, id_map)
     report = {
-        "schema": REPORT_SCHEMA,
+        "suite": dataset.suite,
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "elapsed_seconds": round(time.perf_counter() - started, 2),
         "embedding_configured": bool(embedding_configured()),
@@ -632,9 +854,42 @@ def run_matrix(
         "materials": [dataset.stats[ref] for ref in dataset.stats],
         "configs": rows,
     }
+    if dataset.annotations:
+        report["annotations"] = dataset.annotations
     if probe is not None:
         report["ladder"] = probe
     return report
+
+
+def run_suites(
+    datasets: dict[str, Dataset],
+    configs: Sequence[Config],
+    top_k: Sequence[int],
+    ladder_suites: set[str],
+) -> dict:
+    """两套一起跑：外层 `suites` 并列，**每套的指标各自算、绝不混平均**。
+
+    混着算出来的均值既不是"标题查询"的分数也不是"真实提问"的分数，而两套的难度差
+    20pp 会被一个看起来合理的中间数吃掉——那正是这套评估要防的那类假信号。
+    """
+    materials = next(iter(datasets.values())).materials
+    need_library = any(config.library for config in configs)
+    bundle = {
+        "schema": REPORT_SCHEMA,
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "embedding_configured": bool(embedding_configured()),
+        "top_k": sorted({int(value) for value in top_k}),
+        "suites": {},
+    }
+    with _id_space(materials, need_library=need_library) as id_map:
+        for name in SUITE_NAMES:
+            dataset = datasets.get(name)
+            if dataset is None:
+                continue
+            bundle["suites"][name] = _run_matrix(
+                dataset, configs, top_k, ladder=name in ladder_suites, id_map=id_map)
+    bundle["case_count"] = sum(item["case_count"] for item in bundle["suites"].values())
+    return bundle
 
 
 # ---------------------------------------------------------------- 偏差探针
@@ -849,12 +1104,8 @@ def render_table(report: dict) -> str:
     return "\n".join(lines)
 
 
-def render_markdown(report: dict) -> str:
-    """可直接贴进 `docs/` 的表 + 一段机器可读的基线块。
-
-    基线块是 `--check` 的唯一输入：**没有它，`--check` 读不到基线**。贴表的时候连
-    围栏一起贴，不要只贴上面那张人看的表。
-    """
+def _markdown_table(report: dict) -> list[str]:
+    """一份单套报告的表格行（表头 + 分隔 + 每个配置一行）。"""
     top_k = report["top_k"]
     header = ["配置", "case", *_display_columns(top_k)]
     lines = [
@@ -864,25 +1115,75 @@ def render_markdown(report: dict) -> str:
     for row in report["configs"]:
         lines.append("| " + " | ".join(
             [row["label"], str(row["cases"]), *_row_values(row, top_k)]) + " |")
+    return lines
+
+
+def render_markdown(report: dict) -> str:
+    """单套报告 → 可直接贴进 `docs/` 的表 + 一段机器可读的基线块。
+
+    基线块是 `--check` 的唯一输入：**没有它，`--check` 读不到基线**。贴表的时候连
+    围栏一起贴，不要只贴上面那张人看的表。
+    """
     payload = json.dumps(report, ensure_ascii=False, indent=2)
     return (
-        "\n".join(lines)
+        "\n".join(_markdown_table(report))
         + "\n\n<!-- 下面这段是 --check 的基线：不要删、不要改格式（最后一段 json 围栏）。 -->\n"
         + "```json\n" + payload + "\n```\n"
     )
 
 
+SUITE_TITLES = {
+    "title": "title 套（query = 章节标题原文，自动构造）",
+    "manual": "manual 套（28 条手写真实问法）",
+}
+
+
+def render_bundle_markdown(bundle: dict) -> str:
+    """两套 → 两张表 + **一段**围栏。
+
+    只留一段围栏是要紧的：`--check` 读的是"最后一段 json 围栏"，若两套各写一段，
+    它会读到 manual 那套——而 `--check` 的契约是只比 `title` 套。所以两份报告一起
+    塞进同一个对象（`suites.title` / `suites.manual`），`baseline_from_markdown`
+    再从里面挑 `title`。
+    """
+    blocks: list[str] = []
+    for name in SUITE_NAMES:
+        report = bundle.get("suites", {}).get(name)
+        if report is None:
+            continue
+        blocks.append(f"### {SUITE_TITLES.get(name, name)}\n\n"
+                      + "\n".join(_markdown_table(report)))
+    payload = json.dumps(bundle, ensure_ascii=False, indent=2)
+    return (
+        "\n\n".join(blocks)
+        + "\n\n<!-- 下面这段是 --check 的基线（两套都在里面，--check 只取 title 套）："
+          "不要删、不要改格式（最后一段 json 围栏）。 -->\n"
+        + "```json\n" + payload + "\n```\n"
+    )
+
+
 def baseline_from_markdown(text: str) -> dict:
-    """从 `docs/RETRIEVAL-EVAL.md` 里取基线：**最后一段** ```json 围栏。"""
+    """从 `docs/RETRIEVAL-EVAL.md` 里取基线：**最后一段** ```json 围栏里的 `title` 套。
+
+    兼容两种载荷：v2 外层（`{"suites": {"title": …}}`）与旧的 v1 单套报告。两种情况
+    都只返回**一套**（title），因为 `--check` 的契约就是"只比 title 套"。
+    """
     blocks = re.findall(r"```json[ \t]*\r?\n(.*?)\r?\n```", text, re.DOTALL)
     if not blocks:
         raise SystemExit(
             "基线文件里没有 ```json 围栏。先用 --markdown 产出一段贴进去：\n"
             "    python scripts/evaluate_retrieval.py --markdown -")
     try:
-        return json.loads(blocks[-1])
+        payload = json.loads(blocks[-1])
     except json.JSONDecodeError as error:
         raise SystemExit(f"基线 JSON 解析失败：{error}") from error
+    if isinstance(payload, dict) and "suites" in payload:
+        title = payload["suites"].get("title")
+        if not isinstance(title, dict):
+            raise SystemExit("基线的 suites 里没有 title 套：--check 只比 title 套，"
+                             "先用 --markdown 重新生成基线。")
+        return title
+    return payload
 
 
 def compare_reports(
@@ -1031,14 +1332,24 @@ def _parser() -> argparse.ArgumentParser:
                         help="与基线比对，掉超过 2pp 退出码 1")
     parser.add_argument("--baseline", default=str(DEFAULT_BASELINE), metavar="PATH",
                         help="基线文件（缺省 docs/RETRIEVAL-EVAL.md）")
+    parser.add_argument("--suite", choices=("title", "manual", "both"), default=None,
+                        help="测试集：title=章节标题自动构造 / manual=28 条手写真实问法 /"
+                             " both=两套并列（默认）。--check 时默认只跑 title")
     parser.add_argument("--ladder", action="store_true",
-                        help="跑 query 距离阶梯（量化「标题当 query」的偏差）")
+                        help="跑 query 距离阶梯（量化「标题当 query」的偏差；只对 title 套）")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(list(argv) if argv is not None else None)
     top_k = _k_list(args.top_k)
+    # 默认值分两种情形：平时两套都跑（要看见真实那套），--check 只跑 title（回归门槛）。
+    suite = args.suite or ("title" if args.check else "both")
+    if args.check and suite == "manual":
+        raise SystemExit(
+            "--check 只比 title 套：manual 套的绝对分更低、方差更大（28 条里一条翻面"
+            "就是 3.6pp），不适合当 CI 门槛。要看 manual 请用 --suite both --check，"
+            "或直接 --suite manual 人工看数字。")
 
     if args.check:
         baseline = baseline_from_markdown(Path(args.baseline).read_text(encoding="utf-8"))
@@ -1047,59 +1358,112 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise SystemExit("基线里没有任何配置，无法比对")
         top_k = [int(value) for value in baseline.get("top_k", top_k)]
         # 基线里有阶梯就一起跑、一起比：饱和的 recall@k 抓不住的那类退化，只有阶梯
-        # 能抓住。少跑一档会让 --check 静默地少看一半。
-        ladder = bool(baseline.get("ladder"))
+        # 能抓住。少跑一档会让 --check 静默地少看一半。阶梯只对 title 套有意义。
+        ladder_suites = {"title"} if baseline.get("ladder") else set()
     else:
         baseline = None
         configs = build_configs(args)
-        ladder = args.ladder
+        ladder_suites = {"title"} if args.ladder else set()
 
     paths, docx = _material_paths(args)
-    dataset = build_dataset(load_materials(paths, docx))
-    if not dataset.cases:
-        raise SystemExit("测试集为空：材料里没有可用章节（检查标题/长度阈值）")
+    materials = load_materials(paths, docx)
+    datasets: dict[str, Dataset] = {}
+    if suite in {"title", "both"}:
+        datasets["title"] = build_dataset(materials)
+    if suite in {"manual", "both"}:
+        available = manual_materials_present(materials)
+        if available:
+            # 材料 hash 对不上就在这里退出——比跑到一半发现指标掉了要好。
+            datasets["manual"] = build_manual_dataset(materials)
+        elif suite == "manual":
+            raise SystemExit(
+                "manual 套需要 docs/ 下那四份 md，本次材料集里没有。"
+                "要么去掉 --material（用默认材料集），要么先给新材料补标注。")
+        else:
+            print("提示：本次材料集不含手写套需要的四份 docs md，manual 套跳过，"
+                  "只跑 title 套（回归照旧）。", file=sys.stderr)
+    for name in SUITE_NAMES:
+        dataset = datasets.get(name)
+        if dataset is not None and not dataset.cases:
+            raise SystemExit(f"{name} 套测试集为空：材料里没有可用章节（检查标题/长度阈值）")
 
-    report = run_matrix(dataset, configs, top_k, ladder=ladder)
-    _describe(report, dataset)
-    print()
-    print(render_table(report))
+    bundle = run_suites(datasets, configs, top_k, ladder_suites)
+    for name in SUITE_NAMES:
+        report = bundle["suites"].get(name)
+        if report is None:
+            continue
+        print()
+        _describe(report, datasets[name])
+        print()
+        print(render_table(report))
+        if "annotations" in report:
+            _print_annotations(report["annotations"], top_k)
+        if "ladder" in report:
+            _print_ladder(report["ladder"], top_k)
 
     if args.json:
-        _emit(args.json, json.dumps(report, ensure_ascii=False, indent=2))
+        _emit(args.json, json.dumps(bundle, ensure_ascii=False, indent=2))
     if args.markdown is not None:
-        _emit(args.markdown, render_markdown(report))
-    if "ladder" in report:
-        _print_ladder(report["ladder"], top_k)
+        _emit(args.markdown, render_bundle_markdown(bundle))
 
     if baseline is None:
         return 0
 
-    problems = compare_reports(baseline, report)
+    problems = compare_reports(baseline, bundle["suites"]["title"])
     print()
     if problems:
-        print(f"基线不符（容差 {CHECK_TOLERANCE_PP:.1f}pp，共 {len(problems)} 处）：")
+        print(f"与基线不符（只比 title 套；容差 {CHECK_TOLERANCE_PP:.1f}pp，"
+              f"共 {len(problems)} 处）：")
         for problem in problems:
             print(f"  ↓ {problem}")
         return 1
-    print(f"与基线一致：没有任何配置掉超过 {CHECK_TOLERANCE_PP:.1f}pp。")
+    print(f"与基线一致（只比 title 套）：没有任何配置掉超过 {CHECK_TOLERANCE_PP:.1f}pp。")
     return 0
 
 
 def _describe(report: dict, dataset: Dataset) -> None:
     """开头几行交代测试集规模与口径，省得看表的人去翻代码。"""
     total_chars = sum(int(item["chars"]) for item in report["materials"])
-    print(f"测试集：{len(dataset.materials)} 份材料 / {total_chars} 字 / "
-          f"{report['case_count']} 条 case（每份最多 {MAX_CASES_PER_MATERIAL} 条）")
+    print(f"测试集（{dataset.suite} 套）：{len(dataset.materials)} 份材料 / {total_chars} 字 / "
+          f"{report['case_count']} 条 case")
     for item in report["materials"]:
         print(f"  · {item['ref']:<28} {item['chars']:>6} 字  章 {item['outline_entries']:>2}"
               f"  可用 {item['eligible_sections']:>2}  case {item['cases']:>2}")
-    print(f"命中判据：交集 ≥ 命中块长度的 {HIT_OVERLAP_RATIO:.0%}；排除：标题<{MIN_TITLE_CHARS}字"
-          f" / 章节<{MIN_SECTION_CHARS}字 / 章节占全文>{MAX_SECTION_SHARE:.0%}")
+    if dataset.suite == "title":
+        print(f"命中判据：交集 ≥ 命中块长度的 {HIT_OVERLAP_RATIO:.0%}；排除：标题<{MIN_TITLE_CHARS}字"
+              f" / 章节<{MIN_SECTION_CHARS}字 / 章节占全文>{MAX_SECTION_SHARE:.0%}")
+    else:
+        low, high = manual_cases.OVERLAP_MEAN_RANGE
+        annotations = report.get("annotations", {})
+        print(f"手写标注：query 对**目标区间**的词面重合均值 "
+              f"{_pct(annotations.get('overlap_mean', 0.0))}（构造区间 "
+              f"{low:.0%}–{high:.0%}；标题当 query 恒为 100%）")
+        granularity = annotations.get("by_granularity", {})
+        print(f"粒度分布：整章 {granularity.get('chapter', 0)} / 章内某段 "
+              f"{granularity.get('passage', 0)} / 跨章 {granularity.get('cross', 0)}")
     print(f"无信息地板：随机排第一的 recall@1 期望 {_pct(report['chance_recall@1'])}"
           "（≈ 章节占全文的比例）")
     if not report["embedding_configured"]:
         print("注意：没有 embedding 凭证，hybrid=1 的行实际走纯 BM25，与 hybrid=0 相同"
               "——这是环境事实，不是指标相同。")
+
+
+def _print_annotations(annotations: dict, top_k: Sequence[int]) -> None:
+    """手写套的逐条明细：距离档、粒度、重合度、问法。"""
+    print()
+    print("手写 case（按距离分组；重合 = query 的中文 bigram 落在目标区间里的比例）：")
+    table = [["档", "粒", "重合", "材料", "问法"]]
+    for case in annotations.get("cases", []):
+        table.append([
+            case["distance"],
+            case["granularity"][:4],
+            _pct(case["overlap"]),
+            Path(case["material"]).name,
+            case["query"],
+        ])
+    widths = [max(len(line[index]) for line in table) for index in range(len(table[0]) - 1)]
+    for line in table:
+        print(_pad(line[:-1], widths) + "  " + line[-1])
 
 
 def _print_ladder(rows: Sequence[dict], top_k: Sequence[int]) -> None:

@@ -299,14 +299,19 @@ def test_markdown_round_trips_into_baseline(module):
 
 
 def test_check_passes_against_fresh_baseline(module, tmp_path, capsys):
-    """拿刚跑出来的表当基线，`--check` 必须过（退出码 0）。"""
+    """拿刚跑出来的表当基线，`--check` 必须过（退出码 0）。
+
+    `--json` 自 v2 起是**两套并列**的外层对象（`suites.title` / `suites.manual`），
+    这里取 `title` 那套：`--check` 的契约就是只比它。
+    """
     corpus = _corpus(tmp_path)
     base_argv = ("--material", str(corpus), "--hybrid", "0",
                  "--parent", "1", "--library", "0", "--top-k", "1,3")
     report_path = tmp_path / "report.json"
     assert module.main([*base_argv, "--json", str(report_path)]) == 0
     capsys.readouterr()
-    baseline = _baseline_file(module, tmp_path, json.loads(report_path.read_text("utf-8")))
+    bundle = json.loads(report_path.read_text("utf-8"))
+    baseline = _baseline_file(module, tmp_path, bundle["suites"]["title"])
 
     code, out = _run(module, "--material", str(corpus),
                      "--check", "--baseline", str(baseline), capsys=capsys)
@@ -321,7 +326,7 @@ def test_check_fails_on_3pp_drop_and_names_the_config(module, tmp_path, capsys):
                  "--parent", "1", "--library", "0", "--top-k", "1,3")
     report_path = tmp_path / "report.json"
     assert module.main([*base_argv, "--json", str(report_path)]) == 0
-    report = json.loads(report_path.read_text("utf-8"))
+    report = json.loads(report_path.read_text("utf-8"))["suites"]["title"]
     target = report["configs"][0]
     target["metrics"]["coverage"]["3"] = round(target["metrics"]["coverage"]["3"] + 0.03, 6)
     capsys.readouterr()
