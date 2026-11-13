@@ -43,7 +43,7 @@ from app.contracts import mindmap as mindmap_contract
 from app.contracts.diagnostic import Diagnostic, DiagnosticLevel
 from app.contracts.mindmap import MindMapContent, Node
 from app.contracts.ops import OpBatch, OpError
-from app.contracts.source import Source
+from app.contracts.source import Source, SourceUsage
 from app.generation.service import (
     CONTEXT_TOKEN_LIMIT,
     DETAIL_PROMPT,
@@ -71,7 +71,7 @@ from app.knowledge.service import (
     search_parent,
 )
 from app.optimization.service import check
-from app.optimization.source_refs import EvidenceSpan, annotate_nli
+from app.optimization.source_refs import EvidenceSpan, annotate_nli, verify_source_refs
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +124,24 @@ DEEP_MAX_BRANCHES = 20
 # 一次展开至少要能挂下 2 个子节点才值得发一次调用。额度只剩 1 个节点时直接按
 # "被节点预算截断"处理——花一次调用只为了挂一个节点，是把额度换成噪音。
 DEEP_MIN_BREADTH = 2
+
+# 分片 + 按支检索的每支条数。3 是 `docs/RAG-DECISIONS.md` 第 5 节定的量：一条
+# 父块 450–700 字，三条已经够一次展开的上下文，再多只是把同一段材料换个开头。
+#
+# **成本口径实测**（`scripts/measure_deep_slicing.py`，1.2 万字材料、68 个子块）：
+# 真正花 embedding 的是"本次候选块的向量 + 每条 query"，**不是命中的那 3 条**
+# （命中的文本是检索的输出，不会反过来再 embed 一次）。
+#   - 块向量按文本哈希缓存（`knowledge.vector_cache`），同一份材料在 N 支之间只付一次；
+#   - 第一支跑完就预热了缓存，后面各支只 embed 自己那一条 query。
+# 实测（假向量、冷缓存）：8 支 = 8 次调用 / 10 批 / 76 条文本；20 支 = 20 次 / 22 批 /
+# 88 条文本。**不预热**时是 20 × 69 = 1380 条（56 批），17 倍——所以
+# `_retrieve_branches` 里第一支是串行的，那不是保守，是成本闸。
+DEEP_BRANCH_TOP_K = 3
+
+# 分片检索**全部**失败时退回"整树一次检索"的条数。与 `rag_query` 的默认
+# `top_k=5` 同口径：那正是 `mindmap_generate` 那条路拿到的量，退回时用户看到的
+# 证据量与改造前一致，不是"缩水版的降级"。
+DEEP_FALLBACK_TOP_K = 5
 
 # 工具内单次模型调用的输出上限。这个数必须与 `app.agent.provider._MAX_TOKENS_CAP`
 # 一致：provider 是外层轮次的出口，工具里的 `chat_async` 是另一条出口，两边不同
@@ -306,6 +324,11 @@ def _count_nodes(root) -> int:
     return 1 + sum(_count_nodes(child) for child in root.children)
 
 
+def _count_refs(root) -> int:
+    """整棵树的引用条数。逐字校验前后各数一次，差值就是被剔除的条数。"""
+    return len(root.source_refs) + sum(_count_refs(child) for child in root.children)
+
+
 def _pick_sources(ctx: RunContext, source_ids: list[str]) -> list:
     """只允许缩小到本次请求已带的来源。
 
@@ -376,6 +399,159 @@ def _skeleton_titles(raw: Any) -> list[str]:
     return titles
 
 
+@dataclass(frozen=True)
+class _BranchEvidence:
+    """一条一级分支自己的检索结果：给模型看的那一段 + 用来筛引用的那几段原文。
+
+    三份内容各有各的用处，不能互推：
+
+      - `payload`：`_citable_hits` 的产物，进提示词（含父块 `quote` 与命中子块的
+        `evidence_*`）。模型抄的就是它。
+      - `spans`：本支命中的两级区间。判"这条引用是不是本支的证据"用它——按坐标判，
+        比按文本判便宜，也避开了"两个分支命中同一段，文字一样"的假阳性。
+      - `quotes`：本支命中文本的拼接。只在引用**没有坐标**（模型只抄了 quote）时
+        兜底用它做包含判定：那种引用本来就没有区间可比，而"这段文字在不在本支
+        检索结果里"仍然是可判的。
+
+    **这一支的节点只能引用这一支的证据**：不这么收口的话，20 支的 hits 会累积成
+    一个共享池，模型从别支抄一段也能通过收尾的逐字校验——"按支检索"就退化成了
+    "整树检索一次、top_k 大一点"。收口在这里，不在收尾校验里：那一层拿不到
+    "这条引用是谁给它的"这个信息。
+    """
+
+    payload: list[dict[str, Any]]
+    spans: tuple[EvidenceSpan, ...]
+    text: str
+    quotes: str
+
+
+def _branch_evidence(hits: list[EvidenceHit], sources: list[Source]) -> _BranchEvidence:
+    """命中 → 一支的证据块。空命中不进这里（调用方用 `None` 表示"这一支没有"）。"""
+    payload = _citable_hits(hits, sources)
+    quotes = "\n".join(
+        part for entry in payload
+        for part in (entry.get("quote"), entry.get("evidence_quote"))
+        if isinstance(part, str) and part
+    )
+    return _BranchEvidence(
+        payload=payload,
+        spans=tuple(
+            EvidenceSpan(hit.source_id, hit.start, hit.end, hit.leaf_start, hit.leaf_end)
+            for hit in hits
+        ),
+        text=json.dumps(payload, ensure_ascii=False),
+        quotes=quotes,
+    )
+
+
+def _branch_query(title: str) -> str:
+    """一支的检索问句：**只发分支标题**，不拼主题。
+
+    这个拼法是实测选出来的，不是拍的（`scripts/measure_deep_slicing.py
+    --query-mode {title,topic-title,topic}`，`docs/RAG-DECISIONS.md` 12,392 字、
+    8 支、纯 BM25，三组消融）：
+
+      | 拼法 | 覆盖率 | 8 支共用 top-1 | 两两 Jaccard | 并集段落 |
+      |---|---|---|---|---|
+      | 主题 + 标题 | 19.2% | 8/8 | 0.32 | 9/52 |
+      | **只发标题** | **28.8%** | 3/8 | 0.13 | 13/52 |
+      | 只发主题 | 3.8% | 8/8 | 1.00 | 2/52 |
+
+    主题串为什么有害：它出现在文档标题行/摘要/图例里（在那份材料里是 `# RAG 与召回…`
+    那一块），BM25 里这些词 IDF 高，于是**每一支的 top-1 都被拉回同一个父块**——
+    8 支各查一次，实际只查到 1 处。去掉主题之后，分支标题（"2.1 切块…"、
+    "一句话结论"）才真正落在各自的章节上。只发主题那一行是量"整树一次检索"的
+    上限用的对照组：Jaccard 1.00 意思是 8 支拿到的证据完全一样。
+
+    **反过来说，这里没有结论说"分支标题够用"**：标题和材料用词对不齐时同样会掉
+    （把标题换成"背景/现状/方法"这类通用词，覆盖率 28.8% → 15.4%）。要往上走是
+    让骨架先看一眼材料的章节标题（`_chunk_tree` 的父块本来就按标题行切开，
+    `knowledge.service._HEADING_RE` 已经能识别 `#`、`第N章`、`一、`、`（一）`、`1.1`），
+    那是下一轮的事——本轮只用实测证伪了"主题在前"。
+
+    向量路未实测（本机无 embedding 凭证）：它可能没有这种"标题行高频词"问题，
+    所以这一版是"在唯一测得动的条件下更好"的选择，不是普适定论。
+    """
+    return title.strip()
+
+
+def _ref_from(item: Any, evidence: _BranchEvidence) -> dict[str, Any] | None:
+    """模型给的一条 `source_ref` → 收得下的契约形状；收不下或不属于本支就返回 None。
+
+    逐条清洗都是**必要**的，不是防御性编程：`SourceRef` 的 `start`/`end` 是
+    `strict=True` 的整数、`end > start`、`quote` 不超过 300 字。模型把 start 写成
+    `"123"`、把 quote 抄成父块全段（450–700 字）都是常态，任何一条漏过去都会让
+    `model_validate` 在**整棵树上**炸掉，用户拿到的是一次 `invalid_tree`。
+
+    区间优先于引文判归属（理由见 `_BranchEvidence`）：有坐标就比坐标，没坐标才
+    在文本里找。
+
+    **引文一个字符都不许改，`strip()` 也不行**：带坐标的引用会被
+    `_reference_problem` 拿 `quote != text[start:end]` 逐字比对，而叶子块的原文
+    常常以换行/空格开头（切块按句首吸附，不是按内容吸附）。抹掉首尾空白之后
+    `quote` 与区间原文就差了一个 `\n`，整条引用被判 `SOURCE_QUOTE_MISMATCH` 剔掉
+    ——实测 8 支的树里有 13 条这样消失的引用，界面上看起来像"这一支没有证据"。
+    """
+    if not isinstance(item, dict):
+        return None
+    source_id = item.get("source_id")
+    if not isinstance(source_id, str) or not source_id.strip():
+        return None
+    source_id = source_id.strip()
+
+    quote = item.get("quote")
+    quote = quote if isinstance(quote, str) else ""
+    if len(quote) > _EVIDENCE_QUOTE_MAX_CHARS:
+        # 超过契约上限的引文一律丢掉引文、留区间：截断一段再配原区间必然对不上，
+        # 那比"没有引文"更糟（`_reference_problem` 会判 SOURCE_QUOTE_MISMATCH）。
+        quote = ""
+
+    start, end = item.get("start"), item.get("end")
+    if (isinstance(start, bool) or isinstance(end, bool)
+            or not isinstance(start, int) or not isinstance(end, int)
+            or end <= start):
+        start = end = None
+    if start is None and not quote:
+        return None
+
+    if start is not None:
+        owned = any(
+            span.source_id == source_id and end > span.start and start < span.end
+            for span in evidence.spans
+        )
+    else:
+        owned = quote in evidence.quotes
+    if not owned:
+        return None
+
+    ref: dict[str, Any] = {"source_id": source_id}
+    if quote:
+        ref["quote"] = quote
+    if start is not None:
+        ref["start"] = start
+        ref["end"] = end
+    # `page` 刻意不收：本次检索没有逐页映射（`SourceSpan.page` 是总页数），
+    # 模型给的页码无从核实，收下来只会多一条 INVALID_SOURCE_PAGE 噪音。
+    return ref
+
+
+def _refs_from(item: dict[str, Any], evidence: _BranchEvidence | None) -> list[dict[str, Any]]:
+    """一个子项上带的 `source_refs`。没有证据可依据时**一条都不收**。
+
+    没有检索结果的分支，模型写什么引用都只能是编的（它没看到任何原文）。这一层
+    直接清空，而不是等收尾的逐字校验去剔——两者的界面表现一样，但前者能让
+    "这一支是没有证据才空着"在 `data` 里看得出来。
+    """
+    if evidence is None:
+        return []
+    raw = item.get("source_refs")
+    if not isinstance(raw, list):
+        return []
+    refs = [ref for ref in (_ref_from(entry, evidence) for entry in raw) if ref]
+    # `AddOp.source_refs` 的契约上限是 20，超出会在合并时报错并把整棵树判失败。
+    return refs[:20]
+
+
 @dataclass
 class _Slot:
     """展开出来、还没进树的一个候选节点。
@@ -395,15 +571,23 @@ class _Slot:
     `children` 是模型**多给**的一层（新格式里容忍，见 `_candidate_slots`）：
     一次调用只要求它写一层，给了两层就收下，比再追问一次便宜。自带 `children`
     的节点已经有内容了，它自己不再被追问，它的子节点各按自己的标记决定。
+
+    `source_refs` 只在 `rag` 形态且这一支真的检索到东西时才会有值（见
+    `_refs_from`）。它跟着 slot 一路走到合并那一步，最后作为 `add` 的
+    `source_refs` 挂进树里——**不在** `emit()` 里重新解释一遍。
     """
 
     label: str
     children: list["_Slot"] = field(default_factory=list)
     expandable: bool = True
     expandable_declared: bool = False
+    source_refs: list[dict[str, Any]] = field(default_factory=list)
 
 
-def _candidate_slots(raw: Any, limit: int, depth_left: int = 0) -> list[_Slot]:
+def _candidate_slots(
+    raw: Any, limit: int, depth_left: int = 0, *,
+    evidence: _BranchEvidence | None = None,
+) -> list[_Slot]:
     """从一次展开响应里取出候选子节点，最多 `limit` 个。
 
     接受两种形状：
@@ -430,18 +614,24 @@ def _candidate_slots(raw: Any, limit: int, depth_left: int = 0) -> list[_Slot]:
     for item in items:
         if len(slots) >= limit:
             break
-        slot = _slot_from(item, limit, depth_left, legacy)
+        slot = _slot_from(item, limit, depth_left, legacy, evidence=evidence)
         if slot is not None:
             slots.append(slot)
     return slots
 
 
-def _slot_from(item: Any, limit: int, depth_left: int, legacy_leaf: bool) -> _Slot | None:
+def _slot_from(
+    item: Any, limit: int, depth_left: int, legacy_leaf: bool, *,
+    evidence: _BranchEvidence | None = None,
+) -> _Slot | None:
     """单个候选项 → `_Slot`。空标签、非字符串/非 dict 的项一律丢掉。
 
     `expandable` 只有**布尔值**才算一次声明：模型写成 `"false"` 字符串、写成 0、
     或干脆没写，一律按可展开处理。缺省按 true 是有意的——模型偶尔漏写一个键，
     不该因此让整支内容凭空变成叶子，那是一种代码替它做的决定。
+
+    `evidence` 是**这一支**的检索结果，逐层传下去：模型多给的那一层里的引用同样
+    只能落在本支证据上，否则"只带该支的 hits"就只对第一层成立。
     """
     if isinstance(item, str):
         label = item.strip()
@@ -461,11 +651,12 @@ def _slot_from(item: Any, limit: int, depth_left: int, legacy_leaf: bool) -> _Sl
         label.strip()[:200],
         expandable=flag if declared else True,
         expandable_declared=declared,
+        source_refs=_refs_from(item, evidence),
     )
     nested = item.get("children")
     if depth_left > 0 and isinstance(nested, list):
         for child in nested[:limit]:
-            child_slot = _slot_from(child, limit, depth_left - 1, False)
+            child_slot = _slot_from(child, limit, depth_left - 1, False, evidence=evidence)
             if child_slot is not None:
                 slot.children.append(child_slot)
     return slot
@@ -1124,6 +1315,40 @@ SUBNODE_EXPAND_PROMPT = (
 )
 
 
+# 分片 + 按支检索：有证据时的附加规则。**拼在**上面两份提示词之后，不改基础格式
+# ——改基础格式等于给"这一支没有证据"那条路也塞一个 `source_refs` 字段，而那条路
+# 上一个字都不该抄。
+#
+# 逐字照抄那一句与 `RAG_SOURCE_PROMPT` 同源（那里是整树生成用的），但不能复用：
+# 那份提示词讲的是"你手里只有一份材料清单，先 rag_query"，而这里模型手里已经有
+# 一支的命中，再说"先检索"会让它去调一个它不需要的工具。
+BRANCH_EVIDENCE_RULES = (
+    "这一支的检索结果在 user 消息的 evidence 数组里：每项含 source_id、quote"
+    "（父块原文）与 evidence_start / evidence_end / evidence_quote（真正命中的那一小段）。"
+    '每个子项可以带一个 source_refs 数组，例如 {"label":"要点二","expandable":false,'
+    '"source_refs":[{"source_id":"…","start":0,"end":12,"quote":"…"}]}。'
+    "引用只能从**本支**的 evidence 里抄：source_id 照抄；优先用 evidence_* 那一组，"
+    "start、end、quote 分别取它们的值；没有 evidence_* 时只抄 quote 里连续的一段"
+    "（不超过 300 字），这时不要写 start 和 end。"
+    "引文必须逐字照抄，不要改写、不要概括、不要自己算偏移，也不要写 page。"
+    "evidence 里找不到依据的子项，source_refs 给空数组——空着是对的，编造不是。"
+)
+
+# 这一支没有检索结果时的附加规则。**不能什么都不说**：模型看不到这句话时，会把
+# "我没拿到证据"读成"材料里大概还有"，于是按主题自由展开，产出一棵看起来完整、
+# 实际没有出处的子树——那正是这次改动要消灭的静默缺失。
+#
+# 但它同样不能把这一支彻底判死：材料里真有这块内容却没被这一支的问句召回，是
+# 检索的常态（top_k=3）。所以措辞是"只写你能从 evidence 之外**确认**的东西"是
+# 不行的——模型没有 evidence 之外的信息源。结论只能是如实留空。
+BRANCH_NO_EVIDENCE_RULES = (
+    "注意：这一支这次**没有检索到任何材料依据**（evidence 数组为空）。"
+    "不要凭主题编造内容，也不要写 source_refs。"
+    '材料里确实没有这一块的东西时返回 {"children":[]}——空着是正确结果，'
+    "用常识把这一支填满会让人以为材料里写过这些。"
+)
+
+
 # ---------------------------------------------------------------- 工具实现
 
 
@@ -1221,6 +1446,99 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     )
 
 
+async def _search_branch(
+    sources: list[Source], title: str,
+) -> list[EvidenceHit] | None:
+    """一条分支的检索：query **只发分支标题**（`_branch_query`），`top_k=DEEP_BRANCH_TOP_K`。
+
+    为什么不是"主题 + 标题"——**实测选出来的**，三组消融（`docs/RAG-DECISIONS.md`
+    12,392 字、8 支、纯 BM25，`scripts/measure_deep_slicing.py --query-mode`）：
+
+      | 分支 query | 导图覆盖率 | 8 支共用 top-1 | 两两 Jaccard | 并集段落 |
+      |---|---|---|---|---|
+      | 主题 + 标题 | 19.2% | 8/8 | 0.32 | 9/52 |
+      | **只发标题（现在这一版）** | **28.8%** | 3/8 | 0.13 | 13/52 |
+      | 只发主题 | 3.8% | 8/8 | 1.00 | 2/52 |
+
+    "8 支共用 top-1" 是这里的关键指标：它数的是"有几支问了同一件事"。主题串让这个
+    数字变成 8/8——每支都先把文档标题块（主题词在那里反复出现）取回来，8 次检索
+    实际只覆盖一处。去掉主题后降到 3/8，覆盖率随之从 19.2% 涨到 28.8%。
+
+    同时记下它的天花板：只发标题也不是万能——骨架把标题猜成"背景/现状/方法"这类
+    通用词时，覆盖率掉到 15.4%。要突破得让骨架看到材料的章节标题（见 `_branch_query`
+    的注释），那是下一轮的事。
+
+    抛错返回 `None`——"没检索到"与"检索失败"要能分开记：前者是材料里确实没这块
+    （如实留空是对的），后者是这次检索没成（可能换个配置就有了）。`None` 与 `[]`
+    就是这两个意思。
+
+    放进 `asyncio.to_thread`：`search_parent` 是同步函数，里面有一次 embedding
+    网络往返。直接在协程里调用等于把 20 支串成一条队；线程池让它们真的同时发。
+    线程池只承担"本地 CPU + 一次同步 HTTP"，与工具内模型调用的 `DEEP_CONCURRENCY`
+    信号量无关——那个限的是模型请求配额，这个限的是本机算力。
+    """
+    query = _branch_query(title)
+    try:
+        return await asyncio.to_thread(
+            search_parent, sources, query, DEEP_BRANCH_TOP_K)
+    except Exception as exc:  # noqa: BLE001 — 检索失败只降级，不该废掉整张图
+        logger.warning("分支检索失败（%s / %s）：%s: %s",
+                       title, query, type(exc).__name__, str(exc)[:160])
+        return None
+
+
+async def _retrieve_branches(
+    sources: list[Source], titles: list[str],
+) -> list[list[EvidenceHit] | None]:
+    """N 支各检索一次：**第一支先单独跑，其余并行**。
+
+    为什么要先串一条：`search_parent` 每次都要把本次候选块的向量拿到手，而块向量
+    是按文本哈希缓存的（`knowledge.vector_cache`）。N 支同时发出去的后果是**每一支
+    都认为自己是第一次**——实测 8 支冷启动发出 8 × 69 = 552 条向量文本（24 个批次），
+    20 支发出 1380 条（60 个批次），是"预热之后"的 17 倍。第一支跑完，缓存里已经有
+    这批块的向量，后面 19 支各自只需要 embed 自己那一条 query。
+
+    代价是"最慢的一支"从 max 变成 first + max(其余)，也就是多一次检索的延迟
+    （本机纯 BM25 几毫秒，带向量时约一次 embedding 往返）。换的是向量请求量从
+    N×块数 降到 块数 + N，这是成本闸该有的形状。
+
+    失败就地降成 `None`（不用 `gather(return_exceptions=True)` 再逐点判类型）：
+    调用方只需要知道"这一支有没有证据"。第一支失败不影响其余各支照常并行。
+    """
+    if not titles:
+        return []
+    first = await _search_branch(sources, titles[0])
+    if len(titles) == 1:
+        return [first]
+    rest = await asyncio.gather(
+        *(_search_branch(sources, title) for title in titles[1:]))
+    return [first, *rest]
+
+
+async def _retrieve_whole(
+    sources: list[Source], topic: str, titles: list[str],
+) -> list[EvidenceHit]:
+    """整树一次检索：分片检索**全部**拿不到证据时的兜底（`DEEP_FALLBACK_TOP_K`）。
+
+    query 是**主题 + 全部一级分支标题**。这里与按支检索的规则刻意不同：那条路每支
+    一条 query，需要**区分度**（主题串会让 8 支的 top-1 撞成同一个父块，实测见
+    `_search_branch`），所以不拼主题；这条路只有一条 query、要的是**召回**，多拼
+    几个词只有好处——用户填的主题经常是"整理管理办法"这种指令，光拿它去查 BM25
+    可能一个 token 都不命中（实测：材料正文里只有"预算审批""绩效考核"，"管理办法"
+    只出现在文件名里），而分支标题正是模型认为这张图该覆盖的几块。
+
+    条数取 5 而不是把各支的 3 加起来：兜底的语义是"退回改造之前的行为"
+    （`mindmap_generate` 在 `rag` 形态下拿到的就是 top_k=5），不是"缩水版降级"。
+    """
+    query = " ".join([topic.strip(), *titles]).strip()
+    try:
+        return await asyncio.to_thread(
+            search_parent, sources, query, DEEP_FALLBACK_TOP_K)
+    except Exception as exc:  # noqa: BLE001 — 兜底也失败时只剩"无证据展开"，不是失败
+        logger.warning("整树兜底检索失败：%s: %s", type(exc).__name__, str(exc)[:160])
+        return []
+
+
 async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     """分片生成：先出骨架，再按层并发展开，最后确定性验收并只补不合格的那一支。
 
@@ -1262,21 +1580,39 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     那一棵，两者不一致是正常的（预览可能多、可能少）。通道为 None 时这条路径
     **一行都不走**，工具行为与加预览之前完全相同。
 
-    **它不读来源正文**：`GenerateDeepArgs` 里没有来源字段，骨架与展开都只看
-    主题。请求带材料时 `build_registry(has_sources=True)` 不会注册这个工具——
-    那条路会产出一棵与材料无关的树，而且以 ok=True 成功返回，用户没有任何
-    线索发现它错了。带材料的新建走 `mindmap_generate` 的忠实整理模式。
+    **`rag` 形态下骨架之后、并发展开之前，每条一级分支各检索一次**（分片 + 按支
+    检索，`docs/RAG-DECISIONS.md` 第 5 节）：query 是**分支标题本身**（不含主题，
+    理由与三组消融数字见 `_search_branch`），走 `search_parent`（父块返回，默认开），
+    `top_k=DEEP_BRANCH_TOP_K`。这是这个工具唯一读来源正文的地方，形态是**检索结果**
+    而不是全文。
 
-    `rag` 形态下这条限制**更痛**，但这一轮仍然保持：它一次检索都不发起，
-    而 `rag` 形态的 prompt 里连正文都没有，等于纯靠主题自由展开。缺口记在
-    `build_registry` 里：真正的解法是"每个分支先检索再展开"（分片 + 按支检索），
-    本轮没做——所以"整树一次生成意味着只有一次检索机会"这句话先留在这里，
-    下一轮把检索插进 `expand_branch` 之前别把它当成已经解决的问题。
+    为什么必须按支检索：`rag` 形态下模型看不到正文，整树一次生成 = **整棵树只有
+    一次检索机会**。`top_k=5` 对八千字材料约覆盖 25%、对三万字约 8%，于是"没想到
+    要问的章节"会静默缺失——用户拿到一份看起来正常但缺了几块的导图。分片之后
+    覆盖度由**骨架**决定，不由模型的查询创意决定。
+
+    三条硬约束（违反任意一条，这个能力就变成负资产）：
+      1. **不占 `max_tool_calls`**：检索发生在工具内部，是服务端自己的并发检索，
+         模型看到的仍然只是一次 `mindmap_generate_deep` 调用。
+      2. **成本有闸**：`top_k=3` × N 支，N 上限 `DEEP_MAX_BRANCHES=20`，块向量按
+         文本哈希缓存，实测口径见 `DEEP_BRANCH_TOP_K` 的注释。
+      3. **降级彻底**：没配 embedding 时纯 BM25 照常；某支抛错只让那一支无证据
+         展开；**所有支都拿不到证据**时退回"整树一次检索"（`DEEP_FALLBACK_TOP_K`
+         条，与 `mindmap_generate` 同量），绝不因为检索失败交出一棵空树。
+
+    `full` 形态**不做**这些检索（下面的 `slicing` 只在 `rag` 下为真）：正文整份
+    已经在 prompt 里，分片检索是白花；注册表那边也不会在有来源时给出这个工具
+    （`build_registry` 按形态决定），这里判一次是给"绕过注册表直接调"兜底。
     """
     if ctx.request.intent != "create":
         return _fail("wrong_intent", "只有新建导图时才能调用这个工具；修改现有导图请用 node_expand 或 mindmap_edit。")
     if ctx.candidate is not None and ctx.candidate.root.children:
         return _fail("map_exists", "已经有一张导图了，请用 node_expand 或 mindmap_edit 修改它。")
+
+    # 分片检索的两个前提：真的有可检索的正文，且当前是 `rag` 形态。
+    # 空正文的来源不参与（`status` 是给界面看的，能检索的只有 `text`）。
+    sources = [source for source in _pick_sources(ctx, []) if (source.text or "").strip()]
+    slicing = bool(sources) and source_mode() == SOURCE_MODE_RAG
 
     need = min(args.points_per_branch, MAX_CHILDREN)
     # 深度上限在参数层已经夹过一次（ge/le），这里再夹一次是防"绕过参数模型直接
@@ -1370,6 +1706,95 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         # 而不是"模型说不能再拆"。
         await _emit_grow(ctx, reported_grow, (), title, None)
 
+    # ---- 第二步之前：按支检索（`docs/RAG-DECISIONS.md` 第 5 节的第一条）---------
+    # 位置就在这里：骨架已经定了"分成哪几块"，而每一支的展开还没发出去。早一步
+    # （骨架之前）没有分支标题可当 query，晚一步（展开之后再补）就只能把证据塞进
+    # 下一层，模型已经按主题写完一轮了。
+    #
+    # 它**不占** `max_tool_calls`：模型看到的仍然只是一次 `mindmap_generate_deep`
+    # 调用，检索是工具内部的服务端行为。
+    branch_evidence: list[_BranchEvidence | None] = [None] * len(skeleton)
+    retrieval_queries: list[str] = []
+    retrieval_mode = "off"
+    retrieval_failed: list[int] = []
+    retrieval_empty: list[int] = []
+    if slicing:
+        branch_titles = [title for title, _ in skeleton]
+        retrieval_queries = [_branch_query(title) for title in branch_titles]
+        hits_by_branch = await _retrieve_branches(sources, branch_titles)
+        retrieval_mode = "branch"
+        retrieval_failed = [
+            index for index, hits in enumerate(hits_by_branch) if hits is None]
+        # 没有任何一支拿到证据（全抛错、全空，或两者混合）→ 退回整树一次检索。
+        # 不退回的话，每支都会带着"没有证据就留空"的提示词展开，产出一棵**空树**
+        # ——而"检索失败"不该等于"材料里没有"。这正是降级要彻底的那一条。
+        if all(not hits for hits in hits_by_branch):
+            whole = await _retrieve_whole(sources, args.topic, branch_titles)
+            retrieval_mode = "whole"
+            retrieval_queries = [" ".join([args.topic.strip(), *branch_titles]).strip()]
+            # 兜底命中要**原样给每一支**：这是"整树一次检索"的定义，每支看到的
+            # 是同一批证据；分片的收益在这一刻归零，但那好过一棵空树。
+            hits_by_branch = [whole for _ in hits_by_branch]
+            diagnostics.append(Diagnostic(
+                level=DiagnosticLevel.warn, code="BRANCH_RETRIEVAL_FALLBACK",
+                message=(
+                    f"{len(skeleton)} 条分支按支检索都没有拿到证据，已退回整树一次检索"
+                    f"（{len(whole)} 条命中，全部支共用）；分片检索的覆盖收益本次没有生效"
+                    if whole else
+                    f"{len(skeleton)} 条分支按支检索都没有拿到证据，整树兜底检索也没命中，"
+                    "各支将按「无依据」展开"
+                ),
+            ))
+        retrieval_empty = [
+            index for index, hits in enumerate(hits_by_branch)
+            if hits is not None and not hits]
+        for index, hits in enumerate(hits_by_branch):
+            if not hits:
+                continue
+            evidence = _branch_evidence(hits, sources)
+            branch_evidence[index] = evidence
+            # 累积进 `RunContext.evidence`：去重（四元组）与 200 条上限都在那里，
+            # 这里只管往里放。收尾的 `verify_source_refs` 读的也是它——两处同源，
+            # 否则"校验依据"与"模型看到的证据"会是两份不同的东西。
+            ctx.record_evidence(evidence.spans)
+        for index in retrieval_failed:
+            diagnostics.append(Diagnostic(
+                level=DiagnosticLevel.warn, code="BRANCH_RETRIEVAL_FAILED",
+                node_id=skeleton[index][1],
+                message=(
+                    f"分支「{skeleton[index][0]}」的检索出错，这一支按「无检索结果」展开"
+                    "（其余分支不受影响）"
+                ),
+            ))
+        for index in retrieval_empty:
+            diagnostics.append(Diagnostic(
+                level=DiagnosticLevel.info, code="BRANCH_NO_EVIDENCE",
+                node_id=skeleton[index][1],
+                message=(
+                    f"分支「{skeleton[index][0]}」的检索没有命中材料里的任何片段，"
+                    "这一支如实留空（提示词要求不凭主题编造）"
+                ),
+            ))
+
+    def prompt_for(base: str, evidence: _BranchEvidence | None) -> str:
+        """这一支该用哪份提示词：有证据 / 无证据（分片形态）/ 不看证据（`full`）。
+
+        三者不能合并：`full` 形态下 `evidence is None` 是"这个工具不读来源"，
+        而分片形态下 `evidence is None` 是"这一支没查到"——后一种必须告诉模型
+        不许编，前一种说这句话反而是误导（那里正文就在 prompt 里）。
+        """
+        if evidence is not None:
+            return base + "\n" + BRANCH_EVIDENCE_RULES
+        if slicing:
+            return base + "\n" + BRANCH_NO_EVIDENCE_RULES
+        return base
+
+    def evidence_suffix(evidence: _BranchEvidence | None) -> str:
+        """把这一支的命中拼在 user 消息末尾。`None` 时一个字符都不加。"""
+        if evidence is None:
+            return ""
+        return "\n本支检索结果（evidence 数组）：\n" + evidence.text
+
     # 额度预分配（第一层）：root + 一级分支是"接口层"，先从总节点里扣掉，剩下的
     # 才轮到各支往下长。不先扣的话，一支自己就可能把额度吃到只剩两位数，后面
     # 十九支全部只剩骨架——用户看到的是"第一支很丰满、其余都是空壳"。
@@ -1391,20 +1816,30 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     semaphore = asyncio.Semaphore(DEEP_CONCURRENCY)
 
     async def expand_branch(title: str, branch_index: int) -> list[_Slot] | None:
-        """展开一条分支。额度不够返回 None——那是"没展开"，与"展开失败"是两件事。"""
+        """展开一条分支。额度不够返回 None——那是"没展开"，与"展开失败"是两件事。
+
+        **只带这一支的 hits**：`branch_evidence[branch_index]` 是这一步之前按
+        「主题 + 分支标题」单独检索出来的那一批，兄弟分支的证据一个字都不进来。
+        """
         async with semaphore:
             if not ctx.reserve_model_call():
                 return None
             ctx.extra_model_calls += 1
+            evidence = branch_evidence[branch_index]
             ask = (
                 f"整体主题：{args.topic}\n"
                 f"本条一级分支：{title}\n"
                 f"请给出 {need} 个子要点。"
+                f"{evidence_suffix(evidence)}"
             )
             # 这一路的产出挂在第 branch_index 条一级分支下面，所以父路径是
             # `(branch_index,)`。
-            raw = await ask_model(BRANCH_EXPAND_PROMPT, ask, parent=(branch_index,))
-            kept, _ = _trim_slots(_candidate_slots(raw, point_budget, nested_levels), allowance)
+            raw = await ask_model(
+                prompt_for(BRANCH_EXPAND_PROMPT, evidence), ask, parent=(branch_index,))
+            kept, _ = _trim_slots(
+                _candidate_slots(raw, point_budget, nested_levels, evidence=evidence),
+                allowance,
+            )
             return kept
 
     results = await asyncio.gather(
@@ -1453,22 +1888,27 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         # 已有要点必须一起给：模型看不到自己已经写了什么，却被要求「不要重复」，
         # 那这条要求它根本没法执行——实测同一要点被返回两次，数量验收还通过了。
         existing = "、".join(slot.label for slot in slots_by_branch[index]) or "（暂无）"
+        evidence = branch_evidence[index]
         ask = (
             f"整体主题：{args.topic}\n"
             f"本条一级分支：{title}\n"
             f"已有要点：{existing}\n"
             f"还差 {missing} 个子要点，请补齐，不要重复已有要点。"
+            f"{evidence_suffix(evidence)}"
         )
         try:
             # 补调出来的要点接在已有要点之后，所以这一路的子索引从"已有几个"起算；
             # 不带上这个偏移，预览会把补出来的节点挂到已有节点的位置上。
             raw = await ask_model(
-                BRANCH_EXPAND_PROMPT, ask, parent=(index,),
+                prompt_for(BRANCH_EXPAND_PROMPT, evidence), ask, parent=(index,),
                 base_index=len(slots_by_branch[index]),
             )
         except GenerationError:
             continue  # 补调失败只是"仍然不足"，不升级成整次失败
-        kept, dropped = _keep_new_slots(slots_by_branch[index], _candidate_slots(raw, missing))
+        kept, dropped = _keep_new_slots(
+            slots_by_branch[index],
+            _candidate_slots(raw, missing, evidence=evidence),
+        )
         if dropped:
             duplicates[index] = duplicates.get(index, 0) + dropped
         slots_by_branch[index].extend(kept)
@@ -1497,11 +1937,16 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
 
     async def expand_node(
         slot: _Slot, path: str, indices: tuple[int, ...], count: int, nested_left: int,
+        evidence: _BranchEvidence | None,
     ) -> list[_Slot] | None:
         """展开一层里的一个节点。额度不够返回 None（没展开），抛错则由调用方收拾。
 
         `path` 是给人看的文字路径，`indices` 是同一次遍历给出的子索引链——上报
         生长事件时后者才是指向"这是哪个节点"的东西。
+
+        `evidence` 是**这一支**的检索结果：第 3 层往下同样只能引用本支证据。
+        不传下去的话，"按支检索"就只对第 2 层成立——深层节点要么没有引用，要么
+        被收尾校验剔光，两种都让这一支看起来像"材料里没有"。
         """
         async with semaphore:
             if not ctx.reserve_model_call():
@@ -1514,19 +1959,21 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
                 f"从一级分支到这里的路径：{path}\n"
                 f"本节点：{slot.label}\n"
                 f"请给出 {count} 个子要点。"
+                f"{evidence_suffix(evidence)}"
             )
-            raw = await ask_model(SUBNODE_EXPAND_PROMPT, ask, parent=indices)
-            return _candidate_slots(raw, count, nested_left)
+            raw = await ask_model(
+                prompt_for(SUBNODE_EXPAND_PROMPT, evidence), ask, parent=indices)
+            return _candidate_slots(raw, count, nested_left, evidence=evidence)
 
     for depth in range(3, max_depth + 1):
         # `depth` 是**这一轮要产出的层号**，父节点在它上面一层：第 3 层的父节点
         # 是第 2 层的节点（一级分支的直接下级）。
         # 按分支分别遍历而不是先把第 2 层摊平：索引链的起点是"这条分支在根下面
         # 排第几"，摊平之后就只剩一个混在一起的全局下标，再也拼不出父子路径。
-        parents: list[tuple[_Slot, str, tuple[int, ...]]] = []
+        parents: list[tuple[_Slot, str, tuple[int, ...], _BranchEvidence | None]] = []
         for branch_index, slots in enumerate(slots_by_branch):
             parents.extend(
-                (slot, path, indices)
+                (slot, path, indices, branch_evidence[branch_index])
                 for slot, parent_depth, path, indices
                 in _walk_slots(slots, 2, "", max_depth, (branch_index,))
                 if parent_depth == depth - 1
@@ -1548,11 +1995,11 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         # 整树校验上——那时额度已经花完了。
         level_allowance = min(breadth * (1 + _nested_capacity(fanout, nested_left)), share)
         level_results = await asyncio.gather(
-            *(expand_node(slot, path, indices, breadth, nested_left)
-              for slot, path, indices in parents),
+            *(expand_node(slot, path, indices, breadth, nested_left, evidence)
+              for slot, path, indices, evidence in parents),
             return_exceptions=True,
         )
-        for (slot, _path, _indices), item in zip(parents, level_results):
+        for (slot, _path, _indices, _evidence), item in zip(parents, level_results):
             if item is None:
                 level_skipped[depth] = level_skipped.get(depth, 0) + 1
             elif isinstance(item, BaseException):
@@ -1567,6 +2014,11 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
 
     # 第四步：合并。骨架先成树（分支 id 已在骨架里），再把所有节点按"父在子前"
     # 的顺序作为一批 add 应用上去——整批原子，半截树不会进 ctx.candidate。
+    #
+    # `source_usage` 必须在**建树之前**定下来：契约的第二层校验要求每条
+    # `source_ref.source_id` 都出现在 `source_usage` 里，缺一条整棵树就是
+    # `tree_invalid`。`_generate` 那条路由 `validate_generated_content` 重建它，
+    # 这里没有那个函数，只能自己拼——而"分片形态会产出引用"意味着不拼就一定会炸。
     content = MindMapContent(
         title=root_label,
         root=Node(
@@ -1574,6 +2026,12 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             label=root_label,
             children=[Node(id=branch_id, label=title, children=[]) for title, branch_id in skeleton],
         ),
+        source_usage=[
+            SourceUsage(source_id=source.id, kind=source.kind,
+                        filename=source.filename,
+                        char_count=len((source.text or "").strip()))
+            for source in sources
+        ] if slicing else [],
     )
 
     drafts: list[dict[str, Any]] = []
@@ -1589,6 +2047,9 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
                 "parent_id": parent_id,
                 "index": position,
                 "label": slot.label,
+                # 引用在 `_refs_from` 里已经清洗过（本支证据、契约形状、条数），
+                # 这里原样带上：这一层再"顺手补一条"就会把校验过的引用变成没校验过的。
+                "source_refs": list(slot.source_refs),
             })
             if slot.children:
                 emit(child_id, child_key, slot.children)
@@ -1645,6 +2106,34 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             "too_many_points",
             f"分支「{'、'.join(overfull)}」的要点数超过上限 {MAX_CHILDREN}，这张图不能落库。",
         )
+
+    # 第五步（续）：引用核验。分片形态下树里的每一条引用都声称来自某次分支检索，
+    # 这里逐条拿原文比对，站不住的一律剔掉——**引用准确率不能靠提示词保证**。
+    #
+    # 与 `_generate` 的差别：那条路走 `validate_generated_content`，它给出的
+    # `UNSOURCED_NODE` 是逐节点一条的；分片出来的树动辄几百节点，几百条"没有
+    # 引用"的提示会把真正有用的诊断淹掉，也不给用户任何可操作的信息。所以这里
+    # 只留**聚合**结果，明细（按 code 计数）进 data。
+    refs_kept = refs_dropped = 0
+    refs_by_code: dict[str, int] = {}
+    if slicing:
+        before = _count_refs(content.root)
+        raw_reports = verify_source_refs(
+            content, sources, remove_invalid=True, evidence=ctx.evidence or None)
+        refs_kept = _count_refs(content.root)
+        refs_dropped = before - refs_kept
+        for item in raw_reports:
+            if item.code in ("UNSOURCED_NODE", "SOURCE_PAGE_UNVERIFIED"):
+                continue
+            refs_by_code[item.code] = refs_by_code.get(item.code, 0) + 1
+        if refs_dropped:
+            diagnostics.append(Diagnostic(
+                level=DiagnosticLevel.warn, code="SOURCE_REFS_DROPPED",
+                message=(
+                    f"{refs_dropped} 条引用没有通过逐字校验（引文与原文对不上，"
+                    f"或落在本次检索命中之外），已剔除；保留 {refs_kept} 条"
+                ),
+            ))
 
     retried_set = set(retried)
     # 收尾仍不足的分支：(下标, 标题, 差几个)。这是 `partial` 的第三个来源——
@@ -1783,6 +2272,26 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         content_parts.append(
             "模型未使用可展开标记（expandable），本次按缺省全部可展开处理。"
         )
+    # 检索的事必须出现在 content 里：`rag` 形态下用户拿到的树有没有材料依据，
+    # 全看这一步。只说"共 N 个节点"会让一棵"20 支里有 8 支没查到依据"的树
+    # 与一棵全都查到证据的树看起来一模一样。
+    if slicing:
+        with_evidence = sum(1 for item in branch_evidence if item is not None)
+        line = (
+            f"按支检索：{len(skeleton)} 条分支各检索一次，"
+            f"{with_evidence} 条拿到材料依据（每支 {DEEP_BRANCH_TOP_K} 条）"
+        )
+        if retrieval_mode == "whole":
+            line += "；按支检索一条都没命中，已退回整树一次检索（全部支共用）"
+        elif with_evidence == 0:
+            line += "；一条都没命中，各支按「无依据」展开"
+        else:
+            line += f"，{len(skeleton) - with_evidence} 条没有依据、已如实留空"
+        content_parts.append(line + "。")
+        if refs_kept or refs_dropped:
+            content_parts.append(
+                f"引用：保留 {refs_kept} 条通过逐字校验，剔除 {refs_dropped} 条。"
+            )
     content_parts.append(
         f"按 {max_depth} 层预算展开，实际 {audit.deepest + 1} 层（含中心主题），各层节点数："
         f"{' / '.join(str(audit.depths.get(depth, 0)) for depth in range(audit.deepest + 1))}。"
@@ -1817,6 +2326,26 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
                 {"id": branch_id, "label": title, "points": len(slots_by_branch[index])}
                 for index, (title, branch_id) in enumerate(skeleton)
             ],
+            # 检索这一步的可观测面：模型只能用一次工具调用的参数描述它做过什么，
+            # 而真正发了几个 query、哪几支没拿到证据，只有这里说得清。
+            # `max_tool_calls` 不受影响（这一整段都在工具内部）。
+            "retrieval": {
+                "mode": retrieval_mode,          # off / branch / whole
+                "top_k": (DEEP_BRANCH_TOP_K if retrieval_mode != "whole"
+                          else DEEP_FALLBACK_TOP_K),
+                "queries": retrieval_queries,
+                "branches_with_hits": sum(
+                    1 for item in branch_evidence if item is not None),
+                "failed_branches": [skeleton[index][0] for index in retrieval_failed],
+                "empty_branches": [skeleton[index][0] for index in retrieval_empty],
+                "hits": sum(
+                    len(item.payload) for item in branch_evidence if item is not None),
+            },
+            "source_refs": {
+                "kept": refs_kept,
+                "dropped": refs_dropped,
+                "dropped_by_code": refs_by_code,
+            },
             "diagnostics": [item.model_dump() for item in diagnostics],
         },
     )
@@ -2204,8 +2733,11 @@ _TOOL_SPECS: dict[str, Callable[[], ToolSpec]] = {
             "适合复杂主题——它每次只让模型输出一支，不受单次输出上限挤压，"
             "因此比 mindmap_generate 更稳。"
             "简单主题用 mindmap_generate（一次调用就够，更快）。"
-            "仅在没有附带材料时使用：它按主题自由展开，不读任何来源正文，"
-            "有材料时请用 mindmap_generate 做忠实整理。"
+            # 这句必须与 `_generate_deep` 的实际行为一致：它现在**会**检索
+            # （rag 形态下每支一次，服务端在工具内部做）。写成"不读来源"会让
+            # 模型在带材料的请求里选错工具，也会让读描述判断行为的人判断错。
+            "带材料时它会为每条一级分支各自检索一次并只让那一支看到自己的检索结果，"
+            "所以带材料的复杂主题同样可以用它；它不会把全文读进来。"
             "只有当前还没有导图时可用。"
         ),
         args_model=GenerateDeepArgs,
@@ -2253,29 +2785,30 @@ def build_registry(intent: str = "create", *, has_sources: bool = False) -> Tool
     分片那条路的成本是 N+1 次调用，简单主题走它纯属浪费额度——这个判断
     只有拿到主题的模型能做。
 
-    **有来源时撤掉 `mindmap_generate_deep`**：它的入参里没有任何来源字段，
-    骨架与展开都只看主题，产出的树与材料无关，却会以 ok=True 成功返回。
-    带材料的新建走 `mindmap_generate` 的忠实整理模式（它给模型喂结构化来源、
-    还校验逐字引用）。这条不是"少给一个选项"，而是"少给一条会给出错误答案
-    的路"——模型看不到它，就不会选中它。
+    **有来源时是否撤掉 `mindmap_generate_deep`，按形态决定**：
 
-    **`rag` 形态让这条限制更痛，这一轮仍然保持 discard**：`mindmap_generate_deep`
-    自己一次检索都不发起（入参里根本没有 query），`rag` 形态下它连正文都拿不到，
-    产出的树与材料完全脱钩——比 `full` 形态更离谱，那时 prompt 里至少还有全文。
-    正确形态是「每个分支先检索再展开」（`docs/RAG-DECISIONS.md` 第 5 节的
-    结构引导召回）：**整树一次生成意味着只有一次检索机会**，而分片 + 按支检索
-    才能让每次展开都基于自己那支的证据。那条路留到下一轮，本轮保持 discard：
-    宁可只给模型 `mindmap_generate` 这一条带检索能力的路，也不给它一条会以
-    ok=True 交付无关树的捷径。
+      - `full`：**撤掉**。正文整份已经在 prompt 里，模型自己就能扫全文；而它的
+        入参里没有任何来源字段、骨架与展开都只看主题，产出的树与材料脱钩，却会
+        以 ok=True 成功返回。这条不是"少给一个选项"，是"少给一条会给出错误答案
+        的路"——模型看不到它，就不会选中它。带材料的新建走 `mindmap_generate`
+        的忠实整理模式（它给模型喂结构化来源、还校验逐字引用）。
+      - `rag`：**保留**（这一轮放开的那一条）。`_generate_deep` 现在会为每条
+        一级分支各检索一次（`docs/RAG-DECISIONS.md` 第 5 节的结构引导召回），
+        每支只看到自己的命中，引用也只能落在自己那批证据上。**整树一次生成意味着
+        只有一次检索机会**——`top_k=5` 对八千字材料约覆盖 25%，"没想到要问的
+        章节"会静默缺失；分片之后覆盖度由骨架决定，不由模型的查询创意决定。
+        在 `full` 下做这件事是白花（正文已在 prompt），所以那里的 discard 不变。
 
     `rag_query` 只在真有来源时才注册：没来源的检索必然返回「没有找到」，
     注册它只会诱导模型拿它当"思考"用。未知意图按 `create` 兜底——宁可少给
     工具，也不要把破坏性工具塞进一个没预期到的新意图里。
     """
+    rag_mode = source_mode() == SOURCE_MODE_RAG
     allowed = set(_ALLOWED_BY_INTENT.get(intent, _ALLOWED_BY_INTENT["create"]))
     if has_sources:
-        allowed.discard("mindmap_generate_deep")
-        if intent in _SOURCE_AWARE_INTENTS or source_mode() == SOURCE_MODE_RAG:
+        if not rag_mode:
+            allowed.discard("mindmap_generate_deep")
+        if intent in _SOURCE_AWARE_INTENTS or rag_mode:
             allowed.add("rag_query")
 
     registry = ToolRegistry()

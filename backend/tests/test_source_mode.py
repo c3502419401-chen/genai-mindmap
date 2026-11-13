@@ -389,21 +389,26 @@ def test_invalid_mode_falls_back_to_rag_and_warns_once():
     assert MARKER not in system + user
 
 
-def test_registry_hands_create_the_retrieval_tool_in_rag_mode():
+def test_registry_hands_create_the_retrieval_tools_by_mode():
     """`rag` 下 create 必须拿到 `rag_query`，否则模型一个字都写不出来。
 
     `full` 下恰好相反：正文已在 prompt 里，再给检索入口只会诱导它把"先查一下"
     当成规定动作（实测 10 次里 10 次都先查一遍）。所以这条按形态分别断言——
     两种形态在这个点上结论相反，不能只钉一边。
+
+    `mindmap_generate_deep` 同样按形态：`rag` 下放开（它自己会按支检索，
+    见 `tests/test_deep_slicing.py`），`full` 下仍然撤掉（正文已在 prompt 里，
+    分片检索是白花，而它按主题自由展开的树与材料脱钩却会 ok=True 返回）。
     """
     with _env(SOURCE_MODE_RAG):
         names = build_registry("create", has_sources=True).names()
     assert "rag_query" in names
-    assert "mindmap_generate_deep" not in names      # 仍然 discard，见下一轮
+    assert "mindmap_generate_deep" in names          # 分片 + 按支检索，这一轮放开
 
     with _env(SOURCE_MODE_FULL):
         names = build_registry("create", has_sources=True).names()
     assert "rag_query" not in names
+    assert "mindmap_generate_deep" not in names      # 形态决定，`full` 下不变
 
 
 def test_loop_prompt_does_not_forbid_retrieval_in_rag_mode():

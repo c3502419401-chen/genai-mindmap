@@ -572,7 +572,10 @@ class GenerateGrowTest(unittest.TestCase):
     def _execute(self, ctx):
         registry = build_registry("create", has_sources=bool(ctx.request.sources))
         if ctx.request.sources:
-            self.assertNotIn("mindmap_generate_deep", registry)
+            # 本文件跑在默认形态（`rag`）下。`mindmap_generate_deep` 现在**在**注册表
+            # 里（分片 + 按支检索那一轮放开了 discard），本文件固定走的是整树生成
+            # 那条路，所以这里守住的是"整树生成仍然可用"，不再是"deep 被撤掉"。
+            self.assertIn("mindmap_generate", registry)
         call = ToolCall(call_id="generate-1", name="mindmap_generate",
                         arguments={"topic": "整理论文"})
         return _run(registry.execute(call, ctx))
