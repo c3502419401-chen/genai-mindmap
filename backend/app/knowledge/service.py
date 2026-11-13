@@ -27,6 +27,7 @@ import math
 import os
 import re
 import time
+from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Literal
@@ -627,6 +628,360 @@ def _chunk_tree(text: str) -> list[ChunkSpan]:
             spans.append(ChunkSpan(
                 start=leaf_start, end=leaf_end, level=1, parent=parent))
     return spans
+
+
+# ---------------------------------------------------------------- 材料目录（只读）
+#
+# `heading_outline` 回答的是"**这份材料自己**把内容分成了哪几块"，给骨架调用
+# （`agent/tools._generate_deep`）当结构线索用。它只读原文：不参与切块、不打分、
+# 不进索引、不改任何既有边界——把目录从这份材料里去掉，检索结果逐字段相同。
+#
+# **为什么不靠块边界**：实测 10 份真实材料，父块的**起始行**是标题的只有 12%
+# （`scripts/measure_outline_headings.py`）——父块是"450–700 字 + 句首吸附"切出来的，
+# 一个块常从半句话开始、标题落在块中间或紧跟在前一块末尾。按父块起点取目录会漏掉
+# 八成，所以这里逐行扫原文。
+#
+# **为什么只取一级**：骨架要回答的是"分成哪几块"。把二级小节也拼进去，十几二十条
+# 细碎片段会把一级分支挤成小节罗列，也把真正的大章稀释掉。
+
+OUTLINE_MAX_ITEMS = 30
+"""目录条数上限。超了按 coverage 降序保留（留覆盖大的，丢细碎小节）。"""
+
+OUTLINE_MAX_TITLE_CHARS = 40
+"""单条标题的字数上限。markdown 标题超了**截断**（它确实是标题），
+非 markdown 候选超了**丢弃**（那是散文句，见 `_looks_like_prose`）。"""
+
+OUTLINE_MIN_ITEMS = 2
+"""少于两条不叫目录。一条标题覆盖全文的"目录"对骨架是误导：模型会以为全文只有
+那一章。这类材料按"没有可用目录"处理（返回空列表，调用方回退到自行归纳）。"""
+
+OUTLINE_MIN_TITLE_CHARS = 2
+"""候选标题的最短字数。一个字的"标题"是编号残片（`1.5 倍` 去掉编号后的 `倍`）。"""
+
+OUTLINE_COLON_TAIL_CHARS = 20
+"""冒号后的分句超过这么长就判为正文。见 `_looks_like_prose`。"""
+
+# markdown 标题行：`#` 到 `######`，中间**必须有空格**（`#tag` 不是标题）；
+# 行尾的闭合 `#`（`## 标题 ##`）是 ATX 语法的一部分，取标题时剥掉。
+# 用 `[ \t]` 而不是 `\s`：`\s` 会让一行孤零零的 `#`（正文在下一行）也匹配上。
+_MARKDOWN_HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(\S.*)$", re.MULTILINE)
+_MARKDOWN_CLOSING_RE = re.compile(r"[ \t]+#+[ \t]*$")
+
+# 非 markdown 材料的编号形状。`_HEADING_RE` 只回答"这一行算不算标题"，级别由这里
+# 判：先按字面前缀判，数字编号单独走 `_numbering_line`。
+_NUMBERING_PREFIXES: tuple[tuple[str, int, re.Pattern[str]], ...] = (
+    ("chapter", 1, re.compile(r"^第[一二三四五六七八九十百]+章")),
+    ("section", 2, re.compile(r"^第[一二三四五六七八九十百]+节")),
+    ("article", 1, re.compile(r"^第[一二三四五六七八九十百]+条")),
+    ("cn1", 1, re.compile(r"^[一二三四五六七八九十]+、")),
+    ("cn_sub", 2, re.compile(r"^（[一二三四五六七八九十]+）")),
+    ("paren_sub", 2, re.compile(r"^\([一二三四五六七八九十]+\)")),
+)
+# `1.` / `1、` / `1.1` / `3.1.2` 后面紧跟正文：分隔符之后不能是数字（否则 `1.5 倍`
+# 的 `1.5` 会被当成两级编号），余下部分就是标题。
+_DECIMAL_RE = re.compile(r"^(\d+(?:\.\d+)*)([、.]|[ \t]+)(.*)$")
+# 行首编号从标题里剥掉（markdown 与非 markdown 都剥）：调用方自己会重新编号
+# （`1. 引言（约占 8%）`），留着原文编号会渲染成 `1. 一、实验目的`、`2. 1 已经落地的
+# 两件事`。实测剥不剥对覆盖率没有差别（32.7% vs 30.8%，在噪声内），所以这一条只
+# 按"渲染出来读不读得通"定。
+#
+# 剥的**只是分隔符编号**（`一、` / `1.` / `（一）` / `第N章`）——那是 `_HEADING_RE`
+# 认的形状，天然只是前缀。裸的 `1 已经落地的两件事` 不剥：那里的 `1 ` 后面没有分隔符，
+# 它可能是标题的一部分（`3 种检索形态，别混着谈` 剥掉就成了 `种检索形态`）。
+# `(?=\D)` 是为了不把 `1.5 倍` 的 `1.5` 当编号剥掉——没有它，正则回溯会先试
+# `\d+`="1" + `[、.]`="." 就收工，留下 `5 倍`。
+_LEADING_MARKER_RE = re.compile(
+    r"^(?:第[一二三四五六七八九十百]+[章节条][ \t]*|"
+    r"[一二三四五六七八九十]+、[ \t]*|"
+    r"[（(][一二三四五六七八九十]+[）)][ \t]*|"
+    r"\d+(?:\.\d+)*[、.][ \t]*(?=\D))"
+)
+_COLON_TAIL_RE = re.compile(r"[：:][ \t]*(.+)$")
+# **整个段落加粗**的一行（`**一、实验须知**`）。Docling 把"整段只有加粗文字"的
+# 段落导出成这种形状，而 Word 里手工加粗的章节名正是这样——docx 的章节结构十有
+# 八九落在这一条上。排除内部还有 `*` 的情况：`1. **判断器…**。同一 query…` 是
+# "行首编号 + 段中加粗"，它内层不匹配（前后都有别的字），不会走到这里。
+_BOLD_LINE_RE = re.compile(r"^[ \t]*\*\*([^*\n]+)\*\*[ \t]*$", re.MULTILINE)
+
+
+@dataclass(frozen=True)
+class OutlineEntry:
+    """材料目录里的一条：一个章节标题 + 它管到哪儿。
+
+    `start` 是该标题在**原文**里的起始偏移（码点，与 `ChunkSpan` / `SourceRef`
+    同一口径），`coverage` 是它到**下一个同级标题**之间的字数——两者合起来才是
+    "这一章有多大"。只给标题的话，"引言" 与 "实测数据" 在模型眼里一样重，
+    而它们该分到的分支显然不该一样重。
+
+    `coverage` 只在**同一份材料内部**可比：它是原始码点数，跨材料比没有意义
+    （多份材料时覆盖率要按各自字数加权，见 `outline_coverage`）。
+    """
+
+    title: str
+    start: int
+    coverage: int
+
+
+def _line_bounds(text: str, offset: int) -> tuple[int, int]:
+    """`offset` 所在行的 `[起, 止)`，止于换行符之前。
+
+    `offset` 不在行首时结果仍是**整行**的边界：目录项的 `start` 要落在行首，
+    调用方拿它切片高亮时不该出现半行。
+    """
+    start = text.rfind("\n", 0, offset) + 1
+    end = text.find("\n", offset)
+    return start, len(text) if end < 0 else end
+
+
+def _clean_markdown_title(body: str, max_title_chars: int) -> str:
+    """markdown 标题的正文：去结尾闭合井号、剥分隔符编号、压空白、超长截断。
+
+    截断而不是丢弃：`^#{1,6}` 行就是真标题（上一轮实测 P=100%），长是它自己的事，
+    丢掉等于把这一章从目录里删掉。
+
+    剥编号的理由见 `_LEADING_MARKER_RE`：中文材料的 `# 一、实验目的` 很常见，
+    不剥会渲染成 `1. 一、实验目的`。
+    """
+    title = _MARKDOWN_CLOSING_RE.sub("", body)
+    title = _LEADING_MARKER_RE.sub("", re.sub(r"\s+", " ", title).strip())
+    return title[:max_title_chars]
+
+
+def _numbering_line(line: str) -> tuple[str, str] | None:
+    """非 markdown 材料的一行：`(级别 kind, 去编号后的名字)`；不是标题返回 None。
+
+    两级判定，顺序不能换：
+
+      1. `_HEADING_RE`（切块器**自己**用的标题行首规则）说"不是标题"就到此为止——
+         目录与切块器看同一批行。模型拿到的目录若包含切块器不认的结构，
+         "按章节切开的块"与"目录里的章"就对不上，检索命中会落在目录之外；
+      2. 它说"是标题"之后再分级：字面前缀（`第一章`/`一、`/`（一）`）先判，
+         数字编号走 `_DECIMAL_RE`。分级只决定"哪一层算一级"，不决定要不要它。
+    """
+    if not _HEADING_RE.match(line):
+        return None
+    for kind, _, pattern in _NUMBERING_PREFIXES:
+        match = pattern.match(line)
+        if match:
+            return kind, line[match.end():].strip()
+    match = _DECIMAL_RE.match(line)
+    if match:
+        marker, separator, rest = match.groups()
+        # `1.5 倍`：`\d+(?:\.\d+)*` 把 `1.5` 整体吃掉，分隔符是它后面的空格。
+        # 空格分隔且后面没有正文 = 不是标题。
+        if separator.isspace() and not rest.strip():
+            return None
+        kind = "decimal" if "." in marker else "decimal1"
+        return kind, rest.strip()
+    return None
+
+
+def _looks_like_prose(title: str, max_title_chars: int) -> bool:
+    """这条候选长得像**正文句子 / 表格行 / 列表项**，而不是标题。
+
+    三条都是实测出来的假阳性特征（`scripts/measure_outline_headings.py` 的报告段
+    直接列出了误判行）：
+
+      - 含 `**`：`1. **判断器不是噪声源，是系统性失效**。同一 query 跑 3 次…`
+        是加粗的列表项；
+      - 含 `|`：`| 4 | 单换行 | 列…` 是表格行；
+      - 冒号后跟长分句（> `OUTLINE_COLON_TAIL_CHARS`）或带逗号句号：
+        `1. 检索：把整份材料交给模型、让模型自己找` 是编号列表项。真标题的冒号
+        后面是短语（`5 下一步：结构引导的召回`，7 字）。
+    """
+    if "**" in title or "|" in title:
+        return True
+    if len(title) > max_title_chars:
+        return True
+    tail = _COLON_TAIL_RE.search(title)
+    if tail:
+        clause = tail.group(1).strip()
+        if len(clause) > OUTLINE_COLON_TAIL_CHARS:
+            return True
+        if any(char in clause for char in "。；，,;"):
+            return True
+    return False
+
+
+def _followed_by_blank_line(text: str, line_end: int) -> bool:
+    """这一行之后是空行或文件结束。
+
+    列表项后面通常紧跟内容（下一行还是列表项），标题后面通常空一行再进正文。
+    这是几条过滤里**最贵**的一条：对"一行标题 + 空行 + 正文"的版式（markdown、
+    docx 导出都是这样）它几乎不误伤，对逐行紧排的扫描件会牺牲召回。宁可那种材料
+    返回空目录，也好过把二十条列表项当章节塞给骨架。
+    """
+    if line_end >= len(text) - 1:
+        return True
+    rest_start = line_end + 1
+    rest_end = text.find("\n", rest_start)
+    rest_end = len(text) if rest_end < 0 else rest_end
+    return not text[rest_start:rest_end].strip()
+
+
+def _outline_lines(text: str, *, max_title_chars: int) -> list[tuple[int, str]]:
+    """逐行扫出一级标题：`[(行首偏移, 标题)]`，按原文顺序。
+
+    两条正交的规则：
+
+      - **有 markdown 结构就只认 markdown**（`^#{1,6}[ \\t]`）。上一轮在 10 份真实
+        材料上实测这样取 P=100% / R=100%（`#` 就是真值）。再混进来判 `一、`/`1.`
+        只会引入假阳性（正文里的编号列表项），不会多出一个真章节。
+      - **一级 = 最浅的、真把文档分开了的那一层**。markdown 取"井号最少且至少
+        `OUTLINE_MIN_ITEMS` 条"的那一级：`#` 只有一条时它是**文档标题**而不是章节
+        （本仓库 10 份材料 9 份是这个形状，`docs/RAG-DECISIONS.md` 就是 1 个 `#`
+        + 10 个 `##`），只认 `#` 会得到一条覆盖全文的"目录"，那是书名不是目录。
+        编号行取**出现次数最多**的层级（全是 `一、` 就取 `一、`；`一、` 与 `（一）`
+        混排时前者更多，就只取前者——这就是"只取一级"）。
+
+    **只有一条 markdown 标题时不算"有 markdown 结构"，继续往下走编号行那条路**：
+    这是 docx 的常见形态——Docling 从标题样式推出一个 `## 实验4 …` 当文档标题，
+    正文里的章节名却是**整个段落加粗**（`**一、实验须知**`），一个 `#` 都没有。
+    在这里就返回空，等于让最常见的上传格式一个目录都拿不到。
+    """
+    markdown: list[tuple[int, str, int]] = []
+    for match in _MARKDOWN_HEADING_RE.finditer(text):
+        title = _clean_markdown_title(match.group(2), max_title_chars)
+        if title:
+            markdown.append((match.start(), title, len(match.group(1))))
+    if markdown:
+        counts = Counter(level for _, _, level in markdown)
+        picked = next(
+            (level for level in sorted(counts) if counts[level] >= OUTLINE_MIN_ITEMS),
+            None,
+        )
+        if picked is not None:
+            return [(start, title) for start, title, level in markdown if level == picked]
+
+    numbered: list[tuple[int, str, str]] = []
+    for match in _HEADING_RE.finditer(text):
+        line_start, line_end = _line_bounds(text, match.start())
+        line = text[line_start:line_end].strip()
+        parsed = _numbering_line(line)
+        if parsed is None:
+            # `_HEADING_RE` 说它是标题，但分级说不出来（`2.5` 这类）。
+            # 不猜级别：猜错会让整份目录落在错的那一层上。
+            continue
+        kind, rest = parsed
+        title = re.sub(r"[ \t]+", " ", _LEADING_MARKER_RE.sub("", rest)).strip()
+        if len(title) < OUTLINE_MIN_TITLE_CHARS:
+            continue
+        if _looks_like_prose(title, max_title_chars):
+            continue
+        if not _followed_by_blank_line(text, line_end):
+            continue
+        numbered.append((line_start, title[:max_title_chars], kind))
+    # 整个段落加粗的编号行（`**一、实验须知**`）：`_HEADING_RE` 的 `^` 吃不到它
+    # （行首是 `*`），而 docx 里的章节名十有八九是这个形状。
+    # 判据与上一段**完全相同**（编号形状 + 四条过滤），只有"要不要先摘掉 `**`"这一
+    # 步不同——所以它不是第二条规则，而是同一个规则的另一个入口。
+    for match in _BOLD_LINE_RE.finditer(text):
+        line_start, line_end = _line_bounds(text, match.start())
+        parsed = _numbering_line(match.group(1))
+        if parsed is None:
+            continue
+        kind, rest = parsed
+        title = re.sub(r"[ \t]+", " ", _LEADING_MARKER_RE.sub("", rest)).strip()
+        if len(title) < OUTLINE_MIN_TITLE_CHARS:
+            continue
+        if _looks_like_prose(title, max_title_chars):
+            continue
+        if not _followed_by_blank_line(text, line_end):
+            continue
+        numbered.append((line_start, title[:max_title_chars], kind))
+    numbered.sort(key=lambda item: item[0])
+    if not numbered:
+        return []
+    # 最高频的那一层当一级；票数相同时取更浅的那层（`一、` 优先于 `（一）`），
+    # 让"混排材料"的结论可复现，而不是取决于材料里先出现谁。
+    depth = {kind: level for kind, level, _ in _NUMBERING_PREFIXES}
+    depth["decimal"] = 2
+    depth["decimal1"] = 1
+    counts = Counter(kind for _, _, kind in numbered)
+    picked = min(counts, key=lambda kind: (-counts[kind], depth.get(kind, 2)))
+    return [(start, title) for start, title, kind in numbered if kind == picked]
+
+
+def _outline_entries(text: str, *, max_title_chars: int) -> list[OutlineEntry]:
+    """单份材料的目录：算 coverage、按标题去重。**不做条数裁剪**（那是全局的事）。"""
+    lines = _outline_lines(text, max_title_chars=max_title_chars)
+    if len(lines) < OUTLINE_MIN_ITEMS:
+        return []
+    entries: list[OutlineEntry] = []
+    for index, (start, title) in enumerate(lines):
+        end = lines[index + 1][0] if index + 1 < len(lines) else len(text)
+        entries.append(OutlineEntry(title=title, start=start, coverage=max(0, end - start)))
+    # 去重按**标题文本**、保留第一次出现的位置：PDF 的页眉页脚与 docx 的页眉会把
+    # 同一行印在每一页顶上，不过这一关目录里会有二十条同名项。
+    # coverage 在去重**之前**就算好了（对着原始标题序列），所以留下来的那条记的是
+    # "它第一次出现时管到哪儿"，不会被后面重复的那几行虚增。
+    seen: set[str] = set()
+    unique: list[OutlineEntry] = []
+    for entry in entries:
+        if entry.title in seen:
+            continue
+        seen.add(entry.title)
+        unique.append(entry)
+    return unique if len(unique) >= OUTLINE_MIN_ITEMS else []
+
+
+def _trim_outline(entries: list[OutlineEntry], max_items: int) -> list[OutlineEntry]:
+    """超限时按 coverage 降序保留，再按原文顺序返回。
+
+    排序方向刻意相反：**挑**的时候看覆盖（留下"实测数据"这种大章、丢掉细碎小节），
+    **交出去**的时候看原文顺序——目录一旦乱序，"1. 引言 2. 相关工作"就成了密码表，
+    模型也没法顺着材料的结构写分支。
+    """
+    if len(entries) <= max_items:
+        return entries
+    kept = sorted(entries, key=lambda entry: (-entry.coverage, entry.start))[:max_items]
+    return sorted(kept, key=lambda entry: entry.start)
+
+
+def heading_outline(
+    sources: list[Source], *,
+    max_items: int = OUTLINE_MAX_ITEMS,
+    max_title_chars: int = OUTLINE_MAX_TITLE_CHARS,
+) -> list[OutlineEntry]:
+    """材料自带的章节列表（只读，逐行扫原文）。**空列表 = 这份材料没有可用目录。**
+
+    调用方拿它当骨架的"结构线索"，所以输出只有两类：能用的目录，或者空。
+    没有"凑合能用"的中间态——半份目录（只覆盖 11%）比没有目录更糟：模型会把它
+    当成全文的提纲，于是漏掉的九成内容它再也不会想到要问。
+
+    上限、去重都在这一层收口：`max_items` 条以内、按原文顺序、标题互不重复，
+    `coverage` 之和就是这份目录"管住了多少字"（见 `outline_coverage`）。
+    多份材料时先各自出目录再一起裁剪：一份材料的结构不因另一份材料存在而变形。
+    """
+    entries: list[OutlineEntry] = []
+    for source in sources:
+        text = source.text or ""
+        if not text.strip():
+            continue                      # 空正文没有结构可言（`status` 只给界面看）
+        entries.extend(_outline_entries(text, max_title_chars=max_title_chars))
+    return _trim_outline(entries, max_items)
+
+
+def outline_coverage(
+    sources: list[Source], entries: list[OutlineEntry] | None = None,
+) -> float:
+    """目录覆盖了材料的百分之多少：`Σ coverage / Σ len(text)`（多份按字数加权）。
+
+    分母是**原文总字数**而不是非空白字数：`coverage` 是两条标题之间的原始码点数
+    （含空行与缩进），两边同一口径，比值才不会被空白灌水。多份材料时分子分母各自
+    求和，等价于按字数加权——一份三万字的手册和一份两百字的便签不该各占一半权重。
+
+    `entries` 传进来时用它：调用方拼进 prompt 的通常是**裁剪过**的那份目录，
+    覆盖率必须跟着那份算，否则"覆盖率 95%"配一份只剩 8 条的目录，两边对不上。
+    """
+    total = sum(len(source.text or "") for source in sources)
+    if total <= 0:
+        return 0.0
+    catalogue = heading_outline(sources) if entries is None else entries
+    # 夹到 1.0 是防御：`heading_outline` 的条目互不重叠，理论上 sum ≤ total；
+    # 但调用方可以自己拼一份 entries 进来（测试、将来的多材料合并），
+    # 覆盖率出现 1.3 这种数会让阈值判断变得莫名其妙。
+    return min(1.0, sum(entry.coverage for entry in catalogue) / total)
 
 
 # ---------------------------------------------------------------- 混合检索参数

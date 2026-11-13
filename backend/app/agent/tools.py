@@ -67,6 +67,8 @@ from app.knowledge.service import (
     EvidenceHit,
     SourceFilter,
     filter_sources,
+    heading_outline,
+    outline_coverage,
     search_multi,
     search_parent,
 )
@@ -1018,8 +1020,9 @@ def _audit_tree(root: Node, expected: set[int]) -> _TreeAudit:
 def _source_prompt_input(sources: list[Source], *, system: str = "") -> str:
     """把来源拼成模型这次的输入。**形态由 `MINDMAP_SOURCE_MODE` 决定**。
 
-    - `rag`（默认）：只拼一份**材料清单**（标题、字数、类型），正文一个字都不进。
-      模型要靠 `rag_query` 检索才有内容可写。
+    - `rag`（默认）：只拼一份**材料清单**（标题、字数、类型），正文一个字都不进
+      **这一处**——模型要靠 `rag_query` 检索才有内容可写。（整次请求里还有检索
+      命中、骨架那一次的章节标题，见 `_material_inputs` 的四种说法。）
     - `full`：把每份来源的正文整份拼进去（受上下文预算裁剪），行为与
       `901b484` 逐字节一致，回归用例钉着这一点（`tests/test_source_mode.py`）。
 
@@ -1254,23 +1257,74 @@ PLAN_PROMPT = (
     '{"branches":["分支一","分支二"]}。'
     "每条分支是一个能独立成立的短标题，不超过 20 字；彼此覆盖的范围不重叠，"
     "按逻辑顺序排列；不要编号，不要解释，不要编造具体数据、人名或文献。"
+    "材料自带章节时优先采用它们作为一级分支；目录为空或不完整时再自行归纳。"
 )
 
+# 骨架提示词里那段"材料自带的章节"的表头。测试用它断言"目录拼进去了没有"，
+# 所以必须是**一个字符串常量**而不是散在 `_skeleton_outline` 里的字面量——
+# 两处各写一遍，改一处忘一处时，用例会绿着而提示词已经不再是那个形状。
+OUTLINE_HEADER = "这份材料自带的章节（请优先按它划分一级分支）："
 
-def _plan_ask(topic: str, branches: int) -> str:
+# 目录覆盖率低于它就**不拼**进骨架。
+#
+# 不拼不是保守，是准确：一份只覆盖 11% 的目录拼进去，模型会把它当成全文的提纲，
+# 于是没被目录管住的那 89% 它再也不会想到要问——那比"没有目录"更糟，因为没有
+# 目录时它至少会按主题自己归纳几块。60% 这个数来自上一轮实测：10 份真实材料里
+# 一级标题覆盖字数的中位数是 97%，8/10 份 ≥60%，所以真实材料几乎总在阈值之上，
+# 而"真的没结构"的材料会被这条闸挡住。
+OUTLINE_MIN_COVERAGE = 0.6
+
+
+def _skeleton_outline(sources: list[Source]) -> str:
+    """拼给骨架的目录块；不该拼时返回空串。
+
+    目录是**原文的子集**，和 `_material_inputs` 给 planner 的那前 200 字同一类：
+    `rag` 形态下"正文不进 prompt"这句话的准确版本是"正文不进，标题行作为结构线索
+    会进"（措辞见 `_material_inputs` 的 docstring 与 `generation.service` 里
+    `SOURCE_MODE_ENV` 的注释）。这里进 prompt 的只有标题行，一条最多 40 字。
+
+    三件事一起做：取目录、判覆盖率、渲染。判覆盖率必须用**裁剪后**的那份目录
+    （`outline_coverage(sources, entries)` 而不是不带参数的调用），否则"覆盖率
+    95%"可能配着一份只剩 8 条、恰好漏掉大章的目录。
+
+    百分比的分母是原文总字数，所以"约占 X%"读起来是"这一章大约占全文多少"，
+    与模型的直觉一致；小于 1% 的按 1% 显示，写"约占 0%"是在告诉模型这一段不重要，
+    而它可能正好是唯一提到某件事的地方。
+    """
+    entries = heading_outline(sources)
+    if not entries:
+        return ""
+    coverage = outline_coverage(sources, entries)
+    if coverage < OUTLINE_MIN_COVERAGE:
+        return ""
+    total = sum(len(source.text or "") for source in sources)
+    lines = [OUTLINE_HEADER]
+    for index, entry in enumerate(entries, start=1):
+        share = round(entry.coverage / total * 100) if total else 0
+        lines.append(f"{index}. {entry.title}（约占 {max(1, share)}%）")
+    return "\n".join(lines)
+
+
+def _plan_ask(topic: str, branches: int, *, outline: str = "") -> str:
     """骨架调用的 user 消息。
 
     期望分支数必须写进 user：只靠 system 里的通用说明时，请求 3 支与 8 支的
     模型输入一字不差，它只能按自己的直觉给一个数——而 `branches` 是用户在界面
     上选的值，被无视了。单条长度、互不重叠、逻辑顺序三条也一起重申：system 里
     虽有，但这是决定骨架质量的三条硬约束，重复一次便宜，骨架歪了整张图都歪。
+
+    `outline` 是材料自带的章节（`_skeleton_outline` 的产物），**放在主题之后、
+    条数要求之前**：顺序即权重，先给它看材料的结构，再让它数条数——反过来先
+    见到"最多 8 条"时，它倾向凑满 8 条再找话说。空串表示这份材料没有可用目录，
+    那一字不加（与加目录之前逐字相同）。
     """
-    return (
-        f"主题：{topic}\n"
-        f"根据内容实际包含的方面来定一级分支数量，最多 {branches} 条。\n"
-        "材料层次多就用足、内容单薄就少给，不要为了凑数把不同的事塞进同一支。\n"
-        "每条不超过 20 字，互不重叠，按逻辑顺序排列。"
-    )
+    parts = [f"主题：{topic}"]
+    if outline:
+        parts += ["", outline, ""]
+    parts.append(f"根据内容实际包含的方面来定一级分支数量，最多 {branches} 条。")
+    parts.append("材料层次多就用足、内容单薄就少给，不要为了凑数把不同的事塞进同一支。")
+    parts.append("每条不超过 20 字，互不重叠，按逻辑顺序排列。")
+    return "\n".join(parts)
 
 
 # 分片生成第二步：按骨架逐支展开。与 `EXPAND_PROMPT` 的差别只有上下文——
@@ -1583,8 +1637,8 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     **`rag` 形态下骨架之后、并发展开之前，每条一级分支各检索一次**（分片 + 按支
     检索，`docs/RAG-DECISIONS.md` 第 5 节）：query 是**分支标题本身**（不含主题，
     理由与三组消融数字见 `_search_branch`），走 `search_parent`（父块返回，默认开），
-    `top_k=DEEP_BRANCH_TOP_K`。这是这个工具唯一读来源正文的地方，形态是**检索结果**
-    而不是全文。
+    `top_k=DEEP_BRANCH_TOP_K`。这个工具读来源有两处，形态都不是全文：骨架那一次
+    读的是**标题行**（`_skeleton_outline`，原文的子集），展开读的是**检索结果**。
 
     为什么必须按支检索：`rag` 形态下模型看不到正文，整树一次生成 = **整棵树只有
     一次检索机会**。`top_k=5` 对八千字材料约覆盖 25%、对三万字约 8%，于是"没想到
@@ -1657,11 +1711,24 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         )
 
     # 第一步：出骨架。额度在调用**之前**占——请求一旦发出就是一次真实计费。
+    #
+    # `rag` 形态下这一次调用会带上**材料自带的章节**（`_skeleton_outline`）：正文
+    # 仍然不进 prompt，进的是每份材料自己的标题行（原文的子集，见
+    # `_material_inputs` 的 docstring）。为什么放在骨架这一次而不是展开：分片之后
+    # **覆盖度由骨架决定**——模型凭空想 8 支时，材料里它没想到的章节就再也不会有
+    # 人问；给它一份目录，它至少知道"这份材料有这几块"。实测数字见
+    # `scripts/measure_outline_skeleton.py`。
+    #
+    # `full` 形态**不拼**：正文整份已经在 prompt 里，模型自己就能读到标题，
+    # 目录是同一份内容的第二份拷贝——白花 token，还会诱导它把目录当全文提纲、
+    # 忽略正文里的细节。所以这个开关跟着 `slicing` 走，不单独判一次形态。
     if not ctx.reserve_model_call():
         return _fail("budget_exhausted", "本次运行的模型调用额度已用完，连骨架都出不了，无法分片生成。")
     ctx.extra_model_calls += 1
+    outline = _skeleton_outline(sources) if slicing else ""
     try:
-        raw_plan = await ask_model(PLAN_PROMPT, _plan_ask(args.topic, args.branches))
+        raw_plan = await ask_model(
+            PLAN_PROMPT, _plan_ask(args.topic, args.branches, outline=outline))
     except GenerationError as exc:
         return _fail("generation_failed", f"骨架生成失败：{exc}")
 
@@ -2459,16 +2526,21 @@ def _rag_filters(raw: dict[str, Any] | None) -> SourceFilter | None:
 def _material_inputs(sources: list[Source]) -> list[str]:
     """给 `plan_query` 的材料摘要：每份「标题 + 正文开头」压平成一段。
 
-    **这是 `rag` 形态下唯一主动把正文塞进 LLM prompt 的地方**（检索命中不算：
-    那就是检索的产出）。它的边界很小且是刻意的——只在前 200 字、只在
-    `MINDMAP_QUERY_EXPANSION` 打开时才走（默认关），而 planner 判断"该用哪些词、
-    范围有多大"本来就需要看一眼材料长什么样，只给标题它只能靠猜。
+    **这是 `rag` 形态下主动把正文塞进 LLM prompt 的两处之一**（另一处是
+    `_skeleton_outline` 拼进骨架的章节标题；检索命中不算：那就是检索的产出）。
+    它的边界很小且是刻意的——只在前 200 字、只在 `MINDMAP_QUERY_EXPANSION` 打开
+    时才走（默认关），而 planner 判断"该用哪些词、范围有多大"本来就需要看一眼
+    材料长什么样，只给标题它只能靠猜。
 
-    所以"`rag` 形态下正文不出进程"这句话**不成立**，准确的三种说法：
-      - 进 prompt：只有清单（生成/展开/改树）+ 检索片段（`rag_query` 的返回）+ 这里的前 200 字；
+    所以"`rag` 形态下正文不出进程"这句话**不成立**，准确的四种说法：
+      - 进 prompt：只有清单（生成/展开/改树）+ 检索片段（`rag_query` 的返回）
+        + 这里的前 200 字（默认关）+ `mindmap_generate_deep` 骨架那一次的**标题行**
+        （`_skeleton_outline`，原文的子集，一条最多 40 字）；
       - 离开进程但不进 prompt：混合检索的 embedding 请求（每个参与打分的块发一次，
         按 `sha256(quote)` 缓存），两种形态都一样，与这个开关无关；
       - `full` 形态额外把每份正文整份放进 prompt。
+      - 三种形态共同点：**结构线索（标题行）会进，正文段不进**。目录不改变这一点，
+        它只是把"标题行"这条边从"顺带"变成了"明确的一条输入"。
 
     截断与份数上限全部交给 `_material_snippets`：两处各写一份"前 200 字、最多
     10 份"，迟早出现"提示词看到的是 A、检索依据是 B"这种没人查得出来的差集。
@@ -2734,9 +2806,11 @@ _TOOL_SPECS: dict[str, Callable[[], ToolSpec]] = {
             "因此比 mindmap_generate 更稳。"
             "简单主题用 mindmap_generate（一次调用就够，更快）。"
             # 这句必须与 `_generate_deep` 的实际行为一致：它现在**会**检索
-            # （rag 形态下每支一次，服务端在工具内部做）。写成"不读来源"会让
-            # 模型在带材料的请求里选错工具，也会让读描述判断行为的人判断错。
-            "带材料时它会为每条一级分支各自检索一次并只让那一支看到自己的检索结果，"
+            # （rag 形态下每支一次，服务端在工具内部做），也**会**在骨架那一次
+            # 看材料自带的章节标题。写成"不读来源"会让模型在带材料的请求里选错
+            # 工具，也会让读描述判断行为的人判断错。
+            "带材料时它会先看一眼材料自带的章节标题来定一级骨架，再为每条一级分支"
+            "各自检索一次并只让那一支看到自己的检索结果，"
             "所以带材料的复杂主题同样可以用它；它不会把全文读进来。"
             "只有当前还没有导图时可用。"
         ),

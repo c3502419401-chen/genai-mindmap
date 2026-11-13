@@ -61,8 +61,14 @@ logger = logging.getLogger(__name__)
 #
 # `rag` 形态下"正文不出进程"这句话**不成立**，准确说法见
 # `agent/tools._material_inputs` 的 docstring：进 prompt 的只有清单 + 检索片段 +
-# 查询扩展那每份 200 字（`MINDMAP_QUERY_EXPANSION`，默认关）；离开进程的还有
+# 查询扩展那每份 200 字（`MINDMAP_QUERY_EXPANSION`，默认关）+ **材料自带的章节
+# 标题**（`agent/tools._skeleton_outline` 给骨架的那份目录）；离开进程的还有
 # 混合检索的 embedding 请求（两种形态都一样）。
+#
+# 别把最后那一项读成"正文也进去了"：目录是原文的子集，只是一级标题行（一条最多
+# 40 字），覆盖率不到 60% 的材料一条都不进。准确口径是"正文**段**不进，标题行
+# 作为结构线索会进"——分片生成下覆盖度由骨架决定，看不到结构的骨架只能凭主题猜
+# 分块，材料里它没想到的章节就永远没人问（`docs/RAG-DECISIONS.md` 第 5 节）。
 SOURCE_MODE_ENV = "MINDMAP_SOURCE_MODE"
 SOURCE_MODE_FULL = "full"
 SOURCE_MODE_RAG = "rag"
