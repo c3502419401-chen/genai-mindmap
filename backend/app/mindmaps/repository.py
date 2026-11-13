@@ -24,6 +24,17 @@ def connect() -> sqlite3.Connection:
         id TEXT PRIMARY KEY, version INTEGER NOT NULL,
         content TEXT NOT NULL, updated_at TEXT NOT NULL
     )""")
+    # 知识库的 `library_sources` / `library_chunks` 与上面这张表建在同一时刻、
+    # 同一个连接上：三条 DDL 全部幂等，所以不需要迁移脚本，也不会有"忘了跑脚本"
+    # 的窗口（与 `_record` 读时补齐 schema_version 是同一条理由）。
+    #
+    # import 放在函数内是**为了避免环**，不是风格：`library` 顶层要
+    # `from app.mindmaps import repository` 拿 `connect` / `db_path`，在模块顶层
+    # 反向 import 回去就成环。函数内的 import 在第一次连接之后由 sys.modules 缓存
+    # 命中，没有反复开销。
+    from app.knowledge.library import ensure_schema
+
+    ensure_schema(conn)
     return conn
 
 

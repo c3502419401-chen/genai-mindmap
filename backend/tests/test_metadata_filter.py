@@ -268,13 +268,20 @@ def test_office_parse_attaches_metadata(monkeypatch):
     assert source.text.startswith("# 实验四")
     assert source.metadata.author == "张三"
     assert source.metadata.created_at == "2024-03-01T08:00:00Z"
-    # 正文指纹不该在解析时算：text 之后还会被规整/截断，提前算出来的值是
-    # 对不上的指纹。落库方写入前算一次才是正确时机。
+    # 指纹由 `parse_bytes` 的**唯一出口**盖（`ingestion.service.write_content_hash`）。
+    # `parse_document_bytes` 是它的内部分支，单独调用时不带指纹——这不是漏项，是
+    # 刻意的分层：上传那条路只有一个出口，指纹只可能在那里被漏掉一次；而在四个
+    # 分支里各盖一遍，加第五个分支时漏盖不会有任何报错。
     assert source.content_hash is None
 
 
-def test_source_content_hash_is_a_placeholder():
-    """`content_hash` 现在只是契约占位：默认 None、可显式传、无写入方。"""
+def test_source_content_hash_defaults_to_none():
+    """契约层的默认值：手工构造的 `Source` 没有指纹，可显式传。
+
+    写入方在 `parse_bytes` 的唯一出口，不在契约层——所以这里构造出来的仍然是
+    None。库那一侧（`library.ingest`）对收到的正文**重算**一次，不信任这个字段，
+    理由见 `contracts/source.py` 上 `content_hash` 的注释。
+    """
     source = Source(kind=SourceKind.text, text="正文", status="parsed")
     assert source.content_hash is None
 

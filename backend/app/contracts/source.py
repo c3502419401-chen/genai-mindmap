@@ -191,13 +191,17 @@ class Source(BaseModel):
     # 过滤要读 `source.metadata.author`，空对象与"全字段 None"在过滤语义上
     # 完全等价，却让调用方少一层 None 判断。
     metadata: SourceMetadata = Field(default_factory=SourceMetadata)
-    # 正文指纹（`sha256(text)` 的十六进制），将来落库时的去重键。
+    # 正文指纹（`sha256(text)` 的十六进制），知识库的去重键（`library_sources`
+    # 上的 `UNIQUE(content_hash)`）。
     #
-    # 现在**没有写入方**，也不该有人抢着填：落库那一步还不存在，而提前在
-    # ingestion 里算会得到一个会过期的指纹——`text` 在解析之后仍可能被规整
-    # （调用方编辑、按上下文截断），字段留 None 至少是诚实的"还没有指纹"，
-    # 写一个对不上的 hash 比空值更危险（去重会静默把两份不同正文当成同一份）。
-    # 落库方在写入前对**最终**正文算一次即可，契约这边不用再改。
+    # 写入方只有一个：`ingestion.service.parse_bytes` 的**唯一出口**，时机是正文
+    # 定稿之后（`_normalize_markdown` 已跑完、按上下文截断之前）。这两条都不能挪：
+    # 早算会得到与正文对不上的指纹，而指纹就是唯一键——对不上会把两份不同的正文
+    # 判成同一份（静默丢数据），或者把同一份判成两份（重复入库）。
+    #
+    # 它仍然**不是权威值**：正文在下游还可能被调用方编辑或截断，所以落库方
+    # `knowledge.library.ingest` 对收到的正文重算一次，只有两者不一致时才记一条
+    # warning 并以正文为准。
     content_hash: str | None = None
 
 

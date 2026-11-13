@@ -26,6 +26,7 @@ import logging
 import math
 import os
 import re
+import sqlite3
 import time
 from collections import Counter
 from collections.abc import Iterator
@@ -35,6 +36,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
 
 from app.contracts.source import Source, SourceMetadata, blank_to_none, clean_tags, to_utc_iso
+from app.knowledge import library as knowledge_library
 from app.knowledge import vector_cache
 from app.knowledge.embedding import (
     EmbeddingError,
@@ -1388,13 +1390,230 @@ def _single_search(
     return _pick_ordered(_fuse(collected, question, top_k), top_k)
 
 
+# ---------------------------------------------------------------- 知识库来源
+#
+# `library=True` 让一次检索同时看两批来源：**本次请求带来的**（`sources` 参数）
+# 与**库里存着的**（`knowledge/library.py`）。库那批不是"把整个库都切块"——那在
+# 2C2G 上既慢又贵，而且大部分材料与这次查询无关。两级收窄，每一级都是硬上限：
+#
+#   1. 按 `last_used_at` 取最近 `LIBRARY_SCAN_LIMIT` 份（读正文，**不切块**）；
+#   2. 按查询做一次**字面粗筛**（`_literal_coverage`），取前 `LIBRARY_PICK` 份，
+#      只有这些才真正切块、算 BM25、可能调 embedding。
+#
+# 粗筛只用 `term in text`（C 层的子串搜索），不用 `_token_list`：后者是纯 Python
+# 的 bigram 展开，100 份 × 三万字要一秒级，而粗筛只需要"哪几份更可能相关"这个
+# 排序信号，不需要精确分值。**它不决定最终名次**——名次仍由 `_single_search` /
+# `_fuse` 在真正切块之后给出，粗筛只决定谁进入那一步。
+#
+# 覆盖率全为 0 时照样取前 `LIBRARY_PICK` 份（`sorted` 稳定，退化成"最近使用的"）：
+# 不特判。字面一个字都不沾恰恰是向量路该补的缺口（`docs/RAG-DECISIONS.md` 2.2 的
+# 「谁能批钱」），在这里提前砍掉等于把那条路关掉一半。
+LIBRARY_SCAN_LIMIT = 100
+LIBRARY_PICK = 5
+
+
+def _digest_of(source: Source) -> str | None:
+    """来源的正文指纹；没有正文返回 `None`。
+
+    优先用 `Source.content_hash`（`parse_bytes` 盖的那个），它缺席时按正文重算
+    ——手工构造的 `Source`（测试、脚本、agent 内部拼的）都不带指纹，而"这批来源
+    里有没有一份已经躺在库中"必须能判出来，否则同一份材料会以两个不同的
+    `source_id` 各占一个席位，`top_k` 立刻少一条。
+    """
+    if source.content_hash:
+        return source.content_hash
+    text = source.text or ""
+    return knowledge_library.content_hash(text) if text.strip() else None
+
+
+def _literal_coverage(terms: list[str], text: str) -> float:
+    """查询词在正文里的字面命中率（`命中词数 / 查询词数`）。
+
+    只看"在不在"，不看次数与位置：粗筛要的是"这份材料值不值得切块"，而不是一个
+    可以排序的名次。大小写不折叠——`_token_list` 已经把小写化做在查询侧，正文里
+    的 `Budget` 与查询里的 `budget` 命中不上，代价是排序偏后，不是漏掉（最终名次由
+    BM25 与向量给，那里两个路都能捞回来）。
+    """
+    if not text or not terms:
+        return 0.0
+    hits = sum(1 for term in terms if term in text)
+    return hits / len(terms)
+
+
+def _library_sources(
+    question: str, filters: SourceFilter | None, exclude: list[Source],
+) -> list[Source]:
+    """从库里挑出这次检索要用的来源（含正文），最多 `LIBRARY_PICK` 份。
+
+    顺序是"先筛后切块"的延伸：`filters` 作用在**元数据**上，被筛掉的来源连正文
+    都不必进入切块那一步（`load` 出来的 `Source` 已经带着正文，但粗筛与切块都
+    不为它发生）。`filter_sources` 只读 `source.metadata`，所以这一步与
+    `search_sources` 里的过滤是同一个判断、同一套语义。
+
+    库不可用（磁盘满、文件被锁、表被删）时返回空列表并记 warning：检索退化成
+    "只看本次请求的材料"，与加知识库之前一样。这不是静默——日志里有一条，而且
+    `method` 与 `source_id` 都会告诉调用方"这次没有库证据"。
+    """
+    try:
+        pool = knowledge_library.recent(limit=LIBRARY_SCAN_LIMIT)
+    except (sqlite3.Error, OSError) as exc:
+        logger.warning("知识库不可用，本次只检索请求内的来源：%s", type(exc).__name__)
+        return []
+    if not pool:
+        return []
+
+    # 本次请求里已经有的正文不必再从库里取一遍：同一份材料会以两个不同的
+    # `source_id`（请求内 uuid4 / 持久 id）各占一个席位，而 `_near_duplicate`
+    # 是按 `source_id` 比的，跨来源的重复它拦不住。
+    present = {digest for source in exclude if (digest := _digest_of(source))}
+    candidates = [item for item in pool
+                  if item.content_hash and item.content_hash not in present]
+    if filters is not None:
+        candidates = filter_sources(candidates, filters)
+    if not candidates:
+        return []
+
+    terms = list(dict.fromkeys(_token_list(question)))
+    if not terms:
+        return []
+    ranked = sorted(candidates,
+                    key=lambda item: -_literal_coverage(terms, item.text or ""))
+    return ranked[:LIBRARY_PICK]
+
+
+def _library_batch(
+    question: str, top_k: int, filters: SourceFilter | None, *,
+    exclude: list[Source], parent: bool,
+) -> list[EvidenceHit]:
+    """库那批来源上的检索结果。
+
+    `parent=True` 时走 `_search_parent_core`，与本次请求那批**同一套粒度**：
+    `library=True` 的 `search_parent` 两边都是"子块匹配、父块返回"，否则库证据的
+    `quote` 会是 450–700 字而请求内的那是同一形状……不，反过来：如果库那批走单级
+    块，两边返回的 `quote` 粒度不同，调用方按 `end - start` 判断信息密度时会得到
+    两个互相矛盾的结论。粒度必须跟着入口走。
+    """
+    picked = _library_sources(question, filters, exclude)
+    if not picked:
+        return []
+    knowledge_library.touch([source.id for source in picked])
+    if parent:
+        return _search_parent_core(picked, question, top_k, None)
+    return _search_sources_core(picked, question, top_k, None)
+
+
+def _merge_batches(
+    base: list[EvidenceHit], extra: list[EvidenceHit], top_k: int,
+) -> list[EvidenceHit]:
+    """把「本次请求的命中」与「库的命中」按 RRF 名次融合，**本次保底占半数席位**。
+
+    结构与 `search_multi` 的第 6 条约束同构，理由也是同一个：纯 RRF 累加会让后来
+    的一批把先到的一批顶掉。这里更尖锐——库里的证据可能更多、更同质（同一份制度
+    文件被切成几十块），而用户刚上传的那份材料才是这次请求的**对象**。所以
+    `base` 的前 `reserve = ceil(top_k/2)` 条先占位，其余名额才由两批竞争。
+
+    分数口径：**所有返回的 `score` 都是 RRF 分**（`1/(RRF_K + 名次)`），因为两批的
+    原始分不可比——`search_sources` 的 BM25 分依赖各批自己切出来的块集合（N 与 df
+    都不同），跨批比大小没有意义。`score_bm25` / `score_vector` 保留各自的原始值，
+    它们本来就是"这条在它自己那批里怎么被打出来的"。
+
+    ⚠ 排序是"保底段 + 竞争段"，而 `score` 是名次倒数，所以**分数不单调**：保底段
+    最后一条的分可能低于竞争段第一条。与 `search_multi` 同一条告警——`score` 只用于
+    同一次检索内比较大小，不要拿它反推名次。
+
+    跨批去重按 `quote` 全等：两批的 `source_id` 体系不同（请求内 uuid4 / 持久 id），
+    `_near_duplicate` 按 `source_id` 比、拦不住这种重复。`quote` 全等是"同一段正文
+    被两边各切了一次"的可靠信号——切块算法只有一份，同一段原文切出来的区间也相同。
+    """
+    if not extra:
+        # 库里没有可用证据（或库不可用）：原样返回，**连分数都不重算**。
+        # `library=False` 与"库里捞不到东西"在输出上完全一致，这一点是有意的：
+        # 用户不该因为"库里有别的材料"而看到同一批命中的分数变了。
+        return base
+    if not base:
+        return [
+            hit.model_copy(update={"score": round(1.0 / (RRF_K + rank), 6)})
+            for rank, hit in enumerate(extra[:top_k], 1)
+        ]
+
+    reserve = min(max(1, (top_k + 1) // 2), len(base))
+    kept = list(base[:reserve])
+    seen_quotes = {hit.quote for hit in kept}
+
+    contenders: list[tuple[float, EvidenceHit]] = []
+    for rank, hit in enumerate(base[reserve:], reserve + 1):
+        contenders.append((1.0 / (RRF_K + rank), hit))
+    for rank, hit in enumerate(extra, 1):
+        contenders.append((1.0 / (RRF_K + rank), hit))
+    contenders.sort(key=lambda item: (-item[0], item[1].end - item[1].start))
+
+    fused: list[EvidenceHit] = [
+        hit.model_copy(update={"score": round(1.0 / (RRF_K + rank), 6)})
+        for rank, hit in enumerate(kept, 1)
+    ]
+    for score, hit in contenders:
+        if hit.quote in seen_quotes:
+            continue
+        seen_quotes.add(hit.quote)
+        fused.append(hit.model_copy(update={"score": round(score, 6)}))
+    # `_pick_ordered` 不再排序（顺序就是保底段在前），只做近重复筛与截断。
+    return _pick_ordered(fused, top_k)
+
+
+def _search_sources_core(
+    sources: list[Source], question: str, top_k: int,
+    filters: SourceFilter | None,
+) -> list[EvidenceHit]:
+    """`search_sources` 在**给定来源集合内**的全部打分逻辑（不碰库、不做跨批融合）。
+
+    抽出来的唯一目的：`library=True` 要能用**同一个函数**分别处理两批来源。两批各
+    写一份实现，结局一定是"库里那批少了一道去重"或者"过滤顺序反了"——那种差异在
+    单测里看不出来，只在召回上看得出来。
+
+    `library=False` 时 `search_sources` 就是本函数的转发，所以"默认行为逐字节不变"
+    由结构保证（`tests/test_library.py` 另有一组拿 `038e5fe` 旧模块逐字段对比的
+    用例把它钉住）。
+    """
+    if not _token_list(question):
+        return []
+
+    # 过滤必须在切块与向量化之前。放在这里还有一个原因：BM25 的 IDF 是在
+    # "本次请求切出的块集合"上算的，被筛掉的来源连 N 和 df 都不该污染——
+    # 否则同一份材料在"筛"与"不筛"两种请求里会得到不同的分数，
+    # 而那个差异没有任何语义。向量侧同理：先筛再算，被筛掉的块连一次缓存
+    # 写入都不会发生。注意这与"标签在入库期向量化之后产生"不冲突，见 docstring。
+    if filters is not None:
+        selected = filter_sources(sources, filters)
+        if not selected:
+            logger.info("过滤条件筛掉了全部来源（%d→0）", len(sources))
+            return []
+        if len(selected) != len(sources):
+            logger.debug("检索前过滤：来源 %d→%d", len(sources), len(selected))
+        sources = selected
+
+    collected = _collect_chunks(sources)
+    if not collected:
+        return []
+    # 打分与融合在 `_single_search` 里：`search_multi` 只有一路时也走它。
+    # 两条路径共用同一份实现，"没有扩展"与"只多了一路纠错"才可能逐字段相同。
+    return _single_search(collected, question, top_k)
+
+
 def search_sources(sources: list[Source], query: str, top_k: int = 5, *,
-                   filters: SourceFilter | None = None) -> list[EvidenceHit]:
+                   filters: SourceFilter | None = None,
+                   library: bool = False) -> list[EvidenceHit]:
     """在**本次请求带来的来源**里找相关片段（BM25 + 向量，RRF 融合）。
 
-    只查参数给的这些，不碰任何持久化索引：agent 一次运行能看到的证据范围必须
-    与它实际拿到的来源严格一致，否则它引用的东西在界面上根本点不到。向量缓存
-    不破例——那只是把同一段文本的向量复用，候选集仍然只来自 `sources`。
+    默认（`library=False`）只查参数给的这些，不碰任何持久化索引：agent 一次运行
+    能看到的证据范围必须与它实际拿到的来源严格一致，否则它引用的东西在界面上
+    根本点不到。向量缓存不破例——那只是把同一段文本的向量复用，候选集仍然只来自
+    `sources`。
+
+    `library=True` 是这条规则的**显式例外**：候选集会加上知识库里相关的来源
+    （`knowledge/library.py`）。例外之所以站得住，是因为库命中的 `source_id` 是
+    持久 id，调用方拿它 `library.load()` 一定回查得到——"看得见就必须点得到"没有
+    被打破，只是"点得到"的范围从本次请求扩到了库里。这也是它默认关着的理由：
+    例外必须由调用方显式打开，而且那个调用方还得负责把库来源一并交给引用校验。
 
     `score` 的口径：
       - 混合路：RRF 分（两路 `1/(60+名次)` 相加），通常落在 0.01–0.04
@@ -1426,31 +1645,27 @@ def search_sources(sources: list[Source], query: str, top_k: int = 5, *,
         （按文本哈希缓存，将来就是 `chunk_vectors` 里那些永远查不到的行）。
     两者不矛盾：标签在**入库期**产生、随 `Source` 一起带到每次请求；过滤在
     **检索期**执行。同一份标签，不同阶段各用一次。
+
+    `library=True` 时**额外**检索知识库里与查询相关的来源（选法与上限见
+    `LIBRARY_SCAN_LIMIT` / `_library_sources`），两批按 RRF 名次融合，
+    **本次请求的命中保底占 `ceil(top_k/2)` 席**（`_merge_batches`）。三条要点：
+
+      - 默认 `library=False` 时只是 `_search_sources_core` 的转发，行为与加这个
+        参数之前**逐字节一致**（`tests/test_library.py` 拿 `038e5fe` 的旧模块钉着）；
+      - 库命中的 `source_id` 是**持久 id**，调用方可拿它去 `library.load()` 回查；
+        本次请求那批命中保留请求内的 `source_id`——那条 id 是 `RunContext`、
+        `verify_source_refs` 与界面高亮共用的键，换成持久 id 会让同一份来源在
+        引用链上出现两个身份；
+      - 库里抽不到东西（空库 / 库不可用 / 被 `filters` 筛光 / 本次材料已覆盖）
+        时输出与 `library=False` **完全相同**，连 `score` 都不重算——不该因为
+        "库里有别的材料"而让同一批命中看起来变了。
     """
     question = query.strip()
-    if not _token_list(question):
-        return []
-
-    # 过滤必须在切块与向量化之前。放在这里还有一个原因：BM25 的 IDF 是在
-    # "本次请求切出的块集合"上算的，被筛掉的来源连 N 和 df 都不该污染——
-    # 否则同一份材料在"筛"与"不筛"两种请求里会得到不同的分数，
-    # 而那个差异没有任何语义。向量侧同理：先筛再算，被筛掉的块连一次缓存
-    # 写入都不会发生。注意这与"标签在入库期向量化之后产生"不冲突，见 docstring。
-    if filters is not None:
-        selected = filter_sources(sources, filters)
-        if not selected:
-            logger.info("过滤条件筛掉了全部来源（%d→0）", len(sources))
-            return []
-        if len(selected) != len(sources):
-            logger.debug("检索前过滤：来源 %d→%d", len(sources), len(selected))
-        sources = selected
-
-    collected = _collect_chunks(sources)
-    if not collected:
-        return []
-    # 打分与融合在 `_single_search` 里：`search_multi` 只有一路时也走它。
-    # 两条路径共用同一份实现，"没有扩展"与"只多了一路纠错"才可能逐字段相同。
-    return _single_search(collected, question, top_k)
+    base = _search_sources_core(sources, question, top_k, filters)
+    if not library:
+        return base
+    extra = _library_batch(question, top_k, filters, exclude=sources, parent=False)
+    return _merge_batches(base, extra, top_k)
 
 
 # ---------------------------------------------------------------- 小块检索、大块召回
@@ -1546,8 +1761,49 @@ def _fold_to_parents(ranked: list[EvidenceHit], corpus: _LeafCorpus) -> list[Evi
     return folded
 
 
+def _search_parent_core(
+    sources: list[Source], question: str, top_k: int,
+    filters: SourceFilter | None,
+) -> list[EvidenceHit]:
+    """`search_parent` 在**给定来源集合内**的全部逻辑：切两级树、子块匹配、折父块。
+
+    不含开关判断（`search_parent` 自己那一步），也不做跨批融合。抽出来的理由与
+    `_search_sources_core` 完全相同：`library=True` 时两批来源必须走同一份实现，
+    否则"本次那批返回父块、库里那批返回单级块"这种粒度错位不会有任何报错，只会在
+    调用方按 `end - start` 估信息密度时给出两个互相矛盾的结论。
+    """
+    if not _token_list(question):
+        return []
+
+    # 过滤必须在切块与向量化之前，理由与 `search_sources` 完全一致：被筛掉的
+    # 来源不该污染 BM25 的 N/df，也不该产生 embedding 调用与缓存写入。
+    if filters is not None:
+        selected = filter_sources(sources, filters)
+        if not selected:
+            logger.info("过滤条件筛掉了全部来源（%d→0）", len(sources))
+            return []
+        if len(selected) != len(sources):
+            logger.debug("检索前过滤：来源 %d→%d", len(sources), len(selected))
+        sources = selected
+
+    corpus = _collect_leaves(sources)
+    if not corpus.items:
+        return []
+
+    # 候选池放大：子块级别多取一些，是因为折父块时同一父块的多条会并成一条。
+    # 只取 top_k 条子块时，它们很可能全落在两三个父块里，折完凑不满 top_k。
+    # 放大**不改**已在候选集里的分数（RRF 只吃名次），只是让更多子块有名字可排。
+    ranked = _fuse(corpus.items, question, top_k * CANDIDATE_FACTOR)
+    # 折父块 → 截断。折完就不再跑 `_pick_ordered` 的近重复筛：`_fold_to_parents`
+    # 已经保证每条对应不同的父块，再按"重叠 > 较短者一半"筛一遍，只会在父块短于
+    # 2×`CHUNK_OVERLAP_CHARS`（200 字）时把两个**不同**父块判成重复，净效果是
+    # 静默少给一条证据。截断就是这里需要的全部裁剪。
+    return _fold_to_parents(ranked, corpus)[:top_k]
+
+
 def search_parent(sources: list[Source], query: str, top_k: int = 5, *,
-                  filters: SourceFilter | None = None) -> list[EvidenceHit]:
+                  filters: SourceFilter | None = None,
+                  library: bool = False) -> list[EvidenceHit]:
     """**用子块匹配、把父块回给调用方**（small-to-big / parent-document retrieval）。
 
     与 `search_sources` 的差别只有粒度，不是另一套检索：
@@ -1594,38 +1850,22 @@ def search_parent(sources: list[Source], query: str, top_k: int = 5, *,
     hits 累积进 `RunContext.evidence`，生成收尾时交给
     `verify_source_refs(..., evidence=...)` 判 `SOURCE_REF_OUTSIDE_EVIDENCE`。
     也就是说，"默认开"这件事**依赖**接线先落地，两者不能反过来做。
+
+    `library=True` 与 `search_sources` 的同名参数逐条对齐（选法、上限、排重、
+    保底席位都由 `_library_batch` / `_merge_batches` 负责），唯一区别是库那批也走
+    **同一套粒度**：子块匹配、父块返回。开关关着（`MINDMAP_PARENT_RETRIEVAL=0`）时
+    本函数转发给 `search_sources`，`library` 一并透传——"关掉父块模式"只该改变
+    粒度，不该顺带把知识库关掉。
     """
     if not _parent_retrieval_enabled():
-        return search_sources(sources, query, top_k, filters=filters)
+        return search_sources(sources, query, top_k, filters=filters, library=library)
 
     question = query.strip()
-    if not _token_list(question):
-        return []
-
-    # 过滤必须在切块与向量化之前，理由与 `search_sources` 完全一致：被筛掉的
-    # 来源不该污染 BM25 的 N/df，也不该产生 embedding 调用与缓存写入。
-    if filters is not None:
-        selected = filter_sources(sources, filters)
-        if not selected:
-            logger.info("过滤条件筛掉了全部来源（%d→0）", len(sources))
-            return []
-        if len(selected) != len(sources):
-            logger.debug("检索前过滤：来源 %d→%d", len(sources), len(selected))
-        sources = selected
-
-    corpus = _collect_leaves(sources)
-    if not corpus.items:
-        return []
-
-    # 候选池放大：子块级别多取一些，是因为折父块时同一父块的多条会并成一条。
-    # 只取 top_k 条子块时，它们很可能全落在两三个父块里，折完凑不满 top_k。
-    # 放大**不改**已在候选集里的分数（RRF 只吃名次），只是让更多子块有名字可排。
-    ranked = _fuse(corpus.items, question, top_k * CANDIDATE_FACTOR)
-    # 折父块 → 截断。折完就不再跑 `_pick_ordered` 的近重复筛：`_fold_to_parents`
-    # 已经保证每条对应不同的父块，再按"重叠 > 较短者一半"筛一遍，只会在父块短于
-    # 2×`CHUNK_OVERLAP_CHARS`（200 字）时把两个**不同**父块判成重复，净效果是
-    # 静默少给一条证据。截断就是这里需要的全部裁剪。
-    return _fold_to_parents(ranked, corpus)[:top_k]
+    base = _search_parent_core(sources, question, top_k, filters)
+    if not library:
+        return base
+    extra = _library_batch(question, top_k, filters, exclude=sources, parent=True)
+    return _merge_batches(base, extra, top_k)
 
 
 # ---------------------------------------------------------------- 多路并行检索

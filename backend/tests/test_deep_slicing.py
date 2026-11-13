@@ -503,9 +503,17 @@ def test_all_branch_searches_failing_falls_back_to_whole_tree(monkeypatch):
 
     assert result.ok, result.content
     assert result.data["retrieval"]["mode"] == "whole"
-    # 3 支各失败一次（top_k=3，query 就是分支标题）+ 1 次兜底（top_k=5）
-    assert queries == [(title, DEEP_BRANCH_TOP_K) for title in BRANCHES] + [
-        (WHOLE_QUERY, DEEP_FALLBACK_TOP_K)]
+    # 3 支各失败一次（top_k=3，query 就是分支标题）+ 1 次兜底（top_k=5）。
+    #
+    # **不比顺序**：`_retrieve_branches` 是"第一支串行 + 其余 `asyncio.gather`"，
+    # 而 `_search_branch` 把同步的 `search_parent` 扔进 `to_thread`——第 2、3 支谁
+    # 先进线程池由调度决定。原来这里写的是逐位相等，实测同一天两次全量跑一次绿
+    # 一次红，两次的 `queries` 只差第 2、3 项换了位置。首位与末位仍然确定（第一支
+    # 串行跑完才 gather，兜底在"全失败"之后），所以钉住这两端、其余比多重集。
+    assert queries[0] == (BRANCHES[0], DEEP_BRANCH_TOP_K)
+    assert queries[-1] == (WHOLE_QUERY, DEEP_FALLBACK_TOP_K)
+    assert sorted(queries[:-1]) == sorted(
+        (title, DEEP_BRANCH_TOP_K) for title in BRANCHES)
     assert "BRANCH_RETRIEVAL_FALLBACK" in _codes(result)
     # 不产出空树：每支都有内容，而且用的是兜底那批证据
     for branch in ctx.candidate.root.children:

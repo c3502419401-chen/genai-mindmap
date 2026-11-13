@@ -50,6 +50,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import html
 import re
 import threading
@@ -378,8 +379,31 @@ def parse_document_bytes(filename: str | None, raw: bytes) -> Source:
     return _parse_office_source(filename, raw)
 
 
+def write_content_hash(source: Source) -> Source:
+    """把正文指纹写进 `Source.content_hash`，返回同一个对象。
+
+    **时机是这里的全部意义**：调用点必须在正文**定稿之后**——`_normalize_markdown`
+    已经跑完、任何按上下文截断都还没发生。早一步算得到的是与正文对不上的指纹，
+    而指纹是知识库的唯一键：对不上就会把两份不同的正文判成同一份（静默丢数据），
+    或者把同一份正文判成两份（重复入库）。
+
+    空正文不写指纹（留 `None`）：没有正文就没有可去重的内容，写一个
+    `sha256("")` 反而会让所有空材料在库里挤成一条。判空用 `strip()`，与
+    `library.ingest` 的拒绝条件同一口径——一处用 `if text`、另一处用
+    `if not text.strip()` 的话，纯空白正文会带着指纹进库，然后被库拒收。
+
+    算法与 `knowledge.library.content_hash` 完全同口径（sha256 十六进制全长）。
+    这里独立算一次而不是 import 那一层：`ingestion` 是解析层，不该反向依赖检索层
+    ——那会让"解析器能不能单独跑"取决于知识库有没有被 import。
+    """
+    text = source.text or ""
+    source.content_hash = (
+        hashlib.sha256(text.encode("utf-8")).hexdigest() if text.strip() else None)
+    return source
+
+
 def parse_bytes(kind: SourceKind, filename: str | None, raw: bytes) -> Source:
-    """按类型分发。
+    """按类型分发，并给返回的 `Source` 盖上正文指纹。
 
     分发顺序：
       1. markdown/text → 直接解码
@@ -388,6 +412,23 @@ def parse_bytes(kind: SourceKind, filename: str | None, raw: bytes) -> Source:
 
     一次只处理一个文件：多文件之间的并发属于上传队列（前端）的职责，
     这一层不该再套一层线程池——那会和 vision / asr 内部的并发叠成 N×N。
+
+    指纹在**唯一出口**处盖（`_parse_unstamped` 的返回值），不是在每个分支里各盖
+    一次：四个分支各写一遍，将来加第五个分支时漏盖不会有任何报错，只会在入库时
+    静默退化成"按正文重算"——那种退化看不见，直到有人依赖上传路径的指纹去做
+    去重比较。
+    """
+    return write_content_hash(_parse_unstamped(kind, filename, raw))
+
+
+def _parse_unstamped(kind: SourceKind, filename: str | None, raw: bytes) -> Source:
+    """`parse_bytes` 的本体：只解析，不盖指纹。
+
+    `parse_text` / `parse_document_bytes` 这些**内部分支**保持不带指纹，是因为
+    它们各自还会被单独调用（`/ingestion/text` 走 `parse_text`，脚本走
+    `parse_document_bytes`），而"上传这条路的指纹在 `parse_bytes` 里盖"是一个
+    可以静态检查的边界。知识库那一侧不依赖调用方给指纹：`library.ingest` 对正文
+    重算一次才是权威（正文在下游仍可能被改）。
     """
     if kind in (SourceKind.text, SourceKind.markdown):
         try:

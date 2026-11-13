@@ -17,6 +17,24 @@
 边靠 `UNIQUE(src_id, dst_id, relation, source_id, chunk_start)`。所以"重跑一次
 入库"是安全的，也是修数据时的首选动作（不需要先删后写）。
 
+## 边的 `source_id` 是持久 id（`library.ingest` 给的）
+
+原来存的是 `Source.id`，而它每次都不同（`uuid4` 默认值），所以 `neighbors` 返回
+的 `evidence` 在下一个请求里指向一个不存在的来源——这正是 `docs/RAG-DECISIONS.md`
+第 11 节列的第一个前置条件。现在先 `library.ingest(source)` 拿到跨请求稳定的 id，
+再拿它当证据键；`ingest_graph(..., source_id=...)` 允许调用方显式指定（重跑入库、
+导入历史数据时不想再写一次正文）。
+
+**幂等的语义因此变得更强**：同一份正文（`content_hash` 相同）无论文件名、上传
+次数、来源 `uuid4` 怎么变，都落到同一个 `source_id` 上，所以重复入库命中的是同一
+批边，而不是"看起来一样的另一批"。
+
+`chunk_start` / `chunk_end` **仍然会漂**：材料重新解析后文本可能变（换解析器、
+改清洗规则），同一个 `source_id` 下的旧边指向的偏移就失效了——`UNIQUE` 里带着
+`chunk_start`，所以那批旧边不会被覆盖，而是与新边并存。这是第 11 节的**第二个**
+前置条件（版本一致性），本轮没有解决：要解决得给 `library_sources` 加版本列并在
+重解析时让旧边失效，那是另一轮的事。
+
 ## 每块一次事务
 
 落库走 `graph_store.add_edges_bulk`：一个块的所有边在**一个事务**里写完。
@@ -64,7 +82,7 @@ import logging
 import time
 
 from app.contracts.source import Source
-from app.knowledge import graph_store
+from app.knowledge import graph_store, library
 from app.knowledge.graph_extract import extract_graph
 from app.knowledge.service import _chunk_spans
 
@@ -98,15 +116,35 @@ def _unique_entities(extraction) -> list[tuple[str, str | None]]:
     return list(seen.items())
 
 
-async def ingest_graph(source: Source, *, max_chunks: int = DEFAULT_MAX_CHUNKS) -> dict:
+async def ingest_graph(
+    source: Source, *, max_chunks: int = DEFAULT_MAX_CHUNKS,
+    source_id: str | None = None,
+) -> dict:
     """把一份材料的正文抽成图并落库，返回统计。
 
     `source.text` 为空（解析失败、纯图片材料）时返回全 0 的统计：这不是错误，
     是"这份材料没有可抽的正文"，调用方不该为此走到异常分支。
 
+    **边的 `source_id` 是持久 id**：先把材料写进知识库（`library.ingest`）拿到
+    跨请求稳定的 id，再拿它当边的证据键。这一点是本轮改动的全部要害——原来存的是
+    `Source.id`，而那是每次请求现生成的 `uuid4`，于是 `neighbors` 返回的
+    `evidence` 在下一个请求里指向一个根本不存在的来源（`docs/RAG-DECISIONS.md`
+    第 11 节的第一个前置条件）。`source_id` 参数保留给"调用方已经知道该用哪个 id"
+    的场景（重跑入库、导入历史数据），显式给了就不再去库里查或写。
+
+    入库失败（磁盘满、库被锁）时**直接抛**，不在这一层吞掉：没有持久 id 就没有
+    这一轮要的语义，继续抽块只会写出一批跨请求对不上的边——那比整次入库失败更难
+    发现，因为图看起来是建成了的。
+
     开关关着时每一次 `extract_graph` 都立刻返回 `None`，于是这里会得到
     `chunks == failed == 块数`。**这条路径也走切块**——不额外加一层"开关查询"，
     是因为多一处开关判断就多一处可能与 `graph_extract` 的判断分叉的地方。
+
+    注意开关关着时**正文照样进库**（`library.ingest` 在循环之前）。这是刻意的：
+    "把材料存下来"与"要不要花 LLM 的钱抽边"是两个能力，耦合起来会变成"关掉图
+    就等于关掉知识库"。代价是开关全关的部署里 `library_sources` 也会长——但它有
+    `prune` 与 90 天/200 条的默认阈值，而图那边一旦关了就是零成本，两者不对称
+    是合理的。`max_chunks=0`（"这轮不花钱"）同理：正文进库，一块都不抽。
     """
     started = time.perf_counter()
     stats = _empty_stats()
@@ -117,6 +155,8 @@ async def ingest_graph(source: Source, *, max_chunks: int = DEFAULT_MAX_CHUNKS) 
         # 0 是"这轮不要花钱"的显式写法，与"没设"（默认 20）不同。
         logger.info("图谱入库跳过：max_chunks=%d", max_chunks)
         return stats
+
+    persistent_id = source_id or library.ingest(source)
 
     spans = _chunk_spans(text)
     if len(spans) > max_chunks:
@@ -130,7 +170,7 @@ async def ingest_graph(source: Source, *, max_chunks: int = DEFAULT_MAX_CHUNKS) 
     consecutive_failures = 0
     for start, end in spans:
         chunk = text[start:end]
-        extraction = await extract_graph(chunk, source_id=source.id, chunk_start=start)
+        extraction = await extract_graph(chunk, source_id=persistent_id, chunk_start=start)
         stats["chunks"] += 1
         if extraction is None:
             # 抽取层降级：这个块没碰存储，所以既不算写失败也不重置计数器——
@@ -143,7 +183,7 @@ async def ingest_graph(source: Source, *, max_chunks: int = DEFAULT_MAX_CHUNKS) 
             written = graph_store.add_edges_bulk([
                 graph_store.EdgeInput(
                     src=relation.src, dst=relation.dst, relation=relation.relation,
-                    source_id=source.id, chunk_start=start, chunk_end=end,
+                    source_id=persistent_id, chunk_start=start, chunk_end=end,
                     src_type=kind_of.get(relation.src),
                     dst_type=kind_of.get(relation.dst),
                 )
@@ -165,7 +205,7 @@ async def ingest_graph(source: Source, *, max_chunks: int = DEFAULT_MAX_CHUNKS) 
                     # 所以只记警告，不把整块算作失败（那会让 `failed` 谎报"边也没了"）。
                     logger.warning(
                         "图谱孤立实体写入失败（材料=%s 位置=%d）：%s",
-                        source.id[:8], start, type(exc).__name__,
+                        persistent_id[:8], start, type(exc).__name__,
                     )
         except graph_store.GraphStoreNotConfigured as exc:
             # 配置错误不是偶发抖动：第一块就停，省掉后面所有块的 LLM 调用。
@@ -173,7 +213,7 @@ async def ingest_graph(source: Source, *, max_chunks: int = DEFAULT_MAX_CHUNKS) 
             stats["aborted"] = True
             logger.warning(
                 "图谱存储未配置，停止本次入库（材料=%s 已试 %d/%d 块）：%s",
-                source.id[:8], stats["chunks"], len(spans), type(exc).__name__,
+                persistent_id[:8], stats["chunks"], len(spans), type(exc).__name__,
             )
             break
         except graph_store.GraphStoreError as exc:
@@ -184,13 +224,14 @@ async def ingest_graph(source: Source, *, max_chunks: int = DEFAULT_MAX_CHUNKS) 
             consecutive_failures += 1
             logger.warning(
                 "图谱入库写入失败（材料=%s 位置=%d）：%s",
-                source.id[:8], start, type(exc).__name__,
+                persistent_id[:8], start, type(exc).__name__,
             )
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                 stats["aborted"] = True
                 logger.warning(
                     "图谱入库熔断：连续 %d 块写库失败，剩余 %d 块不再抽取（材料=%s）",
-                    consecutive_failures, len(spans) - stats["chunks"], source.id[:8],
+                    consecutive_failures, len(spans) - stats["chunks"],
+                    persistent_id[:8],
                 )
                 break
         except ValueError as exc:
@@ -199,7 +240,7 @@ async def ingest_graph(source: Source, *, max_chunks: int = DEFAULT_MAX_CHUNKS) 
             stats["failed"] += 1
             logger.warning(
                 "图谱入库写入被拒绝（材料=%s 位置=%d）：%s",
-                source.id[:8], start, type(exc).__name__,
+                persistent_id[:8], start, type(exc).__name__,
             )
         else:
             consecutive_failures = 0
@@ -208,7 +249,7 @@ async def ingest_graph(source: Source, *, max_chunks: int = DEFAULT_MAX_CHUNKS) 
     stats["elapsed_ms"] = int((time.perf_counter() - started) * 1000)
     logger.info(
         "图谱入库完成 材料=%s 块=%d 失败=%d 中止=%s 实体=%d 边=%d 耗时=%dms",
-        source.id[:8], stats["chunks"], stats["failed"], stats["aborted"],
+        persistent_id[:8], stats["chunks"], stats["failed"], stats["aborted"],
         stats["entities"], stats["edges"], stats["elapsed_ms"],
     )
     return stats
