@@ -30,7 +30,7 @@ from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from app.agent.contracts import RunContext, ToolCall, ToolResult, ToolSpec
+from app.agent.contracts import MAX_SOURCES, RunContext, ToolCall, ToolResult, ToolSpec
 from app.agent.ops import (
     TEMP_ID_PREFIX,
     apply_ops,
@@ -842,7 +842,12 @@ def _source_prompt_input(sources: list[Source], *, system: str = "") -> str:
 
 # 材料清单的上限。清单是**元信息**，超限时截断的只能是清单项，正文在任何情况下
 # 都不进 prompt——"截断正文后拼进去"不是"不放"，是"放一部分"，最难排查。
-MATERIAL_MANIFEST_MAX_ITEMS = 50
+#
+# 条数上限与契约的 `MAX_SOURCES` 是同一个数（请求最多带 50 份），直接引用而不是
+# 再写一个 50：两处各写一次，改一处忘一处的结果是"请求收下了、清单里少两份"，
+# 模型连那两份材料存在都不知道。渲染器这里仍然要判一次——`_material_manifest`
+# 也能被直接调用（测试、将来的建库路径），不能假定调用方已经过了契约那关。
+MATERIAL_MANIFEST_MAX_ITEMS = MAX_SOURCES
 # 清单本身的 token 上限。实测 50 条常规行（uuid + 中文标题 + 字数）约 1000 token，
 # 所以常规批量下先撞到的是条数上限；这条 1500 是给"标题很长"那一类兜底的——
 # 80 字标题 × 50 条能到 3000，那时截的是清单项。清单存在的意义只是"知道自己手上
@@ -1909,6 +1914,17 @@ def _rag_filters(raw: dict[str, Any] | None) -> SourceFilter | None:
 
 def _material_inputs(sources: list[Source]) -> list[str]:
     """给 `plan_query` 的材料摘要：每份「标题 + 正文开头」压平成一段。
+
+    **这是 `rag` 形态下唯一主动把正文塞进 LLM prompt 的地方**（检索命中不算：
+    那就是检索的产出）。它的边界很小且是刻意的——只在前 200 字、只在
+    `MINDMAP_QUERY_EXPANSION` 打开时才走（默认关），而 planner 判断"该用哪些词、
+    范围有多大"本来就需要看一眼材料长什么样，只给标题它只能靠猜。
+
+    所以"`rag` 形态下正文不出进程"这句话**不成立**，准确的三种说法：
+      - 进 prompt：只有清单（生成/展开/改树）+ 检索片段（`rag_query` 的返回）+ 这里的前 200 字；
+      - 离开进程但不进 prompt：混合检索的 embedding 请求（每个参与打分的块发一次，
+        按 `sha256(quote)` 缓存），两种形态都一样，与这个开关无关；
+      - `full` 形态额外把每份正文整份放进 prompt。
 
     截断与份数上限全部交给 `_material_snippets`：两处各写一份"前 200 字、最多
     10 份"，迟早出现"提示词看到的是 A、检索依据是 B"这种没人查得出来的差集。

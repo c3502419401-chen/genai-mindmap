@@ -973,11 +973,16 @@ class SourcesContextTest(unittest.TestCase):
     """来源正文的边界是模型上下文，不再是「合计 20000 字」。
 
     20000 那个数没有实测依据，而且与 pipeline 的同名常量互相抄写——两处
-    一起错。现在两处都改判 token：装得下就放行，装不下就在开流前说清楚。
+    一起错。现在改判 token：装得下就放行，装不下就在开流前说清楚。
+
+    **这条边界只在 `full` 形态下存在**：`rag` 形态正文不进 prompt，没有可测的
+    对象，同一份材料必须放行（按形态分叉的用例在 `tests/test_source_mode.py`）。
+    所以下面这条拒绝用例要显式把形态设成 `full`——默认值是 `rag`，不设的话它测
+    的就不再是它名字里那句"超上下文被拒"。
     """
 
     def test_long_material_within_the_context_is_accepted(self):
-        # 30000 汉字 ≈ 20000 token：字数上限删掉之后必须放行
+        # 30000 汉字 ≈ 20000 token：字数上限删掉之后必须放行（两种形态都放行）
         text = "字" * 30000
         request = AgentRunRequest(
             goal="整理材料",
@@ -988,17 +993,18 @@ class SourcesContextTest(unittest.TestCase):
         self.assertLess(estimate_input_tokens(text), CONTEXT_TOKEN_LIMIT)
 
     def test_material_over_the_context_is_rejected_while_parsing_the_request(self):
-        """必须抛 ValueError：只有它会被 FastAPI 收成 422 并把文案带回前端。
+        """`full` 形态下必须抛 ValueError：只有它会被 FastAPI 收成 422 并把文案带回前端。
 
         样本按 `CONTEXT_TOKEN_LIMIT` 现算：限额是可调参数，写死字数的样本在
         调阈值之后就不再超限，用例会从"超限被拒"悄悄退化成"普通材料被接收"。
         """
-        with self.assertRaises(ValidationError) as raised:
-            AgentRunRequest(
-                goal="整理材料",
-                sources=[Source(kind="text", status="parsed",
-                                text="字" * int(CONTEXT_TOKEN_LIMIT * 1.6))],
-            )
+        with patch.dict("os.environ", {"MINDMAP_SOURCE_MODE": "full"}):
+            with self.assertRaises(ValidationError) as raised:
+                AgentRunRequest(
+                    goal="整理材料",
+                    sources=[Source(kind="text", status="parsed",
+                                    text="字" * int(CONTEXT_TOKEN_LIMIT * 1.6))],
+                )
         self.assertIn("超过模型上下文上限", str(raised.exception))
         self.assertIn("请精简后重试，或分成多次生成", str(raised.exception))
 

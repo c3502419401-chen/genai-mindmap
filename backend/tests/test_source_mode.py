@@ -32,7 +32,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import pytest
+from pydantic import ValidationError
+
 from app.agent.contracts import (
+    MAX_SOURCES,
     AgentRunRequest,
     Completion,
     RunBudget,
@@ -49,6 +53,7 @@ from app.agent.tools import (
 )
 from app.contracts.source import AudioSentence, Source, SourceKind
 from app.generation.service import (
+    CONTEXT_TOKEN_LIMIT,
     RAG_SOURCE_PROMPT,
     RAG_THINKING_GUARD,
     SOURCE_MODE_ENV,
@@ -521,3 +526,62 @@ def test_loop_retrieves_first_then_generates_from_hits():
     refs = done[-1].content.root.source_refs
     # 逐字校验通过 = 这条引用确实能在原文里找到（它也确实来自检索结果）
     assert refs and refs[0].quote == quote
+
+
+# ---------------------------------------------------------------- 六、解析层的预检
+
+
+def test_material_over_the_context_is_rejected_in_full_and_accepted_in_rag():
+    """同一份超大材料：`full` 下 422，`rag` 下放行。
+
+    这是这次改动在**请求解析层**的收尾。留着旧的 token 预检不是"保守"，是错：
+    `rag` 形态下正文不进 prompt，一份 25 万字的材料只贡献一行清单（几十 token），
+    却会在开流之前被拒掉——而它本来是能处理的。
+
+    断言成对出现，因为单独任一半都证明不了"差别是形态造成的"：只断言 rag 放行，
+    可能只是阈值被调大了；只断言 full 拒绝，可能只是这条路根本没被改。
+    """
+    text = "字" * int(CONTEXT_TOKEN_LIMIT * 1.6)
+    source = Source(kind=SourceKind.text, status="parsed", text=text)
+
+    with _env(SOURCE_MODE_FULL):
+        with pytest.raises(ValidationError) as raised:
+            AgentRunRequest(goal="整理材料", sources=[source])
+    assert "超过模型上下文上限" in str(raised.value)
+    assert "请精简后重试，或分成多次生成" in str(raised.value)
+
+    with _env(SOURCE_MODE_RAG):
+        request = AgentRunRequest(goal="整理材料", sources=[source])
+    assert len(request.sources) == 1
+    # 放行的理由要落地：这份材料进 prompt 的部分只有一行清单，几十个 token。
+    manifest = _material_manifest(request.sources)
+    assert estimate_input_tokens(manifest) < 100
+    assert "字" * 10 not in manifest          # 正文一个字节都没有
+
+
+def test_too_many_materials_explain_a_reason_that_matches_the_mode():
+    """份数上限两种形态都拦得住，但"为什么"不同，文案不能共用一句。
+
+    `rag` 下卡住的是清单（列不下的材料模型连存在都不知道），`full` 下卡住的是
+    上下文。共用一句"材料太多"会让用户按错误的办法处理：`rag` 形态下他去精简
+    正文是白费力气，真正要做的是分批。
+    """
+    sources = [Source(id=f"n{index}", kind=SourceKind.text, status="parsed", text="正文")
+               for index in range(MAX_SOURCES + 1)]
+
+    with _env(SOURCE_MODE_RAG):
+        with pytest.raises(ValidationError) as rag_raised:
+            AgentRunRequest(goal="整理材料", sources=sources)
+    with _env(SOURCE_MODE_FULL):
+        with pytest.raises(ValidationError) as full_raised:
+            AgentRunRequest(goal="整理材料", sources=sources)
+
+    rag_message, full_message = str(rag_raised.value), str(full_raised.value)
+    both = f"超过单次请求上限 {MAX_SOURCES} 份"
+    assert both in rag_message and both in full_message
+    # 分叉点在"为什么"上：只有 rag 那句要提到清单，也只有它不该提上下文上限
+    assert "清单" in rag_message
+    assert "清单" not in full_message
+    for message in (rag_message, full_message):
+        # 份数超限与体积超限是两件事，不能混成一句话
+        assert "超过模型上下文上限" not in message

@@ -58,6 +58,11 @@ logger = logging.getLogger(__name__)
 # 片段，检索从辅助变成了唯一入口。两种形态的提示词、引用来源、失败方式都不同，
 # 所以是一个显式的两态开关，而**不是**"材料小就走 full"的自适应——行为随材料
 # 大小跳变是最难排查的一类 bug：同一份请求换个字号，结论就变了。
+#
+# `rag` 形态下"正文不出进程"这句话**不成立**，准确说法见
+# `agent/tools._material_inputs` 的 docstring：进 prompt 的只有清单 + 检索片段 +
+# 查询扩展那每份 200 字（`MINDMAP_QUERY_EXPANSION`，默认关）；离开进程的还有
+# 混合检索的 embedding 请求（两种形态都一样）。
 SOURCE_MODE_ENV = "MINDMAP_SOURCE_MODE"
 SOURCE_MODE_FULL = "full"
 SOURCE_MODE_RAG = "rag"

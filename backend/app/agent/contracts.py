@@ -17,7 +17,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from app.contracts.mindmap import MindMapContent
 from app.contracts.ops import OpBatch
 from app.contracts.source import Source
-from app.generation.service import GenerationError, ensure_input_within_context
+from app.generation.service import (
+    SOURCE_MODE_RAG,
+    GenerationError,
+    ensure_input_within_context,
+    source_mode,
+)
 
 
 # ---------------------------------------------------------------- 预算
@@ -227,6 +232,12 @@ class RunContext:
 # ---------------------------------------------------------------- 请求
 
 
+# 单次请求能带的来源份数上限。**这也是清单的条数上限**：`tools.MATERIAL_MANIFEST_MAX_ITEMS`
+# 引用的就是这个常量，两处一个数。分两次写（这里 50、渲染器 50）迟早分叉，而分叉
+# 的表现是"请求收下了、清单里却少两份"，模型连这两份材料存在都不知道。
+MAX_SOURCES = 50
+
+
 class AgentRunRequest(BaseModel):
     """一次 agent 运行。
 
@@ -245,22 +256,71 @@ class AgentRunRequest(BaseModel):
     ] = "default"
     snapshot: MindMapContent | None = None
     selected_ids: list[str] = Field(default_factory=list, max_length=50)
-    sources: list[Source] = Field(default_factory=list, max_length=50)
+    sources: list[Source] = Field(default_factory=list, max_length=MAX_SOURCES)
     budget: RunBudget = Field(default_factory=RunBudget)
+
+    @model_validator(mode="before")
+    @classmethod
+    def sources_not_too_many(cls, data: Any) -> Any:
+        """份数上限：两种形态的"为什么不行"完全不同，文案必须分开。
+
+        - `rag`：正文不进 prompt，所以"材料字太多"根本不是问题；卡住的是**清单**。
+          清单列不下的材料，模型连"有这一份"都不知道——那比拒绝更糟，因为树看起来
+          是完整的，只是少了两块。
+        - `full`：每份正文都要进 prompt，份数上限与上下文是同一件事的两个方向。
+
+        字段上的 `max_length` 仍然留着（OpenAPI 要有 `maxItems`，前端据此先拦一步），
+        这里在它之前给出能照着做的文案：pydantic 的 "List should have at most 50
+        items" 读不出多了几份、也读不出为什么，用户唯一能做的动作是"删到 50 份"。
+
+        放在 `mode="before"`：`mode="after"` 的校验器跑不到这一步（字段校验先失败）。
+        """
+        if not isinstance(data, dict):
+            return data
+        sources = data.get("sources") or []
+        # 只认列表：传进来一个 60 字符的字符串时，"份数"是它自身的长度，按份数报错
+        # 会给出一个用户看不懂的数字。类型错留给字段校验去报。
+        if not isinstance(sources, (list, tuple)):
+            return data
+        count = len(sources)
+        if count <= MAX_SOURCES:
+            return data
+        if source_mode() == SOURCE_MODE_RAG:
+            raise ValueError(
+                f"本次附带 {count} 份材料，超过单次请求上限 {MAX_SOURCES} 份。"
+                f"rag 形态下正文不占上下文，卡住的是材料清单：清单只列得下 "
+                f"{MAX_SOURCES} 条，多出来的材料模型连存在都不知道。请分批生成。")
+        raise ValueError(
+            f"本次附带 {count} 份材料，超过单次请求上限 {MAX_SOURCES} 份。"
+            "请分批生成。")
 
     @model_validator(mode="after")
     def sources_within_context(self) -> "AgentRunRequest":
-        """来源正文合计要装得进模型上下文。
+        """`full` 形态下：来源正文合计要装得进模型上下文。
 
         原先这里卡的是「合计 20000 字」。那个数按一句话主题拍的，没有实测依据，
         而且与 pipeline 的同一口径互相抄写——两处一起错、一起被当成边界。真正
         的边界只有一条：模型的上下文窗口装不装得下。所以改判 token，超了仍然
         在开流之前拒绝，文案给出两条出路（精简 / 分批）。
 
+        **`rag` 形态下这条预检直接跳过**：正文根本不进 prompt，没有可测量的对象。
+        留着它的后果不是"保守"，是错——一份 25 万字的材料在 `rag` 形态下只贡献
+        一行清单（几十 token），却会在开流前被 422 拒掉，而它本来是能处理的。
+        清单自己的 token 上限由 `tools._material_manifest` 负责，超了截的是**清单项**，
+        不是拒绝整个请求：删掉两行索引，比劝用户去精简一份他并不需要精简的材料好。
+
+        份数上限是另一个量，见 `sources_not_too_many`（两种形态都要拦）。
+
+        另两处同名的 token 预检（`provider.complete_tools` 与
+        `generation.chat_async`）量的是**实际要发出去的消息**，不是材料体积：
+        `rag` 形态下那些消息里没有正文，自然不会被它们拦。
+
         这里必须抛 `ValueError`：它发生在 FastAPI 解析请求体的时候，只有
         ValidationError 才会被收成 422 并把文案带回前端；`GenerationError`
         冒出去会变成 500，用户看到的是"服务器内部错误"。
         """
+        if not self.sources or source_mode() == SOURCE_MODE_RAG:
+            return self
         text = "\n".join(source.text or "" for source in self.sources)
         if not text:
             return self
