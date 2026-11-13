@@ -35,6 +35,7 @@ from app.agent.service import run
 from app.agent.stream import encode_event
 from app.agent.stream_items import closed_items
 from app.agent.tools import (
+    GENERATE_EVIDENCE_RULES,
     PLAN_PROMPT,
     ToolRegistry,
     build_registry,
@@ -587,12 +588,15 @@ class GenerateGrowTest(unittest.TestCase):
         tree["root"]["source_refs"] = [{"source_id": "s1", "quote": "论文原文。"}]
 
         async def chat(system, user, *, max_tokens, on_delta):
-            # 默认形态是 `rag`：输入里只有材料清单，正文一个字节都不进来。
-            # 这条断言同时守两件事——预览通道不依赖正文，以及"正文不进 prompt"
-            # 在**流式**这条入口上也成立（工具里是同一处拼装，但入口不同）。
+            # 默认形态是 `rag`：输入里没有整份正文，正文只能经检索命中进来
+            # （生成前那一次主题检索，见 `tests/test_generate_evidence.py`）。
+            # 这条断言同时守两件事——预览通道不依赖正文，以及拼装只有一处
+            # （工具里是同一处拼装，但流式与非流式是两个入口）。
             self.assertTrue(system.startswith(RAG_SOURCE_PROMPT))
             self.assertIn("本次附带 1 份材料", user)
-            self.assertNotIn("论文原文。", user)
+            manifest, _, evidence = user.partition("本次已对该主题做过一次检索")
+            self.assertNotIn("论文原文。", manifest)
+            self.assertIn("论文原文。", evidence)
             self.assertEqual(max_tokens, 1234)
             text = json.dumps(tree, ensure_ascii=False)
             for start in range(0, len(text), 7):
@@ -724,14 +728,22 @@ class GenerateGrowTest(unittest.TestCase):
                 system, user, max_tokens = calls[0]
                 expected_system = DETAIL_PROMPT + thinking_block("default")
                 if with_sources:
-                    # 默认形态是 `rag`：提示词与输入都换成"只有清单"的那一套。
+                    # 默认形态是 `rag`：提示词与输入都换成"清单 + 命中"的那一套。
                     # 之前这里钉的是 `full`（sources 数组 + 整份正文），形态一换，
                     # 期望值就得跟着换——放宽成"以某个前缀开头"是没用的，那正好
                     # 会放过"两种形态拼错了"这一整类问题。
+                    #
+                    # 末尾多出的一句来自 `mindmap_generate` 生成前那次检索：主题
+                    # "整理论文"与正文"论文原文。"共享词项，必有命中，所以提示词
+                    # 要告诉模型"这次不用再检索"（`GENERATE_EVIDENCE_RULES`）。
                     expected_system = (RAG_SOURCE_PROMPT + thinking_block("default")
-                                       + RAG_THINKING_GUARD)
+                                       + RAG_THINKING_GUARD + GENERATE_EVIDENCE_RULES)
                     self.assertIn("本次附带 1 份材料", user)
-                    self.assertNotIn("论文原文。", user)
+                    manifest, _, evidence = user.partition("本次已对该主题做过一次检索")
+                    # 正文只能经检索命中进来，清单里一个字节都没有
+                    self.assertNotIn("论文原文。", manifest)
+                    self.assertIn("论文原文。", evidence)
+                    self.assertNotIn("sources 数组", user)
                 else:
                     self.assertEqual(user, "整理论文")
                 self.assertEqual(system, expected_system)

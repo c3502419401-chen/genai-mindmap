@@ -6,8 +6,12 @@
 
 本文件只钉两种形态的**差别**，四件事：
 
-  1. `rag`（默认）下正文永远不进 prompt——不是"截断后拼进去"，是一个字都不进；
-     反过来 `full` 下必须进，否则这份用例证明不了"差别是开关造成的"。
+  1. `rag`（默认）下正文**不进 system 提示词**，进 user 的唯一通道是检索命中
+     （`mindmap_generate` 生成前自己检一次，见 `tests/test_generate_evidence.py`）；
+     反过来 `full` 下正文必须整份进，否则这份用例证明不了"差别是开关造成的"。
+     这条口径在 `mindmap_generate` 补上自己那次检索之前是"一个字都不进 prompt"，
+     现在是"只能经命中进、不能进 system"——旧口径守的是"别把全文塞进去"，
+     新口径守的是同一件事，同时允许那份被检索回来的片段。
   2. `full` 与 `901b484` 逐字节一致。哈希写死，不取 HEAD：拿 HEAD 当基准等于
      "今天的我再确认一次昨天的我"，一次误改会被下一次提交顺手合法化。
   3. 清单超限只截清单项；**短材料也不回退 `full`**——行为随材料大小跳变是最难
@@ -45,6 +49,7 @@ from app.agent.contracts import (
 )
 from app.agent.service import _INTENT_RULES, _RAG_INTENT_RULES, _system_text, run
 from app.agent.tools import (
+    GENERATE_EVIDENCE_RULES,
     MATERIAL_MANIFEST_MAX_ITEMS,
     MATERIAL_MANIFEST_TOKEN_LIMIT,
     _material_manifest,
@@ -104,18 +109,36 @@ def _ctx(sources: list[Source]) -> RunContext:
     )
 
 
-def _generate_prompt(sources: list[Source]) -> tuple[str, str]:
-    """跑一次真的 `mindmap_generate`，把模型实际收到的 (system, user) 拿回来。"""
+def _generate_prompt(sources: list[Source], *,
+                     topic: str = "整理这些材料") -> tuple[str, str]:
+    """跑一次真的 `mindmap_generate`，把模型实际收到的 (system, user) 拿回来。
+
+    `topic` 可换：`rag` 形态下 `mindmap_generate` 会拿它做**一次主题检索**（见
+    `tools._retrieve_topic`），而检索命中进不进得来，取决于主题与正文有没有共同
+    词项。默认的"整理这些材料"是**刻意选的**：它与制度类正文不共享任何 bigram，
+    于是那几条用例走的是"检索为空 → 退回无来源形态"这条路。
+    """
     mocked = AsyncMock(return_value=TREE)
     with patch("app.agent.tools.chat_async", new=mocked):
         result = asyncio.run(build_registry("create").execute(
             ToolCall(call_id="c-gen", name="mindmap_generate",
-                     arguments={"topic": "整理这些材料"}),
+                     arguments={"topic": topic}),
             _ctx(sources),
         ))
     assert result.ok, result.content
     system, user = mocked.await_args.args
     return system, user
+
+
+# 命中被渲染进 user 消息时的那句表头（`tools.GENERATE_EVIDENCE_HEADER` 的开头）。
+# 断言里拿它当分隔符：它之前是材料清单，之后是检索命中。
+EVIDENCE_HEADER = "本次已对该主题做过一次检索"
+
+
+def _split_evidence(user: str) -> tuple[str, str]:
+    """(清单部分, 命中部分)。没有命中时第一部分是整段、第二部分是空串。"""
+    manifest, _, evidence = user.partition(EVIDENCE_HEADER)
+    return manifest, evidence
 
 
 def _material(text: str, *, filename: str = "预算管理办法.docx",
@@ -127,18 +150,25 @@ def _material(text: str, *, filename: str = "预算管理办法.docx",
 # ---------------------------------------------------------------- 一、正文进不进
 
 
-def test_rag_mode_keeps_the_material_text_out_of_the_prompt():
-    """`rag` 下正文一个字都不进 prompt，清单里只有标题/字数/类型。
+def test_rag_mode_keeps_the_material_text_out_of_the_system_prompt():
+    """`rag` 下正文一个字都不进 **system**；进 user 的只有检索命中那一段。
 
-    断言的是"不含标记词"而不是"长度变小"：长度可以因为截断而变小，那正是这次
-    改动明确要避免的形态（"放一部分"最难排查）。
+    这条用例原来断言的是"正文不进 prompt"。`mindmap_generate` 现在会自己先检索
+    一次（`tools._retrieve_topic`：不检索就一个字都拿不到，见
+    `tests/test_generate_evidence.py`），所以"正文永不进 prompt"不再是事实，也
+    不再是要求——要求变成了：**正文只能经检索命中进入 user，且不能进 system**。
+    断言因此从"不含标记词"改成"标记词只出现在命中段之后"：长度或截断都不能
+    满足这条，位置可以。
     """
     source = _material(f"第一章 总则。{MARKER} 预算由财务经理核准。", filename="预算管理办法.docx")
     with _env(SOURCE_MODE_RAG):
-        system, user = _generate_prompt([source])
+        system, user = _generate_prompt([source], topic="预算由谁核准")
 
-    assert MARKER not in system
-    assert MARKER not in user
+    manifest, evidence = _split_evidence(user)
+    assert MARKER not in system            # 提示词里没有正文
+    assert evidence                        # 主题与正文有共同词项：这次必须命中
+    assert MARKER not in manifest          # 清单里也没有正文
+    assert MARKER in evidence              # 正文只从检索命中这一条路进来
     assert "预算管理办法" in user          # 清单里要有名字
     assert "docx" in user                  # 与类型
     assert f"{len(source.text or ''):,} 字" in user
@@ -175,10 +205,14 @@ def test_default_mode_is_rag():
 
 
 def test_short_material_still_goes_through_retrieval():
-    """材料很短（合计不到 3000 字）也走清单，不偷偷退回 `full`。
+    """材料很短（合计不到 3000 字）也走清单 + 检索，不偷偷退回 `full`。
 
     "小材料退回整份塞入"看起来是优化，实际是把一条形态分界线藏进材料大小里：
     用户改了材料内容、行为就变了，而提示词、引用来源、失败方式全都跟着换。
+
+    判据是**形状**不是"正文在不在"：`full` 形态的输入是一段 `sources 数组（JSON）`，
+    而这里必须是"清单 + 命中"。短材料也会被主题检索命中（"材料"这两个字就在正文
+    里），所以正文会经命中进来——那不是退回 `full`，`full` 的数组形状并不存在。
     """
     sources = [_material("短材料一段。" * 20, source_id=f"s{index}",
                          filename=f"材料{index}.txt") for index in range(3)]
@@ -186,7 +220,10 @@ def test_short_material_still_goes_through_retrieval():
     assert total < 3000
     with _env(SOURCE_MODE_RAG):
         _, user = _generate_prompt(sources)
-    assert "短材料一段" not in user
+    manifest, evidence = _split_evidence(user)
+    assert "sources 数组" not in user          # 没有退回 `full` 的输入形状
+    assert "短材料一段" not in manifest         # 清单里一个字的正文都没有
+    assert "短材料一段" in evidence             # 正文只经检索命中进来
     assert f"本次附带 {len(sources)} 份材料" in user
 
 
@@ -335,11 +372,18 @@ def test_manifest_respects_its_own_token_ceiling():
 
 
 def test_rag_prompt_carries_the_retrieval_protocol():
-    """三条硬规则必须出现在模型真正看到的那段 system 里。"""
-    source = _material(f"正文 {MARKER}")
-    with _env(SOURCE_MODE_RAG):
-        system, _ = _generate_prompt([source])
+    """三条硬规则必须出现在模型真正看到的那段 system 里。
 
+    材料里带着主题词（"整理这些材料"），所以这次会命中、走的是 `rag` 提示词这条
+    路。检索为空时 system 会退回 `DETAIL_PROMPT`（用户至少拿到一张图，见
+    `tests/test_generate_evidence.py`），那条路上这些规程一句都不成立——不设成
+    能命中的材料，这条用例测的就不再是它名字里那句话。
+    """
+    source = _material(f"整理这些材料的说明：正文 {MARKER}")
+    with _env(SOURCE_MODE_RAG):
+        system, user = _generate_prompt([source])
+
+    assert EVIDENCE_HEADER in user          # 前提：这次真的命中了
     assert "看不到材料全文" in system
     assert "引用必须来自检索结果" in system
     assert "检索不到就不要写" in system
@@ -349,11 +393,19 @@ def test_rag_prompt_carries_the_retrieval_protocol():
     # `full` 的提示词教模型读 `sources` 数组；`rag` 下那个数组不存在，
     # 一个字都不能混进来，否则模型会去找一个没有的字段。
     assert "sources 数组" not in system
-    assert system == RAG_SOURCE_PROMPT + thinking_block("default") + RAG_THINKING_GUARD
+    # 有命中时末尾多一句"这次不用再检索"：`RAG_SOURCE_PROMPT` 说"输入里只有清单"，
+    # 而那一版输入末尾已经有检索结果，不点破这层提示词与输入互相矛盾。
+    assert system == (RAG_SOURCE_PROMPT + thinking_block("default") + RAG_THINKING_GUARD
+                      + GENERATE_EVIDENCE_RULES)
 
 
 def test_audio_material_is_manifest_only():
-    """音频材料同样只给清单：`sentences` 一个字都不进 prompt。"""
+    """音频材料同样走清单 + 命中：`sentences` 一个字都不进 prompt。
+
+    主题取"录音转写正文"，与转写正文共享词项——这样命中段才是这段音频的原文。
+    `sentences`（带时间戳的分句）不在 `_citable_hits` 的取材范围内（它只用
+    `Source.text`），所以"分句永远不进 prompt"这条断言与命中无关。
+    """
     audio = Source(
         id="audio-1", kind=SourceKind.audio, status="parsed", filename="会议纪要.mp3",
         text="录音转写正文。",
@@ -361,10 +413,12 @@ def test_audio_material_is_manifest_only():
         sentences=[AudioSentence(text="第一句转写 ZZQX_SENTENCE", begin_ms=0, end_ms=900)],
     )
     with _env(SOURCE_MODE_RAG):
-        system, user = _generate_prompt([audio])
+        system, user = _generate_prompt([audio], topic="录音转写正文")
 
+    manifest, evidence = _split_evidence(user)
+    assert evidence                          # 前提：这次命中了
     assert "ZZQX_SENTENCE" not in system + user
-    assert "录音转写正文" not in system + user
+    assert "录音转写正文" not in manifest      # 清单里没有正文
     assert "会议纪要" in user
     assert "时长 3:12" in user       # 规模要说清楚，否则模型不知道这段录音值不值得查
     assert "mp3" in user
@@ -472,12 +526,17 @@ def _completion(calls: list[ToolCall] | None = None, finish: str = "stop") -> Co
 
 
 def test_loop_retrieves_first_then_generates_from_hits():
-    """整条链路：`rag_query` 真的能查到 → 生成时只带清单 → 引用逐字来自命中。
+    """整条链路：`rag_query` 真的能查到 → 生成时清单 + 自己那次检索的命中 → 引用逐字来自命中。
 
     这才是这次改动要证明的东西。"正文不进 prompt"本身不构成能力——变化在于
     **检索成了入口**：模型必须先查，查到什么才有什么，引用也只能从命中里抄。
     只测 `_source_prompt_input` 的字符串形状测不出这条链有没有接上（比如
     `rag_query` 忘了按形态注册给 `create`，或者循环的 system 还在说"别先检索"）。
+
+    "生成时只带清单"这句话在 `_generate` 补上自己那次检索之后不再成立：清单之外
+    还带着 `mindmap_generate` 对主题查到的命中（否则模型手里一个字都没有，只能
+    交一条"没检索到"的分支——见 `tests/test_generate_evidence.py`）。所以这里
+    断言的是**两段**都在，而不是"只有清单"。
     """
     text = ("第一章 总则。本制度适用于全部预算事项。\n"
             "第八条 预算由财务经理核准后执行，超过五十万元报总经理审批。\n"
@@ -523,8 +582,13 @@ def test_loop_retrieves_first_then_generates_from_hits():
 
     system, user = prompts[0]
     assert system.startswith(RAG_SOURCE_PROMPT)
-    assert "预算由财务经理核准" not in user        # 正文没进 prompt
     assert "本次附带 1 份材料" in user
+    # 主题是"整理预算管理办法"，与正文里的"预算"共享词项：这一次检索必有命中，
+    # 正文因此出现在命中段里（清单里仍然没有，断言在上面那条用例里）。
+    manifest, evidence = _split_evidence(user)
+    assert evidence, "主题与材料有共同词项，`mindmap_generate` 自己那次检索必须命中"
+    assert "预算由财务经理核准" in evidence
+    assert "预算由财务经理核准" not in manifest
 
     done = [event for event in events if event.type == "done"]
     assert done and done[-1].content is not None, [event.type for event in events]

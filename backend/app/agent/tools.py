@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Callable, Literal, Sequence
@@ -1527,6 +1528,112 @@ BRANCH_NO_EVIDENCE_RULES = (
 )
 
 
+# `rag` 形态下生成前那次主题检索取几条。对齐 `RagArgs.top_k` 的默认值（5）而不是
+# `DEEP_BRANCH_TOP_K=3`：这里是**整棵树**一次覆盖主题的全部方面，而分片那 3 条是
+# **一支**的量。父块折叠（`_fold_to_parents`）还会再减一轮，实际落到模型手上的
+# 条数常少于 5；往下调省的是两三千字符，代价是漏掉整节内容，划不来。
+GENERATE_RETRIEVAL_TOP_K = 5
+
+# 命中渲染进 user 消息时的表头。`_rag` 回给模型的是一串裸 JSON 数组（那就是工具
+# 返回值的全部内容，模型知道它来自哪个工具），而这里同一段 JSON 出现在 prompt 里、
+# 没有工具名作上下文：不说清"这是什么、与 rag_query 的返回同形"，模型会把一段
+# 来历不明的数组当成参考资料，或者干脆当没看见。
+GENERATE_EVIDENCE_HEADER = (
+    "\n本次已对该主题做过一次检索，结果如下"
+    "（evidence 数组，与 rag_query 的返回同形）：\n"
+)
+
+# 有命中时拼在 system 末尾的那一句。`RAG_SOURCE_PROMPT` 写着"你看不到材料全文，
+# 输入里只有一份清单，要拿到原文只能 rag_query 检索"——而这一版输入末尾已经有
+# 检索结果了。不点破这层，提示词与输入互相矛盾：模型要么再查一遍（白花一次
+# embedding + rerank），要么怀疑那段数组不该用，退回"没检索到"。
+#
+# 位置与 `BRANCH_EVIDENCE_RULES` 同理，拼在基础提示词与思维限定之后：它只描述
+# 这次的输入形状，不改树规则。
+GENERATE_EVIDENCE_RULES = (
+    "\n本次的 user 消息末尾已经附上「对主题做过的一次检索结果」（evidence 数组）："
+    "这一次不必再为同一件事检索，直接用它的片段写内容与引用。\n"
+)
+
+
+@dataclass(frozen=True)
+class _TopicEvidence:
+    """`rag` 形态下生成前那一次主题检索的产物。
+
+    `text` 为空串 = "没有能交给模型的证据"，这时 `failure` 区分两种原因：非空是
+    **检索本身出错**（换个配置或重试可能就有了），非空之外的 None 是**材料里确实
+    没命中**（问法能改，材料不会变）。两者给用户的文案必须分开——把"这次没查成"
+    说成"材料里没有"是谎报，反过来则是让人白等一次重试。
+    """
+
+    hits: list[EvidenceHit]
+    payload: list[dict[str, Any]]
+    spans: tuple[EvidenceSpan, ...]
+    text: str
+    elapsed: float
+    failure: str | None = None
+
+
+async def _retrieve_topic(sources: list[Source], topic: str) -> _TopicEvidence:
+    """`rag` 形态生成前的**一次**主题级检索：先把材料里与主题有关的原文拿到手。
+
+    为什么必须有这一步：`_source_prompt_input` 在 `rag` 形态下只拼材料清单（标题、
+    字数、类型），而 `mindmap_generate` 自己**没有检索入口**——模型的 `rag_query`
+    命中留在对话里，进不了这次生成的 user 消息。于是模型手里一个字都没有，而
+    `RAG_SOURCE_PROMPT` 又要求"检索不到就不要写，空着是正确结果"。两边都照做，
+    结果是一条分支"材料中没有相关内容：未检索到任何原文依据"，被 `MIN_BRANCHES=3`
+    判成 `invalid_map`。实测同一主题、同一份材料：`full` 形态给 5 条分支，
+    `rag` 形态给 1 条"没检索到"——差别不在模型，在输入。
+
+    检索栈与 `_rag` 是同一套（`search_parent`：子块匹配、父块返回、`MINDMAP_RERANK`
+    打开时带重排），所以命中形状不需要第二套定义；渲染也复用 `_citable_hits`，
+    模型看到的 `evidence_*` 与 `rag_query` 返回的逐字段相同——两套形状会让它按一种
+    抄、被另一种校验。
+
+    只对真有正文的 `sources` 做：调用方（`_generate`）已经滤掉空来源，这里不重复
+    过滤——两处各滤一次，口径迟早分叉。
+
+    永不抛：检索失败只降级（退回"无来源"生成），不该废掉整次生成。失败与空命中
+    靠 `failure` 分开（见 `_TopicEvidence`）。
+
+    耗时单独记一行日志：这是用户点"生成"之后**多出来的**一次等待（embedding 一次
+    往返 + 重排 0.6–0.9 秒），混在总耗时里就永远看不出"慢在哪"。
+    """
+    query = (topic or "").strip()
+    started = time.perf_counter()
+    try:
+        # 与 `_search_branch` 同理：`search_parent` 是同步函数，里面有一次 embedding
+        # 网络往返。直接在协程里调用会把整个事件循环按住，同一个进程里别人的流式
+        # 响应跟着卡住。
+        hits = await asyncio.to_thread(
+            search_parent, sources, query, GENERATE_RETRIEVAL_TOP_K)
+    except Exception as exc:  # noqa: BLE001 — 检索失败只降级，理由见 docstring
+        elapsed = time.perf_counter() - started
+        reason = _reason_text(exc)
+        logger.warning("mindmap_generate 主题预检索失败（top_k=%d，耗时 %.2fs）：%s",
+                       GENERATE_RETRIEVAL_TOP_K, elapsed, reason)
+        return _TopicEvidence((), (), (), "", elapsed, reason)
+
+    elapsed = time.perf_counter() - started
+    payload = _citable_hits(hits, sources)
+    logger.info(
+        "mindmap_generate 主题预检索：%d 条命中（top_k=%d），耗时 %.2fs%s",
+        len(payload), GENERATE_RETRIEVAL_TOP_K, elapsed,
+        "" if payload else "；没有命中，这次按无来源形态生成",
+    )
+    return _TopicEvidence(
+        hits=hits,
+        payload=payload,
+        spans=tuple(
+            EvidenceSpan(hit.source_id, hit.start, hit.end, hit.leaf_start, hit.leaf_end)
+            for hit in hits
+        ),
+        text=(GENERATE_EVIDENCE_HEADER + json.dumps(payload, ensure_ascii=False)
+              if payload else ""),
+        elapsed=elapsed,
+    )
+
+
 # ---------------------------------------------------------------- 工具实现
 
 
@@ -1546,6 +1653,8 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     if not ctx.reserve_model_call():
         return _fail("budget_exhausted", "本次运行的模型调用额度已用完，无法生成导图。")
     ctx.extra_model_calls += 1
+    # `rag` 形态下这一次主题检索的产物；`full` 形态与无来源那条路恒为 None。
+    topic_evidence: _TopicEvidence | None = None
     try:
         # 思维模型只改「怎么拆」，不改「拆什么」：拼在基础提示词之后、来源输入
         # 之前（来源在 user 消息里）。有来源时要多带一句限定，否则「必须举反例」
@@ -1563,14 +1672,47 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             # 那一层只负责"给点什么"，提示词与输入必须是同一次判定的产物，
             # 否则一次请求里两次读环境变量，理论上能拼出 A 的提示词配 B 的输入。
             if source_mode() == SOURCE_MODE_RAG:
-                system = RAG_SOURCE_PROMPT + thinking + RAG_THINKING_GUARD
+                # `rag` 下清单里一个字的正文都没有，而这个工具**自己不做检索**：
+                # 不在这里补一次，模型就只能照 `RAG_SOURCE_PROMPT` 说的"检索不到
+                # 就不要写"如实留空，交出一条分支的树（详见 `_retrieve_topic`）。
+                topic_evidence = await _retrieve_topic(sources, args.topic)
+                # 命中并进本次运行的证据集：收尾的 `verify_source_refs` 要按它判
+                # "这条引用落在命中的那段里吗"。与 `_rag` 累积的是同一份东西，
+                # 两条路各记一份的话，"校验依据"会与"模型看到的证据"分叉。
+                ctx.record_evidence(topic_evidence.spans)
+                if topic_evidence.text:
+                    system = (RAG_SOURCE_PROMPT + thinking + RAG_THINKING_GUARD
+                              + GENERATE_EVIDENCE_RULES)
+                    raw = await chat_async(
+                        system,
+                        _source_prompt_input(sources, system=system) + topic_evidence.text,
+                        max_tokens=_max_tokens(ctx), **stream_kwargs,
+                    )
+                else:
+                    # 检索为空/出错 → **退回无来源形态**（用户至少拿到一张能用的图）。
+                    #
+                    # 另一条路是"仍然按 rag 提示词生成"：那样模型会说"没检索到"，
+                    # 一条分支、`invalid_map`——就是这次的 bug。所以走这条：
+                    # `DETAIL_PROMPT` 是"按主题展开框架"的提示词，它不承诺材料依据，
+                    # 也不教模型写引用。输入只给主题，不给清单：清单会引它去
+                    # `rag_query`，而刚刚证明这个问法查不到东西。
+                    #
+                    # 校验仍然带着来源与证据（不在这里把 `sources` 判成 None）：
+                    # 模型在**本次运行的前几轮**可能已经 `rag_query` 到过真实片段，
+                    # 它据此写出的引用是合法的，不该因为这一次主题检索没命中就全删。
+                    # 逐字与证据两道校验照跑，留下的只可能是真依据——"没有引用"是
+                    # 可见的（聚合诊断 + `ToolResult.content`），"假装有依据"不可能。
+                    system = DETAIL_PROMPT + thinking
+                    raw = await chat_async(
+                        system, args.topic, max_tokens=_max_tokens(ctx), **stream_kwargs,
+                    )
             else:
                 # 有来源时必须给结构化输入：模型要靠 source_id 写引用。
                 system = SOURCED_DETAIL_PROMPT + thinking + SOURCED_THINKING_GUARD
-            raw = await chat_async(
-                system, _source_prompt_input(sources, system=system),
-                max_tokens=_max_tokens(ctx), **stream_kwargs,
-            )
+                raw = await chat_async(
+                    system, _source_prompt_input(sources, system=system),
+                    max_tokens=_max_tokens(ctx), **stream_kwargs,
+                )
         else:
             raw = await chat_async(
                 DETAIL_PROMPT + thinking, args.topic, max_tokens=_max_tokens(ctx),
@@ -1578,6 +1720,9 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             )
     except GenerationError as exc:
         return _fail("generation_failed", f"生成失败：{exc}")
+
+    # 退化成"只凭主题"的那一版：请求带了材料，但这次一条依据都没拿到。
+    unsourced = bool(sources) and topic_evidence is not None and not topic_evidence.text
 
     try:
         # `evidence` 只在这条链、且只在 `rag` 形态下交出去。
@@ -1603,6 +1748,12 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     except Exception as exc:  # noqa: BLE001 — 校验失败的原因就是要回给模型的文本
         return _fail("invalid_map", f"模型返回的导图不合法：{exc}")
 
+    if unsourced:
+        # 退化路径上"每个节点都没有引用"是**一件事**，只是按节点数重复了几十遍；
+        # 逐条留着会把别的诊断淹掉（分片那条路同样的处理，见 `_generate_deep`）。
+        # 聚成一条放在最后，明说这张图没有材料依据——用户要能一眼看出"为什么没有引用"。
+        diagnostics = [item for item in diagnostics if item.code != "UNSOURCED_NODE"]
+
     # 结构与语义两层复核，原先只长在 `pipeline/service.run()` 的收尾里：
     #   - `check()` 只看树本身（单子节点、深度上限、同级重名），没有来源也能跑，
     #     所以对一句话主题的生成同样有效；
@@ -1614,19 +1765,44 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     if verify_sources:
         diagnostics.extend(annotate_nli(content, verify_sources))
 
+    if unsourced:
+        reason = (f"检索出错（{topic_evidence.failure}）" if topic_evidence.failure
+                  else "材料里没有查到与这个主题相关的原文片段")
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="GENERATION_WITHOUT_EVIDENCE",
+            message=(
+                f"{reason}：这张图只基于主题「{args.topic}」生成，"
+                "没有任何材料依据，节点上也不会有引用"
+            ),
+        ))
+
     ctx.candidate = content
     ctx.revision += 1
     count = _count_nodes(content.root)
-    return ToolResult(
-        ok=True,
-        content=f"已生成导图「{content.title}」，共 {count} 个节点。",
-        data={
-            "root_id": content.root.id,
-            "node_count": count,
-            "revision": ctx.revision,
-            "diagnostics": [item.model_dump() for item in diagnostics],
-        },
-    )
+    summary = f"已生成导图「{content.title}」，共 {count} 个节点。"
+    if unsourced:
+        # 一句话必须写进 `content`：这是模型唯一会读回去的地方，也是遥测/日志里
+        # 唯一的"这次没依据"信号。写进 data 不够——用户看的是这句话。
+        summary += (
+            f"{reason}，这张图只基于主题生成，不含任何材料依据；"
+            "要一张有依据的图，请换一个更贴近材料内容的说法后重试。"
+        )
+    data: dict[str, Any] = {
+        "root_id": content.root.id,
+        "node_count": count,
+        "revision": ctx.revision,
+        "diagnostics": [item.model_dump() for item in diagnostics],
+    }
+    if topic_evidence is not None:
+        # 只加在 `rag` + 有材料这条路上：这是本次改动唯一多出来的等待，总耗时里
+        # 看不出来"慢在哪"，得把这一次检索单独报出来（与那条 info 日志同源）。
+        data["retrieval"] = {
+            "hits": len(topic_evidence.payload),
+            "top_k": GENERATE_RETRIEVAL_TOP_K,
+            "seconds": round(topic_evidence.elapsed, 3),
+            "failed": topic_evidence.failure,
+        }
+    return ToolResult(ok=True, content=summary, data=data)
 
 
 async def _search_branch(
