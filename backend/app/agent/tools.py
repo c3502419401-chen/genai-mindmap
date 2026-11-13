@@ -26,7 +26,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
@@ -62,7 +62,7 @@ from app.generation.service import (
     validate_generated_content,
 )
 from app.generation.stream_partial import collect_new_nodes, parse_partial
-from app.knowledge.query_plan import _material_snippets, plan_query
+from app.knowledge.query_plan import _material_snippets, plan_branches, plan_query
 from app.knowledge.service import (
     EvidenceHit,
     SourceFilter,
@@ -139,6 +139,15 @@ DEEP_MIN_BREADTH = 2
 # 88 条文本。**不预热**时是 20 × 69 = 1380 条（56 批），17 倍——所以
 # `_retrieve_branches` 里第一支是串行的，那不是保守，是成本闸。
 DEEP_BRANCH_TOP_K = 3
+
+# 一支最多发几路查询：标题 + 2 条同义问法（`query_plan.plan_branches`）。
+#
+# 为什么是 3 而不是 `plan_branches` 允许的 4（标题 + 3）：那 3 条问法里前两条
+# 才进检索，第三条是提示词留给模型的选择余地（它给 3 条，代码取前 2 条）。
+# 每多一路就多一次 embedding 往返，而 8 支 × 3 路 = 24 条 query 已经在 5 秒
+# 预算的边上。`service.MAX_ROUTES=6` 是**单次检索**的口径，3 路远不到顶：
+# 那个上限防的是"一个 query 列表里塞六条以上"，不是"多少支各发几路"。
+BRANCH_QUERY_LIMIT = 3
 
 # 分片检索**全部**失败时退回"整树一次检索"的条数。与 `rag_query` 的默认
 # `top_k=5` 同口径：那正是 `mindmap_generate` 那条路拿到的量，退回时用户看到的
@@ -475,6 +484,37 @@ def _branch_query(title: str) -> str:
     所以这一版是"在唯一测得动的条件下更好"的选择，不是普适定论。
     """
     return title.strip()
+
+
+def _branch_queries(title: str, intents: Sequence[str] = ()) -> list[str]:
+    """一支实际发出的查询串：**标题永远第一位**，后面接至多 `BRANCH_QUERY_LIMIT-1` 条问法。
+
+    第一位必须是标题，这不是排序偏好而是契约：`search_multi` 的**保底席位**
+    （前 `ceil(top_k/2)` 名）全部来自第一位那一路。把扩展问法放到前面，等于把
+    "用户/骨架原话的召回"降级成"模型猜的问法的召回"——2.3 那次实测里，扩展
+    问法把真答案顶下去过（`search_multi` 的注释钉着那个复现）。
+
+    去重与去空白都在这里做一遍，不指望 `plan_branches` 那道闸：
+      - 与标题**逐字相同**的问法要丢：`plan_branches` 已经过滤过，但这个函数
+        也是 `_generate_deep` 算 `retrieval.queries` 的地方，两处口径必须同一份；
+      - 重复问法要丢：`search_multi` 内部会去重，但"我以为发了 3 路、实际 2 路"
+        这种事在成本核算时会变成一个说不清的差集。
+
+    上限在这里截断而不是靠 `MAX_ROUTES`：那个上限会把**标题**留在前面、把扩展
+    截掉，结论一样，但日志里会多一条"多路检索截断"的 debug——那条日志该只属于
+    "调用方真的给了六七条 query"的情形。
+    """
+    queries: list[str] = []
+    base = title.strip()
+    if base:
+        queries.append(base)
+    for item in intents:
+        text = item.strip() if isinstance(item, str) else ""
+        if text and text not in queries:
+            queries.append(text)
+        if len(queries) >= BRANCH_QUERY_LIMIT:
+            break
+    return queries
 
 
 def _ref_from(item: Any, evidence: _BranchEvidence) -> dict[str, Any] | None:
@@ -1501,9 +1541,9 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
 
 
 async def _search_branch(
-    sources: list[Source], title: str,
+    sources: list[Source], title: str, intents: Sequence[str] = (),
 ) -> list[EvidenceHit] | None:
-    """一条分支的检索：query **只发分支标题**（`_branch_query`），`top_k=DEEP_BRANCH_TOP_K`。
+    """一条分支的检索：标题（`_branch_query`）**加至多 2 条同义问法**，各 top_k=3。
 
     为什么不是"主题 + 标题"——**实测选出来的**，三组消融（`docs/RAG-DECISIONS.md`
     12,392 字、8 支、纯 BM25，`scripts/measure_deep_slicing.py --query-mode`）：
@@ -1526,23 +1566,63 @@ async def _search_branch(
     （如实留空是对的），后者是这次检索没成（可能换个配置就有了）。`None` 与 `[]`
     就是这两个意思。
 
-    放进 `asyncio.to_thread`：`search_parent` 是同步函数，里面有一次 embedding
-    网络往返。直接在协程里调用等于把 20 支串成一条队；线程池让它们真的同时发。
-    线程池只承担"本地 CPU + 一次同步 HTTP"，与工具内模型调用的 `DEEP_CONCURRENCY`
-    信号量无关——那个限的是模型请求配额，这个限的是本机算力。
+    **两条路径，按"有没有扩展"分岔，不是按开关分岔**：
+
+      - `intents` 为空（开关关着、`plan_branches` 降级成 `{}`、或这一支模型没给
+        问法）→ 与这个能力上线之前**逐字节相同**：`to_thread(search_parent, ...)`，
+        父块返回、子块匹配。这一条是本次改动的降级契约。
+      - `intents` 非空 → `search_multi`（多路 + RRF + 原 query 保底席位）。它返回
+        的是**单级块**（`start/end` 就是匹配单元，`leaf_*` 为 None），与 `_rag`
+        的多路分支同一口径；父块折叠只接在单路上（理由见 `_citable_hits`）。
+
+    不另写融合：RRF、去重、保底席位、`MAX_ROUTES` 全在 `search_multi` 里，这里
+    再实现一遍等于让同一件事有两处真相，而两处迟早分叉。
+
+    单路那条路径放进 `asyncio.to_thread`：`search_parent` 是同步函数，里面有一次
+    embedding 网络往返。直接在协程里调用等于把 20 支串成一条队；线程池让它们真的
+    同时发。多路那条**不需要** to_thread：`search_multi` 是协程，它内部已经把
+    向量往返扔进线程池（见 `service._route_vectors`）。
     """
     query = _branch_query(title)
+    queries = _branch_queries(title, intents)
     try:
-        return await asyncio.to_thread(
-            search_parent, sources, query, DEEP_BRANCH_TOP_K)
+        if len(queries) <= 1:
+            return await asyncio.to_thread(
+                search_parent, sources, query, DEEP_BRANCH_TOP_K)
+        return await search_multi(sources, queries, DEEP_BRANCH_TOP_K)
     except Exception as exc:  # noqa: BLE001 — 检索失败只降级，不该废掉整张图
-        logger.warning("分支检索失败（%s / %s）：%s: %s",
-                       title, query, type(exc).__name__, str(exc)[:160])
+        logger.warning("分支检索失败（%s / %d 路）：%s: %s",
+                       title, len(queries), type(exc).__name__, str(exc)[:160])
         return None
 
 
-async def _retrieve_branches(
+async def _expand_branches(
     sources: list[Source], titles: list[str],
+) -> dict[str, list[str]]:
+    """分支标题 → 同义问法；**成本闸就在这里**：单支不值得多一次模型往返。
+
+    为什么单支不扩展：一条分支的检索本来只有一次多路融合的收益，却要多付一次
+    8 秒上限的模型调用；而"多支"时这一次调用是**共享**的（`plan_branches` 一次
+    处理全部标题），摊薄之后才划算。这也是它该放在这里的理由——调用点不该知道
+    "几条分支才值得扩展"这条政策。
+
+    永不抛：`plan_branches` 自己已经把所有失败收成 `{}`，这里再兜一层是为了
+    `CancelledError` 之外的意外（例如 `_material_inputs` 被将来的改动弄成会抛）。
+    扩展失败不该让整张图失败——它只是"这一轮少了几路召回"。
+    """
+    if len(titles) < 2:
+        return {}
+    try:
+        return await plan_branches(titles, materials=_material_inputs(sources))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("分支扩展失败（%d 支）：%s: %s",
+                       len(titles), type(exc).__name__, str(exc)[:160])
+        return {}
+
+
+async def _retrieve_branches(
+    sources: list[Source], titles: list[str], *,
+    expansions: dict[str, list[str]] | None = None,
 ) -> list[list[EvidenceHit] | None]:
     """N 支各检索一次：**第一支先单独跑，其余并行**。
 
@@ -1556,16 +1636,22 @@ async def _retrieve_branches(
     （本机纯 BM25 几毫秒，带向量时约一次 embedding 往返）。换的是向量请求量从
     N×块数 降到 块数 + N，这是成本闸该有的形状。
 
+    **`expansions` 不影响这个结构**：扩展只是让每支多带一两条 query，第一支仍然
+    是串行的——多路时"预热"发生在 `_route_vectors` 的块向量那一次线程池批里，
+    与单路是同一笔成本，先跑一支同样把缓存填上。
+
     失败就地降成 `None`（不用 `gather(return_exceptions=True)` 再逐点判类型）：
     调用方只需要知道"这一支有没有证据"。第一支失败不影响其余各支照常并行。
     """
     if not titles:
         return []
-    first = await _search_branch(sources, titles[0])
+    expanded = expansions or {}
+    first = await _search_branch(sources, titles[0], expanded.get(titles[0], ()))
     if len(titles) == 1:
         return [first]
     rest = await asyncio.gather(
-        *(_search_branch(sources, title) for title in titles[1:]))
+        *(_search_branch(sources, title, expanded.get(title, ()))
+          for title in titles[1:]))
     return [first, *rest]
 
 
@@ -1785,10 +1871,24 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     retrieval_mode = "off"
     retrieval_failed: list[int] = []
     retrieval_empty: list[int] = []
+    # 分支标题 → 同义问法。`full` 形态不做按支检索，所以这里恒为空——它同时是
+    # `retrieval.expanded_branches` 的来源，两处共用一个变量才不会有半开状态。
+    expansions: dict[str, list[str]] = {}
     if slicing:
         branch_titles = [title for title, _ in skeleton]
-        retrieval_queries = [_branch_query(title) for title in branch_titles]
-        hits_by_branch = await _retrieve_branches(sources, branch_titles)
+        # 查询扩展：每支从"一条标题"变成"标题 + 至多 2 条同义问法"。`expansions`
+        # 为空是**常态**（开关默认关、单支时的成本闸、或模型降级），那时下面两行
+        # 与这个能力上线之前逐字节相同。
+        #
+        # 位置必须在这里：扩展的输入是分支标题，而分支标题要等骨架落定；输出要
+        # 赶在 `_retrieve_branches` 之前，否则检索已经按标题跑完了。
+        expansions = await _expand_branches(sources, branch_titles)
+        retrieval_queries = [
+            query for title in branch_titles
+            for query in _branch_queries(_branch_query(title), expansions.get(title, ()))
+        ]
+        hits_by_branch = await _retrieve_branches(
+            sources, branch_titles, expansions=expansions)
         retrieval_mode = "branch"
         retrieval_failed = [
             index for index, hits in enumerate(hits_by_branch) if hits is None]
@@ -2344,9 +2444,14 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     # 与一棵全都查到证据的树看起来一模一样。
     if slicing:
         with_evidence = sum(1 for item in branch_evidence if item is not None)
+        # 扩展生效时每支实际发 1-3 条问法，这时只说"各检索一次"就与
+        # `retrieval.queries` 的长度对不上——而用户看到的正是这句话。
         line = (
             f"按支检索：{len(skeleton)} 条分支各检索一次，"
-            f"{with_evidence} 条拿到材料依据（每支 {DEEP_BRANCH_TOP_K} 条）"
+            + (f"其中 {len(expansions)} 条按标题扩展了同义问法"
+               f"（共 {len(retrieval_queries)} 条问法，多路融合后每支取 "
+               f"{DEEP_BRANCH_TOP_K} 条），" if expansions else "")
+            + f"{with_evidence} 条拿到材料依据（每支 {DEEP_BRANCH_TOP_K} 条）"
         )
         if retrieval_mode == "whole":
             line += "；按支检索一条都没命中，已退回整树一次检索（全部支共用）"
@@ -2401,6 +2506,11 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
                 "top_k": (DEEP_BRANCH_TOP_K if retrieval_mode != "whole"
                           else DEEP_FALLBACK_TOP_K),
                 "queries": retrieval_queries,
+                # 有几支拿到了扩展问法（`plan_branches` 的产出条数）。0 既可能是
+                # "开关关着"，也可能是"开关开着但模型降级了"——这两者从
+                # `queries` 的长度看不出来（8 支 24 条 vs 20 支 20 条都是"看着像
+                # 没扩"）。日志里有 `outcome`，而模型看不到日志。
+                "expanded_branches": len(expansions),
                 "branches_with_hits": sum(
                     1 for item in branch_evidence if item is not None),
                 "failed_branches": [skeleton[index][0] for index in retrieval_failed],

@@ -40,6 +40,25 @@
 算查询向量，绝不能出现在任何 sources、引用或最终正文里 —— 一旦被当成证据，
 检索就变成了"自己检索自己"。
 
+## 分支扩展：只借改写，不借判断
+
+`plan_branches` 把分片检索的每一支从"一条标题"变成"标题 + 2-3 个同义问法"，
+多路并行后由 `service.search_multi` 做 RRF 融合。它借的是 2.3 那次的**改写**
+能力，**不借判断**：
+
+  - 做：标题扩展成同义问法，多路检索后合并；
+  - 不做：不判断材料够不够、不做多轮、不改写后重查。
+
+发散（跑满 20 轮、5483 token、与材料 2-gram 覆盖率恒 0.0）的燃料是"让模型判断
+够不够"那一步，不是改写本身——判断器是确定性地在说"不够"，而那正是循环继续的
+唯一燃料。这里没有那个循环：轮数天然是 1，终止条件不是"够了"而是"这一支查完
+了"。同理，一次调用处理**全部**分支——8 支各调一次等于 8 次往返，在 2C2G +
+5 秒预算下不可能。
+
+返回 `{}` 与"没有这个功能"逐字节一致：调用方退回只发标题的单路检索。没有材料
+时同样返回 `{}` 而不发请求，理由与 `_build_plan` 的代码闸相同——不看材料的
+改写正是那次 2-gram 覆盖率 0.0 的起点。
+
 ## 开关与失败
 
 `MINDMAP_QUERY_EXPANSION` 关着 → 返回 `None`，零 HTTP 请求、零 JSON 解析。
@@ -549,3 +568,246 @@ async def plan_query(
          response_chars=len(json.dumps(payload, ensure_ascii=False, default=str)),
          plan=plan)
     return plan
+
+
+# ---------------------------------------------------------------- 分支扩展（分片检索）
+
+# 这一次调用的硬上限。与 `plan_query` 同一个 8 秒，但**单独一个名字**：两条路径
+# 将来各自的预算可能不同（这里一次要处理 N 条分支），共用一个常量会把它们绑死，
+# 而"改了一支的预算、另一支莫名其妙变慢"这种差集没人查得出来。
+BRANCH_TIMEOUT_SECONDS = 8.0
+
+# 每条分支的问法数上限。提示词要 2-3 条是给模型一点选择余地；**调用方只用前两条**
+# （标题 + 2 = 3 路，见 `agent.tools.BRANCH_QUERY_LIMIT`）。不是每条分支都真发三路：
+# 8 支 × 4 路 = 32 次检索，2C2G + 5 秒预算下不成立。
+BRANCH_MAX_QUERIES = 3
+
+# 一次处理的分支数上限。与 `agent.tools.DEEP_MAX_BRANCHES` 同口径（20），写死在
+# 这里是为了不让 knowledge 层反向依赖 agent 层。超出的标题被截断——那些分支没有
+# 扩展，退回单路，是可接受的降级。
+MAX_BRANCH_TITLES = 20
+
+# 输出上限：20 支 × 3 条 × 十几个字，加 JSON 结构与标点约 1200 token。给大了只会
+# 让慢模型更慢，而预算只有 8 秒。
+BRANCH_MAX_OUTPUT_TOKENS = 1200
+
+# 提示词。与 `SYSTEM_PROMPT` 同一套写法：三条硬约束都用正反例写成"可对照的
+# 形状"，不用形容词；示例只出现「甲」「乙」「它」这类占位词，避免模型把示例
+# 内容抄进结果（2.3 那次编出的超导/离子阱就是"照着别处的词往下写"的产物）。
+# 与 `SYSTEM_PROMPT` 的差别只有一处：这里**没有** hyde / subqueries / corrected，
+# 也不许模型判断"材料够不够"——只借改写，不借判断（见模块 docstring）。
+BRANCH_SYSTEM_PROMPT = (
+    "你在为一次资料检索做准备：把导图的一级分支标题整理成各自的同义问法。"
+    "你只输出一个 JSON 对象，不要写解释、不要加代码围栏、不要在 JSON 前后写字。\n"
+    "\n"
+    "形状（键必须是给你的分支标题，逐字照抄，不要改写、不要新增键、不要少给键）：\n"
+    "  {\"分支标题\": [\"问法1\", \"问法2\"], \"另一个分支标题\": [\"问法1\", \"问法2\"]}\n"
+    "每条分支给 2-3 条问法。某条分支确实变不出别的问法，就给 1 条或空数组，不要编。\n"
+    "\n"
+    "四条硬规则，逐条守：\n"
+    "\n"
+    "1. 必须看材料。用词、术语写法、范围一律以材料为准；材料里没有出现过的领域、"
+    "指标、机构、标准、文号、篇名，一个都不要写进来。\n"
+    "   ❌ 材料讲的是甲领域的甲事物，分支是「甲的费用」，你把问法写成乙领域的收费模式"
+    "——乙在材料里根本没出现，检索从此换了个问题。\n"
+    "   ✅ 材料里把这个东西写作「甲（正式名）」，你就按材料的正式写法问，其余不动。\n"
+    "\n"
+    "2. 禁止意图膨胀。每条分支的问法必须是**这一分支的不同问法**，不得增加原分支没有的方面，"
+    "也不得把别的分支的方面搬过来。\n"
+    "   ❌ 分支「它多少钱」→ 写成「它多少钱」「收费模式是什么」「有哪些优惠政策」"
+    "—— 后两条各自新增了一个方面，向量相似度会被这几个方面摊薄。\n"
+    "   ✅ 分支「它多少钱」→ 写成「它多少钱」「它要花多少钱」「它的费用是多少」"
+    "—— 三个问法问的是同一件事。\n"
+    "\n"
+    "3. 各分支互相独立。不要把一条分支的问法写成另一条的复述——每条分支都问成同一件事，"
+    "检索就只覆盖到一处，多路等于白花。\n"
+    "   ❌ 分支甲与分支乙各给三条，六条问法其实都在问同一段材料。\n"
+    "   ✅ 分支甲的问法只落在甲上，分支乙的问法只落在乙上。\n"
+    "\n"
+    "4. 不确定就给空数组，不要编。值必须是字符串数组；数字、布尔、对象、嵌套数组"
+    "不要塞进来，类型不对的那一项会被整项丢掉。\n"
+    "\n"
+    "上面的例子只用来说明形状，不要把例子里的词写进你的结果。"
+)
+
+
+def _branch_titles(titles: list[str]) -> list[str]:
+    """标题清单：去空白、去重保序、截断到 `MAX_BRANCH_TITLES`。
+
+    去重不是洁癖：同一个标题出现两次只该占一条问法集，否则模型得为同一个键
+    输出两遍，而 dict 里的键本来就会合并成一个。`_generate_deep` 的骨架已经
+    去过重，这里再收一遍是给"别的调用方"留的契约——这个函数是公开入口。
+    """
+    kept: list[str] = []
+    for item in titles or []:
+        text = item.strip() if isinstance(item, str) else ""
+        if text and text not in kept:
+            kept.append(text)
+        if len(kept) >= MAX_BRANCH_TITLES:
+            break
+    return kept
+
+
+def _branches_message(titles: list[str], snippets: list[str]) -> str:
+    """这一次的用户消息：材料摘要 + 待扩展的标题清单。
+
+    标题**逐行编号**给出，并要求模型把标题原样当 JSON 的键。编号不是给模型看
+    顺序，而是让"哪些键是我给的"在解析时能逐条核对——模型自己改写过的键会被
+    `_build_branches` 丢掉，那一支退回单路。
+    """
+    block = "\n".join(f"[材料{i}] {text}" for i, text in enumerate(snippets, 1))
+    listing = "\n".join(f"{i}. {title}" for i, title in enumerate(titles, 1))
+    return (
+        "材料（每份只给标题与开头，是本次判断用词与范围的唯一依据）：\n"
+        f"{block}\n"
+        "\n"
+        "一级分支标题（逐字照抄作 JSON 的键，不要改写、不要增删）：\n"
+        f"{listing}\n"
+        "\n"
+        "只返回那个 JSON 对象。\n"
+    )
+
+
+def _branch_mapping(payload: dict[str, Any]) -> dict[str, Any]:
+    """把模型出口的几种常见形状收敛成一个 `{标题: 原始值}` 映射。
+
+    收三种：直接映射（提示词要的形状）、包一层 `branches` 的映射、以及
+    `{"branches": [{"title": ..., "intents": [...]}, ...]}` 这种数组——模型
+    把"键值对"想成"对象列表"是常态，而这不是内容错误，只是形状。为形状丢掉
+    一整次调用的产出，等于让整条路径的概率下降。
+    """
+    branches = payload.get("branches")
+    if isinstance(branches, dict):
+        return branches
+    if isinstance(branches, list):
+        merged: dict[str, Any] = {}
+        for item in branches:
+            if not isinstance(item, dict):
+                continue
+            key = _clean_text(item.get("title")) or _clean_text(item.get("branch"))
+            if key is None or key in merged:
+                continue
+            merged[key] = item.get("intents", item.get("queries",
+                                                       item.get("questions")))
+        return merged
+    return payload
+
+
+def _branch_values(value: Any) -> list[Any]:
+    """一条分支的原始值 → 候选问法列表。认不出的形状给空列表（不当成一条问法）。"""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        for key in ("intents", "queries", "questions"):
+            inner = value.get(key)
+            if isinstance(inner, list):
+                return inner
+    return []
+
+
+def _build_branches(payload: dict[str, Any], titles: list[str]) -> dict[str, list[str]]:
+    """从 payload 重建 `{标题: [问法]}`：只保留调用方给过的标题，空问法整条丢掉。
+
+    三道代码闸，每一道都对应一种模型会犯的错：
+
+      1. **键必须在 `titles` 里**（逐字）。模型很爱把标题"整理"一下（去掉编号、
+         换个更短的写法），那一支的键就对不上了；拿这种键去检索等于凭空加了一
+         个新分支——目标说"不得增加新方面"，这里是它的字面执行处。
+      2. **问法不得等于标题**。等于标题的那条是白跑一路：`search_multi` 会去重，
+         而"标题 + 标题"会让实际路数从 3 掉到 2 甚至 1，调用方却以为发了 3 路。
+      3. **去重 + 截断到 `BRANCH_MAX_QUERIES`**。同一支里两条一样的问法，同样
+         白占名次。
+
+    空列表的键**不写进返回值**：调用方用 `expanded.get(title, [])` 取，缺省即
+    "这一支没有扩展"，与"模型给了空数组"是同一条路径——少一种状态。
+    """
+    allowed = set(titles)
+    out: dict[str, list[str]] = {}
+    for raw_key, value in _branch_mapping(payload).items():
+        title = _clean_text(raw_key)
+        if title is None or title not in allowed:
+            continue
+        queries: list[str] = []
+        for item in _branch_values(value):
+            text = _clean_text(item)
+            if text and text != title and text not in queries:
+                queries.append(text)
+        if queries:
+            out[title] = queries[:BRANCH_MAX_QUERIES]
+    return out
+
+
+def _log_branches(outcome: str, started: float, *,
+                  requested: int, expanded: dict[str, list[str]]) -> None:
+    """一行日志：**只有形状，没有内容**。
+
+    标题与材料正文一律不记：材料可能是合同、病历、内部制度，日志会被收走、会被
+    翻；而分支标题本身就是材料内容的摘要（"2.3 多轮判断：发散"已经泄漏了一节在
+    讲什么）。这里记的条数与耗时足够回答"开没开、降没降级、扩了几条"。
+    """
+    logger.info(
+        "分支扩展 outcome=%s 耗时=%.0fms 分支=%d 有扩展=%d 问法=%d",
+        outcome, (time.perf_counter() - started) * 1000, requested,
+        len(expanded), sum(len(item) for item in expanded.values()),
+    )
+
+
+async def plan_branches(
+    titles: list[str], *, materials: list[str] | None = None,
+) -> dict[str, list[str]]:
+    """把一组分支标题**一次调用**扩展成各自的同义问法；不成立就返回 `{}`。
+
+    `{}` 的语义与 `plan_query` 的 `None` 相同：**逐字节等于没有这个功能**。
+    调用方拿到它只用标题，走原来的单路检索。
+
+    参数：
+      - `titles`：分支标题。空白、重复、超上限的条目在这里被清掉。
+      - `materials`：每份材料"标题 + 正文开头"的字符串，最多 `MAX_MATERIALS` 份、
+        每份前 `MATERIAL_HEAD_CHARS` 字。**没有材料就返回 `{}`**，一次请求都不发：
+        2.3 那次实测的核心教训就是"改写器不看材料就会编领域"，而没有材料的扩展
+        没有任何东西能把它锚回材料。
+
+    为什么一次调用处理全部分支：8 支 × 1 次 = 8 次往返，在 2C2G + 5 秒预算下
+    不可能，而每条分支 2-3 条问法的产出加起来也就 20 支 × 3 条。这也是它与
+    `plan_query`（一问一计划、还带判断与多轮）最本质的分工：那边服务"一个问题的
+    一次检索"，这边服务"一张图的 N 支各一次检索"，后者没有判断、没有循环。
+
+    开关 `MINDMAP_QUERY_EXPANSION` 关着时在第一行返回：不读 materials、不构造
+    客户端、不发请求。这条路径的代价必须是零。
+    """
+    if not _enabled():
+        return {}
+    wanted = _branch_titles(titles)
+    if not wanted:
+        return {}
+    snippets = _material_snippets(materials)
+    if not snippets:
+        return {}
+    prompt = _branches_message(wanted, snippets)
+    started = time.perf_counter()
+    outcome = "ok"
+    raw: Any = None
+    try:
+        # 只发一次，绝不重试：失败就是这次没有扩展，重试只会把 8 秒预算打穿。
+        raw = await asyncio.wait_for(
+            chat_async(BRANCH_SYSTEM_PROMPT, prompt, max_tokens=BRANCH_MAX_OUTPUT_TOKENS),
+            timeout=BRANCH_TIMEOUT_SECONDS,
+        )
+    except (TimeoutError, asyncio.TimeoutError):
+        outcome = "timeout"
+    # 与 `plan_query` 同样不拦 `CancelledError`：那是我方被取消（客户端断开），
+    # 不是模型坏了，吞掉它会让上层以为任务正常跑完了。
+    except Exception:  # noqa: BLE001
+        outcome = "error"
+    if outcome != "ok":
+        _log_branches(outcome, started, requested=len(wanted), expanded={})
+        return {}
+
+    payload = _payload(raw)
+    if payload is None:
+        _log_branches("bad_json", started, requested=len(wanted), expanded={})
+        return {}
+    expanded = _build_branches(payload, wanted)
+    _log_branches("ok" if expanded else "empty", started,
+                  requested=len(wanted), expanded=expanded)
+    return expanded
