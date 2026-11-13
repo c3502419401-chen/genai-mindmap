@@ -41,7 +41,7 @@ from app.agent.contracts import (
     ToolEndEvent,
 )
 from app.agent.provider import default_provider
-from app.agent.tools import ToolRegistry, build_registry
+from app.agent.tools import ToolRegistry, build_registry, library_available
 from app.contracts.mindmap import MindMapContent
 from app.generation.service import (
     SOURCE_MODE_RAG,
@@ -131,12 +131,22 @@ def outline_text(content: MindMapContent | None, limit: int = 200) -> str:
 
 
 def _intent_rule(request: AgentRunRequest) -> str:
-    """这次意图该配哪条指令。`rag` 形态只覆盖有来源的 `create`（理由见上）。
+    """这次意图该配哪条指令。`rag` 形态只覆盖**有东西可查**的 `create`（理由见上）。
 
-    没有来源时不改：`rag` 与 `full` 在"这次根本没带材料"时行为完全一样，
-    这时换成检索优先的指令，只会让模型去查一个空列表。
+    没有来源、库里也没有材料时不改：`rag` 与 `full` 在"这次根本没带材料"时行为
+    完全一样，这时换成检索优先的指令，只会让模型去查一个空列表。
+
+    条件从 `request.sources` 扩成 `request.sources or 库非空`：知识库接上以后，
+    "这次请求有没有材料"不再等于"有没有东西可查"。库里存着过往材料时，`full`
+    形态那句"直接生成，不要先去检索资料"就成了错的前提——那份材料根本不在
+    上下文里。判据必须跟着**可检索的东西**走，而不是跟着请求来的那几份走。
+
+    代价是每轮刷新 system 时会读一次库（`library_source_count`，一次本地
+    sqlite 计数查询，不读正文）。这里不做缓存：库可能在运行期间被别的请求写入，
+    而"这一轮才发现库里有材料"并不会让前面的轮次变错——模型下一轮就会看到新
+    指令，比一条运行开始时算死的布尔值更接近事实。
     """
-    if request.sources and source_mode() == SOURCE_MODE_RAG:
+    if source_mode() == SOURCE_MODE_RAG and (request.sources or library_available()):
         override = _RAG_INTENT_RULES.get(request.intent)
         if override is not None:
             return override

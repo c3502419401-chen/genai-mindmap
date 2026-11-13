@@ -9,7 +9,8 @@
   来源正文，所以请求带材料时注册表根本不注册它——那条路会产出一棵与材料无关
   的树，而且成功返回
 - `node_expand` 只能在已选中的节点下加子节点，不能删、不能移
-- `rag_query` 只读，且只能查本次请求带来的来源
+- `rag_query` 只读，查本次请求带来的来源**与知识库**（`library=True`，默认开；
+  库命中的 `source_id` 是持久 id，收尾校验前要用 `library.load()` 取回原文）
 - `mindmap_edit` 才允许改/删/移，且必须按节点 id
 
 这样切是为了把「改错地方」的风险压到协议层：`node_expand` 的入参里没有
@@ -23,6 +24,7 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -62,6 +64,7 @@ from app.generation.service import (
     validate_generated_content,
 )
 from app.generation.stream_partial import collect_new_nodes, parse_partial
+from app.knowledge import library as knowledge_library
 from app.knowledge.query_plan import _material_snippets, plan_branches, plan_query
 from app.knowledge.service import (
     EvidenceHit,
@@ -163,6 +166,64 @@ MAX_OUTPUT_TOKENS_CAP = 65536
 # 截断必须让模型知情，否则它会把半份材料当成全文来整理和引用。
 # 校验用的 sources 始终保留完整原文，只有提示词里的副本可以裁剪。
 SOURCE_TRUNCATED_HINT = "（原文过长，已截断）"
+
+
+# ---------------------------------------------------------------- 知识库开关
+#
+# 知识库（`knowledge/library.py`）让"材料"从**一次请求的临时对象**变成**跨请求
+# 可检索的资产**。检索侧能力早就有了（`search_parent(..., library=True)`），缺的
+# 是生产调用方：谁把 `library=True` 传下去、谁把库命中的持久 id 并进引用校验、
+# 谁告诉模型"库里还有东西"。这三件事必须同时成立，缺任何一件这条链接上去都是负
+# 资产（最隐蔽的一种是"检索成功、引用写出、收尾时被静默剔除"）。
+#
+# 默认**开**。关掉的口子留给两类场景：一是排查"某次召回是不是库带进来的"，二是
+# 库表损坏但还想继续用请求内材料。关掉之后整条链的行为与加这个开关之前**逐字节
+# 相同**（`tests/test_library_wiring.py` 拿 `07a2740` 的旧模块钉着）——不是"几乎
+# 相同"：那时连一次库查询都不会发生。
+LIBRARY_SEARCH_ENV = "MINDMAP_LIBRARY_SEARCH"
+LIBRARY_SEARCH_TRUTHY = frozenset({"1", "on", "true", "yes"})
+# 数库里有几份材料时的上限。`list_sources` 的计数是 `len()`，给它一个比
+# `prune(keep_count=200)` 的默认值更宽的数没有意义——超过 200 份时清单里写
+# "200 份以上"（见 `_material_manifest`），而 200 正是淘汰策略的稳态规模。
+LIBRARY_COUNT_LIMIT = 200
+
+
+def library_search_enabled() -> bool:
+    """知识库检索是否打开。默认开，显式写 `0/off/false/no/空串` 才算关。
+
+    判定方式与 `MINDMAP_PARENT_RETRIEVAL` 一致（正列举真值 + 缺省取 `"1"`），
+    理由也一样：谁改默认值，判定逻辑不用跟着改，改错的表现只剩"默认值写错了"。
+    """
+    return os.getenv(LIBRARY_SEARCH_ENV, "1").strip().lower() in LIBRARY_SEARCH_TRUTHY
+
+
+def library_source_count() -> int:
+    """库里现有多少份材料（**不含正文**，最多数到 `LIBRARY_COUNT_LIMIT`）。
+
+    只用于两件"给模型看"的事：材料清单末尾那行"知识库中另有 N 份"，以及
+    `build_registry` 要不要注册 `rag_query`。它不参与任何检索决策——检索侧自己
+    会按 `last_used_at` 取一批再粗筛（`service._library_sources`）。
+
+    库不可用（文件被锁、磁盘满、表被删）时返回 0 并记 warning，**不抛**：知识库
+    是加分项，它坏了不该让"只带材料"的那条路跟着失败。这里捕获 `Exception` 而
+    不是 `sqlite3.Error`，因为这条路上任何异常的正确处置都只有一种——当成空库。
+    """
+    try:
+        return len(knowledge_library.list_sources(limit=LIBRARY_COUNT_LIMIT))
+    except Exception as exc:  # noqa: BLE001 — 库坏了就退化成空库，理由见 docstring
+        logger.warning("读不到知识库（%s），本次按空库处理：%s",
+                       type(exc).__name__, str(exc)[:160])
+        return 0
+
+
+def library_available() -> bool:
+    """现在有没有可检索的库材料：开关开着 **且** 库非空。
+
+    两个条件合成一个函数，是因为三处调用点（`_rag`、`build_registry`、
+    `_intent_rule`）问的是同一个问题。分头写 `enabled() and count()` 的结果是
+    三处各漏一次，而漏一次的表现是"模型看到了工具但查不到东西"或者反过来。
+    """
+    return library_search_enabled() and library_source_count() > 0
 
 
 class ToolRegistry:
@@ -1071,7 +1132,10 @@ def _source_prompt_input(sources: list[Source], *, system: str = "") -> str:
     折中——行为随材料大小跳变最难排查，短材料一样走检索。
     """
     if source_mode() == SOURCE_MODE_RAG:
-        return _material_manifest(sources)
+        # 清单是模型**唯一**能知道"手上有什么"的地方，而知识库里的材料不在
+        # `sources` 里——不在这里说一句，模型连"库里有东西可查"都无从知道，
+        # 提示词里那个"先检索"的指令就成了没有宾语的动作。
+        return _material_manifest(sources, library_total=library_source_count())
     return _full_source_prompt_input(sources, system=system)
 
 
@@ -1139,12 +1203,25 @@ def _material_scale(source: Source) -> str:
     return "，".join(parts)
 
 
-def _material_manifest(sources: list[Source]) -> str:
+def _material_manifest(sources: list[Source], *, library_total: int = 0) -> str:
     """`rag` 形态的输入：只有清单，没有正文。
 
     形状与 `full` 形态的 sources 数组刻意不同（不是 JSON）：两种形态一眼能分出来，
     排查"这次到底走了哪条路"时不用去读提示词全文。模型也不需要从这个结构里
     解析任何东西——它只需要知道有哪几份材料、能不能查到。
+
+    `library_total` 是知识库里**另外**还有几份材料（`library_source_count()` 的
+    结果，0 表示关着或空库）。非 0 时在清单末尾加一行，且**只给数字不列文件名**：
+
+      - 不列是刻意的。库的稳态规模是 200 份（`library.prune` 的 `keep_count`），
+        列出来就是又一份"材料清单"，而清单的 1500 token 上限正是为了防止这件事。
+        再说模型对它们的操作只有 `rag_query` 一个，名字没有可操作性。
+      - 不说是"哪一类"也是刻意的：库里的材料与这次请求无关，任何概括都会变成
+        一条错误的先验（"原来库里都是财务制度"）。
+
+    默认 0 而不是自己去查库：这个函数是纯渲染器，被测试与将来别的入口直接调用，
+    让它内部读一次持久化状态，等于让"渲染"依赖"库的当前内容"，两次调用之间库变了
+    就会得到两份不同的提示词，而那种差异只会在真机上偶发。
     """
     lines = [f"本次附带 {len(sources)} 份材料（你看不到全文，需要用 rag_query 检索）："]
     used = estimate_input_tokens(lines[0])
@@ -1165,6 +1242,13 @@ def _material_manifest(sources: list[Source]) -> str:
         # 于是"清单里没有"被它读成"材料里没有"。
         lines.append(f"（另有 {len(sources) - listed} 份材料未在清单里列出，"
                      "同样可以用 rag_query 检索到。）")
+    if library_total > 0:
+        # `LIBRARY_COUNT_LIMIT` 是计数上限，撞到它说明库比这个数更多；写成
+        # "200 份以上"而不是"200 份"——四舍五入成一个确定数字会让模型以为
+        # 它数得清，而它接下来要判断的是"要不要去查"，不是"到底几份"。
+        shown = (f"{library_total} 份以上" if library_total >= LIBRARY_COUNT_LIMIT
+                 else f"{library_total} 份")
+        lines.append(f"知识库中另有 {shown}过往材料，同样可以用 rag_query 检索到。")
     lines.append("要写与材料有关的内容，先调用 rag_query 检索；"
                  "引用逐字取自检索结果。")
     return "\n".join(lines)
@@ -1509,8 +1593,13 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         # 为空（没检索过、或检索全空）时是 None：`verify_source_refs` 走的是加这个
         # 参数之前的原路，两条路的差异只有"给了非空证据"这一种
         # （`tests/test_evidence_wiring.py` 里"空证据等价无证据"钉着逐字节不变）。
+        #
+        # `sources` 用 `_verify_sources(ctx)` 而不是提示词里那批：库命中的引用指向
+        # 持久 id，只拿 `request.sources` 去校验会把它判成"来源不存在"并静默剔除
+        # （理由见 `_verify_sources`）。开关关着、或这次没查过库时，两者逐元素相同。
+        verify_sources = _verify_sources(ctx)
         content, diagnostics = validate_generated_content(
-            raw, sources=sources or None, evidence=evidence)
+            raw, sources=verify_sources or None, evidence=evidence)
     except Exception as exc:  # noqa: BLE001 — 校验失败的原因就是要回给模型的文本
         return _fail("invalid_map", f"模型返回的导图不合法：{exc}")
 
@@ -1522,8 +1611,8 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     #     照搬即可，不必在调用处再判一次开关。
     # 诊断只是提示，不影响这棵树能不能用——契约校验在上一步就决定过了。
     diagnostics.extend(check(content))
-    if sources:
-        diagnostics.extend(annotate_nli(content, sources))
+    if verify_sources:
+        diagnostics.extend(annotate_nli(content, verify_sources))
 
     ctx.candidate = content
     ctx.revision += 1
@@ -2186,6 +2275,12 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     # `source_ref.source_id` 都出现在 `source_usage` 里，缺一条整棵树就是
     # `tree_invalid`。`_generate` 那条路由 `validate_generated_content` 重建它，
     # 这里没有那个函数，只能自己拼——而"分片形态会产出引用"意味着不拼就一定会炸。
+    #
+    # 用 `_verify_sources(ctx)` 而不是局部 `sources`：这条路径的引用只可能落在
+    # 请求内材料上（分片检索只跑 `sources`），但"校验认的来源集合"与"source_usage
+    # 列出的集合"必须是同一个，否则将来任何一方向库扩展都会先在契约校验上炸一次，
+    # 而那次失败看起来会像"模型返回的树不合法"。
+    verify_sources = _verify_sources(ctx) if slicing else []
     content = MindMapContent(
         title=root_label,
         root=Node(
@@ -2197,8 +2292,8 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             SourceUsage(source_id=source.id, kind=source.kind,
                         filename=source.filename,
                         char_count=len((source.text or "").strip()))
-            for source in sources
-        ] if slicing else [],
+            for source in verify_sources
+        ],
     )
 
     drafts: list[dict[str, Any]] = []
@@ -2286,7 +2381,7 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     if slicing:
         before = _count_refs(content.root)
         raw_reports = verify_source_refs(
-            content, sources, remove_invalid=True, evidence=ctx.evidence or None)
+            content, verify_sources, remove_invalid=True, evidence=ctx.evidence or None)
         refs_kept = _count_refs(content.root)
         refs_dropped = before - refs_kept
         for item in raw_reports:
@@ -2679,14 +2774,22 @@ def _citable_hits(hits: list[EvidenceHit], sources: list[Source]) -> list[dict[s
     给了偏移就只能给一段与其不符的 quote（截断后 `quote != text[start:end]`，
     逐字校验必挂），那比"没有偏移"更糟。这时模型退回"只抄 quote 的连续片段、
     不写偏移"，与父块模式之前的行为一致。
+
+    `sources` 必须包含**库里来的那些来源**（`_rag` 把 `ctx.library_sources` 拼进来
+    再调这里）。库命中的 `source_id` 是持久 id，只传 `request.sources` 时
+    `texts.get(...)` 会拿到空串，于是"偏移有了、引文是空的"——模型照着抄就是一条
+    `quote == ""` 的引用，校验时被判 `SOURCE_QUOTE_MISMATCH` 剔掉，而它自己完全
+    看不出为什么。所以**取不到原文就一个 `evidence_*` 都不给**（判 `in texts`）：
+    只给偏移不给引文，比两者都不给更糟。
     """
     texts = {source.id: source.text or "" for source in sources}
     payload: list[dict[str, Any]] = []
     for hit in hits:
         entry = hit.model_dump()
-        if hit.leaf_start is not None and hit.leaf_end is not None:
-            quote = texts.get(hit.source_id, "")[hit.leaf_start:hit.leaf_end]
-            if len(quote) <= _EVIDENCE_QUOTE_MAX_CHARS:
+        if (hit.leaf_start is not None and hit.leaf_end is not None
+                and hit.source_id in texts):
+            quote = texts[hit.source_id][hit.leaf_start:hit.leaf_end]
+            if quote and len(quote) <= _EVIDENCE_QUOTE_MAX_CHARS:
                 entry["evidence_start"] = hit.leaf_start
                 entry["evidence_end"] = hit.leaf_end
                 entry["evidence_quote"] = quote
@@ -2694,12 +2797,90 @@ def _citable_hits(hits: list[EvidenceHit], sources: list[Source]) -> list[dict[s
     return payload
 
 
+def _verify_sources(ctx: RunContext) -> list[Source]:
+    """收尾校验该认的来源：**本次请求带来的 + 本次真检索到过的库来源**。
+
+    这是整条知识库接线里最容易漏、也最难发现的一处。`verify_source_refs` 用
+    `by_id = {source.id: source}` 查原文，而库命中的 `source_id` 是持久 id：
+    只传 `request.sources` 时，一条**逐字完全正确**的库引用会被判成
+    `SOURCE_TEXT_UNAVAILABLE`（"未提供已解析的来源原文"），随后在
+    `remove_invalid=True` 的那一步被静默删掉。用户看到的是"这一支没有证据"，
+    而检索明明成功、引用明明写对了——没有任何一处日志会说清这件事。
+
+    顺序固定为"请求的在前、库的在后"：`validate_generated_content` 用这个列表
+    重建 `source_usage`，而界面上"本次材料"与"库里引用到的材料"是两种来源，
+    先列请求内那批，展示顺序才与用户的心智一致。
+
+    不去改 `verify_source_refs` 的签名（`optimization/service.py` 那条只读体检
+    也在用它，它与知识库无关）：把来源拼宽是**调用方**的选择，不是校验器的
+    语义。"能查到 → 就点得到"这条老规则也没有被打破——库来源是持久 id，
+    `library.load()` 一定回查得到，这正是允许它进 `by_id` 的前提。
+
+    **没有正文的来源一律剔除**（空白 text）。这不是洁癖：`validate_generated_content`
+    会用这个列表重建 `source_usage`，而契约要求 `char_count >= 1`——把一份还没
+    解析成功的空来源带进去，整次生成会被判 `invalid_tree`，用户只是多勾了一个
+    空文件却得到"模型返回的导图不合法"。`_generate` 里本来就有同一道过滤（只喂
+    真有正文的来源），两处共用这一个函数之后，口径不会再分叉。
+    """
+    return [
+        source for source in
+        (*ctx.request.sources, *ctx.library_sources.values())
+        if (source.text or "").strip()
+    ]
+
+
+def _remember_library_hits(hits: list[EvidenceHit], ctx: RunContext) -> int:
+    """把本次命中里**不属于本次请求**的来源取回并记进 `RunContext`。
+
+    返回真正取到的份数（`data.library_sources` 用它，事件流里能看出"这一批命中
+    有多少来自库"）。
+
+    `load` 取不到（来源被 `prune` 删了、库文件换了、id 被手工清理过）时记 warning
+    并跳过，**不让整次运行失败**：检索已经成功，用户拿到的是一批真实片段；把
+    "收尾时发现来源没了"升级成一次运行失败，等于用一个边缘情况废掉整张图。跳过
+    之后那条命中的引用会在校验时被判 `SOURCE_TEXT_UNAVAILABLE` 剔掉——这是可接受
+    的降级，且 warning 已经在日志里说清了原因。
+    """
+    loaded: list[Source] = []
+    seen: set[str] = set()
+    for hit in hits:
+        source_id = hit.source_id
+        if source_id in seen or source_id in ctx.sources_by_id \
+                or source_id in ctx.library_sources:
+            continue
+        seen.add(source_id)
+        try:
+            source = knowledge_library.load(source_id)
+        except Exception as exc:  # noqa: BLE001 — 查不到就跳过，理由见 docstring
+            logger.warning("回查库来源 %s 失败（%s）：%s",
+                           source_id[:8], type(exc).__name__, str(exc)[:160])
+            continue
+        if source is None:
+            logger.warning("库命中引用的来源 %s 已不存在（可能被 prune 删除），"
+                           "跳过：这条来源上的引用会在收尾校验时被剔除",
+                           source_id[:8])
+            continue
+        loaded.append(source)
+    ctx.record_library_sources(loaded)
+    return len(loaded)
+
+
 async def _rag(args: RagArgs, ctx: RunContext) -> ToolResult:
     sources = _pick_sources(ctx, [])
-    if not sources:
+    # 一次调用只读一次开关：这里要问它四遍（早退、库大小、检索入口、data 的键集），
+    # 四次各读一次环境变量的话，"检索时看的是开、记账时看的是关"这种半开状态在
+    # 理论上就可能拼出来——与 `_generate` 里"提示词与输入必须出自同一次形态判定"
+    # 是同一条规矩。
+    library_on = library_search_enabled()
+    # 开关关着时**一行都不往下走**：与 `07a2740` 逐字节相同的保证就在这里，
+    # 包括"无来源直接 no_sources"这个早退（关掉库之后再走一遍检索是白花）。
+    if not sources and not library_on:
         return _fail("no_sources", "这次请求没有附带任何资料，无法检索。")
 
     filters = _rag_filters(args.filters)
+    # 只在开关打开时问一次库的大小：这既是"库空且请求无材料"那条判定的依据，
+    # 也是空结果话术要用的数字。开关关着时它恒为 0，且一次库查询都不发生。
+    library_total = library_source_count() if library_on else 0
 
     # 查询计划默认关（`MINDMAP_QUERY_EXPANSION`）。关着时 `plan_query` 在返回
     # `None` 之前不发任何请求，这里的 `if` 必须让那条路**一个额外调用都没有**：
@@ -2718,22 +2899,33 @@ async def _rag(args: RagArgs, ctx: RunContext) -> ToolResult:
         queries.extend(plan.intents)
         queries.extend(plan.subqueries)
         hits = await search_multi(sources, queries, args.top_k, filters=filters,
-                                  hyde=plan.hyde)
+                                  hyde=plan.hyde, library=library_on)
     else:
         # 单路走 `search_parent`：**不在这里再判一次开关**。关着时它内部直接返回
         # `search_sources(...)` 的结果（同一个函数，逐字段相同由
         # `tests/test_parent_retrieval.py` 对着 `f72c14c` 钉着），两处各判一次只会
         # 多出"回了父块却没记叶子区间"这类半开状态。多路那条分支仍是单级切块：
         # 父块只接在单路上，理由见 `_citable_hits` 的注释。
-        hits = search_parent(sources, args.question, args.top_k, filters=filters)
-    if not hits:
-        # 过滤把来源筛光与查询没命中，返回给模型的必须是两句不同的话。
-        # 都说"没有找到"，模型会以为材料里没有相关内容，进而改用编造或换主题；
-        # 而实际情况是"条件太严，材料还在"。这类信息差靠日志补不上——模型看不到日志。
         #
-        # 诊断只在空结果这条路径上做一次：正常有命中时不必再算一遍过滤，
-        # 也让 mock 掉 search_sources 的用例仍能走到这里。
-        if filters is not None and not filter_sources(sources, filters):
+        # `library=` 是知识库那条唯一的入口：它让这次检索同时看"请求带来的"与
+        # "库里存着的"两批来源，融合规则（本次命中保底占半数席位）在
+        # `knowledge.service._merge_batches` 里，不在这一层。
+        hits = search_parent(sources, args.question, args.top_k, filters=filters,
+                             library=library_on)
+    if not hits:
+        # 四种"什么都没有"必须给四句不同的话——模型据此决定下一步做什么，而它
+        # 看不到任何日志与指标。
+        #
+        # 1. 本次没带材料、库里也是空的：这不是"没命中"，是"无处可查"。判失败
+        #    （`no_sources`）而不是 ok+空列表：模型该做的是告诉用户先传材料，
+        #    而不是换个问法反复试。
+        if not sources and not library_total:
+            return _fail(
+                "no_sources",
+                "这次请求没有附带任何资料，知识库也是空的，没有可检索的材料。",
+            )
+        # 2. 过滤把**本次的**材料筛光了：材料还在，只是条件太严。给可执行的动作。
+        if filters is not None and sources and not filter_sources(sources, filters):
             return ToolResult(
                 ok=True,
                 content=(
@@ -2742,18 +2934,36 @@ async def _rag(args: RagArgs, ctx: RunContext) -> ToolResult:
                 ),
                 data={"hits": [], "method": "lexical", "filtered_out": len(sources)},
             )
+        # 3. 本次没带材料、库里有东西但没匹配上：这是"库里没有"，不是"材料里
+        #    没有"。换问法还有机会，先传相关材料也还有机会，两条都写出来。
+        if not sources:
+            return ToolResult(
+                ok=True,
+                content=(
+                    f"知识库里现有的 {library_total} 份材料都没有匹配到这个问题"
+                    "（这次请求也没有附带资料）。可以换个问法再检索，"
+                    "或者先上传与这个问题相关的材料。"
+                ),
+                data={"hits": [], "method": "lexical",
+                      "library_sources": library_total},
+            )
+        # 4. 本次带了材料、查不到：与加知识库之前**逐字相同**的那句话。
         return ToolResult(
             ok=True,
             content="没有在本次资料里找到相关片段。",
             data={"hits": [], "method": "lexical"},
         )
 
+    # 库里来的命中带持久 id：取回 `Source` 并记进 ctx，收尾的引用校验才查得到
+    # 原文（`_verify_sources`）。失败只跳过这一份，不影响本次检索结果。
+    library_used = _remember_library_hits(hits, ctx)
+
     # 命中区间要在**这次运行内**累积：模型可能先问一次、看完再问第二次，引用
     # 来自任何一次都算数，而校验发生在生成收尾时、只剩一个 `ctx` 可读。
     # 转换写在 agent 层（一行 `EvidenceSpan`），不在 `source_refs` 里做：那一层是
     # 后处理，不该为了两个整数去 import 60KB 的检索模块（见 `EvidenceSpan` 的
-    # docstring）。`_rag` 的两条早退路径（没来源、没命中）都到不了这里，所以证据
-    # 集里不会混进"没找到"的空批次。
+    # docstring）。`_rag` 的几种空结果路径都到不了这里，所以证据集里不会混进
+    # "没找到"的空批次。
     ctx.record_evidence([
         EvidenceSpan(hit.source_id, hit.start, hit.end, hit.leaf_start, hit.leaf_end)
         for hit in hits
@@ -2763,14 +2973,30 @@ async def _rag(args: RagArgs, ctx: RunContext) -> ToolResult:
     # `method` 由每条命中的实际取值汇总，不再写死 lexical——混合检索生效时写死
     # 会让模型以为这批片段只做了关键词匹配。只要有任意一条走了向量路，本轮就是
     # hybrid（那条路贡献了候选，排序已被它影响）。
+    #
+    # 把 `ctx.library_sources` 拼进 `_citable_hits` 的来源表：库命中的正文不在
+    # `sources` 里，不拼的话回给模型的 `evidence_quote` 会是空串（理由见该函数）。
+    # 用整个缓存而不是"这一批的库来源"：它只是一份 id → 正文的查找表，多几项
+    # 不影响任何输出；`hits` 之外的东西不会出现在返回值里。
+    citable_sources = sources + list(ctx.library_sources.values())
     hits_data = [hit.model_dump() for hit in hits]
+    data: dict[str, Any] = {
+        "hits": hits_data,
+        "method": "hybrid" if any(hit.method == "hybrid" for hit in hits) else "lexical",
+    }
+    if library_on:
+        # 这批命中里有多少来自知识库（不在本次请求里的持久 id）。检索成功但界面上
+        # 只有"命中 N 条"时，看不出证据是从哪来的——而这个数字正是"库到底有没有
+        # 被用上"的唯一可观测信号。
+        #
+        # **开关关着时不加这个键**：那一侧返回给模型的 `content` 与 `data` 的键集
+        # 必须与 `07a2740` 逐字节相同（`tests/test_library_wiring.py` 拿旧模块
+        # 钉着），多一个恒为 0 的键就已经不是"逐字节"了。
+        data["library_sources"] = library_used
     return ToolResult(
         ok=True,
-        content=json.dumps(_citable_hits(hits, sources), ensure_ascii=False),
-        data={
-            "hits": hits_data,
-            "method": "hybrid" if any(hit.method == "hybrid" for hit in hits) else "lexical",
-        },
+        content=json.dumps(_citable_hits(hits, citable_sources), ensure_ascii=False),
+        data=data,
     )
 
 
@@ -2935,7 +3161,10 @@ _TOOL_SPECS: dict[str, Callable[[], ToolSpec]] = {
     ),
     "rag_query": lambda: ToolSpec(
         name="rag_query",
-        description="在本次请求附带的资料里检索相关原文片段。回答关于资料的问题之前先调用它。",
+        description=(
+            "在本次请求附带的资料与知识库里检索相关原文片段。"
+            "回答关于资料的问题之前先调用它。"
+        ),
         args_model=RagArgs,
         fn=_rag,
         readonly=True,
@@ -2949,7 +3178,8 @@ _TOOL_SPECS: dict[str, Callable[[], ToolSpec]] = {
 }
 
 
-def build_registry(intent: str = "create", *, has_sources: bool = False) -> ToolRegistry:
+def build_registry(intent: str = "create", *, has_sources: bool = False,
+                   has_library: bool | None = None) -> ToolRegistry:
     """本次可用的工具集，按意图裁剪。
 
     早先是「四个全注册 + 各自内部校验意图」。那样做的问题是模型看得到工具、
@@ -2964,6 +3194,7 @@ def build_registry(intent: str = "create", *, has_sources: bool = False) -> Tool
       - `rag` 形态（`MINDMAP_SOURCE_MODE=rag`）下，**任何**带来源的意图都加
         `rag_query`，包括 `create`：正文不在 prompt 里，没有检索工具时模型
         只能凭标题编，而它会以 ok=True 交出一棵看起来完整的树。
+      - **请求不带来源、但知识库非空**时，任何意图都加 `rag_query`（见下）。
 
     两个生成工具必须同时在场：只留一个，等于替用户决定了"这张图多大"。而
     分片那条路的成本是 N+1 次调用，简单主题走它纯属浪费额度——这个判断
@@ -2983,17 +3214,28 @@ def build_registry(intent: str = "create", *, has_sources: bool = False) -> Tool
         章节"会静默缺失；分片之后覆盖度由骨架决定，不由模型的查询创意决定。
         在 `full` 下做这件事是白花（正文已在 prompt），所以那里的 discard 不变。
 
-    `rag_query` 只在真有来源时才注册：没来源的检索必然返回「没有找到」，
-    注册它只会诱导模型拿它当"思考"用。未知意图按 `create` 兜底——宁可少给
-    工具，也不要把破坏性工具塞进一个没预期到的新意图里。
+    `rag_query` 只在**真有可查的东西**时才注册：没来源也没库的检索必然返回
+    「没有找到」，注册它只会诱导模型拿它当"思考"用。这里的"有"包含知识库：
+    请求不带材料、库里却有 200 份时，检索是模型唯一能碰到原文的入口——不注册
+    就会出现"system 里叫它先检索，工具列表里却没有这个工具"，模型于是凭标题编，
+    并以 ok=True 交出一棵没有出处的树（它甚至不算说谎，只是没别的路可走）。
+
+    `has_library=None` 表示**自己去问库**（生产调用方 `service.run` 就用这个）。
+    测试与脚本要固定答案时显式传 `False / True`：否则一条用例的结论会悄悄依赖
+    宿主机库里恰好存了什么。未知意图按 `create` 兜底——宁可少给工具，也不要把
+    破坏性工具塞进一个没预期到的新意图里。
     """
     rag_mode = source_mode() == SOURCE_MODE_RAG
+    if has_library is None:
+        has_library = library_available()
     allowed = set(_ALLOWED_BY_INTENT.get(intent, _ALLOWED_BY_INTENT["create"]))
     if has_sources:
         if not rag_mode:
             allowed.discard("mindmap_generate_deep")
         if intent in _SOURCE_AWARE_INTENTS or rag_mode:
             allowed.add("rag_query")
+    if has_library and not has_sources:
+        allowed.add("rag_query")
 
     registry = ToolRegistry()
     for name in _TOOL_ORDER:

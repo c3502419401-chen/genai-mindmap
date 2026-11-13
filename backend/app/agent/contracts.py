@@ -35,6 +35,16 @@ logger = logging.getLogger(__name__)
 # 写完了。丢的时候记 debug：这是容量策略生效，不是错误。
 MAX_EVIDENCE_SPANS = 200
 
+# 一次运行最多缓存多少份**从知识库回查出来的**来源（含正文）。库命中的
+# `source_id` 是持久 id，不在本次 `request.sources` 里，收尾的引用校验要按它
+# 逐字比对原文，就必须把 `Source` 先取回内存。
+#
+# 20 不是拍的：`LIBRARY_PICK=5` 是单次检索最多用几份库来源，而 200 条证据区间
+# 最多对应 40 次检索——真到 20 份说明这次运行在反复换话题查库，再多就只是把
+# 整个库读进内存（一份典型材料 30 KB，200 份 6 MB，而它一次运行只用一个进程）。
+# 超了丢**最旧**的：模型先检索、后写引用，最旧那批的引用通常已经写完。
+MAX_LIBRARY_SOURCES = 20
+
 
 # ---------------------------------------------------------------- 预算
 
@@ -237,6 +247,39 @@ class RunContext:
     # 工具的私有字段。`RunContext` 本来就是"跨轮存活的可变状态"，证据正好是这种
     # 东西，且 `_rag` 与 `_generate` 拿的是同一个 ctx，不需要任何新管道。
     evidence: list[EvidenceSpan] = field(default_factory=list)
+    # 本次运行里从知识库回查出来的来源（持久 id -> Source），`_rag` 命中后填入。
+    #
+    # 它存在的**唯一**理由是收尾的引用校验：`verify_source_refs` 用
+    # `by_id = {source.id: source}` 查原文，而库命中的 `source_id` 是持久 id、
+    # 不在 `request.sources` 里。不把它并进校验，一条逐字正确的库引用会被判成
+    # "来源不存在（SOURCE_TEXT_UNAVAILABLE）"、在 `remove_invalid=True` 时被静默
+    # 剔除——检索成功、引用写出、最后收尾时消失，这是整条链上最隐蔽的一种失败。
+    #
+    # 只装**真的被本次检索命中过**的库来源，不是整库：校验的语义是"你引的东西
+    # 这次确实查到过"，而不是"库里恰好有这份材料"。
+    library_sources: dict[str, Source] = field(default_factory=dict)
+
+    def record_library_sources(self, sources: Iterable[Source]) -> None:
+        """把库来源并进缓存：跳过本次请求已带的、重复的，超上限丢最旧的。
+
+        跳过请求内来源不是优化而是正确性：同一份正文可能既是本次上传的、又在库里
+        （`source_id` 不同），两个身份都要留着——引用写的是哪个身份就按哪个校验，
+        缓存只负责"库那个身份查得到原文"。
+
+        逐出策略与 `record_evidence` 同向（FIFO 丢最旧）：模型先检索、后写引用，
+        最旧那批的引用通常已经写完，丢它的代价最小；而"拒绝新增"会让长循环里
+        后面所有库引用都失去校验依据。
+        """
+        for source in sources:
+            if source.id in self.sources_by_id or source.id in self.library_sources:
+                continue
+            self.library_sources[source.id] = source
+        overflow = len(self.library_sources) - MAX_LIBRARY_SOURCES
+        if overflow > 0:
+            for source_id in list(self.library_sources)[:overflow]:
+                del self.library_sources[source_id]
+            logger.debug("库来源缓存达到 %d 份上限，丢弃最旧的 %d 份",
+                         MAX_LIBRARY_SOURCES, overflow)
 
     def record_evidence(self, spans: Iterable[EvidenceSpan]) -> None:
         """把一批命中区间并进本次运行的证据集：去重、限量、丢最旧。

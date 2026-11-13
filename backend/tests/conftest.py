@@ -59,6 +59,11 @@ BEHAVIOUR = (
     # 里"正文不进 prompt"那几条在别的机器上悄悄变成假绿/假红——它是这个文件
     # 存在的理由（"防护只该有一处"）的又一个例子。
     "MINDMAP_SOURCE_MODE",
+    # 知识库检索（`tools.library_search_enabled`）。**清空而不是置 0**：它默认开，
+    # 而"默认开 + 临时库是空的 = 既有用例行为不变"正是接线时要验证的那条前提。
+    # 置 0 会把那条前提整个跳过：所有用例都不会经过"查了一次空库"的那条路，
+    # 于是"库空时逐字节不变"永远没被人跑过。需要关掉的用例自己 `setenv(..., "0")`。
+    "MINDMAP_LIBRARY_SEARCH",
 )
 
 SWITCHES = ("MINDMAP_HYBRID_SEARCH", "MINDMAP_QUERY_EXPANSION", "MINDMAP_PARENT_RETRIEVAL",

@@ -704,7 +704,7 @@ def test_rag_forwards_filters_as_source_filter(monkeypatch):
     source = _source("预算审批流程由张三发起。", author="张三")
     captured: dict = {}
 
-    def fake_search(sources, query, top_k=5, *, filters=None):
+    def fake_search(sources, query, top_k=5, *, filters=None, library=False):
         captured["filters"] = filters
         copied = {"sources": list(sources), "query": query, "top_k": top_k}
         captured.update(copied)
@@ -724,7 +724,7 @@ def test_rag_without_filters_passes_none(monkeypatch):
     """不带 filters 时传给检索层的是 None——不是空对象，更不是编出来的条件。"""
     captured: dict = {}
 
-    def fake_search(sources, query, top_k=5, *, filters=None):
+    def fake_search(sources, query, top_k=5, *, filters=None, library=False):
         captured["filters"] = filters
         return []
 

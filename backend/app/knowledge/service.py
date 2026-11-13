@@ -2040,6 +2040,7 @@ async def search_multi(
     *,
     filters: SourceFilter | None = None,
     hyde: str | None = None,
+    library: bool = False,
 ) -> list[EvidenceHit]:
     """在**同一批来源**上并行跑 N 个 query，按 RRF 名次把各路**累加**后融合。
 
@@ -2109,6 +2110,44 @@ async def search_multi(
     `score_bm25` 在多路里取"各条走了 BM25 的路中的最高分"，`score_vector` 取
     "各条向量路中的最高余弦"。取最大而不是相加：不同 query 的 BM25 分与余弦
     尺度不可加，最大值才对应"最好那次匹配"这个可解释的量。
+
+    `library=True` 与 `search_sources` / `search_parent` 的同名参数逐条对齐：
+    融合仍然只做一次，交给 `_merge_batches`（本次请求的命中保底占
+    `ceil(top_k/2)` 席，库的只补位）。库那批只用**第一条问法**做粗筛与检索——
+    调用方约定第一位是用户原话，而扩展问法是为"同一批材料的多个角度"服务的，
+    拿它们去筛库只会把库里真正相关的那份挤掉（`_library_sources` 的粗筛是
+    覆盖率的排序，不是多路召回）。
+
+    默认 `library=False` 时只是 `_search_multi_core` 的转发，行为与加这个参数
+    之前**逐字段一致**（`tests/test_search_multi.py` 拿旧模块钉着多路那一半）。
+    之所以要接进来而不是"多路时就不查库"：`MINDMAP_QUERY_EXPANSION` 打开后
+    `_rag` 走的就是这条路，不接的话知识库会在那个开关下静默失效——而失效的表现
+    是"库里明明有材料，模型却一条都没查到"，没有任何一处会说清是开关组合的问题。
+    """
+    fused = await _search_multi_core(sources, queries, top_k, filters, hyde)
+    if not library:
+        return fused
+    question = next((text.strip() for text in queries
+                     if isinstance(text, str) and text.strip()), "")
+    if not question:
+        return fused
+    extra = _library_batch(question, top_k, filters, exclude=sources, parent=False)
+    return _merge_batches(fused, extra, top_k)
+
+
+async def _search_multi_core(
+    sources: list[Source],
+    queries: list[str],
+    top_k: int,
+    filters: SourceFilter | None,
+    hyde: str | None,
+) -> list[EvidenceHit]:
+    """`search_multi` 在**给定来源集合内**的全部逻辑（不碰库、不做跨批融合）。
+
+    抽出来的理由与 `_search_sources_core` / `_search_parent_core` 完全相同：
+    `library=True` 时"多路融合"与"跨批融合"必须是两步，前者的产出（保底席位、
+    累加分、`method`）原样作为后者的输入。混在一起写就会出现"库的命中也被算进
+    某一路的累加分"这种谁也说不清的名次。
     """
     routes = _route_queries(queries, hyde)
     if not routes:
