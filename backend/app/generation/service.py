@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -47,6 +48,48 @@ MAX_OUTPUT_TOKENS = 65536
 # 取不到一半留足余量。60000 token 约合 9 万汉字，实测 12106 字材料只用到
 # 一万多输入 token，正常材料离这条线很远。
 CONTEXT_TOKEN_LIMIT = 200000
+
+logger = logging.getLogger(__name__)
+
+# 「材料怎么进 prompt」的开关：`full` 把每份来源的正文整份拼进去，`rag` 只给清单。
+#
+# 默认 `rag`。这不是性能优化，是**形态切换**：`full` 下模型自己就能扫全文，
+# `rag_query` 只是"帮我定位该引用哪一段"的辅助；`rag` 下模型只看得见检索回来的
+# 片段，检索从辅助变成了唯一入口。两种形态的提示词、引用来源、失败方式都不同，
+# 所以是一个显式的两态开关，而**不是**"材料小就走 full"的自适应——行为随材料
+# 大小跳变是最难排查的一类 bug：同一份请求换个字号，结论就变了。
+SOURCE_MODE_ENV = "MINDMAP_SOURCE_MODE"
+SOURCE_MODE_FULL = "full"
+SOURCE_MODE_RAG = "rag"
+DEFAULT_SOURCE_MODE = SOURCE_MODE_RAG
+
+# 非法取值只告警一次。`source_mode()` 每拼一次提示词就调一次（一次请求里十几次），
+# 每次都 warning 会把日志刷满、把真正要看的东西埋掉——与 Neo4j `id()` 弃用通知
+# 的处理同一个道理（`docs/RAG-DECISIONS.md` 9.3）。
+_WARNED_SOURCE_MODES: set[str] = set()
+
+
+def source_mode() -> str:
+    """这次走哪种形态。只认 `full` / `rag`，其余（含未设置）一律按默认值处理。
+
+    不做记忆化：环境变量在一个进程里是常量，但测试要能逐条切换（`patch.dict`），
+    缓存会把"这条用例显式设成 full"变成"取决于上一条用例跑过什么"。
+
+    非法值按 `rag` 而不是 `full` 兜底：`full` 会把整份正文塞进 prompt，是一个
+    **有成本、有泄露面**的行为；配置写错时落到更省的那一侧，代价只是多调几次
+    检索，反过来则是白花 token 且没人预期到。
+    """
+    raw = os.getenv(SOURCE_MODE_ENV, "").strip().lower()
+    if raw in (SOURCE_MODE_FULL, SOURCE_MODE_RAG):
+        return raw
+    if raw and raw not in _WARNED_SOURCE_MODES:
+        _WARNED_SOURCE_MODES.add(raw)
+        logger.warning(
+            "%s=%r 不是合法取值（只认 %r / %r），按默认值 %r 处理",
+            SOURCE_MODE_ENV, raw, SOURCE_MODE_FULL, SOURCE_MODE_RAG, DEFAULT_SOURCE_MODE,
+        )
+    return DEFAULT_SOURCE_MODE
+
 
 # 一次性生成完整导图的提示词（非流式接口、流式接口的第二段都用它）。
 #
@@ -203,6 +246,53 @@ SOURCED_THINKING_GUARD = (
     "\n上面这套思考方式只用来决定「按什么角度整理」，不是展开许可："
     "所有节点仍然必须落在 sources 覆盖到的范围内，材料里没有的角度宁可不要，"
     "不要为了凑齐这套步骤而补写材料之外的内容。\n"
+)
+
+# `rag` 形态的提示词。**不能复用 `SOURCED_DETAIL_PROMPT`**：那一份写着「用户输入
+# 为 sources 数组，每项含 source_id 和 text，text 是待整理的原文」，而 rag 形态里
+# 一个字的正文都没有——照抄会让模型去找一个不存在的 text 字段，再把"没看见"读成
+# "材料里没有"，最后交出一棵空心树。两份提示词共用 `DETAIL_PROMPT` 的树规则，
+# 之后的每一句都只描述自己那种形态。
+RAG_SOURCE_PROMPT = DETAIL_PROMPT + (
+    "注意：这次输入的是带了来源的材料，按上面第 1 种形态处理，"
+    "不要因为主题简短就自行展开——所有内容都必须能在检索到的原文里找到依据。"
+    # 形态必须先讲清楚。模型不知道"还有东西没给我"时会把清单当成全文，直接从标题
+    # 推内容；这类错最难查，因为树看起来有依据，其实全是常识补的。
+    "\n你看不到材料全文：输入里只有一份材料清单（标题、字数、类型），正文一个字"
+    "都没有进来。要拿到原文，只能调用 rag_query 检索。写任何与材料有关的内容之前，"
+    "先检索。\n"
+    "❌ 清单里有一份《预算管理办法》，就直接写「预算需经财务审批」——这是从标题猜的\n"
+    "✅ 先 rag_query 问「预算审批流程」，拿到片段之后再落节点\n"
+    # 引用怎么抄必须逐字段点名。只说"引用要准确"时，模型会给出一条 quote 看着对、
+    # 偏移却自己算的引用；逐字校验（`optimization/source_refs._reference_problem`）
+    # 会把它整条剔掉，界面上就成了"这篇材料一个字都没被引用"。
+    "引用必须来自检索结果：source_refs 里每个字段都从 rag_query 的返回值里抄，"
+    "不要自己算。"
+    "source_id 用返回的 source_id；quote 用返回的 quote，整段照抄时连着 start、end "
+    "一起照抄。"
+    "返回的 quote 超过 300 字（引用字段的长度上限）时，只截取其中连续的、不超过 300 "
+    "字的一段，这时不要写 start 和 end——偏移自己算是算不准的，而只给 quote 时"
+    "只要求它逐字出现在原文里。\n"
+    '❌ quote="预算由财务经理核准"——检索结果里没有这句，是你概括的\n'
+    "✅ 把某条 hit 的 quote 原样抄过来（太长就截一段连续的），source_id 照抄\n"
+    # 这一形态最容易出事的地方：模型看不见内容，却仍然要把导图填满。
+    "检索不到就不要写：某个分支查不到依据，就如实留空，并在节点里写明"
+    "「材料中没有相关内容」，不要为了填满导图编造。空着是正确结果，编造不是。\n"
+    # 一次问"全部要点"召回必然泛；分开问才准。这是定位型检索本身的用法，
+    # 不需要判断"够不够"的多轮判断器（那套实测发散，见 `docs/RAG-DECISIONS.md` 2.3）。
+    "可以多次检索：不同方面、不同问法分开问，每次只聚焦一个问题。"
+    "先问最具体的那一个（如「谁能批钱」），看结果再决定下一个问法；"
+    "不要一次问「这份材料讲了什么」这种什么都沾一点的问句。\n"
+    "没有直接依据时 source_refs 留空。不要输出 source_usage；不要猜测 page。"
+)
+
+# 与 `SOURCED_THINKING_GUARD` 同义、不同词：那一句的措辞是"落在 sources 覆盖到的
+# 范围内"，而 rag 形态下 `sources` 根本不在输入里。共用一句会让模型去找那个不存在
+# 的字段。位置同理必须排**在思维步骤之后**：它约束的正是上面那套步骤。
+RAG_THINKING_GUARD = (
+    "\n上面这套思考方式只用来决定「按什么角度整理」，不是展开许可："
+    "所有节点仍然必须落在本次检索到的片段范围内，查不到的角度宁可不要，"
+    "不要为了凑齐这套步骤而补写。\n"
 )
 
 

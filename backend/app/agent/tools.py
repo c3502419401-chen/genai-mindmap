@@ -48,12 +48,16 @@ from app.generation.service import (
     CONTEXT_TOKEN_LIMIT,
     DETAIL_PROMPT,
     MIN_BRANCHES,
+    RAG_SOURCE_PROMPT,
+    RAG_THINKING_GUARD,
+    SOURCE_MODE_RAG,
     SOURCED_DETAIL_PROMPT,
     SOURCED_THINKING_GUARD,
     GenerationError,
     chat_async,
     ensure_input_within_context,
     estimate_input_tokens,
+    source_mode,
     thinking_block,
     validate_generated_content,
 )
@@ -820,7 +824,114 @@ def _audit_tree(root: Node, expected: set[int]) -> _TreeAudit:
 
 
 def _source_prompt_input(sources: list[Source], *, system: str = "") -> str:
-    """把来源拼成 `SOURCED_DETAIL_PROMPT` 约定的 sources 数组。
+    """把来源拼成模型这次的输入。**形态由 `MINDMAP_SOURCE_MODE` 决定**。
+
+    - `rag`（默认）：只拼一份**材料清单**（标题、字数、类型），正文一个字都不进。
+      模型要靠 `rag_query` 检索才有内容可写。
+    - `full`：把每份来源的正文整份拼进去（受上下文预算裁剪），行为与
+      `901b484` 逐字节一致，回归用例钉着这一点（`tests/test_source_mode.py`）。
+
+    两种形态的正文可见性完全不同，这是刻意的：`full` 下模型能自己扫全文，
+    检索只是辅助；`rag` 下检索是唯一入口。所以这里没有"材料小就走 full"的
+    折中——行为随材料大小跳变最难排查，短材料一样走检索。
+    """
+    if source_mode() == SOURCE_MODE_RAG:
+        return _material_manifest(sources)
+    return _full_source_prompt_input(sources, system=system)
+
+
+# 材料清单的上限。清单是**元信息**，超限时截断的只能是清单项，正文在任何情况下
+# 都不进 prompt——"截断正文后拼进去"不是"不放"，是"放一部分"，最难排查。
+MATERIAL_MANIFEST_MAX_ITEMS = 50
+# 清单本身的 token 上限。实测 50 条常规行（uuid + 中文标题 + 字数）约 1000 token，
+# 所以常规批量下先撞到的是条数上限；这条 1500 是给"标题很长"那一类兜底的——
+# 80 字标题 × 50 条能到 3000，那时截的是清单项。清单存在的意义只是"知道自己手上
+# 有什么"，涨到两千 token 就本末倒置了。
+MATERIAL_MANIFEST_TOKEN_LIMIT = 1500
+# 单条标题的长度上限。文件名可以是任意长的一串，不夹的话一份材料就能把清单吃满。
+MATERIAL_TITLE_MAX_CHARS = 80
+
+
+def _material_title(source: Source) -> str:
+    """清单里显示的名字：优先文件名（去掉扩展名），没有就用 id 兜底。
+
+    "未命名材料"不写成统一占位，是因为同一批里可能有多份没名字的：都叫
+    "未命名材料"时模型分不清第 1 条和第 3 条是两份不同的东西。
+    """
+    name = (source.filename or "").strip().replace("\\", "/").rsplit("/", 1)[-1]
+    if name:
+        stem, dot, suffix = name.rpartition(".")
+        # `a.b.c` 这种多点名字只吃掉最后一段；没有点、或"扩展名"长得不像扩展名
+        # （超过 5 个字符）时保留原名，免得把《2024 年度报告》里的点当分隔符。
+        if dot and 0 < len(suffix) <= 5:
+            name = stem or name
+    if not name:
+        return source.id
+    return name if len(name) <= MATERIAL_TITLE_MAX_CHARS else name[:MATERIAL_TITLE_MAX_CHARS] + "…"
+
+
+def _material_type_label(source: Source) -> str:
+    """类型标签：有扩展名就给扩展名（pdf/docx/mp3），否则退回 `kind`。
+
+    扩展名比 `kind` 细——`document` 分不出 pdf 与 docx，而模型判断"这份材料能问
+    什么"时，扫描件和表格类文档的可问法并不一样。
+    """
+    name = (source.filename or "").strip()
+    if "." in name:
+        suffix = name.rsplit(".", 1)[-1].strip().lower()
+        if 0 < len(suffix) <= 5 and suffix.isalnum():
+            return suffix
+    return source.kind.value
+
+
+def _material_scale(source: Source) -> str:
+    """规模：文档给字数，语音额外给时长。
+
+    字数取的是**完整** `text` 的长度，不是将要进 prompt 的那部分——rag 形态下没有
+    "进 prompt 的那部分"，这个数字的作用是让模型知道"这份材料值不值得查"。
+    """
+    parts = [f"共 {len(source.text or ''):,} 字"]
+    if source.duration_seconds:
+        total = int(source.duration_seconds)
+        parts.append(f"时长 {total // 60}:{total % 60:02d}")
+    if source.sentences:
+        parts.append(f"{len(source.sentences)} 句带时间戳")
+    return "，".join(parts)
+
+
+def _material_manifest(sources: list[Source]) -> str:
+    """`rag` 形态的输入：只有清单，没有正文。
+
+    形状与 `full` 形态的 sources 数组刻意不同（不是 JSON）：两种形态一眼能分出来，
+    排查"这次到底走了哪条路"时不用去读提示词全文。模型也不需要从这个结构里
+    解析任何东西——它只需要知道有哪几份材料、能不能查到。
+    """
+    lines = [f"本次附带 {len(sources)} 份材料（你看不到全文，需要用 rag_query 检索）："]
+    used = estimate_input_tokens(lines[0])
+    listed = 0
+    for index, source in enumerate(sources, start=1):
+        line = (f"{index}. 《{_material_title(source)}》"
+                f"（id={source.id}，{_material_scale(source)}，{_material_type_label(source)}）")
+        cost = estimate_input_tokens(line)
+        # 两个上限都要判：条数防"份数爆掉"，token 防"单条超长把预算吃满"。
+        # 截断的永远是清单项——正文从一开始就没打算进来。
+        if listed >= MATERIAL_MANIFEST_MAX_ITEMS or used + cost > MATERIAL_MANIFEST_TOKEN_LIMIT:
+            break
+        lines.append(line)
+        used += cost
+        listed += 1
+    if listed < len(sources):
+        # 必须说出来。少列几份却不说，模型会以为手上的材料就这些，
+        # 于是"清单里没有"被它读成"材料里没有"。
+        lines.append(f"（另有 {len(sources) - listed} 份材料未在清单里列出，"
+                     "同样可以用 rag_query 检索到。）")
+    lines.append("要写与材料有关的内容，先调用 rag_query 检索；"
+                 "引用逐字取自检索结果。")
+    return "\n".join(lines)
+
+
+def _full_source_prompt_input(sources: list[Source], *, system: str = "") -> str:
+    """`full` 形态：把来源拼成 `SOURCED_DETAIL_PROMPT` 约定的 sources 数组。
 
     必须逐项带 `source_id`：提示词要求模型按 id 写 `source_refs`，而旧流水线
     的 `_understand()`（已随 `app/pipeline/` 删除）返回的是纯文本合并，里面一个
@@ -1037,8 +1148,16 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         if ctx.emit is not None:
             stream_kwargs["on_delta"] = _GenerateGrowStream(ctx).feed
         if sources:
-            # 有来源时必须给结构化输入：模型要靠 source_id 写引用。
-            system = SOURCED_DETAIL_PROMPT + thinking + SOURCED_THINKING_GUARD
+            # 两种形态的提示词不能混用（理由见 `RAG_SOURCE_PROMPT` 的注释）：
+            # `rag` 下输入里没有正文，`full` 下的提示词却在教模型怎么读 sources 数组。
+            # 判定放在**拼 system 的地方**而不是 `_source_prompt_input` 内部：
+            # 那一层只负责"给点什么"，提示词与输入必须是同一次判定的产物，
+            # 否则一次请求里两次读环境变量，理论上能拼出 A 的提示词配 B 的输入。
+            if source_mode() == SOURCE_MODE_RAG:
+                system = RAG_SOURCE_PROMPT + thinking + RAG_THINKING_GUARD
+            else:
+                # 有来源时必须给结构化输入：模型要靠 source_id 写引用。
+                system = SOURCED_DETAIL_PROMPT + thinking + SOURCED_THINKING_GUARD
             raw = await chat_async(
                 system, _source_prompt_input(sources, system=system),
                 max_tokens=_max_tokens(ctx), **stream_kwargs,
@@ -1127,6 +1246,12 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     主题。请求带材料时 `build_registry(has_sources=True)` 不会注册这个工具——
     那条路会产出一棵与材料无关的树，而且以 ok=True 成功返回，用户没有任何
     线索发现它错了。带材料的新建走 `mindmap_generate` 的忠实整理模式。
+
+    `rag` 形态下这条限制**更痛**，但这一轮仍然保持：它一次检索都不发起，
+    而 `rag` 形态的 prompt 里连正文都没有，等于纯靠主题自由展开。缺口记在
+    `build_registry` 里：真正的解法是"每个分支先检索再展开"（分片 + 按支检索），
+    本轮没做——所以"整树一次生成意味着只有一次检索机会"这句话先留在这里，
+    下一轮把检索插进 `expand_branch` 之前别把它当成已经解决的问题。
     """
     if ctx.request.intent != "create":
         return _fail("wrong_intent", "只有新建导图时才能调用这个工具；修改现有导图请用 node_expand 或 mindmap_edit。")
@@ -1961,8 +2086,10 @@ _ALLOWED_BY_INTENT: dict[str, tuple[str, ...]] = {
     "edit": ("mindmap_edit",),
 }
 
-# 会读来源的意图。`create` 不在里面：整张从零生成时不给检索入口，
-# 否则模型会把"先查一下"当成规定动作（实测 10 次里 10 次都先查一遍）。
+# 会读来源的意图。`create` 在 `full` 形态下不在里面：整张从零生成时正文已经在
+# prompt 里，再给检索入口只会让模型把"先查一下"当成规定动作（实测 10 次里 10 次
+# 都先查一遍，白白多花调用）。`rag` 形态下这个判断整个反转——它看不到正文，
+# 没有 `rag_query` 就一个字都写不出来，所以在 `build_registry` 里按形态补进来。
 _SOURCE_AWARE_INTENTS = ("expand", "edit")
 
 # 注册顺序固定，便于日志与测试对照；用工厂而不是共享实例，避免一个 registry
@@ -2037,6 +2164,9 @@ def build_registry(intent: str = "create", *, has_sources: bool = False) -> Tool
         按主题复杂度自选（描述里写清了两者差别）
       - `expand` 只给 `node_expand`，请求带来源时再加 `rag_query`
       - `edit` 给 `mindmap_edit`，请求带来源时再加 `rag_query`
+      - `rag` 形态（`MINDMAP_SOURCE_MODE=rag`）下，**任何**带来源的意图都加
+        `rag_query`，包括 `create`：正文不在 prompt 里，没有检索工具时模型
+        只能凭标题编，而它会以 ok=True 交出一棵看起来完整的树。
 
     两个生成工具必须同时在场：只留一个，等于替用户决定了"这张图多大"。而
     分片那条路的成本是 N+1 次调用，简单主题走它纯属浪费额度——这个判断
@@ -2048,6 +2178,15 @@ def build_registry(intent: str = "create", *, has_sources: bool = False) -> Tool
     还校验逐字引用）。这条不是"少给一个选项"，而是"少给一条会给出错误答案
     的路"——模型看不到它，就不会选中它。
 
+    **`rag` 形态让这条限制更痛，这一轮仍然保持 discard**：`mindmap_generate_deep`
+    自己一次检索都不发起（入参里根本没有 query），`rag` 形态下它连正文都拿不到，
+    产出的树与材料完全脱钩——比 `full` 形态更离谱，那时 prompt 里至少还有全文。
+    正确形态是「每个分支先检索再展开」（`docs/RAG-DECISIONS.md` 第 5 节的
+    结构引导召回）：**整树一次生成意味着只有一次检索机会**，而分片 + 按支检索
+    才能让每次展开都基于自己那支的证据。那条路留到下一轮，本轮保持 discard：
+    宁可只给模型 `mindmap_generate` 这一条带检索能力的路，也不给它一条会以
+    ok=True 交付无关树的捷径。
+
     `rag_query` 只在真有来源时才注册：没来源的检索必然返回「没有找到」，
     注册它只会诱导模型拿它当"思考"用。未知意图按 `create` 兜底——宁可少给
     工具，也不要把破坏性工具塞进一个没预期到的新意图里。
@@ -2055,7 +2194,7 @@ def build_registry(intent: str = "create", *, has_sources: bool = False) -> Tool
     allowed = set(_ALLOWED_BY_INTENT.get(intent, _ALLOWED_BY_INTENT["create"]))
     if has_sources:
         allowed.discard("mindmap_generate_deep")
-        if intent in _SOURCE_AWARE_INTENTS:
+        if intent in _SOURCE_AWARE_INTENTS or source_mode() == SOURCE_MODE_RAG:
             allowed.add("rag_query")
 
     registry = ToolRegistry()

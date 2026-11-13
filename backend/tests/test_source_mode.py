@@ -1,0 +1,523 @@
+"""`MINDMAP_SOURCE_MODE` 的两态：`full`（正文整份进 prompt）与 `rag`（只给清单）。
+
+这次切换是**形态变化**，不是优化：`full` 下模型自己就能扫全文，`rag_query` 只是
+"帮我定位该引用哪一段"的辅助；`rag` 下模型只看得见检索回来的片段，检索成了唯一
+入口。两者的提示词、引用来源、失败方式都不同，所以各钉一组用例。
+
+本文件只钉两种形态的**差别**，四件事：
+
+  1. `rag`（默认）下正文永远不进 prompt——不是"截断后拼进去"，是一个字都不进；
+     反过来 `full` 下必须进，否则这份用例证明不了"差别是开关造成的"。
+  2. `full` 与 `901b484` 逐字节一致。哈希写死，不取 HEAD：拿 HEAD 当基准等于
+     "今天的我再确认一次昨天的我"，一次误改会被下一次提交顺手合法化。
+  3. 清单超限只截清单项；**短材料也不回退 `full`**——行为随材料大小跳变是最难
+     排查的一类 bug，同一份请求换个字号结论就变了。
+  4. 检索规程（"看不到全文 / 引用必须来自检索结果 / 检索不到就不要写"）真的
+     写进了模型看得到的那段系统提示词，而不只是躺在常量里。
+
+`full` 形态的其余既有用例留在 `tests/test_agent_tools.py`（那个文件按模块固定成
+`full` 形态），这里不重复。
+"""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
+from app.agent.contracts import (
+    AgentRunRequest,
+    Completion,
+    RunBudget,
+    RunContext,
+    ToolCall,
+)
+from app.agent.service import _INTENT_RULES, _RAG_INTENT_RULES, _system_text, run
+from app.agent.tools import (
+    MATERIAL_MANIFEST_MAX_ITEMS,
+    MATERIAL_MANIFEST_TOKEN_LIMIT,
+    _material_manifest,
+    _source_prompt_input,
+    build_registry,
+)
+from app.contracts.source import AudioSentence, Source, SourceKind
+from app.generation.service import (
+    RAG_SOURCE_PROMPT,
+    RAG_THINKING_GUARD,
+    SOURCE_MODE_ENV,
+    SOURCE_MODE_FULL,
+    SOURCE_MODE_RAG,
+    SOURCED_DETAIL_PROMPT,
+    SOURCED_THINKING_GUARD,
+    _WARNED_SOURCE_MODES,
+    estimate_input_tokens,
+    source_mode,
+    thinking_block,
+)
+from app.knowledge.service import search_sources
+
+# 一级分支必须 3 条：`mindmap_generate` 走 `MIN_BRANCHES = 3` 那道关。
+TREE = {
+    "title": "示例",
+    "root": {
+        "id": "root", "label": "根", "children": [
+            {"id": "a", "label": "甲", "children": []},
+            {"id": "b", "label": "乙", "children": []},
+            {"id": "c", "label": "丙", "children": []},
+        ],
+    },
+}
+
+# 正文里的独特标记：只要它出现在 prompt 里，就说明有正文漏进去了。
+MARKER = "ZZQX_MARKER"
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+LEGACY_COMMIT = "901b484"
+LEGACY_PATH = "backend/app/agent/tools.py"
+
+
+def _env(mode: str):
+    """把形态显式切到 `mode`（退出时还原）。"""
+    return patch.dict(os.environ, {SOURCE_MODE_ENV: mode})
+
+
+def _ctx(sources: list[Source]) -> RunContext:
+    request = AgentRunRequest(
+        goal="整理材料", intent="create", sources=sources,
+        budget=RunBudget(max_model_calls=5, max_output_tokens=32768),
+    )
+    return RunContext(
+        request=request, candidate=None,
+        sources_by_id={source.id: source for source in sources},
+    )
+
+
+def _generate_prompt(sources: list[Source]) -> tuple[str, str]:
+    """跑一次真的 `mindmap_generate`，把模型实际收到的 (system, user) 拿回来。"""
+    mocked = AsyncMock(return_value=TREE)
+    with patch("app.agent.tools.chat_async", new=mocked):
+        result = asyncio.run(build_registry("create").execute(
+            ToolCall(call_id="c-gen", name="mindmap_generate",
+                     arguments={"topic": "整理这些材料"}),
+            _ctx(sources),
+        ))
+    assert result.ok, result.content
+    system, user = mocked.await_args.args
+    return system, user
+
+
+def _material(text: str, *, filename: str = "预算管理办法.docx",
+              source_id: str = "src-1", **extra) -> Source:
+    return Source(id=source_id, kind=SourceKind.document, status="parsed",
+                  filename=filename, text=text, **extra)
+
+
+# ---------------------------------------------------------------- 一、正文进不进
+
+
+def test_rag_mode_keeps_the_material_text_out_of_the_prompt():
+    """`rag` 下正文一个字都不进 prompt，清单里只有标题/字数/类型。
+
+    断言的是"不含标记词"而不是"长度变小"：长度可以因为截断而变小，那正是这次
+    改动明确要避免的形态（"放一部分"最难排查）。
+    """
+    source = _material(f"第一章 总则。{MARKER} 预算由财务经理核准。", filename="预算管理办法.docx")
+    with _env(SOURCE_MODE_RAG):
+        system, user = _generate_prompt([source])
+
+    assert MARKER not in system
+    assert MARKER not in user
+    assert "预算管理办法" in user          # 清单里要有名字
+    assert "docx" in user                  # 与类型
+    assert f"{len(source.text or ''):,} 字" in user
+    assert source.id in user               # id 也要在：模型才知道引用该指向谁
+
+
+def test_full_mode_puts_the_material_text_in_the_prompt():
+    """同一个标记词在 `full` 下必须出现——否则上一条证明不了是开关造成的差别。
+
+    system 用**整串相等**钉住（不是 `startswith`）：`full` 形态要与 `901b484`
+    逐字节一致，提示词的拼接顺序（思维步骤在中间、限定句在最后）也在其中。
+    """
+    source = _material(f"第一章 总则。{MARKER} 预算由财务经理核准。")
+    with _env(SOURCE_MODE_FULL):
+        system, user = _generate_prompt([source])
+
+    assert MARKER in user
+    assert system == SOURCED_DETAIL_PROMPT + thinking_block("default") + SOURCED_THINKING_GUARD
+
+
+def test_default_mode_is_rag():
+    """不设变量时走 `rag`：默认值本身是被测行为，不能只靠"某处显式设了"。
+
+    这里把变量删掉而不是设成 `"rag"`：`conftest.clean_env` 也是删掉它，所以
+    "删掉之后是 rag"正是线上不带配置时的实际路径。`patch.dict` 退出时会把整个
+    环境恢复（包括我们 pop 掉的那个键），不需要手工还原。
+    """
+    source = _material(f"正文 {MARKER}")
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop(SOURCE_MODE_ENV, None)
+        assert source_mode() == SOURCE_MODE_RAG
+        system, user = _generate_prompt([source])
+    assert MARKER not in system + user
+
+
+def test_short_material_still_goes_through_retrieval():
+    """材料很短（合计不到 3000 字）也走清单，不偷偷退回 `full`。
+
+    "小材料退回整份塞入"看起来是优化，实际是把一条形态分界线藏进材料大小里：
+    用户改了材料内容、行为就变了，而提示词、引用来源、失败方式全都跟着换。
+    """
+    sources = [_material("短材料一段。" * 20, source_id=f"s{index}",
+                         filename=f"材料{index}.txt") for index in range(3)]
+    total = sum(len(source.text or "") for source in sources)
+    assert total < 3000
+    with _env(SOURCE_MODE_RAG):
+        _, user = _generate_prompt(sources)
+    assert "短材料一段" not in user
+    assert f"本次附带 {len(sources)} 份材料" in user
+
+
+# ---------------------------------------------------------------- 二、full 形态的回归
+
+
+def _fixtures() -> dict[str, list[Source]]:
+    """`full` 形态的回归样本。id 与正文全部写死，否则哈希无法钉住。"""
+    return {
+        "single": [Source(id="s1", kind=SourceKind.text, status="parsed",
+                          text="第一段原始材料。")],
+        "two": [
+            Source(id="s2", kind=SourceKind.text, status="parsed", text="甲材料正文。"),
+            Source(id="s3", kind=SourceKind.document, status="parsed",
+                   filename="乙.docx", text="乙材料正文。"),
+        ],
+        # 空正文：`json.dumps` 出来是 `""`，与"没有这个字段"不是一回事
+        "blank": [Source(id="s4", kind=SourceKind.text, status="parsed", text=None)],
+        # 转义：`ensure_ascii=False` 与裸引号/反斜杠的行为一起钉住
+        "escapes": [Source(id="s5", kind=SourceKind.text, status="parsed",
+                           text='中A\\"\n\t引号"括号（）')],
+        # 超预算：走二分裁剪，落点取决于 token 估算，最容易被"顺手优化"改动
+        "oversized": [Source(id="s6", kind=SourceKind.text, status="parsed",
+                             text="字" * 400_000)],
+    }
+
+
+# 取自 `901b484` 的 `_source_prompt_input` 渲染结果（sha256）。写死是刻意的：
+# 这条断言的价值在于"今天的输出与那个提交逐字节相同"，而不是"与今天自己相同"。
+GOLDEN_DIGESTS: dict[str, str] = {
+    "single": "09dad633796b95214e26057a537a50b1acc002083ccc06522b30fe9d67c7d3ac",
+    "two": "0ddbba96dfa703350137b9d315e07fe2e5c77774eb1768ff7d5fcd42115d0e33",
+    "blank": "309d1757a17504d05d7747846944f2b0280213a74a6b348ffe95311c5331ce22",
+    "escapes": "46593d9c4358005c37cf70123016af4643daace3e2f1bb8ec75397e747d9c10c",
+    "oversized": "5af1af3b9a4ec61c2045f76674b71d1cbb91a67d3670d13fdbd058a6d2c3d4e6",
+}
+
+
+def _digest(sources: list[Source]) -> str:
+    with _env(SOURCE_MODE_FULL):
+        rendered = _source_prompt_input(sources, system=SOURCED_DETAIL_PROMPT)
+    return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
+
+def test_full_mode_rendering_is_pinned_by_digest():
+    """`full` 的渲染结果按 sha256 钉死。不需要 git，也不看 HEAD。"""
+    mismatches = {}
+    for name, sources in _fixtures().items():
+        actual = _digest(sources)
+        expected = GOLDEN_DIGESTS.get(name)
+        if actual != expected:
+            mismatches[name] = {"actual": actual, "pinned": expected}
+    assert not mismatches, (
+        "`full` 形态的输入渲染变了。它必须与 901b484 逐字节一致——"
+        "要改请确认这是有意的，并同时更新 GOLDEN_DIGESTS："
+        + json.dumps(mismatches, ensure_ascii=False)
+    )
+
+
+def _legacy_renderer():
+    """载入 `901b484` 的 `tools.py`，借它的 `_source_prompt_input` 做逐字节对比。
+
+    取文件用 `git show`，但**基准不取 HEAD**：HEAD 会随提交漂移，那样这条用例
+    只能证明"我和我自己一样"。提交号写死在 `LEGACY_COMMIT` 里。
+    """
+    shown = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "show", f"{LEGACY_COMMIT}:{LEGACY_PATH}"],
+        capture_output=True, text=True, encoding="utf-8",
+    )
+    if shown.returncode != 0 or not shown.stdout:
+        return None
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "legacy_tools.py"
+        path.write_text(shown.stdout, encoding="utf-8")
+        spec = importlib.util.spec_from_file_location("legacy_tools_901b484", path)
+        module = importlib.util.module_from_spec(spec)
+        # pydantic 在 exec 期间要能从 `sys.modules` 找到这个模块（dataclass 同理）
+        sys.modules[spec.name] = module
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            sys.modules.pop(spec.name, None)
+    return module._source_prompt_input
+
+
+def test_full_mode_matches_the_901b484_module():
+    """逐字节对比旧模块：哈希钉住的是"与那个提交相同"，这条钉住"同一条实现"。"""
+    legacy = _legacy_renderer()
+    if legacy is None:
+        raise unittest.SkipTest(
+            f"取不到 {LEGACY_COMMIT}:{LEGACY_PATH}（没有 git 或没有这个提交）；"
+            "哈希钉的那条用例仍然有效")
+    for name, sources in _fixtures().items():
+        with _env(SOURCE_MODE_FULL):
+            actual = _source_prompt_input(sources, system=SOURCED_DETAIL_PROMPT)
+        expected = legacy(sources, system=SOURCED_DETAIL_PROMPT)
+        assert actual == expected, f"{name}: full 形态与 {LEGACY_COMMIT} 不再逐字节一致"
+
+
+# ---------------------------------------------------------------- 三、清单的边界
+
+
+def test_manifest_truncation_drops_items_never_the_text():
+    """60 份材料：清单被截断，但任何一份的正文都不在 prompt 里。
+
+    这是"清单也要有上限"与"绝不截断正文拼进去"两条要求的交叉点：截断发生在
+    **清单项**上，正文从头到尾没有进入过 prompt，所以不存在"截一半"的中间态。
+    """
+    sources = [
+        Source(id=f"m{index}", kind=SourceKind.text, status="parsed",
+               filename=f"材料{index}.txt", text=f"第 {index} 份的正文 ZZQX_{index}")
+        for index in range(60)
+    ]
+    rendered = _material_manifest(sources)
+
+    listed = [line for line in rendered.splitlines() if line[:1].isdigit()]
+    assert len(listed) == MATERIAL_MANIFEST_MAX_ITEMS
+    assert f"另有 {len(sources) - MATERIAL_MANIFEST_MAX_ITEMS} 份材料未在清单里列出" in rendered
+    # 一个标记都不许出现：列出来的、没列出来的，正文都一样不进 prompt
+    for index in range(60):
+        assert f"ZZQX_{index}" not in rendered
+
+
+def test_manifest_respects_its_own_token_ceiling():
+    """条数没到上限、但每条都很长时，截断由 token 上限触发。
+
+    两个上限都要有用：只按条数截，50 条 80 字的标题能把清单撑到 3000 token，
+    清单就从一个"索引"变成了又一份材料。
+    """
+    long_name = "很长的文件名" * 20          # 120 字，会被夹到 80 字 + 省略号
+    sources = [
+        Source(id=f"t{index}", kind=SourceKind.text, status="parsed",
+               filename=f"{long_name}{index}.txt", text="正文" * 50)
+        for index in range(50)
+    ]
+    rendered = _material_manifest(sources)
+
+    listed = [line for line in rendered.splitlines() if line[:1].isdigit()]
+    assert 0 < len(listed) < MATERIAL_MANIFEST_MAX_ITEMS
+    assert "另有" in rendered
+    # 清单项本身必须落在上限内（尾注与"另有"那行是上限之后追加的，留一点余量）
+    assert estimate_input_tokens(rendered) <= MATERIAL_MANIFEST_TOKEN_LIMIT + 200
+
+
+# ---------------------------------------------------------------- 四、提示词与接线
+
+
+def test_rag_prompt_carries_the_retrieval_protocol():
+    """三条硬规则必须出现在模型真正看到的那段 system 里。"""
+    source = _material(f"正文 {MARKER}")
+    with _env(SOURCE_MODE_RAG):
+        system, _ = _generate_prompt([source])
+
+    assert "看不到材料全文" in system
+    assert "引用必须来自检索结果" in system
+    assert "检索不到就不要写" in system
+    # 规程要成组出现：缺一条都不行，所以逐条钉关键动作
+    for phrase in ("先检索", "逐字", "source_id", "不要自己算", "可以多次检索"):
+        assert phrase in system, phrase
+    # `full` 的提示词教模型读 `sources` 数组；`rag` 下那个数组不存在，
+    # 一个字都不能混进来，否则模型会去找一个没有的字段。
+    assert "sources 数组" not in system
+    assert system == RAG_SOURCE_PROMPT + thinking_block("default") + RAG_THINKING_GUARD
+
+
+def test_audio_material_is_manifest_only():
+    """音频材料同样只给清单：`sentences` 一个字都不进 prompt。"""
+    audio = Source(
+        id="audio-1", kind=SourceKind.audio, status="parsed", filename="会议纪要.mp3",
+        text="录音转写正文。",
+        duration_seconds=192.0,
+        sentences=[AudioSentence(text="第一句转写 ZZQX_SENTENCE", begin_ms=0, end_ms=900)],
+    )
+    with _env(SOURCE_MODE_RAG):
+        system, user = _generate_prompt([audio])
+
+    assert "ZZQX_SENTENCE" not in system + user
+    assert "录音转写正文" not in system + user
+    assert "会议纪要" in user
+    assert "时长 3:12" in user       # 规模要说清楚，否则模型不知道这段录音值不值得查
+    assert "mp3" in user
+
+
+def test_invalid_mode_falls_back_to_rag_and_warns_once():
+    """非法取值按 `rag` 处理，且只告警一次。
+
+    告警一次不是洁癖：`source_mode()` 每拼一次提示词就调一次，一次请求十几次，
+    逐次告警会把日志刷满，把真正要看的东西埋掉。
+    """
+    _WARNED_SOURCE_MODES.discard("zz-not-a-mode")
+    source = _material(f"正文 {MARKER}")
+    with patch.dict(os.environ, {SOURCE_MODE_ENV: "zz-not-a-mode"}):
+        with unittest.TestCase().assertLogs("app.generation.service", level="WARNING") as logs:
+            assert source_mode() == SOURCE_MODE_RAG
+            assert source_mode() == SOURCE_MODE_RAG      # 第二次不再刷日志
+        system, user = _generate_prompt([source])
+
+    assert len(logs.output) == 1
+    assert "zz-not-a-mode" in logs.output[0]
+    assert MARKER not in system + user
+
+
+def test_registry_hands_create_the_retrieval_tool_in_rag_mode():
+    """`rag` 下 create 必须拿到 `rag_query`，否则模型一个字都写不出来。
+
+    `full` 下恰好相反：正文已在 prompt 里，再给检索入口只会诱导它把"先查一下"
+    当成规定动作（实测 10 次里 10 次都先查一遍）。所以这条按形态分别断言——
+    两种形态在这个点上结论相反，不能只钉一边。
+    """
+    with _env(SOURCE_MODE_RAG):
+        names = build_registry("create", has_sources=True).names()
+    assert "rag_query" in names
+    assert "mindmap_generate_deep" not in names      # 仍然 discard，见下一轮
+
+    with _env(SOURCE_MODE_FULL):
+        names = build_registry("create", has_sources=True).names()
+    assert "rag_query" not in names
+
+
+def test_loop_prompt_does_not_forbid_retrieval_in_rag_mode():
+    """外层循环的 system 不能在 `rag` 下继续说"不要先去检索资料"。
+
+    两处提示词打架时模型听更具体的那句：一边"看不到全文必须先查"，一边"不要先查"，
+    结果是它既不查也写不出，交出一棵空心树。
+    """
+    source = _material("正文")
+    with _env(SOURCE_MODE_RAG):
+        text = _system_text(_ctx([source]).request, None)
+    assert _RAG_INTENT_RULES["create"] in text
+    assert _INTENT_RULES["create"] not in text
+
+    with _env(SOURCE_MODE_FULL):
+        text = _system_text(_ctx([source]).request, None)
+    assert _INTENT_RULES["create"] in text
+
+
+def test_blank_source_is_left_out_of_the_manifest():
+    """没正文的来源不进清单，也不进份数——它没有内容可查。"""
+    blank = Source(id="blank-1", kind=SourceKind.text, status="pending", text=None)
+    usable = _material("有正文的一段材料。", source_id="ok-1")
+    with _env(SOURCE_MODE_RAG):
+        _, user = _generate_prompt([blank, usable])
+
+    assert "本次附带 1 份材料" in user
+    assert blank.id not in user
+    assert usable.id in user
+
+
+# ---------------------------------------------------------------- 五、整条链路
+
+
+class _ScriptedProvider:
+    """按脚本依次返回预设 Completion，并记下每轮模型看到的 system。"""
+
+    def __init__(self, script: list[Completion]) -> None:
+        self._script = list(script)
+        self.systems: list[str] = []
+
+    async def complete_tools(self, messages, tools, *, budget):
+        if not self._script:
+            raise AssertionError("脚本已用完，循环比预期多调了一次模型")
+        self.systems.append(messages[0]["content"])
+        return self._script.pop(0)
+
+
+def _completion(calls: list[ToolCall] | None = None, finish: str = "stop") -> Completion:
+    calls = calls or []
+    message: dict = {"role": "assistant", "content": "好的"}
+    if calls:
+        message["tool_calls"] = [
+            {"id": call.call_id, "type": "function",
+             "function": {"name": call.name,
+                          "arguments": json.dumps(call.arguments, ensure_ascii=False)}}
+            for call in calls
+        ]
+    return Completion(message=message, tool_calls=calls, finish_reason=finish,
+                      usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})
+
+
+def test_loop_retrieves_first_then_generates_from_hits():
+    """整条链路：`rag_query` 真的能查到 → 生成时只带清单 → 引用逐字来自命中。
+
+    这才是这次改动要证明的东西。"正文不进 prompt"本身不构成能力——变化在于
+    **检索成了入口**：模型必须先查，查到什么才有什么，引用也只能从命中里抄。
+    只测 `_source_prompt_input` 的字符串形状测不出这条链有没有接上（比如
+    `rag_query` 忘了按形态注册给 `create`，或者循环的 system 还在说"别先检索"）。
+    """
+    text = ("第一章 总则。本制度适用于全部预算事项。\n"
+            "第八条 预算由财务经理核准后执行，超过五十万元报总经理审批。\n"
+            "第九条 每季度末做一次预算执行分析。")
+    source = _material(text, filename="预算管理办法.docx", source_id="doc-1")
+
+    # 先算一次真实命中：链路里 `rag_query` 走的就是这个函数（无网络，纯 BM25）。
+    hits = search_sources([source], "预算由谁核准", 5)
+    assert hits, "样本必须能命中，否则这条用例证明不了引用来自检索"
+    quote = hits[0].quote[:200]
+
+    provider = _ScriptedProvider([
+        _completion([ToolCall(call_id="c-rag", name="rag_query",
+                              arguments={"question": "预算由谁核准"})], finish="tool_calls"),
+        _completion([ToolCall(call_id="c-gen", name="mindmap_generate",
+                              arguments={"topic": "整理预算管理办法"})], finish="tool_calls"),
+        _completion(),
+    ])
+    prompts: list[tuple[str, str]] = []
+
+    async def chat(system, user, *, max_tokens, on_delta=None):
+        prompts.append((system, user))
+        tree = json.loads(json.dumps(TREE))
+        # 逐字回填检索到的那一段：`rag` 形态要求引用只能这么来。
+        tree["root"]["source_refs"] = [{"source_id": "doc-1", "quote": quote}]
+        if on_delta is not None:      # `run()` 这条入口会带流式预览回调
+            await on_delta(json.dumps(tree, ensure_ascii=False))
+        return tree
+
+    async def drain():
+        return [event async for event in run(_ctx([source]).request, provider=provider)]
+
+    with _env(SOURCE_MODE_RAG), patch("app.agent.tools.chat_async", new=chat):
+        events = asyncio.run(drain())
+
+    # 第一轮的 system 里是"先检索"，不是 `full` 形态里那句"不要先去检索资料"
+    assert _RAG_INTENT_RULES["create"] in provider.systems[0]
+    # `rag_query` 真跑通了（不然下面的引用无从谈起）
+    rag_ends = [event for event in events
+                if event.type == "tool_end" and event.name == "rag_query"]
+    assert rag_ends and rag_ends[0].ok
+    assert rag_ends[0].result_summary["hits"], rag_ends[0].result_summary  # 有命中
+
+    system, user = prompts[0]
+    assert system.startswith(RAG_SOURCE_PROMPT)
+    assert "预算由财务经理核准" not in user        # 正文没进 prompt
+    assert "本次附带 1 份材料" in user
+
+    done = [event for event in events if event.type == "done"]
+    assert done and done[-1].content is not None, [event.type for event in events]
+    refs = done[-1].content.root.source_refs
+    # 逐字校验通过 = 这条引用确实能在原文里找到（它也确实来自检索结果）
+    assert refs and refs[0].quote == quote

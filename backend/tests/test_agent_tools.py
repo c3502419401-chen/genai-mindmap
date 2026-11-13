@@ -10,6 +10,12 @@
 分片生成（`mindmap_generate_deep`）的用例额外盯住三件事：分支调用是并发的、
 并发被限在 3 个以内、要点不足时只补那一支而不是整张重来。这三条一旦退化，
 单次调用会被打回「一次出一整棵树」，而那正是这条路径要解决的问题。
+
+**本文件按模块固定成 `MINDMAP_SOURCE_MODE=full`**（见下面的 `_full_source_mode`）。
+这里的一批用例钉的是"正文整份进 prompt"这条形态的契约：结构化 sources 数组、
+超预算二分裁剪、来源 id 原样透传——它们在 `rag` 形态下没有意义（那里正文根本
+不进 prompt）。`rag` 形态的行为在 `tests/test_source_mode.py`，默认值也是在那里
+钉的，所以这里的固定不会把"默认到底是不是 rag"藏起来。
 """
 from __future__ import annotations
 
@@ -60,6 +66,22 @@ TREE = {
 }
 
 
+@pytest.fixture(autouse=True)
+def _full_source_mode(clean_env, monkeypatch):
+    """整个模块跑在 `full` 形态下（理由见模块 docstring）。
+
+    必须显式依赖 `clean_env`：那个 fixture 会把 `MINDMAP_SOURCE_MODE` 删掉
+    （宿主机上留着 `full` 不该影响别的文件），同作用域的两条 autouse 之间没有
+    可靠顺序，只有依赖关系能定住"先清、后设"。
+
+    用 fixture 而不是逐条 `patch.dict`：这个文件里 unittest 用例与裸 pytest 函数
+    混着写，逐条加装饰器必然漏——而漏掉的那条在 `rag` 形态下会静默变成"另一个
+    测试"，不是报错。
+    """
+    monkeypatch.setenv("MINDMAP_SOURCE_MODE", "full")
+    yield
+
+
 def _content() -> MindMapContent:
     return MindMapContent.model_validate(TREE)
 
@@ -94,7 +116,11 @@ def _run(coro):
 
 
 def _prompt_payload(user: str) -> list[dict]:
-    """取出 `_source_prompt_input` 里那段 JSON 数组。"""
+    """取出 `_source_prompt_input` 里那段 JSON 数组（**只有 `full` 形态有**）。
+
+    `rag` 形态的输入是纯文本清单，拿它来解析只会得到一条 JSONDecodeError。
+    那一边的断言在 `tests/test_source_mode.py`。
+    """
     return json.loads(user.split("\n", 1)[1])
 
 

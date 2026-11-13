@@ -43,8 +43,8 @@ from app.contracts.mindmap import MindMapContent
 from app.contracts.source import Source
 from app.generation.service import (
     DETAIL_PROMPT,
-    SOURCED_DETAIL_PROMPT,
-    SOURCED_THINKING_GUARD,
+    RAG_SOURCE_PROMPT,
+    RAG_THINKING_GUARD,
     GenerationError,
     chat_async,
     thinking_block,
@@ -584,9 +584,12 @@ class GenerateGrowTest(unittest.TestCase):
         tree["root"]["source_refs"] = [{"source_id": "s1", "quote": "论文原文。"}]
 
         async def chat(system, user, *, max_tokens, on_delta):
-            self.assertTrue(system.startswith(SOURCED_DETAIL_PROMPT))
-            self.assertEqual(json.loads(user.split("\n", 1)[1]),
-                             [{"source_id": "s1", "text": "论文原文。"}])
+            # 默认形态是 `rag`：输入里只有材料清单，正文一个字节都不进来。
+            # 这条断言同时守两件事——预览通道不依赖正文，以及"正文不进 prompt"
+            # 在**流式**这条入口上也成立（工具里是同一处拼装，但入口不同）。
+            self.assertTrue(system.startswith(RAG_SOURCE_PROMPT))
+            self.assertIn("本次附带 1 份材料", user)
+            self.assertNotIn("论文原文。", user)
             self.assertEqual(max_tokens, 1234)
             text = json.dumps(tree, ensure_ascii=False)
             for start in range(0, len(text), 7):
@@ -603,6 +606,7 @@ class GenerateGrowTest(unittest.TestCase):
             result = self._execute(ctx)
         self.assertTrue(result.ok, result.content)
         self.assertEqual(result.data["node_count"], 7)
+        # 引用校验用的仍是完整原文：提示词里没有正文，不代表核验也拿不到正文。
         self.assertEqual(ctx.candidate.root.source_refs[0].quote, "论文原文。")
         self.assertEqual(ctx.candidate.source_usage[0].source_id, "s1")
         self.assertEqual((ctx.revision, ctx.extra_model_calls, ctx.model_calls_used), (1, 1, 1))
@@ -717,10 +721,14 @@ class GenerateGrowTest(unittest.TestCase):
                 system, user, max_tokens = calls[0]
                 expected_system = DETAIL_PROMPT + thinking_block("default")
                 if with_sources:
-                    expected_system = (SOURCED_DETAIL_PROMPT + thinking_block("default")
-                                       + SOURCED_THINKING_GUARD)
-                    self.assertEqual(json.loads(user.split("\n", 1)[1]),
-                                     [{"source_id": "s1", "text": "论文原文。"}])
+                    # 默认形态是 `rag`：提示词与输入都换成"只有清单"的那一套。
+                    # 之前这里钉的是 `full`（sources 数组 + 整份正文），形态一换，
+                    # 期望值就得跟着换——放宽成"以某个前缀开头"是没用的，那正好
+                    # 会放过"两种形态拼错了"这一整类问题。
+                    expected_system = (RAG_SOURCE_PROMPT + thinking_block("default")
+                                       + RAG_THINKING_GUARD)
+                    self.assertIn("本次附带 1 份材料", user)
+                    self.assertNotIn("论文原文。", user)
                 else:
                     self.assertEqual(user, "整理论文")
                 self.assertEqual(system, expected_system)
