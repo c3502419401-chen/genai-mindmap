@@ -637,17 +637,20 @@ def _corpus() -> list[Source]:
 
 
 def _dump(hits) -> list[dict]:
-    """`model_dump()` 并补齐基线没有的两个键。
+    """`model_dump()` 并补齐基线没有的三个键。
 
-    `f72c14c` 的 `EvidenceHit` 还没有 `leaf_start/leaf_end`，直接比字典会输在
-    "键少了两个"上，而那与行为无关。补齐之后比的仍然是逐键逐值：当前实现若在
-    关着时把 `leaf_*` 填成非 None，`==` 立刻会红。
+    `f72c14c` 的 `EvidenceHit` 还没有 `leaf_start/leaf_end`（两级切块加的），
+    `c38684c` 的更没有 `rerank_score`（重排加的）。直接比字典会输在"键少了几个"
+    上，而那与行为无关。补齐之后比的仍然是逐键逐值：当前实现若在开关关着时把
+    `leaf_*` 或 `rerank_score` 填成非 None，`==` 立刻会红——这正是那条
+    "重排没接通时不能留下任何痕迹"的保证。
     """
     payload = []
     for hit in hits:
         entry = hit.model_dump()
         entry.setdefault("leaf_start", None)
         entry.setdefault("leaf_end", None)
+        entry.setdefault("rerank_score", None)
         payload.append(entry)
     return payload
 

@@ -326,7 +326,7 @@ def test_bm25_monotonic_in_term_frequency():
 
 
 def test_hits_dump_keeps_tool_shape(monkeypatch):
-    """`_rag` 的 `model_dump()` 路径：多了五个键，既有键一个不少。"""
+    """`_rag` 的 `model_dump()` 路径：多了六个键，既有键一个不少。"""
     _keyed(monkeypatch)
     _use(monkeypatch, VecHttp())
     hits = search_sources([_source("预算审批流程由财务部统一发起。")], QUERY)
@@ -336,16 +336,20 @@ def test_hits_dump_keeps_tool_shape(monkeypatch):
     legacy = {"source_id", "start", "end", "quote", "score"}
     assert legacy <= set(entry)
     assert set(entry) == legacy | {"score_bm25", "score_vector", "method",
-                                   "leaf_start", "leaf_end"}
+                                   "leaf_start", "leaf_end", "rerank_score"}
     # `leaf_*` 只属于父块返回模式（`search_parent`）：这条路上 `start/end` 就是
     # 匹配单元，再记一遍没有信息，所以必须是 None 而不是与 start/end 相等。
     assert entry["leaf_start"] is None and entry["leaf_end"] is None
+    # `rerank_score` 只在 `MINDMAP_RERANK=1` 且真调过 reranker 的路径上有值。
+    # `search_sources` 上没接重排，所以这里必须逐条为 None。
+    assert entry["rerank_score"] is None
 
     # 新字段都有默认值：不传也能构造，旧调用方不会被破坏
     old = EvidenceHit(source_id="s", start=0, end=1, quote="字", score=0.5)
     assert old.method == "lexical"
     assert old.score_bm25 is None and old.score_vector is None
     assert old.leaf_start is None and old.leaf_end is None
+    assert old.rerank_score is None
 
 
 def test_dedup_drops_overlapping_copies():

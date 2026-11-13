@@ -10,8 +10,16 @@
   - **没有凭证**：embedding 与 LLM 的 key/base/model 一律清空，`configured()`
     恒为假，`search_sources` 稳定走纯 BM25。
   - **开关显式关**：`MINDMAP_HYBRID_SEARCH=0`、`MINDMAP_QUERY_EXPANSION=0`、
-    `MINDMAP_PARENT_RETRIEVAL=0`、`MINDMAP_GRAPH_EXTRACTION=0`。需要它们的用例自己 `monkeypatch.setenv(..., "1")`，
+    `MINDMAP_PARENT_RETRIEVAL=0`、`MINDMAP_GRAPH_EXTRACTION=0`、`MINDMAP_RERANK=0`。
+    需要它们的用例自己 `monkeypatch.setenv(..., "1")`，
     那会覆盖这里的值；反过来，忘记开的用例只会"少测"一条路，不会偷偷发出真实请求。
+
+    `MINDMAP_RERANK` 在**线上默认是 1**（评估跑出 R@1 +14.2pp 之后翻的，见
+    `app/knowledge/rerank.py`），这里仍然置 0，理由与其余开关不同：它是唯一一个
+    "开着就要多一次网络往返"的开关，而绝大多数用例关心的不是重排。置 0 之后
+    "重排这条路"只在 `tests/test_rerank.py` 里被覆盖——那是刻意的，别在这里改成
+    1，否则每个配了 `MINDMAP_EMBEDDING_API_KEY` 替身的用例都会多出一次被 mock
+    的 rerank 调用，断言会以"多了一条请求"的形式莫名失败。
   - **数据库落 tmp**：`MINDMAP_DB_PATH` 指向本次测试的 `tmp_path`，仓库里的
     `backend/data/mindmaps.db` 不会被任何测试碰到。
   - **`MINDMAP_NEO4J_*` 一律清空**：宿主机上可能正好跑着一个 Neo4j（开发机上很
@@ -64,10 +72,13 @@ BEHAVIOUR = (
     # 置 0 会把那条前提整个跳过：所有用例都不会经过"查了一次空库"的那条路，
     # 于是"库空时逐字节不变"永远没被人跑过。需要关掉的用例自己 `setenv(..., "0")`。
     "MINDMAP_LIBRARY_SEARCH",
+    # 重排模型名（`knowledge/rerank.py`）。清空 = 用默认值。不清的话宿主机上换个
+    # 模型名会让 `tests/test_rerank.py` 里断言请求体的几条换一个字符串。
+    "MINDMAP_RERANK_MODEL",
 )
 
 SWITCHES = ("MINDMAP_HYBRID_SEARCH", "MINDMAP_QUERY_EXPANSION", "MINDMAP_PARENT_RETRIEVAL",
-            "MINDMAP_GRAPH_EXTRACTION")
+            "MINDMAP_GRAPH_EXTRACTION", "MINDMAP_RERANK")
 
 # 图存储的连接参数。清空而不是设默认值：URI/USER/DATABASE 有代码默认，PASSWORD
 # 没有——"没配"必须是可见的未配置状态，否则宿主机上跑着的 Neo4j 会被单测连上。

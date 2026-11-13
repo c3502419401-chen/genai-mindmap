@@ -37,6 +37,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validat
 
 from app.contracts.source import Source, SourceMetadata, blank_to_none, clean_tags, to_utc_iso
 from app.knowledge import library as knowledge_library
+from app.knowledge import rerank as knowledge_rerank
 from app.knowledge import vector_cache
 from app.knowledge.embedding import (
     EmbeddingError,
@@ -122,6 +123,17 @@ class EvidenceHit(BaseModel):
     # `verify_source_refs(..., evidence=...)`。
     leaf_start: int | None = None
     leaf_end: int | None = None
+    # 重排分（0–1），**只有被 reranker 打过分的那几条有值**，其余一律 None。
+    #
+    # 为什么不覆盖 `score`（见 `knowledge/rerank.py` 的模块 docstring）：`score`
+    # 是融合分（RRF / BM25 / 多路累加），而且它**本来就不单调**（`search_multi`
+    # 与 `_merge_batches` 都有保底段）。把 rerank 的 [0,1] 概率灌进同一个字段，
+    # 会让下游任何一次 `sorted(hits, key=score)` 把重排静默撤销。留成两个字段，
+    # `is not None` 就是"这条被重排过"的唯一标记，误用的表现是"重排没生效"。
+    #
+    # 顺序与分数因此**不再单调**：重排后名次由 `rerank_score` 决定，`score` 仍是
+    # 融合口径。要按名次读，看列表顺序；要比相关性，看 `rerank_score`。
+    rerank_score: float | None = None
 
 
 # ---------------------------------------------------------------- 检索前置过滤
@@ -1790,9 +1802,46 @@ def _fold_to_parents(ranked: list[EvidenceHit], corpus: _LeafCorpus) -> list[Evi
     return folded
 
 
+# ---------------------------------------------------------------- 召回后的重排
+#
+# 扩池与重排是**两件事**，必须一起做才有意义：`top_k` 条候选上来就开始重排，
+# 能做的只有换顺序；而 R@1 要涨，靠的是"把原本排第 6 的那条抬到第 1"。
+#
+# 扩池放在最外层而不是各 core 里，是为了让 `search_multi` 的"多路各自重排"变成
+# "融合之后重排一次"——N 路各调一次 reranker 既贵 N 倍，也会让每一路都看不到
+# 别的路捞回来的候选（而多路的价值恰恰在那些候选上）。
+
+
+def _rerank_depth(top_k: int) -> int:
+    """这一次检索的候选池大小：真会重排时扩到 `rerank.pool_size(top_k)`，否则 `top_k`。
+
+    **两个条件缺一不可**：开关打开 **且** 凭证齐备。少了任何一个就只取 `top_k`。
+    这不是省事的写法，而是"关着时逐字节一致"的构造保证：扩池会改变每路截断的
+    `pool` 与 RRF 名次映射（见 `_fuse` / `_search_multi_core`），那是**分数口径**
+    的变化，不只是"多了几条候选"。没配 key 时白扩池会让同一批命中的 `score`
+    悄悄变一个数——那比不扩池糟得多。
+    """
+    if top_k > 0 and knowledge_rerank.enabled() and knowledge_rerank.configured():
+        return knowledge_rerank.pool_size(top_k)
+    return max(top_k, 0)
+
+
+def _rerank_top(
+    question: str, hits: list[EvidenceHit], top_k: int,
+) -> list[EvidenceHit]:
+    """候选池 → 重排 → 截断 `top_k`。开关关着（或没配 key）时等价于 `hits[:top_k]`。
+
+    `hits` 已经是**融合与去重之后**的顺序（`_pick_ordered` / `_fold_to_parents`
+    出来的），所以这里不需要再筛一次近重复——重排只换顺序，不动候选集合。
+    """
+    if _rerank_depth(top_k) <= top_k or not question:
+        return hits[:top_k]
+    return knowledge_rerank.rerank(question, hits, top_k)
+
+
 def _search_parent_core(
     sources: list[Source], question: str, top_k: int,
-    filters: SourceFilter | None,
+    filters: SourceFilter | None, *, depth: int | None = None,
 ) -> list[EvidenceHit]:
     """`search_parent` 在**给定来源集合内**的全部逻辑：切两级树、子块匹配、折父块。
 
@@ -1800,7 +1849,13 @@ def _search_parent_core(
     `_search_sources_core` 完全相同：`library=True` 时两批来源必须走同一份实现，
     否则"本次那批返回父块、库里那批返回单级块"这种粒度错位不会有任何报错，只会在
     调用方按 `end - start` 估信息密度时给出两个互相矛盾的结论。
+
+    `depth` 是**返回条数**（候选池），缺省等于 `top_k`。只给重排用：`depth > top_k`
+    时本函数返回一个还没截到 `top_k` 的池子，交给 `_rerank_top` 挑。两处随它一起
+    放大——子块级的融合池（`depth * CANDIDATE_FACTOR`）与折父块后的截断——否则
+    池子会被其中任何一处卡回 `top_k`，"扩池"等于没发生。
     """
+    want = top_k if depth is None else depth
     if not _token_list(question):
         return []
 
@@ -1822,12 +1877,12 @@ def _search_parent_core(
     # 候选池放大：子块级别多取一些，是因为折父块时同一父块的多条会并成一条。
     # 只取 top_k 条子块时，它们很可能全落在两三个父块里，折完凑不满 top_k。
     # 放大**不改**已在候选集里的分数（RRF 只吃名次），只是让更多子块有名字可排。
-    ranked = _fuse(corpus.items, question, top_k * CANDIDATE_FACTOR)
+    ranked = _fuse(corpus.items, question, want * CANDIDATE_FACTOR)
     # 折父块 → 截断。折完就不再跑 `_pick_ordered` 的近重复筛：`_fold_to_parents`
     # 已经保证每条对应不同的父块，再按"重叠 > 较短者一半"筛一遍，只会在父块短于
     # 2×`CHUNK_OVERLAP_CHARS`（200 字）时把两个**不同**父块判成重复，净效果是
     # 静默少给一条证据。截断就是这里需要的全部裁剪。
-    return _fold_to_parents(ranked, corpus)[:top_k]
+    return _fold_to_parents(ranked, corpus)[:want]
 
 
 def search_parent(sources: list[Source], query: str, top_k: int = 5, *,
@@ -1885,16 +1940,32 @@ def search_parent(sources: list[Source], query: str, top_k: int = 5, *,
     **同一套粒度**：子块匹配、父块返回。开关关着（`MINDMAP_PARENT_RETRIEVAL=0`）时
     本函数转发给 `search_sources`，`library` 一并透传——"关掉父块模式"只该改变
     粒度，不该顺带把知识库关掉。
+
+    **重排（`MINDMAP_RERANK`，默认 1）**在这里接：`_rerank_depth(top_k)` 把候选池
+    放宽到 `max(top_k*4, 10)` 条，`_rerank_top` 在**融合与去重之后、截断之前**
+    把池子重排并截回 `top_k`。三条边界写在这里：
+
+      - `library=True` 时仍然**只重排一次**：库那批与本地那批各自扩池，`_merge_batches`
+        用 `depth` 而不是 `top_k` 做跨批融合的截断，重排只发生在融合之后
+        （`_rerank_top(question, _merge_batches(base, extra, depth), top_k)`）。
+      - `MINDMAP_PARENT_RETRIEVAL=0` 时本函数转发给 `search_sources`，**不重排**：
+        那条路的入口是 `search_sources`，而重排只接在 `search_parent` 与
+        `search_multi` 上。要重排又不要父块粒度，请在 `search_sources` 上接——现在
+        没接，因为单级块的 `quote` 只有 200 字，重排的收益与它带来的多样性损失
+        还没量过，不猜。
+      - 重排只改顺序、附加 `rerank_score`，`start`/`end`/`quote`/`leaf_*`
+        **一个都不动**（"只重排不改变证据"由 `rerank.rerank` 的 `model_copy` 保证）。
     """
     if not _parent_retrieval_enabled():
         return search_sources(sources, query, top_k, filters=filters, library=library)
 
     question = query.strip()
-    base = _search_parent_core(sources, question, top_k, filters)
+    depth = _rerank_depth(top_k)
+    base = _search_parent_core(sources, question, top_k, filters, depth=depth)
     if not library:
-        return base
-    extra = _library_batch(question, top_k, filters, exclude=sources, parent=True)
-    return _merge_batches(base, extra, top_k)
+        return _rerank_top(question, base, top_k)
+    extra = _library_batch(question, depth, filters, exclude=sources, parent=True)
+    return _rerank_top(question, _merge_batches(base, extra, depth), top_k)
 
 
 # ---------------------------------------------------------------- 多路并行检索
@@ -2152,16 +2223,24 @@ async def search_multi(
     之所以要接进来而不是"多路时就不查库"：`MINDMAP_QUERY_EXPANSION` 打开后
     `_rag` 走的就是这条路，不接的话知识库会在那个开关下静默失效——而失效的表现
     是"库里明明有材料，模型却一条都没查到"，没有任何一处会说清是开关组合的问题。
+
+    **重排**（`MINDMAP_RERANK`，默认 1）接在这条路的最后一格，而且**整次检索只调
+    一次**：候选池是"多路累加 → 保底席位 → 去重"之后的那个池子，不是每路各排一遍。
+    每路各排会有两个后果——N 倍的 reranker 调用，以及每一路都看不到别的路捞回来的
+    候选（而多路的价值恰好在那些候选上）。用哪个 query 打分：**第一路**，也就是
+    调用方放的原始问题（`_route_queries` 的约定），扩展问法只是同一批材料的不同
+    角度，拿它们当重排的 query 会把"多少条问法都指向它"这件事重新混进来。
     """
-    fused = await _search_multi_core(sources, queries, top_k, filters, hyde)
-    if not library:
-        return fused
+    depth = _rerank_depth(top_k)
+    fused = await _search_multi_core(sources, queries, top_k, filters, hyde, depth=depth)
     question = next((text.strip() for text in queries
                      if isinstance(text, str) and text.strip()), "")
     if not question:
-        return fused
-    extra = _library_batch(question, top_k, filters, exclude=sources, parent=False)
-    return _merge_batches(fused, extra, top_k)
+        return fused[:top_k]
+    if not library:
+        return _rerank_top(question, fused, top_k)
+    extra = _library_batch(question, depth, filters, exclude=sources, parent=False)
+    return _rerank_top(question, _merge_batches(fused, extra, depth), top_k)
 
 
 async def _search_multi_core(
@@ -2170,6 +2249,8 @@ async def _search_multi_core(
     top_k: int,
     filters: SourceFilter | None,
     hyde: str | None,
+    *,
+    depth: int | None = None,
 ) -> list[EvidenceHit]:
     """`search_multi` 在**给定来源集合内**的全部逻辑（不碰库、不做跨批融合）。
 
@@ -2177,7 +2258,12 @@ async def _search_multi_core(
     `library=True` 时"多路融合"与"跨批融合"必须是两步，前者的产出（保底席位、
     累加分、`method`）原样作为后者的输入。混在一起写就会出现"库的命中也被算进
     某一路的累加分"这种谁也说不清的名次。
+
+    `depth` 是**返回条数**（候选池），缺省等于 `top_k`；只给重排用。放大时三处
+    一起跟着走——每路截断的 `pool`、单路快路径的 `_single_search`、末尾的
+    `_pick_ordered`——少任何一处，池子都会被卡回 `top_k`。
     """
+    want = top_k if depth is None else depth
     routes = _route_queries(queries, hyde)
     if not routes:
         return []
@@ -2201,7 +2287,7 @@ async def _search_multi_core(
     # 这不是快路径优化，是可观测契约——开关关着与只有纠错时，用户看到的召回
     # 与没有多路召回时一模一样。
     if len(routes) == 1 and routes[0][1]:
-        return _single_search(collected, routes[0][0], top_k)
+        return _single_search(collected, routes[0][0], want)
 
     quotes = [item[3] for item in collected]
     lengths = [item[2] - item[1] for item in collected]
@@ -2224,7 +2310,7 @@ async def _search_multi_core(
                 logger.info("多路检索第 %d 路走单路 BM25（%s）", index + 1, reason)
 
     # 约束 5：每路各自截断到 pool，再把 RRF 分累加到同一个块上。
-    pool = max(top_k * CANDIDATE_FACTOR, top_k)
+    pool = max(want * CANDIDATE_FACTOR, want)
     fused: dict[int, float] = {}
     primary: dict[int, float] = {}
     for position, (lexical, similarity) in enumerate(
@@ -2275,7 +2361,11 @@ async def _search_multi_core(
     # 单路时「预算审批」0.0328 排第 1，五路时「蛋白质折叠」0.0653 反超、真答案
     # 掉到第 2（`tests/test_search_multi.py` 里钉着这个复现）。累加分回答的是
     # "多少条问法都指向它"，而扩展问法只是猜测，票数不该压过用户原话。
-    reserve = min(max(1, (top_k + 1) // 2), len(primary))
+    #
+    # 席位按**候选池**（`want`）而不是 `top_k` 算：扩池时若仍只保 `ceil(top_k/2)`
+    # 席，原始问题自己的第 2、3 名就会在"池子变大"之后被更多扩展路挤出去——
+    # 与保底席位的初衷正好相反。`want == top_k` 时两者是同一个数。
+    reserve = min(max(1, (want + 1) // 2), len(primary))
     reserved = sorted(primary, key=lambda index: (-primary[index], lengths[index]))
     reserved = reserved[:reserve]
     taken = set(reserved)
@@ -2283,4 +2373,4 @@ async def _search_multi_core(
                   key=lambda index: (-fused[index], lengths[index]))
     hits = [_to_hit(index, fused[index], collected, bm25_values, vector_values, method)
             for index in [*reserved, *rest]]
-    return _pick_ordered(hits, top_k)
+    return _pick_ordered(hits, want)

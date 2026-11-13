@@ -203,9 +203,10 @@ def test_search_sources_is_byte_identical_to_baseline(tmp_path, monkeypatch):
     混合检索真正跑起来（有 key、有向量）才有对比价值：只比纯 BM25 的话，
     向量路的截断、排序、`method` 标注都没被覆盖到。
 
-    基线模块的 `EvidenceHit` 没有 `leaf_start/leaf_end`（那是后来两级切块加的），
-    所以拿它的 dump 之前先补上两个 None：比的仍然是逐键逐值，当前实现若在
-    `search_sources` 里把这两个字段填成非 None，`==` 立刻会红。
+    基线模块的 `EvidenceHit` 没有 `leaf_start/leaf_end`（那是后来两级切块加的）、
+    也没有 `rerank_score`（重排加的），所以拿它的 dump 之前先补上三个 None：
+    比的仍然是逐键逐值，当前实现若在 `search_sources` 里把这三个字段填成非 None，
+    `==` 立刻会红。
     """
     baseline = _load_baseline_module(tmp_path)
     _keyed(monkeypatch)
@@ -227,6 +228,7 @@ def test_search_sources_is_byte_identical_to_baseline(tmp_path, monkeypatch):
                 entry = hit.model_dump()
                 entry.setdefault("leaf_start", None)
                 entry.setdefault("leaf_end", None)
+                entry.setdefault("rerank_score", None)
                 expected.append(entry)
             actual = [hit.model_dump()
                       for hit in search_sources(sources, question, top_k)]

@@ -1324,6 +1324,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--hybrid", default="", metavar="0,1")
     parser.add_argument("--parent", default="", metavar="0,1")
     parser.add_argument("--library", default="", metavar="0,1")
+    parser.add_argument("--rerank", choices=("0", "1"), default="0", metavar="0,1",
+                        help="重排开关（默认 0）。**默认关是刻意的**：本文件里记的基线都是"
+                             "关着采的，而线上 `MINDMAP_RERANK` 已默认开——评估必须显式"
+                             "固定这一维，否则同一份配置在有凭证的机器上会读出另一个数，"
+                             "`--check` 会莫名其妙地挂。要看重排的收益就用 --rerank 1 跑一遍"
+                             "再与 --rerank 0 比（两份结果不会自动并列，手工对比）。")
     parser.add_argument("--top-k", default=",".join(str(k) for k in DEFAULT_TOP_K))
     parser.add_argument("--json", metavar="PATH", help="报告落盘（- 表示 stdout）")
     parser.add_argument("--markdown", nargs="?", const="-", metavar="PATH",
@@ -1343,6 +1349,9 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(list(argv) if argv is not None else None)
     top_k = _k_list(args.top_k)
+    # 重排是**环境变量**驱动的（`rerank.enabled()`），而且线上已默认开。评估必须把它
+    # 显式钉住：不钉的话，同一份配置在有凭证的机器上会多跑一次重排、读出另一个数。
+    os.environ["MINDMAP_RERANK"] = args.rerank
     # 默认值分两种情形：平时两套都跑（要看见真实那套），--check 只跑 title（回归门槛）。
     suite = args.suite or ("title" if args.check else "both")
     if args.check and suite == "manual":
@@ -1386,6 +1395,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         dataset = datasets.get(name)
         if dataset is not None and not dataset.cases:
             raise SystemExit(f"{name} 套测试集为空：材料里没有可用章节（检查标题/长度阈值）")
+
+    # 有凭证的机器上，hybrid=1 × 多配置是一个时间陷阱：每个 case 每次检索都要真调
+    # 一次（或两次）embedding 接口，28 条 case × 8 配置足以把一轮推到十分钟以上，
+    # 而多出来的那几行读数在无凭证的机器上根本不存在。跑到超时才反应过来没有意义，
+    # 所以在开跑之前就把代价说清楚。
+    hybrid_rows = sum(1 for config in configs if config.hybrid)
+    if hybrid_rows and embedding_configured():
+        cases = sum(len(dataset.cases) for dataset in datasets.values())
+        print(f"提示：本次 {len(configs)} 个配置里有 {hybrid_rows} 个 hybrid=1，且本机配了"
+              f" embedding 凭证——{cases} 条 case 每条都会真调向量接口。"
+              "只想要可比读数时用 --hybrid 0，或把配置缩到一个（--parent 1 --library 0）。",
+              file=sys.stderr)
 
     bundle = run_suites(datasets, configs, top_k, ladder_suites)
     for name in SUITE_NAMES:
