@@ -49,6 +49,18 @@ DEFAULT_URI = "bolt://127.0.0.1:7687"
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
 
 
+def expect(entities: int, edges: int, isolated: int) -> dict:
+    """`stats()` 的三项核心计数，别名两项固定为 0。
+
+    写成函数而不是每处手抄整字典：实体消解那一轮给 `stats()` 加了 `aliases` /
+    `merged_entities`，散在十几个用例里的字典字面量只能一个个改——一处漏改就会
+    让那条断言在"少一个键"上失败，而失败信息看起来像是图建错了。别名本身的计数
+    在 `tests/test_graph_resolve.py` 里断言。
+    """
+    return {"entities": entities, "edges": edges, "isolated_entities": isolated,
+            "aliases": 0, "merged_entities": 0}
+
+
 def _host_of(uri: str) -> str:
     """从 `bolt://host:7687` 里取 host。够用就行，不做 URI 解析。"""
     return uri.split("://", 1)[-1].split("/", 1)[0].rsplit(":", 1)[0].strip("[]").lower()
@@ -163,7 +175,7 @@ def test_edge_without_type_reuses_typed_entity(graph):
     assert add_edge("甲", "乙", "依赖", source_id="s1",
                     chunk_start=0, chunk_end=10) is True
     # 甲（人物，被复用）+ 乙（无类型，新建）= 2 个实体、0 个孤立。
-    assert stats() == {"entities": 2, "edges": 1, "isolated_entities": 0}
+    assert stats() == expect(2, 1, 0)
     assert [path.nodes for path in neighbors("甲", hops=1)] == [["甲", "乙"]]
     # 边挂的正是那个带类型的节点：直接查一遍库，读接口可能自己做过变换。
     with graph._transaction(read_only=True) as transaction:
@@ -357,11 +369,11 @@ def test_stats_counts_isolated_entities(graph):
     """孤立实体数回答的是"抽出来有没有连上"，不是"抽了多少"。"""
     upsert_entity("孤", "概念")
     add_edge("甲", "乙", "依赖", source_id="s1", chunk_start=0, chunk_end=10)
-    assert stats() == {"entities": 3, "edges": 1, "isolated_entities": 1}
+    assert stats() == expect(3, 1, 1)
 
 
 def test_stats_on_empty_graph_is_zero(graph):
-    assert stats() == {"entities": 0, "edges": 0, "isolated_entities": 0}
+    assert stats() == expect(0, 0, 0)
 
 
 # ------------------------------------------------------------ 6. 批量写入
@@ -394,7 +406,7 @@ def test_bulk_writes_500_edges_quickly(graph):
 
     assert written == 500
     assert elapsed < 10.0
-    assert stats() == {"entities": 1000, "edges": 500, "isolated_entities": 0}
+    assert stats() == expect(1000, 500, 0)
 
 
 def test_bulk_rolls_back_entirely_on_midway_failure(graph, monkeypatch):
@@ -410,7 +422,7 @@ def test_bulk_rolls_back_entirely_on_midway_failure(graph, monkeypatch):
     )
     with pytest.raises(graph_store.GraphStoreError):
         add_edges_bulk(bulk_edges(10))
-    assert stats() == {"entities": 1, "edges": 0, "isolated_entities": 1}
+    assert stats() == expect(1, 0, 1)
 
 
 def test_bulk_rejects_inverted_offsets_before_writing(graph):
@@ -420,7 +432,7 @@ def test_bulk_rejects_inverted_offsets_before_writing(graph):
                            chunk_start=100, chunk_end=10))
     with pytest.raises(ValueError):
         add_edges_bulk(edges)
-    assert stats() == {"entities": 0, "edges": 0, "isolated_entities": 0}
+    assert stats() == expect(0, 0, 0)
 
 
 def test_bulk_skips_self_loops_and_blank_and_counts_written(graph):
@@ -436,7 +448,7 @@ def test_bulk_skips_self_loops_and_blank_and_counts_written(graph):
                   chunk_start=0, chunk_end=10),
     ])
     assert written == 1
-    assert stats() == {"entities": 2, "edges": 1, "isolated_entities": 0}
+    assert stats() == expect(2, 1, 0)
 
 
 def test_bulk_reuses_typed_entity_without_duplicating(graph):
@@ -444,7 +456,7 @@ def test_bulk_reuses_typed_entity_without_duplicating(graph):
     typed = upsert_entity("甲", "人物")
     add_edges_bulk([EdgeInput(src="甲", dst="乙", relation="依赖",
                               source_id="s1", chunk_start=0, chunk_end=10)])
-    assert stats() == {"entities": 2, "edges": 1, "isolated_entities": 0}
+    assert stats() == expect(2, 1, 0)
     with graph._transaction(read_only=True) as transaction:
         record = transaction.run(
             "MATCH (a:Entity)-[r:REL]->() RETURN id(a) AS id").single()
@@ -453,7 +465,7 @@ def test_bulk_reuses_typed_entity_without_duplicating(graph):
 
 def test_bulk_empty_input_is_a_noop(graph):
     assert add_edges_bulk([]) == 0
-    assert stats() == {"entities": 0, "edges": 0, "isolated_entities": 0}
+    assert stats() == expect(0, 0, 0)
 
 
 def test_bulk_is_idempotent_across_reruns(graph):
@@ -461,7 +473,7 @@ def test_bulk_is_idempotent_across_reruns(graph):
     edges = bulk_edges(20)
     assert add_edges_bulk(edges) == 20
     assert add_edges_bulk(edges) == 0
-    assert stats() == {"entities": 40, "edges": 20, "isolated_entities": 0}
+    assert stats() == expect(40, 20, 0)
 
 
 # ------------------------------------------------- 7. 编排入库端到端（真库）
@@ -509,7 +521,7 @@ def test_ingest_writes_the_graph_end_to_end(graph, monkeypatch):
     assert result["failed"] == 0
     assert result["entities"] == 4          # 甲 / 乙 / 丙 / 孤
     assert result["edges"] == 2
-    assert stats() == {"entities": 4, "edges": 2, "isolated_entities": 1}
+    assert stats() == expect(4, 2, 1)
 
     paths = neighbors("甲", hops=2)
     assert [path.nodes for path in paths] == [["甲", "乙"], ["甲", "乙", "丙"]]
@@ -518,7 +530,7 @@ def test_ingest_writes_the_graph_end_to_end(graph, monkeypatch):
     # 重跑一次：零新边，零新实体 —— 幂等是"可以重跑"而不是"最好别重跑"。
     again = asyncio.run(graph_ingest.ingest_graph(source))
     assert again["edges"] == 0
-    assert stats() == {"entities": 4, "edges": 2, "isolated_entities": 1}
+    assert stats() == expect(4, 2, 1)
 
 
 def test_ingest_breaker_trips_on_real_store_failure(graph, monkeypatch):
@@ -553,4 +565,4 @@ def test_ingest_breaker_trips_on_real_store_failure(graph, monkeypatch):
     assert result["failed"] == 3
     assert len(calls) == 3                # 第 4、5 块没有被抽取
     # 整批都回滚了：库里没有任何实体或边。
-    assert stats() == {"entities": 0, "edges": 0, "isolated_entities": 0}
+    assert stats() == expect(0, 0, 0)

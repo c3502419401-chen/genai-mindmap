@@ -56,6 +56,13 @@ def run(coro):
     return asyncio.run(coro)
 
 
+# 空图的完整 `stats()`。别名两项是实体消解那一轮加的：没写过别名时恒为 0，但键必须
+# 一起出现在这里——`stats()` 的返回结构变了，任何按整字典比较的用例都该同时红，
+# 而不是靠"只比三个键"把新字段的回归放过去。
+STATS_EMPTY = {"entities": 0, "edges": 0, "isolated_entities": 0,
+               "aliases": 0, "merged_entities": 0}
+
+
 def fake_chat(monkeypatch, result):
     """替换模型出口，返回调用记录。
 
@@ -166,7 +173,7 @@ def test_unconfigured_writes_raise_graph_store_error():
 def test_unconfigured_reads_return_empty():
     """读接口降级成空值：查询侧不该为"图没建好"准备第二个分支。"""
     assert neighbors("甲", hops=2) == []
-    assert stats() == {"entities": 0, "edges": 0, "isolated_entities": 0}
+    assert stats() == STATS_EMPTY
 
 
 def test_empty_name_is_rejected_before_any_connection():
@@ -237,7 +244,7 @@ def test_unreachable_server_degrades_like_unconfigured(monkeypatch):
     monkeypatch.setattr(graph_store, "ACQUISITION_TIMEOUT_SECONDS", 0.2)
     monkeypatch.setattr(graph_store, "RETRY_TIME_SECONDS", 0.2)
     assert neighbors("甲", hops=1) == []
-    assert stats() == {"entities": 0, "edges": 0, "isolated_entities": 0}
+    assert stats() == STATS_EMPTY
     with pytest.raises(GraphStoreError):
         upsert_entity("甲", "人物")
 
@@ -828,11 +835,13 @@ def test_every_cypher_placeholder_is_bound(monkeypatch):
 def test_walk_query_interpolates_only_clamped_ints():
     """变长路径的唯一一处内插：值只能是 0~MAX_HOPS 的 int。
 
-    这是防注入的正面证据——Cypher 的 `[*1..$hops]` 不接受参数，只能拼字符串，所以
-    "拼进去的东西是什么"必须被钉住。非整数进不去（`int()` 会先抛），超上限也会被夹。
+    这是防注入的正面证据——Cypher 的 `[:REL*1..$hops]` 不接受参数，只能拼字符串，
+    所以"拼进去的东西是什么"必须被钉住。非整数进不去（`int()` 会先抛），超上限也
+    会被夹。类型名 `REL` 是常量拼进去的（不是用户输入），顺带钉住"变长模式限定
+    `:REL`"这件事——不限定类型，`ALIAS_OF` 会变成一跳。
     """
-    assert "[*1..5]-(other" in graph_store._walk_query(999)
-    assert "[*1..3]-(other" in graph_store._walk_query("3")
+    assert "[:REL*1..5]-(other" in graph_store._walk_query(999)
+    assert "[:REL*1..3]-(other" in graph_store._walk_query("3")
     assert graph_store._walk_query(0) == graph_store.CYPHER_WALK.replace("{hops}", "0")
     for hostile in ("1]-(x) DETACH DELETE x //", "2 MATCH (n) DELETE n", None):
         with pytest.raises((TypeError, ValueError)):
