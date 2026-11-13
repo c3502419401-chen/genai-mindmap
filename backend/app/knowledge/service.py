@@ -114,7 +114,9 @@ class EvidenceHit(BaseModel):
     # 模型从父块里引一句与查询无关的话也照样通过逐字校验，`verify_source_refs`
     # 会从"证据核验"退化成"格式检查"。有了子块区间，校验才能问出那句
     # "这条引用落在命中的那 200 字里吗"（见 `optimization/source_refs.py`
-    # 的 `EvidenceSpan`）。没接入校验链之前它们只是两个可读的数字。
+    # 的 `EvidenceSpan`）。它们现在的去处是 `RunContext.evidence`：`tools._rag`
+    # 每检索一次就把这一批转成 `EvidenceSpan` 并进去，生成收尾时统一交给
+    # `verify_source_refs(..., evidence=...)`。
     leaf_start: int | None = None
     leaf_end: int | None = None
 
@@ -689,21 +691,34 @@ def _hybrid_enabled() -> bool:
     return os.getenv(HYBRID_ENV, "1").strip().lower() not in {"0", "off", "false", "no"}
 
 
-# `MINDMAP_PARENT_RETRIEVAL=1` 打开"子块匹配、父块召回"（`search_parent`）。
-# 默认**关**，理由见 `docs/RAG-DECISIONS.md` 第 3 节：现在每次检索都把材料整份
-# 交给模型，父块只是"把模型已经读过的内容再贴一遍"，收益抵不上多一层的复杂度；
-# 这个开关是为建库之后的"只给片段"形态准备的——那时返回的块就是模型能看到
-# 的全部上下文，粒度不够就真的读不懂。
+# `MINDMAP_PARENT_RETRIEVAL` 控制"子块匹配、父块召回"（`search_parent`）。
+#
+# **默认开**。原先默认关的理由（见 `docs/RAG-DECISIONS.md` 第 3 节）是两条前提：
+# ①每次检索都把材料整份交给模型，父块只是"把模型已经读过的内容再贴一遍"；
+# ②父块会让引用链失真——`score` 来自 200 字的子块，`quote` 却是 450–700 字的父块，
+# 模型从父块里挑一句与查询无关的话也照样通过逐字校验。
+#
+# 两条前提现在都不成立了：
+#   - `MINDMAP_SOURCE_MODE` 已默认 `rag`：正文不进 prompt，检索返回的块**就是**模型
+#     能看到的全部上下文，粒度不够就真的读不懂。这条正是原注释说的"这个开关是为
+#     '只给片段'的形态准备的"——那个形态已经是默认形态。
+#   - ②有了对策：命中区间（`leaf_start`/`leaf_end`）会随 hits 一路累积到
+#     `RunContext.evidence`，生成收尾时交给 `verify_source_refs(..., evidence=...)`，
+#     落在父块里但不在命中子块里的引用会被判 `SOURCE_REF_OUTSIDE_EVIDENCE`。
+#     接线在 `tools._rag` → `RunContext.record_evidence` → `_generate` →
+#     `validate_generated_content` 这条链上，**先接线、后翻默认值**的顺序是刻意的：
+#     反过来会有一段时间是"父块模式 + 无防护"。
 PARENT_RETRIEVAL_ENV = "MINDMAP_PARENT_RETRIEVAL"
 
-# 注意这里的判定方向与 `_hybrid_enabled` 相反：那个默认开，所以"不在假值集合里"
-# 就是开；这个默认关，必须**正列举**真值——否则不设变量时默认值会变成开，而
-# "默认关"正是这个开关存在的理由（宿主机的环境变量不该改变默认行为）。
+# 判定方向与 `_hybrid_enabled` 相反这件事没变，但含义反过来了：那个默认开，所以
+# "不在假值集合里"就是开；这个现在也默认开，却仍然**正列举**真值——不设变量时取
+# 默认值 `"1"`，显式写 `0/off/false/no/空串` 一律关。保留正列举的理由是可读性：
+# 谁改了默认值，判定逻辑不用跟着改，改错的表现也只剩"默认值写错了"一种。
 _PARENT_RETRIEVAL_TRUTHY = {"1", "on", "true", "yes"}
 
 
 def _parent_retrieval_enabled() -> bool:
-    return os.getenv(PARENT_RETRIEVAL_ENV, "0").strip().lower() in _PARENT_RETRIEVAL_TRUTHY
+    return os.getenv(PARENT_RETRIEVAL_ENV, "1").strip().lower() in _PARENT_RETRIEVAL_TRUTHY
 
 
 def _bm25_scores(query: str, quotes: list[str]) -> list[float]:
@@ -1212,12 +1227,18 @@ def search_parent(sources: list[Source], query: str, top_k: int = 5, *,
         判断材料够不够，看 `score` 与 `score_bm25` 是否为正、以及命中的父块之间
         是否真的换了话题，不要看条数。
 
-    开关 `MINDMAP_PARENT_RETRIEVAL` 默认 **0**。关着时**直接返回
+    开关 `MINDMAP_PARENT_RETRIEVAL` 默认 **1**（开）。关着时**直接返回
     `search_sources(...)` 的结果**——不是"照着它再实现一遍"，是同一个函数，
     所以逐字段相同由构造保证（`tests/test_parent_retrieval.py` 拿 `f72c14c`
-    的旧模块钉着这条）。默认关的理由见 `docs/RAG-DECISIONS.md` 第 3 节：当前
-    材料整份进 prompt，父块只是把模型读过的内容再贴一遍；这个能力是为建库之后
-    "只给片段"的形态准备的。
+    的旧模块钉着这条）。
+
+    为什么从"默认关"翻成"默认开"：原注释说这个能力是为"只给片段"的形态准备的，
+    那时返回的块就是模型能看到全部上下文，粒度不够就真的读不懂——而
+    `MINDMAP_SOURCE_MODE` 已经默认 `rag`，那个形态就是现在的默认形态。另一半
+    顾虑（父块里与查询无关的段落也能通过逐字校验）已经有对策：命中的子块区间随
+    hits 累积进 `RunContext.evidence`，生成收尾时交给
+    `verify_source_refs(..., evidence=...)` 判 `SOURCE_REF_OUTSIDE_EVIDENCE`。
+    也就是说，"默认开"这件事**依赖**接线先落地，两者不能反过来做。
     """
     if not _parent_retrieval_enabled():
         return search_sources(sources, query, top_k, filters=filters)

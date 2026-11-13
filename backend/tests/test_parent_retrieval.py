@@ -701,17 +701,23 @@ def test_parent_retrieval_with_vectors(monkeypatch):
     assert len(spans) == len(set(spans))
 
 
-def test_parent_switch_is_off_by_default(monkeypatch):
-    """不设变量时是关的：`delenv` 之后 `search_parent` 仍等于 `search_sources`。"""
+def test_parent_switch_is_on_by_default(monkeypatch):
+    """不设变量时是**开**的：`delenv` 之后 `search_parent` 返回父块。
+
+    这一条在翻默认值那一轮从一个"等价"断言变成了"不等价"断言，方向相反且更强：
+    等价断言在默认值错成任何一个方向时都可能通过（只要两条路都退化），而这里先
+    要求两条路**不同**，再要求差异正好是"两级坐标齐备"。
+    """
     monkeypatch.delenv(PARENT_RETRIEVAL_ENV, raising=False)
     sources = _corpus()
-    assert [hit.model_dump() for hit in search_parent(sources, "预算审批", 3)] \
-        == [hit.model_dump() for hit in search_sources(sources, "预算审批", 3)]
-    # 只有显式真值才开：`0` / 空串 / 乱写都当关
+    on = [hit.model_dump() for hit in search_parent(sources, "预算审批", 3)]
+    plain = [hit.model_dump() for hit in search_sources(sources, "预算审批", 3)]
+    assert on != plain, "默认值没生效：默认仍返回单级切块"
+    assert all(hit["leaf_start"] is not None and hit["leaf_end"] is not None for hit in on)
+    # 只有显式假值才关：`0` / 空串 / off / False / 其它非真值都当关
     for value in ("0", "", "off", "False", "2"):
         monkeypatch.setenv(PARENT_RETRIEVAL_ENV, value)
-        assert [hit.model_dump() for hit in search_parent(sources, "预算审批", 3)] \
-            == [hit.model_dump() for hit in search_sources(sources, "预算审批", 3)]
+        assert [hit.model_dump() for hit in search_parent(sources, "预算审批", 3)] == plain
 
 
 # ---------------------------------------------------------------- 7 重叠与去重

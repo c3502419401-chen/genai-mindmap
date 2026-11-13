@@ -64,13 +64,14 @@ from app.generation.service import (
 from app.generation.stream_partial import collect_new_nodes, parse_partial
 from app.knowledge.query_plan import _material_snippets, plan_query
 from app.knowledge.service import (
+    EvidenceHit,
     SourceFilter,
     filter_sources,
     search_multi,
-    search_sources,
+    search_parent,
 )
 from app.optimization.service import check
-from app.optimization.source_refs import annotate_nli
+from app.optimization.source_refs import EvidenceSpan, annotate_nli
 
 logger = logging.getLogger(__name__)
 
@@ -1176,7 +1177,21 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         return _fail("generation_failed", f"生成失败：{exc}")
 
     try:
-        content, diagnostics = validate_generated_content(raw, sources=sources or None)
+        # `evidence` 只在这条链、且只在 `rag` 形态下交出去。
+        #
+        # 为什么按形态门控：`full` 下材料正文整份在 prompt 里，模型引用一段"这次
+        # 检索没命中"的原文是合法且常见的——`full` 形态本来就不该有"你只能引命中
+        # 的那一段"这条约束。不门控的话，`full` + 父块开会把落在父块中非命中段里的
+        # 合法引用判成越界并剔除（`remove_invalid=True`），而用户看不出原因。
+        #
+        # 形态与"检索回什么粒度"无关（`_rag` 里不读 `source_mode()`），两件事各管
+        # 各的：粒度是检索的事，约束是 prompt 形态的事。
+        evidence = (ctx.evidence or None) if source_mode() == SOURCE_MODE_RAG else None
+        # 为空（没检索过、或检索全空）时是 None：`verify_source_refs` 走的是加这个
+        # 参数之前的原路，两条路的差异只有"给了非空证据"这一种
+        # （`tests/test_evidence_wiring.py` 里"空证据等价无证据"钉着逐字节不变）。
+        content, diagnostics = validate_generated_content(
+            raw, sources=sources or None, evidence=evidence)
     except Exception as exc:  # noqa: BLE001 — 校验失败的原因就是要回给模型的文本
         return _fail("invalid_map", f"模型返回的导图不合法：{exc}")
 
@@ -1934,6 +1949,40 @@ def _material_inputs(sources: list[Source]) -> list[str]:
         [f"{source.filename or ''}\n{source.text or ''}" for source in sources])
 
 
+# 回给模型的 `quote` 在父块返回模式下是 450–700 字的父块，而 `SourceRef.quote`
+# 的上限是 300 字（见 `contracts/source.py`）。模型只能截一段抄，而截完就没了
+# 可抄的偏移——自己算的偏移过不了逐字校验。于是父块模式把"带偏移的引用"这条路
+# 整个堵死，`EvidenceSpan` 也就永远没有输入，那半条防护等于没接。
+#
+# 所以这里把**命中的子块**单独给出一组 `evidence_*`，模型抄它就是一条既带偏移、
+# 又落在证据上的引用；从父块里挑别的句子则要么对不上偏移、要么被判越界。
+# 只加在回给模型的 `content` 上，不改 `data["hits"]`：事件流与既有的"命中形状"
+# 断言都按 `EvidenceHit` 的字段走，多两个键会让它们变成两处真相。
+_EVIDENCE_QUOTE_MAX_CHARS = 300
+
+
+def _citable_hits(hits: list[EvidenceHit], sources: list[Source]) -> list[dict[str, Any]]:
+    """把命中翻成回给模型的结构：单级模式下与原来逐字段相同，父块模式多一组证据。
+
+    子块长度理论上可以到 `LEAF_MAX_CHARS = 320`，超过 300 时**不给** `evidence_*`：
+    给了偏移就只能给一段与其不符的 quote（截断后 `quote != text[start:end]`，
+    逐字校验必挂），那比"没有偏移"更糟。这时模型退回"只抄 quote 的连续片段、
+    不写偏移"，与父块模式之前的行为一致。
+    """
+    texts = {source.id: source.text or "" for source in sources}
+    payload: list[dict[str, Any]] = []
+    for hit in hits:
+        entry = hit.model_dump()
+        if hit.leaf_start is not None and hit.leaf_end is not None:
+            quote = texts.get(hit.source_id, "")[hit.leaf_start:hit.leaf_end]
+            if len(quote) <= _EVIDENCE_QUOTE_MAX_CHARS:
+                entry["evidence_start"] = hit.leaf_start
+                entry["evidence_end"] = hit.leaf_end
+                entry["evidence_quote"] = quote
+        payload.append(entry)
+    return payload
+
+
 async def _rag(args: RagArgs, ctx: RunContext) -> ToolResult:
     sources = _pick_sources(ctx, [])
     if not sources:
@@ -1960,7 +2009,12 @@ async def _rag(args: RagArgs, ctx: RunContext) -> ToolResult:
         hits = await search_multi(sources, queries, args.top_k, filters=filters,
                                   hyde=plan.hyde)
     else:
-        hits = search_sources(sources, args.question, args.top_k, filters=filters)
+        # 单路走 `search_parent`：**不在这里再判一次开关**。关着时它内部直接返回
+        # `search_sources(...)` 的结果（同一个函数，逐字段相同由
+        # `tests/test_parent_retrieval.py` 对着 `f72c14c` 钉着），两处各判一次只会
+        # 多出"回了父块却没记叶子区间"这类半开状态。多路那条分支仍是单级切块：
+        # 父块只接在单路上，理由见 `_citable_hits` 的注释。
+        hits = search_parent(sources, args.question, args.top_k, filters=filters)
     if not hits:
         # 过滤把来源筛光与查询没命中，返回给模型的必须是两句不同的话。
         # 都说"没有找到"，模型会以为材料里没有相关内容，进而改用编造或换主题；
@@ -1983,6 +2037,17 @@ async def _rag(args: RagArgs, ctx: RunContext) -> ToolResult:
             data={"hits": [], "method": "lexical"},
         )
 
+    # 命中区间要在**这次运行内**累积：模型可能先问一次、看完再问第二次，引用
+    # 来自任何一次都算数，而校验发生在生成收尾时、只剩一个 `ctx` 可读。
+    # 转换写在 agent 层（一行 `EvidenceSpan`），不在 `source_refs` 里做：那一层是
+    # 后处理，不该为了两个整数去 import 60KB 的检索模块（见 `EvidenceSpan` 的
+    # docstring）。`_rag` 的两条早退路径（没来源、没命中）都到不了这里，所以证据
+    # 集里不会混进"没找到"的空批次。
+    ctx.record_evidence([
+        EvidenceSpan(hit.source_id, hit.start, hit.end, hit.leaf_start, hit.leaf_end)
+        for hit in hits
+    ])
+
     # 回给模型的是结构化 JSON：它要能拿到 source_id 与偏移，才能在引用里指准。
     # `method` 由每条命中的实际取值汇总，不再写死 lexical——混合检索生效时写死
     # 会让模型以为这批片段只做了关键词匹配。只要有任意一条走了向量路，本轮就是
@@ -1990,7 +2055,7 @@ async def _rag(args: RagArgs, ctx: RunContext) -> ToolResult:
     hits_data = [hit.model_dump() for hit in hits]
     return ToolResult(
         ok=True,
-        content=json.dumps(hits_data, ensure_ascii=False),
+        content=json.dumps(_citable_hits(hits, sources), ensure_ascii=False),
         data={
             "hits": hits_data,
             "method": "hybrid" if any(hit.method == "hybrid" for hit in hits) else "lexical",

@@ -675,7 +675,7 @@ def _execute_rag(ctx: RunContext, **arguments):
 def test_rag_distinguishes_filtered_out_from_no_hit(monkeypatch):
     """过滤筛光与查询没命中要返回两句不同的话——模型看不到日志，只能靠这句话。"""
     source = _source("预算审批流程由张三发起。", author="张三")
-    monkeypatch.setattr(agent_tools, "search_sources", lambda *a, **k: [])
+    monkeypatch.setattr(agent_tools, "search_parent", lambda *a, **k: [])
 
     filtered = _execute_rag(_ctx([source]), question=QUERY,
                             filters={"author": "查无此人"})
@@ -703,7 +703,7 @@ def test_rag_forwards_filters_as_source_filter(monkeypatch):
         captured.update(copied)
         return []
 
-    monkeypatch.setattr(agent_tools, "search_sources", fake_search)
+    monkeypatch.setattr(agent_tools, "search_parent", fake_search)
     result = _execute_rag(_ctx([source]), question=QUERY,
                           filters={"author": "张三", "tags": [" 预算 ", "预算"]})
 
@@ -721,7 +721,7 @@ def test_rag_without_filters_passes_none(monkeypatch):
         captured["filters"] = filters
         return []
 
-    monkeypatch.setattr(agent_tools, "search_sources", fake_search)
+    monkeypatch.setattr(agent_tools, "search_parent", fake_search)
     _execute_rag(_ctx([_source("预算审批流程说明。")]), question=QUERY)
     assert captured["filters"] is None
 

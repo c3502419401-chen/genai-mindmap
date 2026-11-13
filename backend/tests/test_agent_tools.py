@@ -1404,7 +1404,9 @@ class RagToolTest(unittest.TestCase):
         source = Source(kind=SourceKind.text, status="parsed", text="abc")
         for expected, hits in (("hybrid", [hit("hybrid")]), ("lexical", [hit("lexical")])):
             ctx = _ctx(intent="expand", sources=[source])
-            with patch("app.agent.tools.search_sources", return_value=hits):
+            # 单路检索走 `search_parent`（关着时它内部就是 `search_sources`），
+            # 所以打桩要打这一层：打 `search_sources` 打不到 `_rag` 直接调的那个名字。
+            with patch("app.agent.tools.search_parent", return_value=hits):
                 result = _run(build_registry("expand", has_sources=True).execute(
                     _call("rag_query", question="abc"), ctx))
             self.assertEqual(result.data["method"], expected)

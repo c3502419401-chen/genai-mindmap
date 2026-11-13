@@ -475,12 +475,16 @@ def test_one_route_hitting_429_degrades_to_bm25(monkeypatch):
 # ---------------------------------------------------------------- 11/12 _rag 接入
 
 
-def test_rag_without_plan_calls_search_sources_only(monkeypatch):
-    """`plan is None` 时走原来那条分支：一次 search_sources、零次 search_multi。"""
+def test_rag_without_plan_uses_single_search_only(monkeypatch):
+    """`plan is None` 时走单路检索：一次 `search_parent`、零次 `search_multi`。
+
+    打桩打 `search_parent` 而不是 `search_sources`：`_rag` 直接调的是前者，开关
+    关着时它内部才转到后者——打内层等于绕过了 `_rag` 的真实调用点。
+    """
     sources = _four_sources()
     ctx = _ctx(sources)
     with patch.object(agent_tools, "plan_query", AsyncMock(return_value=None)), \
-         patch.object(agent_tools, "search_sources", return_value=[]) as single, \
+         patch.object(agent_tools, "search_parent", return_value=[]) as single, \
          patch.object(agent_tools, "search_multi", AsyncMock()) as multi:
         result = run(agent_tools.build_registry("expand", has_sources=True).execute(
             _rag_call("预算审批"), ctx))
@@ -500,7 +504,7 @@ def test_rag_with_llm_plan_uses_multi_and_keeps_the_original_question(monkeypatc
         source="llm",
     )
     with patch.object(agent_tools, "plan_query", AsyncMock(return_value=plan)), \
-         patch.object(agent_tools, "search_sources") as single, \
+         patch.object(agent_tools, "search_parent") as single, \
          patch.object(agent_tools, "search_multi", AsyncMock(return_value=[])) as multi:
         result = run(agent_tools.build_registry("expand", has_sources=True).execute(
             _rag_call("预算审批"), ctx))

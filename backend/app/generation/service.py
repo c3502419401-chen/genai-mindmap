@@ -6,7 +6,7 @@ import logging
 import math
 import os
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from copy import deepcopy
 from typing import Any
 from uuid import uuid4
@@ -22,7 +22,7 @@ from app.contracts.mindmap import (
     Node,
 )
 from app.contracts.source import Source, SourceUsage
-from app.optimization.source_refs import verify_source_refs
+from app.optimization.source_refs import EvidenceSpan, verify_source_refs
 
 # 单次模型调用的超时（秒）与响应体上限（字节）：超时避免请求无限挂起，
 # 上限避免异常响应把内存读满。
@@ -275,6 +275,13 @@ RAG_SOURCE_PROMPT = DETAIL_PROMPT + (
     "不要自己算。"
     "source_id 用返回的 source_id；quote 用返回的 quote，整段照抄时连着 start、end "
     "一起照抄。"
+    # 父块返回模式下 hit 的 quote 是 450–700 字的父块，超过 300 字的上限就只能截段，
+    # 而截完没有偏移可抄——校验于是只剩"逐字在原文里"，落没落在命中的那一段查不出来。
+    # `evidence_*` 就是给这条路准备的：它是命中的那一小段（约 200 字，带绝对值偏移），
+    # 抄它既过逐字校验、又过"落在证据上"那道。
+    "返回里如果还带 evidence_start / evidence_end / evidence_quote，优先用这一组："
+    "start、end、quote 分别抄它们的值——那是这次检索真正命中的那一小段，"
+    "引用必须落在它上面。"
     "返回的 quote 超过 300 字（引用字段的长度上限）时，只截取其中连续的、不超过 300 "
     "字的一段，这时不要写 start 和 end——偏移自己算是算不准的，而只给 quote 时"
     "只要求它逐字出现在原文里。\n"
@@ -700,6 +707,7 @@ def _branch_shortfall(count: int) -> GenerationError:
 def validate_generated_content(
     result: Any, *, sources: list[Source] | None = None,
     enforce_min_branches: bool = True,
+    evidence: Sequence[EvidenceSpan] | None = None,
 ) -> tuple[MindMapContent, list[Diagnostic]]:
     """以真实输入重建来源摘要，剔除模型伪造的关联，再执行契约与原文校验。
 
@@ -709,6 +717,11 @@ def validate_generated_content(
 
     `enforce_min_branches` 是**质量**门槛而不是契约门槛：模型整图生成要求一级
     分支不少于 `MIN_BRANCHES` 条，demo 占位结构与用户已保存的旧图不走这道关。
+
+    `evidence` 是本次运行累积的命中区间（`RunContext.evidence`），只在这条链上
+    传：它回答的是"这条引用落在检索命中的那一段里吗"，而不是"逐字在不在原文里"。
+    不给（或给空序列）时与加这个参数之前**逐字节一致**——`full` 形态下模型看得见
+    全文，引用任何段落都是合法的，那条路本来就不该带这个约束。
     """
     raw = deepcopy(result)
     diagnostics: list[Diagnostic] = []
@@ -749,7 +762,12 @@ def validate_generated_content(
     if enforce_min_branches and len(content.root.children) < MIN_BRANCHES:
         raise _branch_shortfall(len(content.root.children))
     if sources is not None:
-        diagnostics.extend(verify_source_refs(content, sources, remove_invalid=True))
+        # `evidence or None`：空序列与"没给"必须是同一条路。留着空列表会让
+        # `verify_source_refs` 进到"有 evidence"的分支，虽然判定结果相同，但
+        # "这条链有没有接上"就被这个细节绑住了——接线的可观测差异只该来自
+        # 非空证据。
+        diagnostics.extend(verify_source_refs(
+            content, sources, remove_invalid=True, evidence=evidence or None))
     return content, diagnostics
 
 

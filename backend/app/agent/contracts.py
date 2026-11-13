@@ -9,8 +9,9 @@
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
-from typing import Annotated, Any, Awaitable, Callable, Literal, Protocol, Union
+from typing import Annotated, Any, Awaitable, Callable, Iterable, Literal, Protocol, Union
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -23,6 +24,16 @@ from app.generation.service import (
     ensure_input_within_context,
     source_mode,
 )
+from app.optimization.source_refs import EvidenceSpan
+
+logger = logging.getLogger(__name__)
+
+# 一次运行最多保留多少条命中区间。模型可能反复调 `rag_query`（改一条长材料时
+# 实测能刷十几次），不设上限就是"内存随运行时长线性增长"。200 条覆盖 40 次
+# `top_k=5` 的检索；超了丢**最旧**的，因为引用校验只需要"这条引用落在哪次命中
+# 的哪一段"，而模型总是先检索、后生成——最旧的条目被丢时，对应的引用通常已经
+# 写完了。丢的时候记 debug：这是容量策略生效，不是错误。
+MAX_EVIDENCE_SPANS = 200
 
 
 # ---------------------------------------------------------------- 预算
@@ -215,6 +226,47 @@ class RunContext:
     # 必须与加通道之前**逐字相同**（连流式请求都不发）。判空只在
     # `tools._emit_grow` 与 `tools._GrowStream` 的入口处做一次。
     emit: EmitFn | None = None
+    # 本次运行累积的命中区间（`tools._rag` 每检索一次并一批进来）。它是
+    # `verify_source_refs(..., evidence=...)` 的唯一输入，也是"父块模式"下唯一能
+    # 区分"引用落在命中的子块里"与"引用落在父块里与查询无关的一半"的东西。
+    #
+    # 为什么存在这里而不是 `ToolResult.data`：hits 只活在 `_rag` 的返回值里，而
+    # 校验发生在 `mindmap_generate` 收尾（`validate_generated_content`），中间隔着
+    # 整个循环。`ToolResult.data` 是**一次调用**的产物，循环从不汇总它；要汇总就得
+    # 在 `service.run()` 里按工具名特判 `data["hits"]` 的形状，等于让循环认识检索
+    # 工具的私有字段。`RunContext` 本来就是"跨轮存活的可变状态"，证据正好是这种
+    # 东西，且 `_rag` 与 `_generate` 拿的是同一个 ctx，不需要任何新管道。
+    evidence: list[EvidenceSpan] = field(default_factory=list)
+
+    def record_evidence(self, spans: Iterable[EvidenceSpan]) -> None:
+        """把一批命中区间并进本次运行的证据集：去重、限量、丢最旧。
+
+        去重键是 `(source_id, start, end, leaf_start, leaf_end)`——比"父块三元组"
+        多两位，理由是可证伪的：同一个父块被两次不同问法命中时，两次命中的**子块**
+        往往不同（父块 450–700 字，子块 200 字上下，一个父块 2–4 个子块），而校验
+        问的正是"这条引用落在哪个子块里"。只按父块区间去重会把后一次的叶子区间
+        丢掉，那条本来合法的引用随后被判成"落在父块里与查询无关的部分"——用一次
+        去重换来一次系统性误伤，代价方向完全错了。重试同一次检索时两个叶子区间
+        也相同，所以"同一批 hits 累两次只有一份"照样成立。
+
+        逐出策略是 FIFO 而不是"拒绝新增"：新证据总是比旧证据有用（模型刚检索完
+        就会写引用），而拒绝新增会让长循环里后面所有引用都失去校验依据。
+        """
+        seen = {
+            (span.source_id, span.start, span.end, span.leaf_start, span.leaf_end)
+            for span in self.evidence
+        }
+        for span in spans:
+            key = (span.source_id, span.start, span.end, span.leaf_start, span.leaf_end)
+            if key in seen:
+                continue
+            seen.add(key)
+            self.evidence.append(span)
+        overflow = len(self.evidence) - MAX_EVIDENCE_SPANS
+        if overflow > 0:
+            del self.evidence[:overflow]
+            logger.debug("证据区间达到 %d 条上限，丢弃最旧的 %d 条",
+                         MAX_EVIDENCE_SPANS, overflow)
 
     def reserve_model_call(self) -> bool:
         """占掉一次模型调用额度，拿不到返回 False。

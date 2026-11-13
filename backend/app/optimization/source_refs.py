@@ -119,9 +119,13 @@ def verify_source_refs(content: MindMapContent, sources: list[Source], *,
     `evidence` 是**可选**的两级命中区间，用于父块返回模式（`search_parent`）：
     给了它，落在命中父块里、但与子块区间没有交集的引用会被判为
     `SOURCE_REF_OUTSIDE_EVIDENCE`（判定规则见 `_evidence_problem`）。不给时
-    逐字节等同于加这个参数之前的行为——现在没有调用方传它：hits 还只活在
-    `rag_query` 的返回里，没有进到这条校验链上。等 `search_parent` 接入
-    `_rag` 时，调用方把 hits 转成 `EvidenceSpan` 传进来即可，不需要再动这里。
+    逐字节等同于加这个参数之前的行为。
+
+    唯一接线点是生成链：`tools._rag` 把每次检索的命中区间累积进
+    `RunContext.evidence`，`tools._generate` 再交给
+    `generation.service.validate_generated_content(..., evidence=...)`，由它转到这里。
+    `optimization/service.py::check()` 那条诊断路径**不传**——它是只读体检，
+    没有"本次运行"这个概念；`full` 形态也不传，那里的模型看得见全文。
     """
     by_id = {source.id: source for source in sources}
     if len(by_id) != len(sources):
