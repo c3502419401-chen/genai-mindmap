@@ -69,7 +69,7 @@
 两者一起看才分得出"命中一段就收工"（recall 高、coverage 低）与"真把整章召回"
 （两者都高）。只看 recall，会把"父块够大、随便沾一点就算命中"的退化当成进步。
 
-## 两套测试集：`--suite title|manual|both`
+## 三套测试集：`--suite title|manual|crossdoc|both`
 
 `title` 套就是上面那套（标题当 query）。它有一个结构性偏差：标题是章节的第一行，
 query 的每个 bigram 都在目标区间里，于是 `R@3/5/10` 全饱和、三列判别力为零。
@@ -78,9 +78,16 @@ query 的每个 bigram 都在目标区间里，于是 `R@3/5/10` 全饱和、三
 真实提问，按近/中/远三档与章/段/跨章三种粒度标注）。它量的是"真实提问下检索还剩
 多少"，数字比 `title` 套低 20pp 上下——那是难度差，不是检索退步。
 
-**两套分别算指标，绝不混在一起平均**：混算出来的均值既不是"标题查询"的分数，也不是
-"真实提问"的分数，两套 20pp 的难度差会被一个看似合理的中间数掩掉。报告里它们是
-`suites.title` / `suites.manual` 两个并列对象。
+`crossdoc` 套是 `scripts/eval_cases_crossdoc.py` 里 14 条**必须两份以上材料才能答完**
+的问法，专为量图检索（`MINDMAP_GRAPH_SEARCH`）而建：manual 那套 28 条里 26 条只指向
+一份材料，那个形状测不出桥接价值。它只在 `--suite crossdoc` 时跑——读数取决于图里
+有什么（那是跨机器的外部状态），并进默认回归会让 `--check` 依赖一台跑着的 Neo4j。
+报告里除了四类常规指标，还多一节 `crossdoc`（`doc_cover` / `bridge` / `full_bridge`，
+见 `crossdoc_metrics`）。
+
+**各套分别算指标，绝不混在一起平均**：混算出来的均值既不是"标题查询"的分数，也不是
+"真实提问"的分数，几套 20pp 的难度差会被一个看似合理的中间数掩掉。报告里它们是
+`suites.title` / `suites.manual` / `suites.crossdoc` 几个并列对象。
 
 `manual` 套的 `source_hash` 对着 `MANUAL_SOURCE_HASHES` 校验：材料正文一变，
 **直接报错退出**，不跳过。跳过会让"标注失效"伪装成"指标掉了 10pp"。
@@ -104,6 +111,7 @@ query 的每个 bigram 都在目标区间里，于是 `R@3/5/10` 全饱和、三
     cd backend
     python scripts/evaluate_retrieval.py                     # 两套并列（默认 --suite both）
     python scripts/evaluate_retrieval.py --suite manual      # 只看手写那套
+    python scripts/evaluate_retrieval.py --suite crossdoc    # 只看跨文档那套（要 Neo4j）
     python scripts/evaluate_retrieval.py --json out.json     # 报告落盘
     python scripts/evaluate_retrieval.py --markdown -        # 贴进 docs 的表 + 基线块
     python scripts/evaluate_retrieval.py --check             # 与基线比 title 套，掉超 2pp 退出码 1
@@ -141,6 +149,7 @@ if str(BACKEND) not in sys.path:
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+import eval_cases_crossdoc as crossdoc_cases  # noqa: E402
 import eval_cases_manual as manual_cases  # noqa: E402
 from app.contracts.source import Source, SourceKind  # noqa: E402
 from app.ingestion.service import parse_bytes, parse_text  # noqa: E402
@@ -202,7 +211,19 @@ REPORT_SCHEMA = "retrieval-eval/v2"
 """v2：外层多了 `suites`（两套并列）。v1 是单套报告，`baseline_from_markdown` 仍认。"""
 
 SUITE_NAMES = ("title", "manual")
-"""两套的名字与固定顺序。顺序进报告与控制台：先回归那套，再看真实那套。"""
+"""默认两套的名字与固定顺序。顺序进报告与控制台：先回归那套，再看真实那套。
+
+`crossdoc` **不在**这里：它是本轮为量图检索而新加的一套，只由 `--suite crossdoc`
+显式触发。放进默认列表会改掉 `--suite both` 的契约（两套并列、57 条），而那条契约
+已经被 `test_retrieval_eval_manual.py` 钉住——更要紧的是，跨文档套的价值取决于
+「图里到底有什么」，把它并进默认回归等于让每次 `--check` 都依赖一台跑着的 Neo4j。
+"""
+
+EXTRA_SUITE_NAMES = ("crossdoc",)
+"""只在显式指定时跑的套。`run_suites` 与报告渲染都按 `SUITE_NAMES + EXTRA_SUITE_NAMES`
+遍历，所以加一套不需要再改两处循环。"""
+
+ALL_SUITE_NAMES = (*SUITE_NAMES, *EXTRA_SUITE_NAMES)
 
 DEFAULT_BASELINE = REPO / "docs" / "RETRIEVAL-EVAL.md"
 
@@ -271,8 +292,14 @@ class Config:
 class Dataset:
     """测试集：case 列表 + 材料清单 + 每份材料的结构统计（都进报告）。
 
-    `suite` 标明这套 case 是怎么来的（`title` / `manual`），`annotations` 放手写套
-    自己的元数据（词面重合统计）：`title` 套是结构派生的，没有可注明的东西。
+    `suite` 标明这套 case 是怎么来的（`title` / `manual` / `crossdoc`），`annotations`
+    放手写套自己的元数据（词面重合统计）：`title` 套是结构派生的，没有可注明的东西。
+
+    `crossdoc` 只有跨文档套才非空：每条是 `{query, materials, per_material, overlap,
+    why}`，`materials` 是这条 case 涉及的**材料指纹**（≥2 个），`per_material` 是
+    `{指纹: [(start, end), ...]}`。`cases` 里那条 case 被摊成了多条 `EvalCase`
+    （一条 query × 一份材料），所以「跨了几份材料」这件事在 `cases` 上已经看不出来
+    ——它必须留在这里，`crossdoc_metrics` 靠它算覆盖份数。
     """
 
     cases: list[EvalCase]
@@ -280,6 +307,7 @@ class Dataset:
     stats: dict[str, dict]
     suite: str = "title"
     annotations: dict = field(default_factory=dict)
+    crossdoc: list[dict] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------- 区间运算
@@ -572,6 +600,208 @@ def build_manual_dataset(materials: Sequence[Material]) -> Dataset:
                    suite="manual", annotations=annotations)
 
 
+# ---------------------------------------------------------------- 跨文档测试集装载
+
+
+def _crossdoc_spans(target, material: Material, entries) -> list[tuple[int, int]]:
+    """把一条 `CrossTarget` 解析成 `relevant` 区间（已合并）。
+
+    与 `_manual_spans` 同一套纪律，只是没有 `distance` / `granularity` 两种元数据：
+    跨文档套的每一条目标**各自**决定是整章还是章内某段（有 `focus` 就是段）。
+    任何一步对不上都抛 `SystemExit`——标注与正文是一对一绑死的，对不上说明标注过期，
+    此时唯一正确的动作是让人回去重标，不是跳过。
+    """
+    text = material.text
+    matches = [entry for entry in entries if entry.title.startswith(target.section)]
+    if len(matches) != 1:
+        raise SystemExit(
+            f"跨文档用例的章节前缀命中 {len(matches)} 个（要恰好 1 个）："
+            f"{target.material} /「{target.section}」")
+    entry = matches[0]
+    span = (entry.start, min(entry.start + entry.coverage, len(text)))
+    if not target.focus:
+        return [span]
+    found = text.count(target.focus)
+    if found != 1:
+        raise SystemExit(
+            f"跨文档用例的锚点命中 {found} 次（要恰好 1 次）："
+            f"{target.material} /「{target.focus}」")
+    start = text.index(target.focus)
+    if not span[0] <= start < span[1]:
+        raise SystemExit(
+            f"跨文档用例的锚点不在目标章节内：{target.material} /「{target.focus}」")
+    end = start + target.chars
+    if end > span[1]:
+        raise SystemExit(
+            f"跨文档用例的锚点离章末太近（{target.chars} 字的标注段会越界）："
+            f"{target.material} /「{target.focus}」")
+    return [(start, end)]
+
+
+def build_crossdoc_dataset(materials: Sequence[Material]) -> Dataset:
+    """装载 `eval_cases_crossdoc.py` 那 14 条跨文档 case。
+
+    三道校验与 manual 套共用同一批指纹与同一套报错口径：材料不在集里报错、正文变了
+    报错（不跳过）、前缀/锚点对不上报错。
+
+    **一条 case 摊成多条 `EvalCase`**（query × 每份目标材料一条）。这个摊法是刻意的：
+    `evaluate_case` 只认一份材料，而"两段证据各命中没命中"本来就是要分开算的两个
+    问题——摊开之后 `recall@k` 自然变成"两条证据命中了几条"的平均，不需要给
+    `EvalCase` 加一个会污染 title/manual 两套的多目标字段。真正的跨文档指标
+    （覆盖了几份材料）由 `crossdoc_metrics` 在 `crossdoc` 上算。
+    """
+    by_ref = {material.ref: material for material in materials}
+    missing = [ref for ref in crossdoc_cases.CROSSDOC_SOURCE_HASHES if ref not in by_ref]
+    if missing:
+        raise SystemExit(
+            "跨文档套需要的材料不在本次材料集里：\n  "
+            + "\n  ".join(missing)
+            + "\n跨文档 case 只对这四份 md 标注，换材料请先补标注。")
+
+    drifted = [
+        (ref, expected, by_ref[ref].content_hash)
+        for ref, expected in crossdoc_cases.CROSSDOC_SOURCE_HASHES.items()
+        if by_ref[ref].content_hash != expected
+    ]
+    if drifted:
+        detail = "\n  ".join(
+            f"{ref}\n    登记 {expected[:16]}…  实际 {actual[:16]}…"
+            for ref, expected, actual in drifted)
+        raise SystemExit(
+            "材料正文变了，跨文档套的标注已失效（不跳过，直接报错）：\n  "
+            + detail
+            + "\n请重读材料、复核 relevant 区间与问法，再把新指纹写回 "
+              "scripts/eval_cases_manual.py 的 MANUAL_SOURCE_HASHES（两套共用那张表）。")
+
+    entries_by_ref = {
+        ref: heading_outline([material.source], max_items=10 ** 6)
+        for ref, material in by_ref.items()
+    }
+    cases: list[EvalCase] = []
+    groups: list[dict] = []
+    overlaps: list[float] = []
+    material_counts: dict[str, int] = {ref: 0 for ref in crossdoc_cases.CROSSDOC_SOURCE_HASHES}
+    for case in crossdoc_cases.CASES:
+        if not crossdoc_cases.is_cross_document(case):
+            raise SystemExit(f"跨文档用例只涉及一份材料（应 ≥2 份）：{case.query}")
+        per_material: dict[str, list[tuple[int, int]]] = {}
+        texts: list[str] = []
+        for target in case.targets:
+            material = by_ref[target.material]
+            spans = _crossdoc_spans(target, material, entries_by_ref[target.material])
+            per_material.setdefault(material.content_hash, []).extend(spans)
+            texts.extend(material.text[start:end] for start, end in spans)
+            cases.append(EvalCase(query=case.query, source_hash=material.content_hash,
+                                  relevant=spans))
+        for fingerprint in per_material:
+            for ref, material in by_ref.items():
+                if material.content_hash == fingerprint:
+                    material_counts[ref] += 1
+                    break
+        ratio = crossdoc_cases.overlap_ratio(case.query, "".join(texts))
+        overlaps.append(ratio)
+        groups.append({
+            "query": case.query,
+            "materials": sorted(per_material),
+            "per_material": {fingerprint: per_material[fingerprint]
+                             for fingerprint in sorted(per_material)},
+            "targets": [
+                {"material": target.material, "section": target.section,
+                 "focus": target.focus}
+                for target in case.targets
+            ],
+            "overlap": round(ratio, 6),
+            "why": case.why,
+        })
+
+    stats: dict[str, dict] = {}
+    for ref, material in by_ref.items():
+        stats[ref] = {
+            "ref": ref,
+            "content_hash": material.content_hash,
+            "chars": len(material.text),
+            "outline_entries": len(entries_by_ref[ref]),
+            "eligible_sections": material_counts[ref],
+            "cases": material_counts[ref],
+        }
+
+    mean = sum(overlaps) / len(overlaps) if overlaps else 0.0
+    annotations = {
+        "overlap_mean": round(mean, 6),
+        "overlap_min": round(min(overlaps), 6) if overlaps else 0.0,
+        "overlap_max": round(max(overlaps), 6) if overlaps else 0.0,
+        "cases": groups,
+        "case_count": len(crossdoc_cases.CASES),
+        "pair_count": len(cases),
+        "materials_per_case": round(
+            sum(len(group["materials"]) for group in groups) / len(groups), 3)
+        if groups else 0.0,
+    }
+    return Dataset(cases=cases, materials=list(materials), stats=stats,
+                   suite="crossdoc", annotations=annotations, crossdoc=groups)
+
+
+def crossdoc_metrics(
+    dataset: Dataset,
+    config: Config,
+    top_k: Sequence[int],
+    id_map: dict[str, str],
+    *,
+    cache: dict[str, list[tuple[str, int, int]]] | None = None,
+) -> dict[str, dict]:
+    """跨文档指标：一行检索结果覆盖了几份目标材料。
+
+    三个口径一起报，因为「覆盖了几份材料」有强弱两种读法，差的正是这套件想量的东西：
+
+      - `doc_cover@k`：top-k 命中**提到了**几份目标材料（只要指纹对得上就算，不管落在
+        材料里哪一段）。**宽松**，也最容易虚高：命中同一份材料里的无关章节同样算数。
+      - `bridge@k`：top-k 里**落在 relevant 区间**的命中覆盖了几份目标材料（
+        `hit_is_relevant` 同一判据）。这才是"桥"——两份材料的正确位置都拿到了。
+      - `full_bridge@k`：`bridge@k == 1.0` 的 case 比例，即真正的**跨文档命中率**：
+        一次检索把两份材料各自该去的地方都覆盖到了。
+
+    都按 case 平均。分母是该 case 的**目标材料份数**（本套恒为 2，但公式不假设它）。
+    空 `crossdoc`（title / manual 套）返回 `{}`，报告里就不会有这一节。
+    """
+    groups = dataset.crossdoc
+    if not groups:
+        return {}
+    ks = sorted({int(value) for value in top_k})
+    depth = max(ks)
+    hits_cache = cache if cache is not None else {}
+    rows: dict[int, list[tuple[float, float, float]]] = {k: [] for k in ks}
+    for group in groups:
+        if group["query"] not in hits_cache:
+            hits_cache[group["query"]] = _ranked_hits(
+                dataset, config, group["query"], depth, id_map)
+        hits = hits_cache[group["query"]][:depth]
+        per_material = group["per_material"]
+        total = len(per_material) or 1
+        for k in ks:
+            window = hits[:k]
+            mentioned = {fingerprint for fingerprint, _s, _e in window
+                         if fingerprint in per_material}
+            strict = {
+                fingerprint for fingerprint, start, end in window
+                if fingerprint in per_material
+                and hit_is_relevant((start, end), per_material[fingerprint])
+            }
+            rows[k].append((
+                len(mentioned) / total,
+                len(strict) / total,
+                1.0 if len(strict) == len(per_material) else 0.0,
+            ))
+    metrics: dict[str, dict] = {}
+    for k in ks:
+        values = rows[k]
+        metrics[str(k)] = {
+            "doc_cover": round(sum(v[0] for v in values) / len(values), 6),
+            "bridge": round(sum(v[1] for v in values) / len(values), 6),
+            "full_bridge": round(sum(v[2] for v in values) / len(values), 6),
+        }
+    return metrics
+
+
 # ---------------------------------------------------------------- 材料装载
 
 
@@ -696,24 +926,45 @@ def _env(**values: str) -> Iterator[None]:
                 os.environ[name] = old
 
 
+PERSIST_DB_ENV = "MINDMAP_EVAL_DB_PATH"
+"""把材料入库到**固定库**而不是临时库。只在量图检索时用。
+
+为什么非它不可：图上的每条边存的是**入库那一刻**的持久 `source_id`，而
+`library.ingest` 的 id 是 `uuid4`（同一个正文在两个库里是两个 id）。默认的临时库
+每次换路径，于是图证据的 `source_id` 在 `library.load` 里查不到，`_Resolver` 把它
+整条丢掉——`--graph 1` 会与 `--graph 0` 逐位相同，而且**看不出原因**（丢证据是
+`logger.debug`）。所以建图与评估必须指同一个库文件：建图那一刻 `MINDMAP_DB_PATH`
+指哪，评估就把它写进 `MINDMAP_EVAL_DB_PATH`。
+"""
+
+
 @contextmanager
 def _id_space(materials: Sequence[Material], *, need_library: bool) -> Iterator[dict[str, str]]:
-    """给出 `source_id → 指纹` 的映射；需要时把材料入库到临时库并并进同一个映射。
+    """给出 `source_id → 指纹` 的映射；需要时把材料入库到（临时或固定）库。
 
     这是整条链路最容易出错的地方：请求内 `Source.id` 是 uuid4，库命中的 `source_id`
     是持久 id，两套身份指向同一份正文。`EvalCase` 只认 `content_hash`，所以两个
     id 空间都得登记——漏了任何一个，那批命中都会因为"查不到指纹"被静默判成别的
     材料（`library=False` 时 id_map 为空，就是把全部 recall 变成 0 的那个 bug）。
 
-    库落临时目录、跑完删掉：**不碰** `backend/data/mindmaps.db`。
+    默认库落临时目录、跑完删掉：**不碰** `backend/data/mindmaps.db`。设了
+    `MINDMAP_EVAL_DB_PATH` 就改用那个文件并且**不删**（理由见那个常量）——重复
+    `ingest` 同一份正文是幂等的（`UNIQUE(content_hash)`），所以多条 case 共用它安全。
     """
     id_map = {material.source.id: material.content_hash for material in materials}
     if not need_library:
         yield id_map
         return
-    work = Path(tempfile.mkdtemp(prefix="retrieval-eval-"))
+    persistent = os.getenv(PERSIST_DB_ENV, "").strip()
+    work = None
+    if persistent:
+        db_path = Path(persistent)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        work = Path(tempfile.mkdtemp(prefix="retrieval-eval-"))
+        db_path = work / "library.db"
     previous = os.environ.get("MINDMAP_DB_PATH")
-    os.environ["MINDMAP_DB_PATH"] = str(work / "library.db")
+    os.environ["MINDMAP_DB_PATH"] = str(db_path)
     try:
         for material in materials:
             id_map[knowledge_library.ingest(material.source)] = material.content_hash
@@ -723,8 +974,10 @@ def _id_space(materials: Sequence[Material], *, need_library: bool) -> Iterator[
             os.environ.pop("MINDMAP_DB_PATH", None)
         else:
             os.environ["MINDMAP_DB_PATH"] = previous
+        if work is None:
+            return
         for suffix in ("", "-journal", "-wal", "-shm"):
-            candidate = Path(f"{work / 'library.db'}{suffix}")
+            candidate = Path(f"{db_path}{suffix}")
             if candidate.exists():
                 candidate.unlink()
         try:
@@ -796,7 +1049,7 @@ def score_config(
                 sum(scores[depth]["recall"] for scores in bucket) / len(bucket), 6),
         }
 
-    return {
+    result = {
         "label": config.label(),
         "source_mode": config.source_mode,
         "hybrid": config.hybrid,
@@ -806,6 +1059,13 @@ def score_config(
         "metrics": metrics,
         "by_material": by_material,
     }
+    # 跨文档套额外算一组「覆盖了几份材料」：`cases` 已经被摊成 (query × 材料) 对，
+    # 那一侧的 recall 只回答"每条证据各自命中没有"，回答不了"两份都拿到了没有"。
+    # 复用同一个 `cache`：同一批 query 的命中不再检索第二遍（一次检索真调 embedding）。
+    crossdoc = crossdoc_metrics(dataset, config, top_k, id_map, cache=cache)
+    if crossdoc:
+        result["crossdoc"] = crossdoc
+    return result
 
 
 def run_matrix(
@@ -882,7 +1142,7 @@ def run_suites(
         "suites": {},
     }
     with _id_space(materials, need_library=need_library) as id_map:
-        for name in SUITE_NAMES:
+        for name in ALL_SUITE_NAMES:
             dataset = datasets.get(name)
             if dataset is None:
                 continue
@@ -1135,6 +1395,7 @@ def render_markdown(report: dict) -> str:
 SUITE_TITLES = {
     "title": "title 套（query = 章节标题原文，自动构造）",
     "manual": "manual 套（28 条手写真实问法）",
+    "crossdoc": "crossdoc 套（14 条跨文档问法，量图检索用）",
 }
 
 
@@ -1147,7 +1408,7 @@ def render_bundle_markdown(bundle: dict) -> str:
     再从里面挑 `title`。
     """
     blocks: list[str] = []
-    for name in SUITE_NAMES:
+    for name in ALL_SUITE_NAMES:
         report = bundle.get("suites", {}).get(name)
         if report is None:
             continue
@@ -1343,9 +1604,10 @@ def _parser() -> argparse.ArgumentParser:
                         help="与基线比对，掉超过 2pp 退出码 1")
     parser.add_argument("--baseline", default=str(DEFAULT_BASELINE), metavar="PATH",
                         help="基线文件（缺省 docs/RETRIEVAL-EVAL.md）")
-    parser.add_argument("--suite", choices=("title", "manual", "both"), default=None,
+    parser.add_argument("--suite", choices=(*ALL_SUITE_NAMES, "both"), default=None,
                         help="测试集：title=章节标题自动构造 / manual=28 条手写真实问法 /"
-                             " both=两套并列（默认）。--check 时默认只跑 title")
+                             " crossdoc=14 条跨文档问法（要 Neo4j 里真有图才有意义）/"
+                             " both=title+manual 两套并列（默认）。--check 时默认只跑 title")
     parser.add_argument("--ladder", action="store_true",
                         help="跑 query 距离阶梯（量化「标题当 query」的偏差；只对 title 套）")
     return parser
@@ -1369,6 +1631,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--check 只比 title 套：manual 套的绝对分更低、方差更大（28 条里一条翻面"
             "就是 3.6pp），不适合当 CI 门槛。要看 manual 请用 --suite both --check，"
             "或直接 --suite manual 人工看数字。")
+    if args.check and suite == "crossdoc":
+        raise SystemExit(
+            "--check 只比 title 套：crossdoc 套的读数取决于**图里有什么**（Neo4j 在不在、"
+            "建图花了多少块、抽取精度），那是跨机器的外部状态，不能当 CI 门槛。"
+            "要看跨文档套请直接 --suite crossdoc，与 --graph 0/1 各跑一遍手工对比。")
 
     if args.check:
         baseline = baseline_from_markdown(Path(args.baseline).read_text(encoding="utf-8"))
@@ -1401,7 +1668,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             print("提示：本次材料集不含手写套需要的四份 docs md，manual 套跳过，"
                   "只跑 title 套（回归照旧）。", file=sys.stderr)
-    for name in SUITE_NAMES:
+    if suite == "crossdoc":
+        datasets["crossdoc"] = build_crossdoc_dataset(materials)
+    for name in ALL_SUITE_NAMES:
         dataset = datasets.get(name)
         if dataset is not None and not dataset.cases:
             raise SystemExit(f"{name} 套测试集为空：材料里没有可用章节（检查标题/长度阈值）")
@@ -1419,7 +1688,7 @@ def main(argv: Sequence[str] | None = None) -> int:
               file=sys.stderr)
 
     bundle = run_suites(datasets, configs, top_k, ladder_suites)
-    for name in SUITE_NAMES:
+    for name in ALL_SUITE_NAMES:
         report = bundle["suites"].get(name)
         if report is None:
             continue
@@ -1427,7 +1696,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         _describe(report, datasets[name])
         print()
         print(render_table(report))
-        if "annotations" in report:
+        if name == "crossdoc":
+            _print_crossdoc(report)
+        elif "annotations" in report:
             _print_annotations(report["annotations"], top_k)
         if "ladder" in report:
             _print_ladder(report["ladder"], top_k)
@@ -1463,7 +1734,7 @@ def _describe(report: dict, dataset: Dataset) -> None:
     if dataset.suite == "title":
         print(f"命中判据：交集 ≥ 命中块长度的 {HIT_OVERLAP_RATIO:.0%}；排除：标题<{MIN_TITLE_CHARS}字"
               f" / 章节<{MIN_SECTION_CHARS}字 / 章节占全文>{MAX_SECTION_SHARE:.0%}")
-    else:
+    elif dataset.suite == "manual":
         low, high = manual_cases.OVERLAP_MEAN_RANGE
         annotations = report.get("annotations", {})
         print(f"手写标注：query 对**目标区间**的词面重合均值 "
@@ -1472,11 +1743,58 @@ def _describe(report: dict, dataset: Dataset) -> None:
         granularity = annotations.get("by_granularity", {})
         print(f"粒度分布：整章 {granularity.get('chapter', 0)} / 章内某段 "
               f"{granularity.get('passage', 0)} / 跨章 {granularity.get('cross', 0)}")
+    else:
+        low, high = crossdoc_cases.OVERLAP_MEAN_RANGE
+        annotations = report.get("annotations", {})
+        print(f"跨文档标注：{annotations.get('case_count', 0)} 条问法 / 摊成 "
+              f"{annotations.get('pair_count', 0)} 个（query × 材料）用例，平均每条跨 "
+              f"{annotations.get('materials_per_case', 0):.2f} 份材料")
+        print(f"词面重合：均值 {_pct(annotations.get('overlap_mean', 0.0))}"
+              f"（单条 {_pct(annotations.get('overlap_min', 0.0))}–"
+              f"{_pct(annotations.get('overlap_max', 0.0))}；构造区间 {low:.0%}–{high:.0%}）")
     print(f"无信息地板：随机排第一的 recall@1 期望 {_pct(report['chance_recall@1'])}"
           "（≈ 章节占全文的比例）")
     if not report["embedding_configured"]:
         print("注意：没有 embedding 凭证，hybrid=1 的行实际走纯 BM25，与 hybrid=0 相同"
               "——这是环境事实，不是指标相同。")
+
+
+def _print_crossdoc(report: dict) -> None:
+    """跨文档套的逐条明细 + 覆盖表。
+
+    逐条明细先给（问法、涉及哪两份材料、重合度），覆盖表后给：看表的人得先知道这 14
+    条问的到底是什么，才判得动「doc_cover 与 bridge 差这么多」意味着什么。
+    """
+    annotations = report.get("annotations", {})
+    print()
+    print("跨文档 case（重合 = query 的中文 bigram 落在**各目标区间**里的比例）：")
+    table = [["#", "材料", "重合", "问法"]]
+    for index, case in enumerate(annotations.get("cases", []), 1):
+        refs = " + ".join(Path(item["material"]).name for item in case["targets"])
+        table.append([str(index), refs, _pct(case["overlap"]), case["query"]])
+    widths = [max(len(line[0]) for line in table),
+              max(len(line[1]) for line in table),
+              max(len(line[2]) for line in table)]
+    for line in table:
+        print(_pad(line[:3], widths) + "  " + line[3])
+
+    ks = sorted({int(value) for value in report.get("top_k", [])})
+    if not ks:
+        return
+    k = ks[-1]
+    print()
+    print(f"跨文档覆盖 @top{k}（doc_cover=提到几份 / bridge=落在正确区间几份 / "
+          f"full_bridge=两份都拿到）：")
+    rows = [["配置", "doc_cover", "bridge", "full_bridge"]]
+    for row in report.get("configs", []):
+        block = row.get("crossdoc", {}).get(str(k))
+        if block is None:
+            continue
+        rows.append([row["label"], _pct(block["doc_cover"]), _pct(block["bridge"]),
+                     _pct(block["full_bridge"])])
+    widths = [max(len(line[index]) for line in rows) for index in range(len(rows[0]))]
+    for line in rows:
+        print(_pad(line, widths))
 
 
 def _print_annotations(annotations: dict, top_k: Sequence[int]) -> None:
