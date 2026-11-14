@@ -392,10 +392,12 @@ def _tree(ref: dict[str, Any]) -> dict[str, Any]:
 
 
 def test_generate_flags_ref_inside_parent_but_outside_leaf(monkeypatch):
-    """生成收尾把 `ctx.evidence` 交出去：越界引用被剔除并给出新码。
+    """生成收尾把 `ctx.evidence` 交出去：越界引用被**标记**，但不再剔除。
 
     这是整条改动的核心用例：引用**逐字**在原文里（`text[start:end] == quote`），
-    只是落在父块中与这次查询无关的那一半。
+    只是落在父块中与这次查询无关的那一半。上一版把它剔掉，实测会成批删掉合法引用
+    （模型看到的是 450–700 字的父块，不是命中的那 200 字）。现在留一条 warn：
+    行为可观测，但不由代码替用户做删改决定。
     """
     source, hit, _leaf, outside = _scene(monkeypatch)
     reference = {
@@ -413,9 +415,11 @@ def test_generate_flags_ref_inside_parent_but_outside_leaf(monkeypatch):
     assert result.ok, result.content
     codes = [item["code"] for item in result.data["diagnostics"]]
     assert "SOURCE_REF_OUTSIDE_EVIDENCE" in codes
-    # `remove_invalid=True`：越界的那条被剔掉，节点因此变成"无可核验引用"
-    assert ctx.candidate.root.children[0].source_refs == []
-    assert "UNSOURCED_NODE" in codes
+    # 分支 a 的引用留着 → 它不该再报"没有可核验引用"（b/c 两条分支本来就没写引用，
+    # 它们的 `UNSOURCED_NODE` 是既有语义，与本条无关）
+    assert not [item for item in result.data["diagnostics"]
+                if item["code"] == "UNSOURCED_NODE" and item["node_id"] == "a"]
+    assert [ref.quote for ref in ctx.candidate.root.children[0].source_refs] == [outside]
 
 
 def test_generate_keeps_ref_inside_leaf_span(monkeypatch):
@@ -597,7 +601,9 @@ def test_end_to_end_rag_mode_cites_evidence_and_flags_the_rest(monkeypatch):
     _rag_end, gen_end_bad, done_bad = build(bad)
     assert "SOURCE_REF_OUTSIDE_EVIDENCE" in {
         item["code"] for item in gen_end_bad.result_summary["diagnostics"]}
-    assert done_bad.content.root.children[0].source_refs == []
+    # 父块里、命中区之外：**保留**并标记。剔除这条口子在本轮关掉了——模型引的这段
+    # 逐字在原文里，只是不在这轮命中的那 200 字内。
+    assert [ref.quote for ref in done_bad.content.root.children[0].source_refs] == [outside]
 
 
 # ---------------------------------------------------------------- 四、默认值

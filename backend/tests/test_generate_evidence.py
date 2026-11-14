@@ -47,6 +47,7 @@ from app.agent.tools import (
 )
 from app.contracts.source import Source, SourceKind
 from app.generation.service import (
+    DETAIL_NO_SOURCE_RULES,
     DETAIL_PROMPT,
     RAG_SOURCE_PROMPT,
     RAG_THINKING_GUARD,
@@ -147,8 +148,11 @@ def test_rag_generation_hands_the_retrieved_text_to_the_model(monkeypatch):
     """核心回归：`rag` 形态下清单之外必须带上原文片段，且不再"只有清单"。
 
     这就是真实用户撞到的那个阻断：`_source_prompt_input` 在 `rag` 下只给标题/
-    字数/类型，工具自己又不检索，模型手里一个字都没有；而 `RAG_SOURCE_PROMPT`
+    字数/类型，工具自己又不检索，模型手里一个字都没有；而当时的 `RAG_SOURCE_PROMPT`
     要求"检索不到就不要写"，它照做，于是只有一条"材料中没有相关内容"的分支。
+    （那一版提示词已经换掉了：现在检索不到可以按知识展开、只是不挂引用，见
+    `tests/test_citation_contract.py`。这一次预检索仍然必须存在——没有原文，
+    "标明出处"就无从谈起。）
     断言的落点因此是**正文片段出现在模型看得到的那段 user 消息里**。
     """
     monkeypatch.delenv(PARENT_RETRIEVAL_ENV, raising=False)
@@ -232,8 +236,11 @@ def test_empty_retrieval_falls_back_to_topic_only_generation(monkeypatch):
         result, (system, user), ctx = _run_generate([source], UNRELATED_TOPIC, _tree())
 
     assert result.ok, result.content
-    # 1) 提示词与输入都退回"无来源"形态：一个字的材料清单都不给
-    assert system == DETAIL_PROMPT + thinking_block("default")
+    # 1) 提示词与输入都退回"无来源"形态：一个字的材料清单都不给。
+    #    末尾那句 `DETAIL_NO_SOURCE_RULES` 是这一轮加的：没有材料可标出处时，
+    #    提示词要明说"不要写引用"，否则模型会把 `CONTENT_FREEDOM_CONTRACT` 的
+    #    前半句（内容可以自由展开）执行到底，连引用一起编。
+    assert system == DETAIL_PROMPT + thinking_block("default") + DETAIL_NO_SOURCE_RULES
     assert user == UNRELATED_TOPIC
     # 2) 一句话说清这次没有依据（用户看得到的地方）
     assert "只基于主题" in result.content
@@ -266,7 +273,7 @@ def test_retrieval_failure_falls_back_but_says_it_failed(monkeypatch):
         result, (system, _user), _ctx_after = _run_generate([source], TOPIC, _tree())
 
     assert result.ok, result.content
-    assert system == DETAIL_PROMPT + thinking_block("default")
+    assert system == DETAIL_PROMPT + thinking_block("default") + DETAIL_NO_SOURCE_RULES
     assert "检索出错" in result.content
     assert "RuntimeError" in result.data["retrieval"]["failed"]
     assert result.data["retrieval"]["hits"] == 0

@@ -253,12 +253,17 @@ def _fixtures() -> dict[str, list[Source]]:
 
 # 取自 `901b484` 的 `_source_prompt_input` 渲染结果（sha256）。写死是刻意的：
 # 这条断言的价值在于"今天的输出与那个提交逐字节相同"，而不是"与今天自己相同"。
+#
+# `oversized` 这一条在"内容可自由展开、引用必须标出处"那一轮更新过：那个样本走
+# 二分裁剪，裁剪点由 `system` 的 token 估算决定，而 `SOURCED_DETAIL_PROMPT` 变长了
+# ——渲染算法一个字节没动，落点却必须跟着变。这是**有意的**更新，其余四条仍与
+# `901b484` 一致，正好证明改的只是预算、不是渲染。
 GOLDEN_DIGESTS: dict[str, str] = {
     "single": "09dad633796b95214e26057a537a50b1acc002083ccc06522b30fe9d67c7d3ac",
     "two": "0ddbba96dfa703350137b9d315e07fe2e5c77774eb1768ff7d5fcd42115d0e33",
     "blank": "309d1757a17504d05d7747846944f2b0280213a74a6b348ffe95311c5331ce22",
     "escapes": "46593d9c4358005c37cf70123016af4643daace3e2f1bb8ec75397e747d9c10c",
-    "oversized": "5af1af3b9a4ec61c2045f76674b71d1cbb91a67d3670d13fdbd058a6d2c3d4e6",
+    "oversized": "dc921766b42304e69d97535ac309465368fc5fddb2374fbfa56015a8e4a450ff",
 }
 
 
@@ -371,13 +376,19 @@ def test_manifest_respects_its_own_token_ceiling():
 # ---------------------------------------------------------------- 四、提示词与接线
 
 
-def test_rag_prompt_carries_the_retrieval_protocol():
-    """三条硬规则必须出现在模型真正看到的那段 system 里。
+def test_rag_prompt_carries_the_citation_protocol():
+    """`rag` 那一段必须把"内容可以展开、出处不许编"说清，且不再要求模型自行检索。
 
     材料里带着主题词（"整理这些材料"），所以这次会命中、走的是 `rag` 提示词这条
     路。检索为空时 system 会退回 `DETAIL_PROMPT`（用户至少拿到一张图，见
     `tests/test_generate_evidence.py`），那条路上这些规程一句都不成立——不设成
     能命中的材料，这条用例测的就不再是它名字里那句话。
+
+    这一轮改掉了三条旧规则，逐条钉住它们**没有回来**：
+      - "检索不到就不要写…空着是正确结果" → 改成按知识展开、不挂引用；
+      - "写任何与材料有关的内容之前，先检索" → 整树这条路已经做过预检索
+        （`tools._retrieve_topic`），再让模型自行检索是重复的；
+      - "可以多次检索…分开问" → 同上，模型手里已经有命中，再查拿不到新东西。
     """
     source = _material(f"整理这些材料的说明：正文 {MARKER}")
     with _env(SOURCE_MODE_RAG):
@@ -385,15 +396,22 @@ def test_rag_prompt_carries_the_retrieval_protocol():
 
     assert EVIDENCE_HEADER in user          # 前提：这次真的命中了
     assert "看不到材料全文" in system
-    assert "引用必须来自检索结果" in system
-    assert "检索不到就不要写" in system
+    assert "引用必须来自 evidence" in system
+    assert "检索不到就按自己的知识展开" in system
+    assert "未检索到不等于材料里没有" in system
     # 规程要成组出现：缺一条都不行，所以逐条钉关键动作
-    for phrase in ("先检索", "逐字", "source_id", "不要自己算", "可以多次检索"):
+    for phrase in ("逐字", "source_id", "不要自己算", "evidence_quote"):
         assert phrase in system, phrase
+    # 旧规则必须真的没了：留在提示词里就是两套契约打架，模型只听更保守的那套
+    assert "空着是正确结果" not in system
+    assert "检索不到就不要写" not in system
+    assert "写任何与材料有关的内容之前" not in system
+    assert "可以多次检索" not in system
+    assert "rag_query" not in system
     # `full` 的提示词教模型读 `sources` 数组；`rag` 下那个数组不存在，
     # 一个字都不能混进来，否则模型会去找一个没有的字段。
     assert "sources 数组" not in system
-    # 有命中时末尾多一句"这次不用再检索"：`RAG_SOURCE_PROMPT` 说"输入里只有清单"，
+    # 有命中时末尾多一句"这次不用再检索"：`RAG_SOURCE_PROMPT` 说正文没进来，
     # 而那一版输入末尾已经有检索结果，不点破这层提示词与输入互相矛盾。
     assert system == (RAG_SOURCE_PROMPT + thinking_block("default") + RAG_THINKING_GUARD
                       + GENERATE_EVIDENCE_RULES)

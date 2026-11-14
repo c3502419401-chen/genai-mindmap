@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from app.contracts.diagnostic import Diagnostic, DiagnosticLevel
 from app.contracts.mindmap import MindMapContent
@@ -39,9 +39,230 @@ class EvidenceSpan:
     leaf_end: int | None = None
 
 
-def _evidence_problem(
-    ref: SourceRef, evidence: Sequence[EvidenceSpan],
-) -> tuple[str, str] | None:
+@dataclass(frozen=True)
+class _Verdict:
+    """一条引用的判定结果：**有没有问题**与**留不留**是两件事。
+
+    上一版的 `_reference_problem` 把两者绑死（返回 code 就等于剔除），于是"提示"
+    一定带着删除的副作用。放宽之后必须拆开：
+
+      - 落在父块内、命中子块外 → warn，`drop=False`（模型引的是材料里的某段，
+        只是不在这轮命中的那 200 字里，而它看到的是 450–700 字的父块）；
+      - 引文在可见范围内多处出现 → warn，`drop=False`（判不了对错，交给人核）；
+      - 逐字对不上且定位不到 → `drop=True`（这条真的是编的）。
+
+    `fix` 是服务端补正后的 `(start, end)`：只在可写路径（`remove_invalid=True`）
+    写回模型。`check_evidence=False` 表示这条引用不要再按偏移判"落在命中的子块里吗"
+    ——它的偏移本来就是猜的，用错误坐标去判只会产出噪声。
+    """
+
+    code: str | None = None
+    message: str = ""
+    level: DiagnosticLevel = DiagnosticLevel.warn
+    drop: bool = False
+    fix: tuple[int, int] | None = None
+    check_evidence: bool = True
+
+
+_OK = _Verdict()
+
+
+def _evidence_ranges(
+    text: str, evidence: Sequence[EvidenceSpan], source_id: str, start: int, end: int,
+) -> list[tuple[int, int]]:
+    """这条引用**这次可见**的范围，按"模型手上实际有什么"排序。
+
+    模型在父块返回模式下看到的是 450–700 字的父块，在 `full` 形态下看到的是全文。
+    所以定位引文时先查覆盖它原区间的父块，查不到再退回全文：
+
+      - 先父块：模型就是从那里抄的，落在父块内的定位比"全文里唯一"更贴近事实；
+      - 再全文：`full` 形态、没有证据、或者引用跨出了父块时，可见范围就是全文。
+        少这一段，`full` 形态下"偏移写错但引文逐字正确"的引用会被判成编造。
+
+    没有任何父块覆盖它时（引用落在本次命中的范围之外），只剩全文这一个范围——
+    "落在父块外"由 `_outside_evidence` 单独判，与定位是两件事。
+    """
+    covering = [
+        (span.start, span.end) for span in evidence
+        if span.source_id == source_id and span.start < end and span.end > start
+    ]
+    covering.append((0, len(text)))
+    return covering
+
+
+def _quote_occurrences(text: str, quote: str, window: tuple[int, int]) -> list[int]:
+    """`quote` 在 `window` 里出现的所有起点（含重叠）。
+
+    重叠也算一处：`aa` 在 `aaa` 里出现两次，这时"唯一定位"本来就不成立，
+    少算一次会把一条有歧义的引用误判成补正成功。
+    """
+    low, high = window
+    found: list[int] = []
+    position = text.find(quote, low)
+    while 0 <= position and position + len(quote) <= high:
+        found.append(position)
+        position = text.find(quote, position + 1)
+    return found
+
+
+def _locate_quote(
+    text: str, quote: str, evidence: Sequence[EvidenceSpan] | None,
+    source_id: str, start: int | None, end: int | None,
+) -> tuple[str, tuple[int, int] | None]:
+    """在可见范围内定位引文：返回 `("unique", (start, end))` / `("ambiguous", None)` /
+    `("missing", None)`。
+
+    **这是放宽之后补上的那一半**：上一版只要引文与给定区间不一致就判
+    `SOURCE_QUOTE_MISMATCH` 整条剔掉，而模型本来就被告知"只截一段连续的、别自己算
+    偏移"——它照做之后，只给 quote 的引用永远只能靠"逐字在全文里"，落在父块的哪一段
+    查不出来。现在服务端自己定位：唯一命中就把偏移补对，多处命中就标"待核"，
+    真的找不到才认定是编的。
+    """
+    windows = ([(0, len(text))] if evidence is None or start is None or end is None
+               else _evidence_ranges(text, evidence, source_id, start, end))
+    ambiguous = False
+    for window in windows:
+        positions = _quote_occurrences(text, quote, window)
+        if len(positions) == 1:
+            found = positions[0]
+            return "unique", (found, found + len(quote))
+        if len(positions) > 1:
+            ambiguous = True
+    return ("ambiguous", None) if ambiguous else ("missing", None)
+
+
+def _page_verdict(ref: SourceRef, source: Source) -> _Verdict | None:
+    """页码只在**明确不可能**时才判死：`SourceSpan.page` 是总页数，不是页与文本的映射。"""
+    if ref.page is None:
+        return None
+    total_pages = source.span.page if source.span else None
+    if (total_pages is not None and ref.page > total_pages) or ref.page in source.failed_pages:
+        return _Verdict(
+            "INVALID_SOURCE_PAGE", "引用页码超出来源页数或指向解析失败的页面", drop=True)
+    return None
+
+
+def _check_reference(
+    ref: SourceRef, source: Source | None, *,
+    evidence: Sequence[EvidenceSpan] | None = None,
+) -> _Verdict:
+    """一条引用的判定：通过 / 保留并提示 / 剔除，三种结果分开表达。
+
+    上一版这个函数返回 `(code, message)` 或者 `None`，而调用方把"有 code"直接当成
+    "剔除"——于是所有提示都带着删除的副作用。放宽之后两者必须解耦：落在父块外的
+    引用、定位不唯一而"待核"的引用都要**留在树上**，只是各带一条诊断。
+    """
+    if source is None or source.status != "parsed" or not (source.text or "").strip():
+        return _Verdict(
+            "SOURCE_TEXT_UNAVAILABLE", "未提供已解析的来源原文，无法核验引用", drop=True)
+    text = source.text or ""
+    quote = ref.quote
+
+    if ref.start is not None and ref.end is not None:
+        if ref.end > len(text):
+            return _Verdict(
+                "SOURCE_RANGE_OUT_OF_BOUNDS", "引用字符区间超出来源原文", drop=True)
+        excerpt = text[ref.start:ref.end]
+        if not excerpt.strip():
+            return _Verdict("EMPTY_SOURCE_EXCERPT", "引用字符区间只有空白", drop=True)
+        if quote is None:
+            # 放行口之一（本轮堵住）：区间合法、引文为空时旧实现直接通过。那等于
+            # 只核对了一对坐标——谁都能给任意区间"标记"一段自己从没读过的原文，
+            # 而界面上它会显示成一条有出处的引用。
+            return _Verdict(
+                "UNVERIFIED_SOURCE_REF",
+                "引用只有字符区间、没有引文，无法核验它指的是原文的哪一段",
+                drop=True,
+            )
+        if quote == excerpt:
+            return _page_verdict(ref, source) or _OK
+        return _relocate(ref, source, text, evidence)
+
+    if quote is None:
+        # 放行口之二：既无区间也无引文。旧实现这条 else 分支本来就拦住（返回
+        # `UNVERIFIED_SOURCE_REF` 并剔除），这里保留同样的判定，只把文案说清。
+        return _Verdict(
+            "UNVERIFIED_SOURCE_REF",
+            "引用既没有引文也没有字符区间，无法核验原文依据",
+            drop=True,
+        )
+    if quote not in text:
+        return _Verdict(
+            "SOURCE_QUOTE_MISMATCH", "在指定来源原文中找不到该引文", drop=True)
+    # 只有 quote、没有偏移：逐字匹配本来就算通过，但服务端仍然把偏移补上——
+    # 界面上"点引用跳原文"要坐标，`annotate_nli` 后面也要用它。定位不唯一时
+    # 只标一条 warn、不补：猜一个坐标比没有坐标更糟。
+    outcome, fix = _locate_quote(text, quote, evidence, ref.source_id, None, None)
+    page = _page_verdict(ref, source)
+    if page is not None:
+        return page
+    if outcome == "ambiguous":
+        return _Verdict(
+            "SOURCE_QUOTE_AMBIGUOUS",
+            "引文在可见范围内出现多次，无法确定它指的是哪一处，已保留并标为待核",
+            check_evidence=False,
+        )
+    if outcome == "unique" and fix is not None:
+        # 只给引文时补上偏移是**补齐元数据**，不是修错，所以不产诊断：整树生成时
+        # 每个节点都会有一条这样的引用，逐条报 info 只会把真正要看的东西淹掉。
+        return _Verdict(fix=fix)
+    return _OK
+
+
+def _relocate(
+    ref: SourceRef, source: Source, text: str,
+    evidence: Sequence[EvidenceSpan] | None,
+) -> _Verdict:
+    """引文与给定区间不一致：由服务端重新定位，而不是直接判死。
+
+    三种结果对应三种处置，缺任何一种都会退化成上一版的"一律剔除"：
+
+      - 唯一定位 → 补正偏移（info `SOURCE_QUOTE_OFFSET_FIXED`），引用保留。
+        写回只在 `remove_invalid=True` 时发生：`check()` 那条只读体检路径不能因为
+        "顺手修一下"就改了调用方的树。
+      - 多处出现 → 保留并标"待核"（warn `SOURCE_QUOTE_AMBIGUOUS`）。判不了对错时
+        删掉是替用户做了决定，而这条引用**确实**逐字存在于原文里。
+      - 定位不到 → 剔除（`SOURCE_QUOTE_MISMATCH`）。这才是真编的那一种。
+    """
+    outcome, fix = _locate_quote(
+        text, ref.quote, evidence, ref.source_id, ref.start, ref.end)
+    if outcome == "unique" and fix is not None:
+        page = _page_verdict(ref, source)
+        if page is not None:
+            return page
+        return _Verdict(
+            "SOURCE_QUOTE_OFFSET_FIXED",
+            f"引文与给定区间不一致，已按原文定位补正为 [{fix[0]}, {fix[1]})",
+            level=DiagnosticLevel.info, fix=fix, check_evidence=False,
+        )
+    if outcome == "ambiguous":
+        return _Verdict(
+            "SOURCE_QUOTE_AMBIGUOUS",
+            "引文在可见范围内出现多次，无法确定它指的是哪一处，已保留并标为待核",
+            check_evidence=False,
+        )
+    return _Verdict(
+        "SOURCE_QUOTE_MISMATCH",
+        "引文与指定字符区间的原文不一致，且在可核验的原文里定位不到这句",
+        drop=True,
+    )
+
+
+def _reference_problem(ref: SourceRef, source: Source | None) -> tuple[str, str] | None:
+    """`_check_reference` 的**旧二元视图**：只回答"这条引用该不该剔除"。
+
+    保留它是给两个测量脚本（`scripts/measure_branch_expansion.py`、
+    `scripts/measure_deep_slicing.py`）用的：它们要在不接生成链的情况下数"这条引用
+    站不站得住"。新代码不要用它——它丢掉了"保留并提示"这一档，而那正是这一轮
+    放宽出来的第三种结果（父块越界、多处待核）。
+    """
+    verdict = _check_reference(ref, source)
+    if verdict.drop:
+        return verdict.code or "SOURCE_QUOTE_MISMATCH", verdict.message
+    return None
+
+
+def _outside_evidence(ref: SourceRef, evidence: Sequence[EvidenceSpan]) -> bool:
     """引用是否落进了"父块里与查询无关的那部分"。
 
     为什么需要这一层：父块返回模式下 `quote` 是 450–700 字的上下文，命中的
@@ -58,10 +279,13 @@ def _evidence_problem(
     3. 引用与多条命中都重叠时，只要**有一条**命中的子块区间与它有交集就通过。
        不同父块之间会重叠（`CHUNK_OVERLAP_CHARS`），一条引用同时落进两个父块
        是正常形态，不能因为其中一个的命中区不在交集里就判失败。
+
+    **它现在只产出诊断，不剔除**（三轮实测的教训见 `verify_source_refs` 的
+    docstring）：模型写的是自己的话、引的是材料里的某段，它看到的是父块而不是
+    命中的那 200 字，按子块卡等于要求它做一个它没有信息的判断。
     """
     if ref.start is None or ref.end is None:
-        return None
-
+        return False
     covering = [
         span for span in evidence
         if span.source_id == ref.source_id
@@ -70,41 +294,9 @@ def _evidence_problem(
         and ref.end > span.start and ref.start < span.end
     ]
     if not covering:
-        return None
-    if any(ref.end > span.leaf_start and ref.start < span.leaf_end
-           for span in covering):
-        return None
-    return (
-        "SOURCE_REF_OUTSIDE_EVIDENCE",
-        "引用区间与本次命中的证据子块没有交集：引文确实在原文里，但落在父块中"
-        "与查询无关的部分",
-    )
-
-
-def _reference_problem(ref: SourceRef, source: Source | None) -> tuple[str, str] | None:
-    if source is None or source.status != "parsed" or not (source.text or "").strip():
-        return "SOURCE_TEXT_UNAVAILABLE", "未提供已解析的来源原文，无法核验引用"
-    text = source.text or ""
-    if ref.start is not None and ref.end is not None:
-        if ref.end > len(text):
-            return "SOURCE_RANGE_OUT_OF_BOUNDS", "引用字符区间超出来源原文"
-        excerpt = text[ref.start:ref.end]
-        if not excerpt.strip():
-            return "EMPTY_SOURCE_EXCERPT", "引用字符区间只有空白"
-        if ref.quote is not None and ref.quote != excerpt:
-            return "SOURCE_QUOTE_MISMATCH", "引文与指定字符区间的原文不一致"
-    elif ref.quote is not None:
-        if ref.quote not in text:
-            return "SOURCE_QUOTE_MISMATCH", "在指定来源原文中找不到该引文"
-    else:
-        return "UNVERIFIED_SOURCE_REF", "引用没有引文或字符区间，无法核验原文依据"
-
-    # SourceSpan.page 记录总页数，不是页与文本的映射；只能排除明确不可能的页码。
-    if ref.page is not None:
-        total_pages = source.span.page if source.span else None
-        if (total_pages is not None and ref.page > total_pages) or ref.page in source.failed_pages:
-            return "INVALID_SOURCE_PAGE", "引用页码超出来源页数或指向解析失败的页面"
-    return None
+        return False
+    return not any(ref.end > span.leaf_start and ref.start < span.leaf_end
+                   for span in covering)
 
 
 def verify_source_refs(content: MindMapContent, sources: list[Source], *,
@@ -116,16 +308,25 @@ def verify_source_refs(content: MindMapContent, sources: list[Source], *,
     没有原文时不能凭 source_usage 推断已验证。未找到依据的节点只给出提示，
     不删除节点，也不据此生成自动删除建议。
 
-    `evidence` 是**可选**的两级命中区间，用于父块返回模式（`search_parent`）：
-    给了它，落在命中父块里、但与子块区间没有交集的引用会被判为
-    `SOURCE_REF_OUTSIDE_EVIDENCE`（判定规则见 `_evidence_problem`）。不给时
-    逐字节等同于加这个参数之前的行为。
+    `evidence` 是**可选**的两级命中区间，用于父块返回模式（`search_parent`）。
+    给了它之后有两条相关行为：
+
+      1. 引文与偏移对不上时**先在可见父块内定位**（`_locate_quote`），唯一定位就
+         补正偏移、多处出现就标「待核」，两者都**保留**引用；
+      2. 引用落在命中的父块里、但不在命中的子块范围内 → warn
+         `SOURCE_REF_OUTSIDE_EVIDENCE`，**保留**（判定规则见 `_outside_evidence`）。
+
+    第 2 条这一轮从"剔除"降级为"提示"：模型现在写的是自己的话、引的是材料里的某段，
+    它看到的是 450–700 字的父块，要求引用精确落在命中的那 200 字里过于苛刻——实测
+    它会把合法引用成批剔掉，界面上表现为"这一支没有证据"。子块约束保留下来是为了
+    **可观测**（谁引了父块里与查询无关的部分，诊断里看得见），不是为了删。
+
+    不给 `evidence` 时只有逐字校验与定位补正，没有父块约束——`full` 形态和
+    `optimization/service.py::check()` 那条只读体检走的就是这条路。
 
     唯一接线点是生成链：`tools._rag` 把每次检索的命中区间累积进
     `RunContext.evidence`，`tools._generate` 再交给
     `generation.service.validate_generated_content(..., evidence=...)`，由它转到这里。
-    `optimization/service.py::check()` 那条诊断路径**不传**——它是只读体检，
-    没有"本次运行"这个概念；`full` 形态也不传，那里的模型看得见全文。
     """
     by_id = {source.id: source for source in sources}
     if len(by_id) != len(sources):
@@ -136,25 +337,37 @@ def verify_source_refs(content: MindMapContent, sources: list[Source], *,
         node = stack.pop()
         verified: list[SourceRef] = []
         for ref in node.source_refs:
-            problem = _reference_problem(ref, by_id.get(ref.source_id))
-            if problem is not None:
-                code, message = problem
+            verdict = _check_reference(ref, by_id.get(ref.source_id), evidence=evidence)
+            if verdict.fix is not None:
+                if remove_invalid:
+                    # 只在可写路径写回：`check()` 那条只读体检不能因为"顺手修一下"
+                    # 就改了调用方传进来的树（`test_bad_evidence_is_reported_without_editing_the_map`
+                    # 钉着这条契约）。
+                    ref.start, ref.end = verdict.fix
+                else:
+                    # 只读路径不改树 → "已补正"这句话是假的。能补正就当它通过，
+                    # 一条诊断都不报：把没实施的改动写进诊断，比没有诊断更糟。
+                    verdict = replace(verdict, code=None, message="")
+            if verdict.code is not None:
                 diagnostics.append(Diagnostic(
-                    level=DiagnosticLevel.warn, code=code, node_id=node.id,
-                    message=f"来源 {ref.source_id}：{message}", evidence=ref.quote,
+                    level=verdict.level, code=verdict.code, node_id=node.id,
+                    message=f"来源 {ref.source_id}：{verdict.message}", evidence=ref.quote,
                 ))
+            if verdict.drop:
                 continue
-            # 逐字校验通过之后才问"落在命中的那段里吗"：顺序反过来会对一条
-            # 本来就对不上原文的引用再报一次位置问题，两条诊断里只有前一条有意义。
-            if evidence is not None:
-                off_evidence = _evidence_problem(ref, evidence)
-                if off_evidence is not None:
-                    code, message = off_evidence
-                    diagnostics.append(Diagnostic(
-                        level=DiagnosticLevel.warn, code=code, node_id=node.id,
-                        message=f"来源 {ref.source_id}：{message}", evidence=ref.quote,
-                    ))
-                    continue
+            # 逐字校验通过之后才问"落在命中的那段里吗"：顺序反过来会对一条本来就
+            # 对不上原文的引用再报一次位置问题，两条诊断里只有前一条有意义。
+            # 补正过 / 待核的引用跳过这一层：它们的偏移是模型猜的，用错误坐标去判
+            # 只会产出"落在父块外"的噪声。
+            if (evidence is not None and verdict.check_evidence
+                    and _outside_evidence(ref, evidence)):
+                diagnostics.append(Diagnostic(
+                    level=DiagnosticLevel.warn, code="SOURCE_REF_OUTSIDE_EVIDENCE",
+                    node_id=node.id,
+                    message=(f"来源 {ref.source_id}：引文确实在原文里，但落在父块中"
+                             "与本次查询无关的部分；已保留，可人工核对"),
+                    evidence=ref.quote,
+                ))
             verified.append(ref)
             if ref.page is not None:
                 diagnostics.append(Diagnostic(

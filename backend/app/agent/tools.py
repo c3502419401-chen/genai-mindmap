@@ -49,6 +49,7 @@ from app.contracts.ops import OpBatch, OpError
 from app.contracts.source import Source, SourceUsage
 from app.generation.service import (
     CONTEXT_TOKEN_LIMIT,
+    DETAIL_NO_SOURCE_RULES,
     DETAIL_PROMPT,
     MIN_BRANCHES,
     RAG_SOURCE_PROMPT,
@@ -157,6 +158,24 @@ BRANCH_QUERY_LIMIT = 3
 # `top_k=5` 同口径：那正是 `mindmap_generate` 那条路拿到的量，退回时用户看到的
 # 证据量与改造前一致，不是"缩水版的降级"。
 DEEP_FALLBACK_TOP_K = 5
+
+# ---- 限额补查（`_generate_deep` 的 `expand_branch`）---------------------------
+#
+# 按支检索的 query 是**分支标题本身**，实测比"主题 + 标题"好（8 支挤同一父块的
+# 从 8/8 降到 3/8，覆盖率 19.2% → 28.8%），但标题与正文用词对不齐的那一支仍然
+# 一条都召不回。这一层补的就是那几支，**只补一次、只补三支**：
+#
+#   - 每支最多 1 次（`SUPPLEMENTARY_BRANCH_LIMIT`）：补查的 query 是从这一支自己
+#     刚写出来的子节点里取的，补了还没有就是检索栈的极限，再补只是换同义词；
+#   - 每次运行最多 3 次（`SUPPLEMENTARY_RUN_LIMIT`）：20 支的图上放开会让 embedding
+#     请求数翻倍，而收益集中在少数几支（实测 8 支里通常 2–3 支需要补）。
+#
+# `SUPPLEMENTARY_MIN_NODES` 是自动触发条件的门槛：一支写得够多（≥3 个要点）却一条
+# 引用都没有，说明它整支都是凭知识补的——这正是"看起来完整、其实没有出处"的形态，
+# 值得花一次检索换依据。少于 3 个要点的支不补：它本来就没写多少东西，补了也填不满。
+SUPPLEMENTARY_BRANCH_LIMIT = 1
+SUPPLEMENTARY_RUN_LIMIT = 3
+SUPPLEMENTARY_MIN_NODES = 3
 
 # 工具内单次模型调用的输出上限。这个数必须与 `app.agent.provider._MAX_TOKENS_CAP`
 # 一致：provider 是外层轮次的出口，工具里的 `chat_async` 是另一条出口，两边不同
@@ -1119,11 +1138,13 @@ def _audit_tree(root: Node, expected: set[int]) -> _TreeAudit:
     return _TreeAudit(depths=depths, total=total, deepest=deepest, blank=blank, missing=missing)
 
 
-def _source_prompt_input(sources: list[Source], *, system: str = "") -> str:
+def _source_prompt_input(
+    sources: list[Source], *, system: str = "", retrieval_hint: bool = True,
+) -> str:
     """把来源拼成模型这次的输入。**形态由 `MINDMAP_SOURCE_MODE` 决定**。
 
     - `rag`（默认）：只拼一份**材料清单**（标题、字数、类型），正文一个字都不进
-      **这一处**——模型要靠 `rag_query` 检索才有内容可写。（整次请求里还有检索
+      **这一处**——内容要么靠检索命中，要么靠模型自己的知识。（整次请求里还有检索
       命中、骨架那一次的章节标题，见 `_material_inputs` 的四种说法。）
     - `full`：把每份来源的正文整份拼进去（受上下文预算裁剪），行为与
       `901b484` 逐字节一致，回归用例钉着这一点（`tests/test_source_mode.py`）。
@@ -1131,12 +1152,17 @@ def _source_prompt_input(sources: list[Source], *, system: str = "") -> str:
     两种形态的正文可见性完全不同，这是刻意的：`full` 下模型能自己扫全文，
     检索只是辅助；`rag` 下检索是唯一入口。所以这里没有"材料小就走 full"的
     折中——行为随材料大小跳变最难排查，短材料一样走检索。
+
+    `retrieval_hint` 只对 `rag` 生效：整树生成（`_generate`）在拼之前已经做过一次
+    主题预检索、命中就附在 user 末尾，这时再指示模型"先调用 `rag_query`"是重复的
+    （见 `RAG_SOURCE_PROMPT` 的注释）。别的入口（`rag_query` / 展开 / 改树）那里
+    模型确实要自己检索，保留提示。
     """
     if source_mode() == SOURCE_MODE_RAG:
         # 清单是模型**唯一**能知道"手上有什么"的地方，而知识库里的材料不在
-        # `sources` 里——不在这里说一句，模型连"库里有东西可查"都无从知道，
-        # 提示词里那个"先检索"的指令就成了没有宾语的动作。
-        return _material_manifest(sources, library_total=library_source_count())
+        # `sources` 里——不在这里说一句，模型连"库里有东西可查"都无从知道。
+        return _material_manifest(
+            sources, library_total=library_source_count(), retrieval_hint=retrieval_hint)
     return _full_source_prompt_input(sources, system=system)
 
 
@@ -1204,7 +1230,9 @@ def _material_scale(source: Source) -> str:
     return "，".join(parts)
 
 
-def _material_manifest(sources: list[Source], *, library_total: int = 0) -> str:
+def _material_manifest(
+    sources: list[Source], *, library_total: int = 0, retrieval_hint: bool = True,
+) -> str:
     """`rag` 形态的输入：只有清单，没有正文。
 
     形状与 `full` 形态的 sources 数组刻意不同（不是 JSON）：两种形态一眼能分出来，
@@ -1220,11 +1248,19 @@ def _material_manifest(sources: list[Source], *, library_total: int = 0) -> str:
       - 不说是"哪一类"也是刻意的：库里的材料与这次请求无关，任何概括都会变成
         一条错误的先验（"原来库里都是财务制度"）。
 
+    `retrieval_hint=False` 时改写末行：整树生成这条路已经由服务端做过一次主题
+    预检索、命中就附在 user 末尾（`_retrieve_topic`），这时再让模型"先调用
+    `rag_query`"就是让它重复查同一件事——它拿不到新东西，却多花一次 embedding。
+    首行也一并去掉工具名：那一行只需要回答"正文在不在提示词里"。
+
     默认 0 而不是自己去查库：这个函数是纯渲染器，被测试与将来别的入口直接调用，
     让它内部读一次持久化状态，等于让"渲染"依赖"库的当前内容"，两次调用之间库变了
     就会得到两份不同的提示词，而那种差异只会在真机上偶发。
     """
-    lines = [f"本次附带 {len(sources)} 份材料（你看不到全文，需要用 rag_query 检索）："]
+    head = ("本次附带 {count} 份材料（你看不到全文，正文不在提示词里）："
+            if not retrieval_hint else
+            "本次附带 {count} 份材料（你看不到全文，需要用 rag_query 检索）：")
+    lines = [head.format(count=len(sources))]
     used = estimate_input_tokens(lines[0])
     listed = 0
     for index, source in enumerate(sources, start=1):
@@ -1250,8 +1286,12 @@ def _material_manifest(sources: list[Source], *, library_total: int = 0) -> str:
         shown = (f"{library_total} 份以上" if library_total >= LIBRARY_COUNT_LIMIT
                  else f"{library_total} 份")
         lines.append(f"知识库中另有 {shown}过往材料，同样可以用 rag_query 检索到。")
-    lines.append("要写与材料有关的内容，先调用 rag_query 检索；"
-                 "引用逐字取自检索结果。")
+    lines.append(
+        "要写与材料有关的内容，先调用 rag_query 检索；引用逐字取自检索结果。"
+        if retrieval_hint else
+        "与材料有关的原文片段由系统检索后附在本条消息末尾（evidence 数组）："
+        "引用逐字取自它，不必自己再查。"
+    )
     return "\n".join(lines)
 
 
@@ -1499,32 +1539,46 @@ SUBNODE_EXPAND_PROMPT = (
 # 上一个字都不该抄。
 #
 # 逐字照抄那一句与 `RAG_SOURCE_PROMPT` 同源（那里是整树生成用的），但不能复用：
-# 那份提示词讲的是"你手里只有一份材料清单，先 rag_query"，而这里模型手里已经有
-# 一支的命中，再说"先检索"会让它去调一个它不需要的工具。
+# 那份提示词讲的是"你看不到全文，检索结果附在末尾"，而这里模型手里已经有一支的
+# 命中，措辞必须指向 evidence 数组本身。
+#
+# 内容与出处分两句说（与 `generation.service.CONTENT_FREEDOM_CONTRACT` 同一契约）：
+# 上一版只写了"引用只能从本支的 evidence 里抄…找不到依据就给空数组"，模型把前半句
+# 读成了内容范围，于是 evidence 没覆盖的方面整个消失——覆盖率就是这样掉下来的。
 BRANCH_EVIDENCE_RULES = (
     "这一支的检索结果在 user 消息的 evidence 数组里：每项含 source_id、quote"
     "（父块原文）与 evidence_start / evidence_end / evidence_quote（真正命中的那一小段）。"
+    "内容可以自由展开：evidence 没覆盖的方面按你的知识补全，不要留空节点。"
     '每个子项可以带一个 source_refs 数组，例如 {"label":"要点二","expandable":false,'
     '"source_refs":[{"source_id":"…","start":0,"end":12,"quote":"…"}]}。'
-    "引用只能从**本支**的 evidence 里抄：source_id 照抄；优先用 evidence_* 那一组，"
-    "start、end、quote 分别取它们的值；没有 evidence_* 时只抄 quote 里连续的一段"
-    "（不超过 300 字），这时不要写 start 和 end。"
+    "但凡引用、转述、概括材料的，出处只能从**本支**的 evidence 里抄：source_id 照抄；"
+    "优先用 evidence_* 那一组，start、end、quote 分别取它们的值；没有 evidence_* 时"
+    "只抄 quote 里连续的一段（不超过 300 字），这时不要写 start 和 end。"
     "引文必须逐字照抄，不要改写、不要概括、不要自己算偏移，也不要写 page。"
-    "evidence 里找不到依据的子项，source_refs 给空数组——空着是对的，编造不是。"
+    "自己补的内容 source_refs 给空数组——不挂引用是对的，编造不是。"
+    # 「这一支要不要再查一次」是模型唯一比代码多知道的事：它刚写完这些论断，只有
+    # 它知道哪些地方缺依据。信号走响应里的一个布尔字段，不额外花一次判断调用
+    # （判据与限额见 `SUPPLEMENTARY_*`）。
+    "如果你判断这一支里有关键论断需要材料依据、而 evidence 不足以支撑，"
+    '在响应里带一个与 children 同级的字段 "needs_evidence": true，'
+    "系统会为这一支再检索一次。\n"
 )
 
 # 这一支没有检索结果时的附加规则。**不能什么都不说**：模型看不到这句话时，会把
 # "我没拿到证据"读成"材料里大概还有"，于是按主题自由展开，产出一棵看起来完整、
 # 实际没有出处的子树——那正是这次改动要消灭的静默缺失。
 #
-# 但它同样不能把这一支彻底判死：材料里真有这块内容却没被这一支的问句召回，是
-# 检索的常态（top_k=3）。所以措辞是"只写你能从 evidence 之外**确认**的东西"是
-# 不行的——模型没有 evidence 之外的信息源。结论只能是如实留空。
+# 上一版的结论是"如实留空、返回空 children"，代价是 8 支里有 5 支变成空壳：
+# 材料里真有这块内容却没被这一支的问句召回，是检索的常态（top_k=3），把它判死等于
+# 让检索质量决定导图完整度。新契约只保留"不许冒充材料"那一半：照常展开写满，
+# 引用一律留空。
 BRANCH_NO_EVIDENCE_RULES = (
-    "注意：这一支这次**没有检索到任何材料依据**（evidence 数组为空）。"
-    "不要凭主题编造内容，也不要写 source_refs。"
-    '材料里确实没有这一块的东西时返回 {"children":[]}——空着是正确结果，'
-    "用常识把这一支填满会让人以为材料里写过这些。"
+    "注意：这一支这次**没有检索到材料依据**（evidence 数组为空）。"
+    "未检索到不等于材料里没有——照常把这一支展开写满，不要留空节点、"
+    "也不要在节点里写「材料中没有相关内容」。"
+    "source_refs 一律给空数组：没有依据可标时挂一个引用就是编造。"
+    '如果你判断这一支里有关键论断需要材料依据，在响应里带一个与 children 同级的'
+    '字段 "needs_evidence": true，系统会为这一支再检索一次。\n'
 )
 
 
@@ -1543,16 +1597,18 @@ GENERATE_EVIDENCE_HEADER = (
     "（evidence 数组，与 rag_query 的返回同形）：\n"
 )
 
-# 有命中时拼在 system 末尾的那一句。`RAG_SOURCE_PROMPT` 写着"你看不到材料全文，
-# 输入里只有一份清单，要拿到原文只能 rag_query 检索"——而这一版输入末尾已经有
-# 检索结果了。不点破这层，提示词与输入互相矛盾：模型要么再查一遍（白花一次
-# embedding + rerank），要么怀疑那段数组不该用，退回"没检索到"。
+# 有命中时拼在 system 末尾的那一句。
+#
+# `RAG_SOURCE_PROMPT` 已经写明"与主题相关的原文片段由系统检索后附在输入末尾"，
+# 这一句仍要单独留着：它把"这次已经查过了"说成一句明确的话。少了它，模型一边看着
+# evidence 一边觉得"我还没检索过"，会再查一遍同一件事——成本是一次 embedding +
+# 一轮对话，回报是零（同一份清单、同一个问法，回来的还是那几条）。
 #
 # 位置与 `BRANCH_EVIDENCE_RULES` 同理，拼在基础提示词与思维限定之后：它只描述
 # 这次的输入形状，不改树规则。
 GENERATE_EVIDENCE_RULES = (
     "\n本次的 user 消息末尾已经附上「对主题做过的一次检索结果」（evidence 数组）："
-    "这一次不必再为同一件事检索，直接用它的片段写内容与引用。\n"
+    "这一次不必再检索同一件事，直接用它的片段写内容与引用。\n"
 )
 
 
@@ -1579,11 +1635,16 @@ async def _retrieve_topic(sources: list[Source], topic: str) -> _TopicEvidence:
 
     为什么必须有这一步：`_source_prompt_input` 在 `rag` 形态下只拼材料清单（标题、
     字数、类型），而 `mindmap_generate` 自己**没有检索入口**——模型的 `rag_query`
-    命中留在对话里，进不了这次生成的 user 消息。于是模型手里一个字都没有，而
-    `RAG_SOURCE_PROMPT` 又要求"检索不到就不要写，空着是正确结果"。两边都照做，
-    结果是一条分支"材料中没有相关内容：未检索到任何原文依据"，被 `MIN_BRANCHES=3`
-    判成 `invalid_map`。实测同一主题、同一份材料：`full` 形态给 5 条分支，
-    `rag` 形态给 1 条"没检索到"——差别不在模型，在输入。
+    命中留在对话里，进不了这次生成的 user 消息。于是模型手里一个字都没有：旧契约
+    下它会照 `RAG_SOURCE_PROMPT` 说"检索不到就不要写"交出一条"材料中没有相关内容：
+    未检索到任何原文依据"，被 `MIN_BRANCHES=3` 判成 `invalid_map`；新契约下它倒是
+    敢写了，但一个字的原文都没见过，"标明出处"就无从谈起——所以这一次预检索不是
+    可选项，它是引用能成立的前提。
+
+    实测：同一主题、同一份材料，`full` 形态给 5 条分支，加了这一步之前 `rag` 形态
+    只给 1 条"没检索到"——差别不在模型，在输入。新契约上线后提示词侧还额外删掉了
+    "让模型自己调 `rag_query`"那条要求（重复检索拿不到新东西，见 `RAG_SOURCE_PROMPT`
+    的注释），命中只有这一个入口。
 
     检索栈与 `_rag` 是同一套（`search_parent`：子块匹配、父块返回、`MINDMAP_RERANK`
     打开时带重排），所以命中形状不需要第二套定义；渲染也复用 `_citable_hits`，
@@ -1673,11 +1734,11 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             # 否则一次请求里两次读环境变量，理论上能拼出 A 的提示词配 B 的输入。
             if source_mode() == SOURCE_MODE_RAG:
                 # `rag` 下清单里一个字的正文都没有，而这个工具**自己不做检索**：
-                # 不在这里补一次，模型就只能照 `RAG_SOURCE_PROMPT` 说的"检索不到
-                # 就不要写"如实留空，交出一条分支的树（详见 `_retrieve_topic`）。
+                # 不在这里补一次，模型手里就一个字都没有——按旧契约它会交出一条
+                # "材料中没有相关内容"的分支（详见 `_retrieve_topic`）。
                 topic_evidence = await _retrieve_topic(sources, args.topic)
                 # 命中并进本次运行的证据集：收尾的 `verify_source_refs` 要按它判
-                # "这条引用落在命中的那段里吗"。与 `_rag` 累积的是同一份东西，
+                # "这条引用落在可见的父块里吗"。与 `_rag` 累积的是同一份东西，
                 # 两条路各记一份的话，"校验依据"会与"模型看到的证据"分叉。
                 ctx.record_evidence(topic_evidence.spans)
                 if topic_evidence.text:
@@ -1685,7 +1746,9 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
                               + GENERATE_EVIDENCE_RULES)
                     raw = await chat_async(
                         system,
-                        _source_prompt_input(sources, system=system) + topic_evidence.text,
+                        _source_prompt_input(
+                            sources, system=system, retrieval_hint=False
+                        ) + topic_evidence.text,
                         max_tokens=_max_tokens(ctx), **stream_kwargs,
                     )
                 else:
@@ -1694,15 +1757,15 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
                     # 另一条路是"仍然按 rag 提示词生成"：那样模型会说"没检索到"，
                     # 一条分支、`invalid_map`——就是这次的 bug。所以走这条：
                     # `DETAIL_PROMPT` 是"按主题展开框架"的提示词，它不承诺材料依据，
-                    # 也不教模型写引用。输入只给主题，不给清单：清单会引它去
-                    # `rag_query`，而刚刚证明这个问法查不到东西。
+                    # 也不教模型写引用。输入只给主题，不给清单：清单里那句"你看不到
+                    # 全文"会让模型以为还有别的东西没拿到，反而不敢写。
                     #
                     # 校验仍然带着来源与证据（不在这里把 `sources` 判成 None）：
                     # 模型在**本次运行的前几轮**可能已经 `rag_query` 到过真实片段，
                     # 它据此写出的引用是合法的，不该因为这一次主题检索没命中就全删。
-                    # 逐字与证据两道校验照跑，留下的只可能是真依据——"没有引用"是
-                    # 可见的（聚合诊断 + `ToolResult.content`），"假装有依据"不可能。
-                    system = DETAIL_PROMPT + thinking
+                    # 逐字校验照跑，留下的只可能是真依据——"没有引用"是可见的
+                    # （聚合诊断 + `ToolResult.content`），"假装有依据"不可能。
+                    system = DETAIL_PROMPT + thinking + DETAIL_NO_SOURCE_RULES
                     raw = await chat_async(
                         system, args.topic, max_tokens=_max_tokens(ctx), **stream_kwargs,
                     )
@@ -1715,8 +1778,8 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
                 )
         else:
             raw = await chat_async(
-                DETAIL_PROMPT + thinking, args.topic, max_tokens=_max_tokens(ctx),
-                **stream_kwargs,
+                DETAIL_PROMPT + thinking + DETAIL_NO_SOURCE_RULES, args.topic,
+                max_tokens=_max_tokens(ctx), **stream_kwargs,
             )
     except GenerationError as exc:
         return _fail("generation_failed", f"生成失败：{exc}")
@@ -1828,8 +1891,8 @@ async def _search_branch(
     的注释），那是下一轮的事。
 
     抛错返回 `None`——"没检索到"与"检索失败"要能分开记：前者是材料里确实没这块
-    （如实留空是对的），后者是这次检索没成（可能换个配置就有了）。`None` 与 `[]`
-    就是这两个意思。
+    （这一支按知识展开、不挂引用是对的），后者是这次检索没成（可能换个配置就有了）。
+    `None` 与 `[]` 就是这两个意思。
 
     **两条路径，按"有没有扩展"分岔，不是按开关分岔**：
 
@@ -1944,6 +2007,104 @@ async def _retrieve_whole(
         return []
 
 
+async def _search_text(sources: list[Source], query: str) -> list[EvidenceHit] | None:
+    """按一段自由文本检索——**补查专用**，与 `_search_branch` 是同一条检索栈。
+
+    为什么单独一个函数而不是复用 `_search_branch`：那个函数的 query 由
+    `_branch_query(title)` 从**分支标题**拼出来，语义是"这一支叫什么"；补查要发的是
+    这一支里**最长的那句子节点文字**，两者不是一回事。硬塞进去会让"分支 query 就是
+    标题本身"这条被实测钉过的规则出现一个例外，下一个人再读就看不出边界在哪。
+
+    失败返回 `None`（与 `_search_branch` 一致）：补查失败只等于"这一支仍然没有依据"，
+    不该废掉已经展开好的内容。
+    """
+    text = (query or "").strip()
+    if not text:
+        return None
+    try:
+        return await asyncio.to_thread(search_parent, sources, text, DEEP_BRANCH_TOP_K)
+    except Exception as exc:  # noqa: BLE001 — 补查失败只降级
+        logger.warning("补查检索失败（%d 字 query）：%s: %s",
+                       len(text), type(exc).__name__, str(exc)[:160])
+        return None
+
+
+def _merge_branch_evidence(
+    old: "_BranchEvidence | None", new: _BranchEvidence, sources: list[Source],
+) -> _BranchEvidence:
+    """把补查到的证据并进这一支：`spans` / `payload` / `quotes` 三份一起扩。
+
+    不能只换掉 `payload`：`spans` 是收尾校验判"这条引用是不是本支证据"的依据，
+    只扩 payload 会让新抄进来的引用在 `_ref_from` 那里被当成越界丢掉；反过来只扩
+    spans 会让模型看不到新证据。两份必须同源。
+
+    去重按 `(source_id, start, end, leaf_start, leaf_end)`：补查的 query 是从这一支
+    自己的内容里取的，与原 query 命中同一段是常态，不去重会把同一段文字在 prompt 里
+    印两遍。
+    """
+    if old is None:
+        return new
+    spans = tuple(dict.fromkeys((*old.spans, *new.spans)))
+    payload = [*old.payload]
+    seen = {(item.get("source_id"), item.get("start"), item.get("end"))
+            for item in payload}
+    payload.extend(
+        item for item in new.payload
+        if (item.get("source_id"), item.get("start"), item.get("end")) not in seen
+    )
+    return _BranchEvidence(
+        payload=payload,
+        spans=spans,
+        text=json.dumps(payload, ensure_ascii=False),
+        quotes="\n".join(
+            part for entry in payload
+            for part in (entry.get("quote"), entry.get("evidence_quote"))
+            if isinstance(part, str) and part
+        ),
+    )
+
+
+def _slot_ref_count(slots: list[_Slot]) -> int:
+    """这一支（含多给的下层）一共写了多少条引用。触发补查的判据之一。"""
+    return sum(len(slot.source_refs) + _slot_ref_count(slot.children) for slot in slots)
+
+
+def _longest_slot_label(slots: list[_Slot]) -> str:
+    """这一支里**最长**的子节点文字，补查用它当 query。
+
+    为什么不是再发一次分支标题：标题已经查过了，再查一遍回来的是同一批命中
+    （`_branch_query` 的消融数字就是这么测出来的）。展开之后才有的东西是这一支
+    写出来的具体说法——它更长、更接近正文用词，是唯一还没被试过的问法。
+    """
+    labels: list[str] = []
+    stack = list(slots)
+    while stack:
+        slot = stack.pop()
+        labels.append(slot.label)
+        stack.extend(slot.children)
+    return max(labels, key=len).strip() if labels else ""
+
+
+def _needs_supplementary(raw: Any, slots: list[_Slot]) -> bool:
+    """这一支要不要补查一次（限额见 `SUPPLEMENTARY_*`）。
+
+    两个触发条件，都在展开**之后**判：
+
+      1. 模型自己说这支配不上依据：响应里带 `needs_evidence: true`。它刚写完这些
+         论断，只有它知道哪几处是硬凑的——这是代码拿不到的信息；
+      2. 一支写得够多（≥ `SUPPLEMENTARY_MIN_NODES` 个要点）却一条引用都没有。
+         这是"展开成功、内容全是常识补的"的沉默信号，也是最容易变成
+         "看起来完整、其实没有出处"的那一类子树。
+
+    只判一次：补查的结果不再回判，这就是"每支最多补 1 次"的实现。
+    """
+    if isinstance(raw, dict) and raw.get("needs_evidence") is True:
+        return True
+    if len(slots) < SUPPLEMENTARY_MIN_NODES:
+        return False
+    return _slot_ref_count(slots) == 0
+
+
 async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     """分片生成：先出骨架，再按层并发展开，最后确定性验收并只补不合格的那一支。
 
@@ -1972,6 +2133,12 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         「本层 + 容忍的一层」）取小，得到这一次响应最多能落多少节点
       - 额度不足就**停手**，已经展开的部分照常交出，标 `partial` 并说明原因。
         少交一层不是失败，"报完整成功却少了半棵树"才是。
+
+    **展开之后还有一步限额补查**（`supplement`）：首路 query 是分支标题，与正文用词
+    对不齐的那一支会一条都召不回。判据是"模型自己说这支配不上依据"或"这一支写了
+    ≥`SUPPLEMENTARY_MIN_NODES` 个要点却零引用"；命中后换 query（该支最长子节点
+    文字）再检索一次、重写这一支并与原结果合并。上限：每支 1 次、每次运行
+    `SUPPLEMENTARY_RUN_LIMIT` 次，**不占 `max_tool_calls`**（与按支检索同一条规矩）。
 
     四段都有各自的失败语义，不要合并：
       1. 骨架拿不到 → 整次失败（连框架都没有，没有可交付的东西）
@@ -2204,7 +2371,7 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
                 node_id=skeleton[index][1],
                 message=(
                     f"分支「{skeleton[index][0]}」的检索没有命中材料里的任何片段，"
-                    "这一支如实留空（提示词要求不凭主题编造）"
+                    "这一支按自己的知识展开、不挂引用（未检索到不等于材料里没有）"
                 ),
             ))
 
@@ -2212,8 +2379,8 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         """这一支该用哪份提示词：有证据 / 无证据（分片形态）/ 不看证据（`full`）。
 
         三者不能合并：`full` 形态下 `evidence is None` 是"这个工具不读来源"，
-        而分片形态下 `evidence is None` 是"这一支没查到"——后一种必须告诉模型
-        不许编，前一种说这句话反而是误导（那里正文就在 prompt 里）。
+        而分片形态下 `evidence is None` 是"这一支没查到"——后一种要告诉模型
+        "照常写、但不要挂引用"，前一种说这句话反而是误导（那里正文就在 prompt 里）。
         """
         if evidence is not None:
             return base + "\n" + BRANCH_EVIDENCE_RULES
@@ -2247,11 +2414,96 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     # 排队中的任务一次性预占，实际请求却还没发出去。
     semaphore = asyncio.Semaphore(DEEP_CONCURRENCY)
 
+    # 补查的运行级计数与可观测面（策略见 `SUPPLEMENTARY_*`）。
+    #
+    # 不加锁：整个工具跑在一个事件循环线程里，"判额度 + 自增"之间没有 await，
+    # 两个并发分支不可能同时看到 `supplementary_used == 0`。加一把 `asyncio.Lock`
+    # 只是在保护一段本来就不会被抢占的代码。
+    supplementary_used = 0
+    supplementary_queries: list[str] = []
+    supplementary_branches: list[int] = []
+
+    async def supplement(
+        title: str, branch_index: int, slots: list[_Slot],
+    ) -> list[_Slot]:
+        """一支的限额补查：换一条 query 再检索一次，命中就补写内容并合并。
+
+        四道闸，任意一道不满足就原样返回已经展开的内容：
+
+          1. 每次运行最多 `SUPPLEMENTARY_RUN_LIMIT` 次（成本闸，理由见常量注释）；
+          2. 这一支只能补一次——调用点只判一次，补查结果不再回判；
+          3. 补查失败或空命中 → 保持原结果（"没补到"不等于"这一支该空着"）；
+          4. 模型额度不够重写 → 保留原结果，但新证据已经记进 `branch_evidence`
+             与 `ctx.evidence`，补点轮和收尾校验都能用上它。
+
+        **合并而不是替换**：补查是为了补依据，不是重写这一支。实测第二次响应
+        常比第一次少一两条要点，替换会让已经写好的内容凭空消失。
+        """
+        nonlocal supplementary_used
+        if supplementary_used >= SUPPLEMENTARY_RUN_LIMIT:
+            return slots
+        query = _longest_slot_label(slots)
+        if not query:
+            return slots
+        supplementary_used += 1
+        supplementary_queries.append(query)
+        supplementary_branches.append(branch_index)
+
+        hits = await _search_text(sources, query)
+        if not hits:
+            diagnostics.append(Diagnostic(
+                level=DiagnosticLevel.info, code="BRANCH_SUPPLEMENTARY_EMPTY",
+                node_id=skeleton[branch_index][1],
+                message=(f"分支「{title}」按子节点「{query[:40]}」补查了一次，"
+                         "仍然没有命中材料里的片段，这一支保持无引用"),
+            ))
+            return slots
+
+        evidence = _merge_branch_evidence(
+            branch_evidence[branch_index], _branch_evidence(hits, sources), sources)
+        branch_evidence[branch_index] = evidence
+        # 新证据同样要进本次运行的证据集：收尾的 `verify_source_refs` 按它判
+        # "这条引用落在可见的父块里吗"。少记一条，模型照它抄的引用就会被判成编的。
+        ctx.record_evidence(evidence.spans)
+        if not ctx.reserve_model_call():
+            return slots
+        ctx.extra_model_calls += 1
+        ask = (
+            f"整体主题：{args.topic}\n"
+            f"本条一级分支：{title}\n"
+            f"请给出 {need} 个子要点。"
+            f"{evidence_suffix(evidence)}"
+        )
+        try:
+            raw = await ask_model(
+                prompt_for(BRANCH_EXPAND_PROMPT, evidence), ask, parent=(branch_index,))
+        except GenerationError:
+            return slots          # 重写失败只是"仍然按原来的内容交"，不升级成失败
+        more, _ = _trim_slots(
+            _candidate_slots(raw, point_budget, nested_levels, evidence=evidence),
+            allowance,
+        )
+        added, _ = _keep_new_slots(slots, more)
+        # 合并后仍要过一遍节点预算：两次响应各给满 `point_budget` 时会翻倍，
+        # 而 `allowance` 是这一支在整树里能占的上限。
+        merged, _ = _trim_slots([*slots, *added], allowance)
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.info, code="BRANCH_SUPPLEMENTARY_HITS",
+            node_id=skeleton[branch_index][1],
+            message=(f"分支「{title}」按子节点「{query[:40]}」补查了一次，"
+                     f"命中 {len(hits)} 条，补出 {len(added)} 个要点"),
+        ))
+        return merged
+
     async def expand_branch(title: str, branch_index: int) -> list[_Slot] | None:
         """展开一条分支。额度不够返回 None——那是"没展开"，与"展开失败"是两件事。
 
         **只带这一支的 hits**：`branch_evidence[branch_index]` 是这一步之前按
         「主题 + 分支标题」单独检索出来的那一批，兄弟分支的证据一个字都不进来。
+
+        展开之后多一道判据：这一支要不要**补查一次**（`_needs_supplementary`）。
+        判定与检索都在工具内部，所以仍然**不占** `max_tool_calls`——模型看到的只是
+        一次 `mindmap_generate_deep` 调用。
         """
         async with semaphore:
             if not ctx.reserve_model_call():
@@ -2272,7 +2524,9 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
                 _candidate_slots(raw, point_budget, nested_levels, evidence=evidence),
                 allowance,
             )
-            return kept
+            if not (slicing and _needs_supplementary(raw, kept)):
+                return kept
+            return await supplement(title, branch_index, kept)
 
     results = await asyncio.gather(
         *(expand_branch(title, index) for index, (title, _) in enumerate(skeleton)),
@@ -2727,9 +2981,13 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         if retrieval_mode == "whole":
             line += "；按支检索一条都没命中，已退回整树一次检索（全部支共用）"
         elif with_evidence == 0:
-            line += "；一条都没命中，各支按「无依据」展开"
+            line += "；一条都没命中，各支按自己的知识展开、不挂引用"
         else:
-            line += f"，{len(skeleton) - with_evidence} 条没有依据、已如实留空"
+            line += (f"，{len(skeleton) - with_evidence} 条没有检索到依据，"
+                     "按自己的知识展开、不挂引用")
+        if supplementary_branches:
+            line += (f"；其中 {len(supplementary_branches)} 条按子节点补查了一次"
+                     f"（本次上限 {SUPPLEMENTARY_RUN_LIMIT} 次）")
         content_parts.append(line + "。")
         if refs_kept or refs_dropped:
             content_parts.append(
@@ -2788,6 +3046,16 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
                 "empty_branches": [skeleton[index][0] for index in retrieval_empty],
                 "hits": sum(
                     len(item.payload) for item in branch_evidence if item is not None),
+                # 限额补查：首路 query 是分支标题，与正文用词对不齐的那几支一条都
+                # 召不回。`used` 与 `branches` 分开记——前者是成本（几次检索），
+                # 后者是收益（救回几支），只报一个数看不出补查值不值。
+                "supplementary": {
+                    "limit_per_branch": SUPPLEMENTARY_BRANCH_LIMIT,
+                    "limit": SUPPLEMENTARY_RUN_LIMIT,
+                    "used": supplementary_used,
+                    "branches": [skeleton[index][0] for index in supplementary_branches],
+                    "queries": supplementary_queries,
+                },
             },
             "source_refs": {
                 "kept": refs_kept,
@@ -3402,7 +3670,7 @@ def build_registry(intent: str = "create", *, has_sources: bool = False,
         入参里没有任何来源字段、骨架与展开都只看主题，产出的树与材料脱钩，却会
         以 ok=True 成功返回。这条不是"少给一个选项"，是"少给一条会给出错误答案
         的路"——模型看不到它，就不会选中它。带材料的新建走 `mindmap_generate`
-        的忠实整理模式（它给模型喂结构化来源、还校验逐字引用）。
+        的 `full` 提示词（它给模型喂结构化来源、回填 source_usage 并逐字校验引用）。
       - `rag`：**保留**（这一轮放开的那一条）。`_generate_deep` 现在会为每条
         一级分支各检索一次（`docs/RAG-DECISIONS.md` 第 5 节的结构引导召回），
         每支只看到自己的命中，引用也只能落在自己那批证据上。**整树一次生成意味着

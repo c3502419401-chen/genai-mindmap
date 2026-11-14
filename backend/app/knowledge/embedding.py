@@ -46,9 +46,11 @@ KEY_ENVS = ("MINDMAP_EMBEDDING_API_KEY", "DASHSCOPE_API_KEY")
 BASE_URL_ENV = "MINDMAP_EMBEDDING_BASE_URL"
 PROTOCOL_ENV = "MINDMAP_EMBEDDING_PROTOCOL"
 
-# 单次请求最多 25 条。**这个上限是按 DashScope 文档取的**；MaaS 网关的实际上限
-# 未验证（实测 2 条正常）。25 是个保守值，真要撞上限会拿到 400 而不是静默截断。
-MAX_BATCH = 25
+# 单次请求最多 10 条。**这个数字是实测出来的，不是按文档取的**：MaaS 网关在 12 条
+# 就开始回 400 `batch size is invalid`，8 与 10 通过。DashScope 文档写的是 25，
+# 但同一个模型换到工作空间端点后上限不同——按文档取会整批失败，而整批失败在这个
+# 模块里等于"向量路全废、静默退化成纯 BM25"，日志里只有一行 warning。
+MAX_BATCH = 10
 # 单条文本的安全长度（码点）。v3 的上下文是 8192 token，中文按 1 token ≈ 1.2–1.5
 # 字估算，6000 码点仍留有余量。切块上限 700 码点，正常路径碰不到这里。
 MAX_CHARS = 6000

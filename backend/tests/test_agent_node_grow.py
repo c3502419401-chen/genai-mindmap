@@ -43,6 +43,7 @@ from app.agent.tools import (
 from app.contracts.mindmap import MindMapContent
 from app.contracts.source import Source
 from app.generation.service import (
+    DETAIL_NO_SOURCE_RULES,
     DETAIL_PROMPT,
     RAG_SOURCE_PROMPT,
     RAG_THINKING_GUARD,
@@ -624,7 +625,8 @@ class GenerateGrowTest(unittest.TestCase):
         tree = self._tree()
 
         async def chat(system, user, *, max_tokens, on_delta):
-            self.assertEqual(system, DETAIL_PROMPT + thinking_block("default"))
+            self.assertEqual(system, DETAIL_PROMPT + thinking_block("default")
+                             + DETAIL_NO_SOURCE_RULES)
             self.assertEqual(user, "整理论文")
             await on_delta(json.dumps(tree, ensure_ascii=False))
             return tree
@@ -726,7 +728,8 @@ class GenerateGrowTest(unittest.TestCase):
                 self.assertTrue(result.ok, result.content)
                 self.assertEqual(len(calls), 1)
                 system, user, max_tokens = calls[0]
-                expected_system = DETAIL_PROMPT + thinking_block("default")
+                expected_system = (DETAIL_PROMPT + thinking_block("default")
+                                   + DETAIL_NO_SOURCE_RULES)
                 if with_sources:
                     # 默认形态是 `rag`：提示词与输入都换成"清单 + 命中"的那一套。
                     # 之前这里钉的是 `full`（sources 数组 + 整份正文），形态一换，

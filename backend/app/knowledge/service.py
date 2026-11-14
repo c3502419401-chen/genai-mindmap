@@ -1102,10 +1102,11 @@ def _hybrid_enabled() -> bool:
 #     '只给片段'的形态准备的"——那个形态已经是默认形态。
 #   - ②有了对策：命中区间（`leaf_start`/`leaf_end`）会随 hits 一路累积到
 #     `RunContext.evidence`，生成收尾时交给 `verify_source_refs(..., evidence=...)`，
-#     落在父块里但不在命中子块里的引用会被判 `SOURCE_REF_OUTSIDE_EVIDENCE`。
-#     接线在 `tools._rag` → `RunContext.record_evidence` → `_generate` →
-#     `validate_generated_content` 这条链上，**先接线、后翻默认值**的顺序是刻意的：
-#     反过来会有一段时间是"父块模式 + 无防护"。
+#     落在父块里但不在命中子块里的引用会被标 `SOURCE_REF_OUTSIDE_EVIDENCE`。
+#     它是 warn 级诊断、**不剔除引用**（要求模型精确落在命中的那 200 字里过于苛刻，
+#     实测会成批删掉合法引用）；接线在 `tools._rag` → `RunContext.record_evidence`
+#     → `_generate` → `validate_generated_content` 这条链上，**先接线、后翻默认值**
+#     的顺序是刻意的：反过来会有一段时间是"父块模式 + 无防护"。
 PARENT_RETRIEVAL_ENV = "MINDMAP_PARENT_RETRIEVAL"
 
 # 判定方向与 `_hybrid_enabled` 相反这件事没变，但含义反过来了：那个默认开，所以
@@ -1932,8 +1933,8 @@ def search_parent(sources: list[Source], query: str, top_k: int = 5, *,
     `MINDMAP_SOURCE_MODE` 已经默认 `rag`，那个形态就是现在的默认形态。另一半
     顾虑（父块里与查询无关的段落也能通过逐字校验）已经有对策：命中的子块区间随
     hits 累积进 `RunContext.evidence`，生成收尾时交给
-    `verify_source_refs(..., evidence=...)` 判 `SOURCE_REF_OUTSIDE_EVIDENCE`。
-    也就是说，"默认开"这件事**依赖**接线先落地，两者不能反过来做。
+    `verify_source_refs(..., evidence=...)` 标 `SOURCE_REF_OUTSIDE_EVIDENCE`
+    （warn，不剔除）。也就是说，"默认开"这件事**依赖**接线先落地，两者不能反过来做。
 
     `library=True` 与 `search_sources` 的同名参数逐条对齐（选法、上限、排重、
     保底席位都由 `_library_batch` / `_merge_batches` 负责），唯一区别是库那批也走

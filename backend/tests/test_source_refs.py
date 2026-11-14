@@ -140,7 +140,10 @@ def test_quotes_and_unicode_offsets_match_the_original_text(tree, sources):
     start = sources[0].text.index(quote)
     tree["root"]["children"][0]["source_refs"] = [
         {"source_id": "s1", "start": start, "end": start + len(quote), "quote": quote},
-        {"source_id": "s1", "start": 0, "end": len(sources[0].text)},
+        # 整段引用也带上引文：只给区间的引用现在会被拦（见
+        # `test_range_without_quote_is_rejected`）——坐标本身说明不了引的是哪一段。
+        {"source_id": "s1", "start": 0, "end": len(sources[0].text),
+         "quote": sources[0].text},
     ]
     content = MindMapContent.model_validate(tree)
     before = content.model_dump()
@@ -152,9 +155,13 @@ def test_quotes_and_unicode_offsets_match_the_original_text(tree, sources):
     ({"source_id": "s1", "quote": "下周发布"}, "SOURCE_QUOTE_MISMATCH"),
     ({"source_id": "s1", "quote": "根本没有这句话"}, "SOURCE_QUOTE_MISMATCH"),
     ({"source_id": "s1", "start": 0, "end": 2, "quote": "机器学习"}, "EMPTY_SOURCE_EXCERPT"),
-    ({"source_id": "s1", "start": 2, "end": 6, "quote": "识别图像"}, "SOURCE_QUOTE_MISMATCH"),
+    # 偏移错、引文逐字存在于原文、且在可见范围内唯一定位 → 这一条**不再**判
+    # `SOURCE_QUOTE_MISMATCH`：服务端按引文补正偏移。见
+    # `test_offset_is_repaired_when_quote_is_unique`。
     ({"source_id": "s1", "start": 0, "end": 999}, "SOURCE_RANGE_OUT_OF_BOUNDS"),
     ({"source_id": "s1"}, "UNVERIFIED_SOURCE_REF"),
+    # 放行口：区间合法、引文为空。旧实现直接通过，等于只核对了坐标。
+    ({"source_id": "s1", "start": 0, "end": 4}, "UNVERIFIED_SOURCE_REF"),
 ])
 def test_bad_evidence_is_reported_without_editing_the_map(tree, sources, ref, code):
     tree["root"]["children"][0]["source_refs"] = [ref]
@@ -218,7 +225,12 @@ def test_validation_rebuilds_source_usage_and_drops_invented_references(tree, so
     assert [s.source_id for s in content.source_usage] == ["s1", "s2"]
     assert content.source_usage[1].filename == "会议.md"
     assert content.source_usage[0].char_count == len(sources[0].text.strip())
-    assert content.root.children[0].source_refs == [SourceRef(source_id="s1", quote="识别图像")]
+    # 这条引用只给了引文，服务端按原文把偏移补齐了（`_check_reference` 的
+    # "只有 quote"那条路）——引文一个字符都没变，多出来的是坐标。
+    kept = content.root.children[0].source_refs
+    assert [ref.quote for ref in kept] == ["识别图像"]
+    start = sources[0].text.index("识别图像")
+    assert (kept[0].start, kept[0].end) == (start, start + len("识别图像"))
     assert {(d.code, d.node_id) for d in diagnostics} == {
         ("UNKNOWN_SOURCE_REF", "a"), ("SOURCE_QUOTE_MISMATCH", "a"),
     }
@@ -381,11 +393,13 @@ def test_ref_inside_hit_span_passes():
                               evidence=[_evidence_span()]) == []
 
 
-def test_ref_in_parent_but_outside_hit_is_flagged():
-    """引用在父块里、但不在命中的子块里：这才是新约束要抓的那种引用。
+def test_ref_in_parent_but_outside_hit_is_kept_with_a_warning():
+    """引用在父块里、但不在命中的子块里：**保留**，只给一条 warn。
 
-    同一条引用在不给 `evidence` 时完全合法——这不是作废逐字校验，而是把
-    "逐字在原文里"与"落在证据上"分成两条，两条都要过。
+    上一版在这里剔除。放宽的理由：模型现在写的是自己的话、引的是材料里的某段，
+    它看到的是 450–700 字的父块；要求它精确落在命中的那 200 字里过于苛刻，
+    实测会成批剔掉合法引用，界面上表现为"这一支没有证据"。
+    子块约束保留下来是为了**可观测**：谁引了父块里与查询无关的部分，诊断里看得见。
     """
     content = _content_with(_ref_of(_UNRELATED))
 
@@ -393,10 +407,7 @@ def test_ref_in_parent_but_outside_hit_is_flagged():
 
     diagnostics = verify_source_refs(content, [_the_source()],
                                      evidence=[_evidence_span()])
-    # 唯一一条引用被判掉之后，节点自然变成"没有可核验引用"，所以还会跟一条
-    # `UNSOURCED_NODE`——那是既有语义，不是这次改动引入的。
-    assert [d.code for d in diagnostics] == [
-        "SOURCE_REF_OUTSIDE_EVIDENCE", "UNSOURCED_NODE"]
+    assert [d.code for d in diagnostics] == ["SOURCE_REF_OUTSIDE_EVIDENCE"]
     assert diagnostics[0].level == DiagnosticLevel.warn
     assert diagnostics[0].node_id == "r"
 
@@ -431,7 +442,7 @@ def test_ref_passes_when_any_covering_hit_contains_it():
 
 
 def test_quote_mismatch_wins_over_span_check():
-    """顺序不可换：逐字对不上时只报 `SOURCE_QUOTE_MISMATCH`。
+    """顺序不可换：逐字对不上且定位不到时只报 `SOURCE_QUOTE_MISMATCH`。
 
     先查区间的话，一条本来就对不上原文的引用会同时得到"位置不对"的提示，
     两条诊断里只有前一条有信息量，后一条是噪声。
@@ -444,11 +455,11 @@ def test_quote_mismatch_wins_over_span_check():
     assert codes == {"SOURCE_QUOTE_MISMATCH", "UNSOURCED_NODE"}
 
 
-def test_remove_invalid_drops_refs_outside_hit():
-    """`remove_invalid=True` 时新码的引用被剔除，通过的引用留下。"""
+def test_outside_hit_ref_is_no_longer_removed():
+    """`remove_invalid=True` 也不剔除落在父块外的引用：它只剔除真的对不上的那些。"""
     content = _content_with(_ref_of(_HIT), _ref_of(_UNRELATED))
     diagnostics = verify_source_refs(content, [_the_source()],
                                      evidence=[_evidence_span()],
                                      remove_invalid=True)
-    assert [ref.quote for ref in content.root.source_refs] == [_HIT]
+    assert [ref.quote for ref in content.root.source_refs] == [_HIT, _UNRELATED]
     assert {d.code for d in diagnostics} == {"SOURCE_REF_OUTSIDE_EVIDENCE"}
