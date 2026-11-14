@@ -30,6 +30,17 @@ const POSITIONS: Record<ChildSide, Position> = {
 const truncated = computed(() => props.data.label !== props.data.fullLabel);
 
 /**
+ * 卡片里是否还有节点上看不到的内容。
+ *
+ * 两种来源：标题被截断（旧图的长标题），或正文（`detail`）与标题不是同一段文字。
+ * 生成侧的标题现在 ≤16 字，画布上不会被截断——那时这张卡片的全部价值就在于
+ * "点开看长文"，所以 `truncated` 这一条不能单独当作提示的判据。
+ */
+const hasMore = computed(
+  () => truncated.value || props.data.body !== props.data.fullLabel,
+);
+
+/**
  * 节点框的样式。
  *
  * 三条真实分支原样保留——`content` 渲染出来必须和加预览之前逐像素一致。
@@ -198,8 +209,10 @@ onBeforeUnmount(() => clearTimeout(timer));
       <p class="max-h-56 overflow-y-auto whitespace-pre-wrap break-words text-sm text-slate-700">
         {{ data.body }}
       </p>
-      <p v-if="truncated" class="mt-2 text-xs text-slate-400">
-        节点上只显示前 24 个字，完整内容见此处或右侧详情面板
+      <p v-if="hasMore" class="mt-2 text-xs text-slate-400">
+        <span v-if="data.bodySource === 'detail'">节点上只显示标题，这里是生成时写的详情</span>
+        <span v-else-if="data.bodySource === 'note'">节点上只显示标题，这里是你的备注</span>
+        <span v-else>节点上只显示前 24 个字，完整内容见此处或右侧详情面板</span>
       </p>
     </div>
   </div>

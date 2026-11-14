@@ -205,6 +205,9 @@ export function applyOps(content: MindMapContent, batch: OpBatch): ApplyResult {
           // 缺省给空数组而不是 undefined：模型漏写这一项时，节点不该凭空继承
           // 任何引用，也不该让下游 `node.source_refs.length` 抛错。
           source_refs: cloneTree(op.source_refs ?? []),
+          // `detail` 是生成产出的说明，与用户备注 `note` 分开存；`add` 不带
+          // note 字段，正是为了这两条写入路径永不交叉。
+          detail: op.detail ?? null,
         };
         next.root = insertChildAt(next.root, op.parent_id, op.index, node);
         changed.add(op.id);
@@ -219,10 +222,15 @@ export function applyOps(content: MindMapContent, batch: OpBatch): ApplyResult {
         if (!node) {
           throw new OpError('node_not_found', path('id'), `节点 ${op.id} 不存在`);
         }
-        const changes: { label?: string; source_refs?: SourceRef[] } = op.changes ?? {};
+        const changes: { label?: string; source_refs?: SourceRef[]; detail?: string | null } =
+          op.changes ?? {};
         // 后端 UpdateChanges.at_least_one 直接拒绝空 changes。前端不拦的话，
         // 同一条 op 在这里成功、在服务端 ValidationError，模型收到的反馈相反。
-        if (changes.label === undefined && changes.source_refs === undefined) {
+        if (
+          changes.label === undefined &&
+          changes.source_refs === undefined &&
+          changes.detail === undefined
+        ) {
           throw new OpError('empty_changes', path('changes'), `节点 ${op.id} 的 update 至少要改一个字段`);
         }
         // `undefined` 是"这一项不动"，`[]` 是"显式清空"。这两句必须分开写，
@@ -231,6 +239,12 @@ export function applyOps(content: MindMapContent, batch: OpBatch): ApplyResult {
         if (changes.label !== undefined) node.label = changes.label;
         if (changes.source_refs !== undefined) {
           node.source_refs = cloneTree(changes.source_refs);
+        }
+        // `detail` 同一套约定：`undefined` 不动，空串归一成 `null`（清空）。
+        // 这里**不碰 note**：那是用户的备注，op 通道无权重写它。
+        if (changes.detail !== undefined) {
+          const detail = (changes.detail ?? '').trim();
+          node.detail = detail ? detail : null;
         }
         changed.add(op.id);
         break;

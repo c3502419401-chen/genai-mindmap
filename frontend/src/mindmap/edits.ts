@@ -11,8 +11,19 @@ export const LIMITS = {
   children: 50,
   label: 200,
   note: 2000,
+  /** 生成产出的说明（契约 `Node.detail`）。与 `note` 同容量、不同语义。 */
+  detail: 2000,
   title: 200,
 } as const;
+
+/**
+ * AI 生成时标题的软上限（契约 `GENERATED_LABEL_MAX_CHARS`）。
+ *
+ * 与 `LIMITS.label`（200，契约硬上限、旧图读取口径）是两件事：生成侧要求 16 字，
+ * 但旧图里那句 20–30 字的长标题必须照常读、照常存。前端用它只做**提示**（"这个
+ * 标题有点长，画布上会折行"），不做校验——把 16 写进校验会让用户改不动旧节点。
+ */
+export const GENERATED_LABEL_HINT = 16;
 
 /** 复制一棵树：编辑操作都在副本上做，撤销栈里的快照才不会被后续修改带跑。 */
 export function cloneTree<T>(value: T): T {
@@ -179,6 +190,9 @@ export function validateDraft(content: MindMapContent): string | null {
     }
     if (node.note && charLength(node.note.trim()) > LIMITS.note) {
       return `节点「${shortLabel(label)}」的正文超过 ${LIMITS.note} 个字`;
+    }
+    if (node.detail && charLength(node.detail.trim()) > LIMITS.detail) {
+      return `节点「${shortLabel(label)}」的详情超过 ${LIMITS.detail} 个字`;
     }
     if (node.children.length > LIMITS.children) {
       return `节点「${shortLabel(label)}」最多 ${LIMITS.children} 个子节点`;

@@ -27,9 +27,7 @@ import {
 export const TRUNCATE_CHARS = 24;
 
 /** 撤销栈上限。整树快照一步几 KB，50 步封顶，内存与手感都够用。 */
-export const HISTORY_LIMIT = 50;
-
-/**
+export const HISTORY_LIMIT = 50;/**
  * 撤销栈的总字节上限。
  *
  * 只有步数上限时，节点上限从 300 提到 1000 之后会失真：一份快照就能到几十 KB，
@@ -41,19 +39,43 @@ export const HISTORY_BYTES_LIMIT = 10 * 1024 * 1024;
 /** 保存的结果分类：界面据此决定提示什么，而不是把所有失败都说成"保存失败"。 */
 export type SaveResult = 'saved' | 'conflict' | 'invalid' | 'empty' | 'busy' | 'failed';
 
-/** 节点上显示的短标题：按码点截断，超出加省略号。 */
+/** 节点上显示的短标题：按码点截断，超出加省略号。
+ *
+ * 生成侧现在把 `label` 限制在 16 字以内（契约 `GENERATED_LABEL_MAX_CHARS`），所以
+ * 这个截断**对新图不再生效**——它是给旧图留的兜底：库里那些 20–30 字的长标题必须
+ * 照常画得下，不能被"我们改好了生成侧"这件事连累。
+ */
 export function displayTitle(node: MindNode): string {
   const chars = Array.from(node.label.trim());
   return chars.length > TRUNCATE_CHARS ? `${chars.slice(0, TRUNCATE_CHARS).join('')}…` : chars.join('');
 }
 
 /**
- * 卡片与详情面板里的正文：契约 v2 的 `note` 优先，v1 没有该字段时回退 `label` 全文。
- * v2 落地后这里不需要改调用方，只改这一个函数的取值。
+ * 详情面板 / 悬停卡片里的正文：`detail → note → label`。
+ *
+ * 三段的语义完全不同，所以回退顺序不能调：
+ *   - `detail`：这次生成产出的说明（模型写的，2–3 句）；
+ *   - `note`：用户自己写的备注（生成侧永远不碰它）；
+ *   - `label`：都没有时的兜底——旧图（v1/v2 早期）只有标题，那时"完整内容"
+ *     就是标题本身。
+ *
+ * 回退顺序写反（比如 `note` 优先）的后果是：用户给一个已有详情的节点随手写了句
+ * 备注，画布与导出就只剩那句备注了——而 detail 还在数据里，只是没人显示。
  */
 export function displayBody(node: MindNode): string {
+  const detail = node.detail?.trim();
+  if (detail) return detail;
   const note = node.note?.trim();
   return note && note.length > 0 ? note : node.label.trim();
+}
+
+/** 正文当前来自哪一段。详情面板据此给出"这一段是什么"的说明。 */
+export type BodySource = 'detail' | 'note' | 'label';
+
+export function bodySource(node: MindNode): BodySource {
+  if (node.detail?.trim()) return 'detail';
+  if (node.note?.trim()) return 'note';
+  return 'label';
 }
 
 /**
@@ -201,10 +223,17 @@ function agentWarningsFrom(summary?: Record<string, unknown>): AgentWarning[] {
 export interface MindNodeData {
   /** 截断后的短标题，画在节点框里 */
   label: string;
-  /** 悬停卡片与详情面板里的全文 */
+  /**
+   * 悬停卡片里的正文：`detail → note → label`（见 `displayBody`）。
+   *
+   * 画布上**只画 `label`**，正文不再往节点框里挤——这正是"画布上短、点开看长文"
+   * 的那条分界。`body` 只服务悬停卡片（用户没点开时的快速预览）。
+   */
   body: string;
   /** 完整 label（不截断），供 title 属性与无障碍读屏使用 */
   fullLabel: string;
+  /** 正文来自哪一段（detail / note / label）。卡片据此决定要不要标"我的备注"。 */
+  bodySource?: BodySource;
   depth: number;
   /** 需要渲染的源句柄：子节点分布在哪几侧就要哪几个（双向布局的根两侧都有） */
   out: ChildSide[];
@@ -684,6 +713,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
           label: displayTitle(node),
           body: displayBody(node),
           fullLabel: node.label,
+          bodySource: bodySource(node),
           depth,
           out: outSides,
           in: inSides,

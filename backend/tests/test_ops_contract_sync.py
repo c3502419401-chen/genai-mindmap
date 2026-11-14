@@ -43,6 +43,19 @@ def _flatten(root) -> list[list[str]]:
     return out
 
 
+def _flatten_field(root, field: str) -> list:
+    """同一顺序取某个节点字段（`detail` / `note`），与 fixture 的 expect_* 同构。"""
+    out: list = []
+
+    def walk(node) -> None:
+        out.append(getattr(node, field))
+        for child in node.children:
+            walk(child)
+
+    walk(root)
+    return out
+
+
 CASES = _fixture()["cases"]
 
 
@@ -71,6 +84,12 @@ def test_backend_matches_shared_fixture(case: dict) -> None:
 
     assert "expect_error" not in case, f"{case['name']}：预期失败 {case['expect_error']}，实际成功"
     assert _flatten(result.root) == case["expect_tree"], case["name"]
+    # 详情与备注：只在 fixture 声明的用例上比较。`detail` 归生成、`note` 归用户，
+    # 两端都必须"改一个不动另一个"——这正是混用两个字段会立刻出事的地方。
+    if "expect_details" in case:
+        assert _flatten_field(result.root, "detail") == case["expect_details"], case["name"]
+    if "expect_notes" in case:
+        assert _flatten_field(result.root, "note") == case["expect_notes"], case["name"]
 
 
 def test_fixture_covers_both_outcomes() -> None:

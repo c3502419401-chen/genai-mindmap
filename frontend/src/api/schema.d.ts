@@ -488,6 +488,8 @@ export interface components {
             children?: components["schemas"]["Node-Input"][];
             /** Note */
             note?: string | null;
+            /** Detail */
+            detail?: string | null;
             /**
              * Collapsed
              * @default false
@@ -508,6 +510,8 @@ export interface components {
             children?: components["schemas"]["Node-Output"][];
             /** Note */
             note?: string | null;
+            /** Detail */
+            detail?: string | null;
             /**
              * Collapsed
              * @default false
@@ -601,7 +605,7 @@ export interface components {
         RunBudget: {
             /**
              * Max Model Calls
-             * @default 80
+             * @default 100
              */
             max_model_calls: number;
             /**

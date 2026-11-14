@@ -8,7 +8,7 @@ import SourceInputs from './components/SourceInputs.vue';
 import { SOURCE_LABELS } from './sources/input';
 import { ApiError, exportFilename, exportLabel, exportMindMap, type ExportFormat } from './api/client';
 import type { SampleMap } from './dev/samples';
-import { displayBody, useMindMapStore } from './stores/mindmap';
+import { displayBody, bodySource, useMindMapStore } from './stores/mindmap';
 import { useSourcesStore } from './stores/sources';
 import { resolveRefs, type ResolvedRef } from './mindmap/refs';
 
@@ -78,6 +78,24 @@ const directions: { value: Direction; label: string }[] = [
 
 const selected = computed(() => store.selectedNode);
 const pathText = computed(() => store.breadcrumb.map(node => node.label.trim()).join(' / '));
+
+/**
+ * 「节点详情」分区的正文。
+ *
+ * 取值来自 `displayBody`（`detail → note → label`），与卡片、导出、复制全文同一个
+ * 函数——四处各写一遍回退链，迟早出现"卡片里有正文、面板里没有"这种说不清的分歧。
+ *
+ * `bodyFrom` 决定那行小字怎么写。它存在的理由：旧图没有 `detail`，回退到 `note`
+ * 之后界面上那段文字**同时也是「我的备注」输入框里的内容**，不说明来源的话，用户
+ * 会以为生成说明了什么，其实那是他自己以前写的备注。
+ */
+const bodyText = computed(() => (selected.value ? displayBody(selected.value.node) : ''));
+const bodyFrom = computed(() => (selected.value ? bodySource(selected.value.node) : 'label'));
+const BODY_SOURCE_NOTE: Record<string, string> = {
+  detail: '这次生成写的说明',
+  note: '这个节点没有生成详情，下面是你以前写的备注',
+  label: '这个节点没有正文，下面是标题全文',
+};
 
 /**
  * 正文编辑框的草稿。
@@ -387,20 +405,34 @@ async function copyBody() {
         <AgentPanel />
         <template v-if="selected">
           <p class="text-xs text-slate-400">{{ pathText }}</p>
+          <!-- 标题：与画布上那颗节点是同一段文字（双击节点改的就是它） -->
           <h2 class="text-sm font-semibold">
             {{ selected.node.label.trim() }}
           </h2>
+
+          <!--
+            详情分区（只读）：生成产出的正文。
+            `detail` 是模型写的，界面不提供编辑入口——要改内容就重新生成，
+            或者写到下面的「我的备注」里。两个字段分开存，正是为了这两种意图
+            不会互相覆盖。
+          -->
+          <section class="flex flex-col gap-1" aria-label="节点详情">
+            <h3 class="text-xs font-medium text-slate-500">详情</h3>
+            <p class="whitespace-pre-wrap break-words rounded-md bg-slate-50 px-2 py-1.5 text-sm leading-relaxed text-slate-700">{{ bodyText }}</p>
+            <p class="text-xs text-slate-400">{{ BODY_SOURCE_NOTE[bodyFrom] }}</p>
+          </section>
+
           <label class="flex flex-1 flex-col gap-1">
             <span class="text-xs text-slate-400">
-              正文 {{ noteLength }} / 2000
-              <span v-if="!(selected.node.note ?? '').trim()">· 现在是空的，画布与导出用标题</span>
+              我的备注 {{ noteLength }} / 2000
+              <span v-if="!(selected.node.note ?? '').trim()">· 现在是空的，不影响详情与导出</span>
             </span>
             <textarea
               v-model="noteDraft"
-              aria-label="节点正文"
+              aria-label="我的备注"
               class="min-h-24 flex-1 resize-y rounded-md border border-slate-200 px-2 py-1.5 text-sm leading-relaxed text-slate-700 focus:border-slate-400 focus:outline-none"
               maxlength="2000"
-              placeholder="写这个节点的解释或细节；留空则画布与导出都用标题"
+              placeholder="写你自己的备忘；这里的字不会被重新生成覆盖"
               @blur="commitNoteDraft"
               @keydown.esc="resetNoteDraft"
             />

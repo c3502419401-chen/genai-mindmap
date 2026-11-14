@@ -1034,8 +1034,13 @@ class GenerateDeepToolTest(unittest.TestCase):
         self.assertGreaterEqual(state["peak"], 2)
 
     def test_depth_limit_is_configurable(self):
-        """`max_depth` 真的会改变结果：3 与 4 各跑一次，最深一层差一层。"""
-        for max_depth, calls in ((3, 10), (4, 16)):
+        """`max_depth` 真的会改变结果：2 与 3 各跑一次，最深一层差一层。
+
+        原来这里的两个取值是 3 与 4。**初次生成现在上限 4 层（含根）**，也就是
+        `max_depth <= 3`（这个参数按 root 之下算），所以 4 这一档已经不可能生效
+        ——它现在由下面那条 `test_initial_depth_is_capped_at_four_levels` 负责。
+        """
+        for max_depth, calls in ((2, 4), (3, 10)):
             ctx = _ctx(max_model_calls=20)
             seen: list[str] = []
 
@@ -1058,6 +1063,39 @@ class GenerateDeepToolTest(unittest.TestCase):
             self.assertEqual([item["depth"] for item in result.data["levels"]],
                              list(range(max_depth + 1)))
             self.assertEqual(len(seen), calls)
+
+    def test_initial_depth_is_capped_at_four_levels(self):
+        """初次生成恒定 4 层（含根）：传 4 会被夹到 3，传 8 同样。
+
+        这一条钉的是"别差一层"：`GenerateDeepArgs.max_depth` 按 **root 之下** 算，
+        `INITIAL_MAX_DEPTH = 3` 对应 4 层树。写成 4 就变成 5 层，节点数上界从
+        79 跳到 241，第一次生成必然撑爆调用预算并交出半棵树。
+        """
+        from app.agent.tools import INITIAL_MAX_DEPTH
+
+        self.assertEqual(INITIAL_MAX_DEPTH, 3)
+        for requested in (4, 8):
+            ctx = _ctx(max_model_calls=20)
+            seen: list[str] = []
+
+            async def fake(system, user, *, max_tokens=None, _seen=seen):
+                _seen.append(user)
+                if system.startswith(PLAN_PROMPT):
+                    return _plan("甲", "乙", "丙")
+                if "本条一级分支：" in user:
+                    return _children(f"{_branch_title(user)}一", f"{_branch_title(user)}二")
+                return _children(_subnode_label(user) + "·细节")
+
+            with patch("app.agent.tools.chat_async", new=AsyncMock(side_effect=fake)):
+                result = _run(build_registry("create").execute(_call(
+                    "mindmap_generate_deep", topic="机器学习", branches=3,
+                    points_per_branch=2, max_depth=requested), ctx))
+
+            self.assertTrue(result.ok, result.content)
+            self.assertEqual(result.data["depth_limit"], INITIAL_MAX_DEPTH)
+            # 4 层含根 = levels 里出现 0/1/2/3，没有第 4 层
+            self.assertEqual([item["depth"] for item in result.data["levels"]],
+                             [0, 1, 2, 3])
 
     def test_two_level_output_is_unchanged_at_depth_two(self):
         """`max_depth=2` 时产出与改多级之前一致：两层，且不吃模型多给的下层。"""

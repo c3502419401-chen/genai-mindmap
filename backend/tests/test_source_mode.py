@@ -258,12 +258,16 @@ def _fixtures() -> dict[str, list[Source]]:
 # 二分裁剪，裁剪点由 `system` 的 token 估算决定，而 `SOURCED_DETAIL_PROMPT` 变长了
 # ——渲染算法一个字节没动，落点却必须跟着变。这是**有意的**更新，其余四条仍与
 # `901b484` 一致，正好证明改的只是预算、不是渲染。
+#
+# 第二次更新（`label ≤16 字 + detail`）同理：提示词里多了"label 是一句话短语…
+# detail 是 2–3 句说明"那几句，`SOURCED_DETAIL_PROMPT` 又长了 200 多字，同一个
+# 样本的裁剪落点随之后移。渲染算法仍然没动，另外四条摘要一字未变。
 GOLDEN_DIGESTS: dict[str, str] = {
     "single": "09dad633796b95214e26057a537a50b1acc002083ccc06522b30fe9d67c7d3ac",
     "two": "0ddbba96dfa703350137b9d315e07fe2e5c77774eb1768ff7d5fcd42115d0e33",
     "blank": "309d1757a17504d05d7747846944f2b0280213a74a6b348ffe95311c5331ce22",
     "escapes": "46593d9c4358005c37cf70123016af4643daace3e2f1bb8ec75397e747d9c10c",
-    "oversized": "dc921766b42304e69d97535ac309465368fc5fddb2374fbfa56015a8e4a450ff",
+    "oversized": "67942f263df84649b59e3c6e3cdd9e1c889a05154e75def5338994e694021e24",
 }
 
 

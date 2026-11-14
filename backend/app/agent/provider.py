@@ -23,6 +23,7 @@ from app.generation.service import (
     _config,
     context_overflow_error,
     estimate_input_tokens,
+    max_tokens_cap,
 )
 
 # 单次响应上限。与 generation 那边同口径：超过这个体积说明模型跑飞了，
@@ -35,6 +36,11 @@ _TIMEOUT_SECONDS = 600.0
 # 实测可用的输出上限：DeepSeek 接受 max_tokens=65536（HTTP 200）。RunBudget
 # 允许配到 131072，超过实测值的部分本来也只会拿到 400，所以这里夹一层；
 # 要再放开得先重新实测服务端接受度。
+#
+# 它是**默认值**，不是唯一值：真正发出去的那个数由
+# `generation.service.max_tokens_cap()` 给出（`MINDMAP_LLM_MAX_TOKENS` 配置值、
+# 与服务端 400 里学到的上限取小）。写死一个数的后果是"换一个模型就整条链 400"，
+# 而 qwen 系只认 32768 这件事不该要求改代码。
 _MAX_TOKENS_CAP = 65536
 
 
@@ -85,7 +91,7 @@ class DeepSeekProvider:
             "model": model,
             "messages": messages,
             "temperature": 0.2,
-            "max_tokens": min(budget.max_output_tokens, _MAX_TOKENS_CAP),
+            "max_tokens": min(budget.max_output_tokens, max_tokens_cap()),
         }
         # 没有工具时不要挂空的 tools 数组：部分兼容端点会因此返回 400。
         if tools:

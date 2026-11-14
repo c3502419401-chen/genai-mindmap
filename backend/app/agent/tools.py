@@ -44,9 +44,16 @@ from app.agent.ops import (
 from app.agent.stream_items import StreamItem, closed_items
 from app.contracts import mindmap as mindmap_contract
 from app.contracts.diagnostic import Diagnostic, DiagnosticLevel
-from app.contracts.mindmap import MindMapContent, Node
+from app.contracts.mindmap import (
+    GENERATED_LABEL_MAX_CHARS,
+    MAX_NODE_DETAIL_CHARS,
+    MindMapContent,
+    Node,
+    clip_label,
+)
 from app.contracts.ops import OpBatch, OpError
 from app.contracts.source import Source, SourceUsage
+from app.generation import budget
 from app.generation.service import (
     CONTEXT_TOKEN_LIMIT,
     DETAIL_NO_SOURCE_RULES,
@@ -61,6 +68,7 @@ from app.generation.service import (
     chat_async,
     ensure_input_within_context,
     estimate_input_tokens,
+    max_tokens_cap,
     source_mode,
     thinking_block,
     validate_generated_content,
@@ -181,7 +189,39 @@ SUPPLEMENTARY_MIN_NODES = 3
 # 一致：provider 是外层轮次的出口，工具里的 `chat_async` 是另一条出口，两边不同
 # 时 `RunBudget.max_output_tokens` 只约束了其中一半的调用。不去 import 那个私有
 # 常量，是为了不让「工具」反向依赖「适配层」——适配层是可替换的。
+#
+# 它是**默认值**，不是生效值：生效值由 `generation.service.max_tokens_cap()` 给出
+# （`MINDMAP_LLM_MAX_TOKENS` 配置值 + 服务端 400 里学到的上限，两者取小）。
+# 于是"qwen 系只认 32768"这件事不需要改代码，只需要配一个环境变量。
 MAX_OUTPUT_TOKENS_CAP = 65536
+
+# 初次生成的规模上限：**80 个节点、4 层（含根）**。
+#
+# 这不是承载能力（契约给的是 1000/8），而是"第一次点击生成之后，用户多久能看到
+# 一张完整的图"的承诺。实测（rag 形态、12106 字材料）：按契约上限一路展开会长到
+# 240 个节点、7 层，`max_model_calls=80` 在第 6/7 层被烧光——最终交付的是一棵
+# **残缺的大树**：上面四层很丰满，最下面两层整片留空。
+#
+# 换一种分配就完全不同：同样一笔调用如果只要求一棵 4 层树（1 + 6 + 18 + 54 =
+# 79 个节点），每一次调用恰好对应一个父节点，树是**完整**的。用户要的是"一张能看
+# 完的图"，不是"一张看不完的图的前 60%"。
+#
+# 真实调用数 **25**，不是 79：骨架 1 次产出第 1 层，之后每次调用展开一个父节点
+# （展开 6 个分支 → 第 2 层的 18 个；展开 18 个二级 → 第 3 层的 54 个）。**最后
+# 那一层不需要被展开**——它已经被上一层写出来了。加外层两轮与每支最多一次补点，
+# 一次完整初次生成 = 33 次，`RunBudget` 的默认额度因此定在 100（算式见
+# `_initial_call_plan` 的注释）。
+#
+# 扩展（`node_expand`）不受这条限制：初次紧、后续松——用户明确点了某个节点要更深，
+# 那时上限回到契约的 1000 节点 / 8 层。
+#
+# 数值定义在 `generation.budget` 里：提示词、工具分配、契约守卫三处共用一个数。
+INITIAL_MAX_NODES = budget.INITIAL_MAX_NODES
+
+# 初次生成的深度上限，**按 root 之下算**（与 `GenerateDeepArgs.max_depth` 同口径）。
+# 3 = 4 层含根。差一层是这里最容易犯的错：写成 4 就变成 5 层树，节点数上界从
+# 79 变成 1+6+18+54+162 = 241，第一次生成必然撑爆调用预算。
+INITIAL_MAX_DEPTH = budget.INITIAL_MAX_DEPTH
 
 # 截断必须让模型知情，否则它会把半份材料当成全文来整理和引用。
 # 校验用的 sources 始终保留完整原文，只有提示词里的副本可以裁剪。
@@ -416,6 +456,44 @@ def _count_nodes(root) -> int:
     return 1 + sum(_count_nodes(child) for child in root.children)
 
 
+def _clip_tree(content: MindMapContent, limit: int) -> tuple[MindMapContent, int]:
+    """前序保留前 `limit` 个节点，返回 `(裁剪后的内容, 丢掉的节点数)`。
+
+    **前序**是刻意的：父节点一定排在它自己的子节点前面，所以裁出来的仍是一棵合法
+    的树（不会出现"有子无父"）。代价是"一层的末尾被切掉"——第 80 个节点之后的分支
+    整支消失，而不是每个分支均匀地少一点。均匀裁剪反而更难解释：用户会看到每个分支
+    都缺一两个，说不出"哪里不完整"。
+
+    裁剪之后要重新走一遍契约校验（`model_validate`）：`relations` 可能指向被裁掉的
+    节点，`source_usage` 也不会自己变。**先裁再校验**，校验失败仍然如实报错——一次
+    "悄悄留着一棵树但存不进去"的失败比解析失败难查得多。
+    """
+    total = _count_nodes(content.root)
+    if total <= limit:
+        return content, 0
+
+    remaining = [max(0, limit)]
+
+    def walk(node: Node) -> Node:
+        remaining[0] -= 1
+        kept: list[Node] = []
+        for child in node.children:
+            if remaining[0] <= 0:
+                break
+            kept.append(walk(child))
+        return node.model_copy(update={"children": kept})
+
+    root = walk(content.root)
+    kept_ids = _node_ids(root)
+    relations = [item for item in content.relations
+                 if item.source in kept_ids and item.target in kept_ids]
+    trimmed = content.model_copy(update={"root": root, "relations": relations})
+    # 走一次 dump/validate：`model_copy` 不做校验，而这里是"结构被代码改过"的唯一
+    # 一处，不校验就等于相信自己的算术。
+    trimmed = MindMapContent.model_validate(trimmed.model_dump())
+    return trimmed, total - _count_nodes(trimmed.root)
+
+
 def _count_refs(root) -> int:
     """整棵树的引用条数。逐字校验前后各数一次，差值就是被剔除的条数。"""
     return len(root.source_refs) + sum(_count_refs(child) for child in root.children)
@@ -443,14 +521,67 @@ def _reason_text(exc: BaseException, limit: int = 200) -> str:
     return text[:limit]
 
 
+def _note_truncation(diagnostics: list[Diagnostic], raw: Any) -> bool:
+    """模型输出被长度上限截断、但回收出了完整节点时，记一条告警。
+
+    返回"这次被截断了吗"。截断本身**不再是失败**（`SalvagedOutput` 已经带着
+    回收到的节点回来了），但它必须可见：用户拿到的是一棵少了尾巴的树，而工具
+    返回的 `ok=true` 与"完整成功"长得一模一样。没有这条告警，唯一的信号是
+    "节点数比预期少几个"——那件事没人能判断。
+
+    只在 `raw` 是 `SalvagedOutput` 时触发（`partial` 属性由那一类显式声明），
+    普通 dict 与旧的 mock 一律不触发，这条路径对既有行为零影响。
+    """
+    if not getattr(raw, "partial", False):
+        return False
+    recovered = getattr(raw, "recovered", 0)
+    diagnostics.append(Diagnostic(
+        level=DiagnosticLevel.warn, code="OUTPUT_TRUNCATED_RECOVERED",
+        message=(
+            f"模型输出撞上长度上限被截断，已从被切断的 JSON 里回收 {recovered} 个完整节点；"
+            "这一批的后续内容缺失，整棵树可能比预期浅一层"
+        ),
+    ))
+    return True
+
+
 def _max_tokens(ctx: RunContext) -> int:
     """工具内一次模型调用的输出上限。
 
     不显式传 `max_tokens` 时 `chat_async` 会回落到它自己的默认值，于是
     `RunBudget.max_output_tokens` 只对 provider 那条路生效——预算里写了上限，
     工具这条更大的输出口却没人守。
+
+    夹的是 `max_tokens_cap()` 而不是字面常量：那个函数把
+    `MINDMAP_LLM_MAX_TOKENS` 与服务端 400 里学到的上限取小（见它的 docstring）。
+    qwen 系列只认 32768 时，配一个环境变量就能让这条出口跟着降下来。
     """
-    return min(ctx.request.budget.max_output_tokens, MAX_OUTPUT_TOKENS_CAP)
+    return min(ctx.request.budget.max_output_tokens, max_tokens_cap())
+
+
+# 一次调用除节点之外的输入开销估计（user 消息 + 证据数组 + 系统提示词）。
+# 数值取实测上界：分片展开的 user 含 3 条父块（每条 450–700 字）+ 路径 + 已有
+# 要点，约 3000 字 ≈ 2000 token；系统提示词（含思维模型块）约 4000 字 ≈ 2700
+# token。取 12000 是给"材料很长、路径很深"那种情况留的余量。
+_INPUT_HEADROOM_TOKENS = 12_000
+
+
+def _nodes_per_call(ctx: RunContext, *, system: str = "") -> int:
+    """这一次调用最多能要几个"满额节点"（见 `generation.budget` 的模块注释）。
+
+    三条边界一起算：`RunBudget.max_output_tokens`、模型输出上限、剩余上下文。
+    调用方拿它去夹"这一次要求几个节点"，于是"prompt 要 100 个、单次输出 40 个
+    就截断"在结构上不可能发生——要求量在发请求之前就已经被夹住了。
+    """
+    available = budget.available_output_tokens(
+        _max_tokens(ctx),
+        model_cap=max_tokens_cap(),
+        context_left=max(
+            0,
+            CONTEXT_TOKEN_LIMIT - estimate_input_tokens(system) - _INPUT_HEADROOM_TOKENS,
+        ),
+    )
+    return budget.max_nodes_for_tokens(available)
 
 
 def _require_candidate(ctx: RunContext) -> MindMapContent | ToolResult:
@@ -470,10 +601,14 @@ def _node_ids(root) -> set[str]:
 
 
 def _skeleton_titles(raw: Any) -> list[str]:
-    """从骨架响应里取出分支标题，剔除空项，超长截到 50 字。
+    """从骨架响应里取出分支标题，剔除空项，超长截到 16 字。
 
     只接受字符串：`{"branches":[{"label":"x"}]}` 说明模型没照格式写，硬转字符串
     会把一整个 dict 的 repr 当成节点标题挂到树上——那种"成功"比失败更难发现。
+
+    截断长度改成 `GENERATED_LABEL_MAX_CHARS`（16）：骨架标题就是画布上的一级
+    分支，它与其余节点受同一条限制。**不做二次校验**——模型偶尔写长一点不该判整
+    次失败（那会浪费一次已经完成的骨架调用），截断后仍是一棵合法的树。
     """
     if not isinstance(raw, dict):
         return []
@@ -484,10 +619,10 @@ def _skeleton_titles(raw: Any) -> list[str]:
     for item in items:
         if not isinstance(item, str):
             continue
-        title = item.strip()
+        title = clip_label(item.strip())
         if not title:
             continue
-        titles.append(title[:50])
+        titles.append(title)
     return titles
 
 
@@ -698,9 +833,14 @@ class _Slot:
     `source_refs` 只在 `rag` 形态且这一支真的检索到东西时才会有值（见
     `_refs_from`）。它跟着 slot 一路走到合并那一步，最后作为 `add` 的
     `source_refs` 挂进树里——**不在** `emit()` 里重新解释一遍。
+
+    `detail` 是模型为这个节点写的 2–3 句说明（与 `label` 一起构成两层节点）。
+    它在 `_slot_from` 里已经按 `MAX_NODE_DETAIL_CHARS` 截过，之后一路原样带到
+    `add` 草案上，中间不再改写：这棵树是模型的作品，代码只负责长度与形状。
     """
 
     label: str
+    detail: str | None = None
     children: list["_Slot"] = field(default_factory=list)
     expandable: bool = True
     expandable_declared: bool = False
@@ -753,6 +893,10 @@ def _slot_from(
     或干脆没写，一律按可展开处理。缺省按 true 是有意的——模型偶尔漏写一个键，
     不该因此让整支内容凭空变成叶子，那是一种代码替它做的决定。
 
+    `label` 截到 `GENERATED_LABEL_MAX_CHARS`（16）；超出的**不**升级成 `detail`：
+    那不是模型写的说明，是标题的后半截，拼进去会得到一句从中间断开的话。宁可
+    丢掉那半句，也不要制造一段读不通的正文——真正的长内容应该由 `detail` 承载。
+
     `evidence` 是**这一支**的检索结果，逐层传下去：模型多给的那一层里的引用同样
     只能落在本支证据上，否则"只带该支的 hits"就只对第一层成立。
     """
@@ -762,7 +906,7 @@ def _slot_from(
             return None
         # 裸字符串没有任何层级信息：旧 points 里它是叶子，新格式里按缺省可展开，
         # 与引入 `expandable` 之前的行为逐节点相同。
-        return _Slot(label[:200], expandable=not legacy_leaf)
+        return _Slot(clip_label(label), expandable=not legacy_leaf)
     if not isinstance(item, dict):
         return None
     label = item.get("label")
@@ -771,7 +915,8 @@ def _slot_from(
     flag = item.get("expandable")
     declared = isinstance(flag, bool)
     slot = _Slot(
-        label.strip()[:200],
+        clip_label(label.strip()),
+        detail=_detail_text(item.get("detail")),
         expandable=flag if declared else True,
         expandable_declared=declared,
         source_refs=_refs_from(item, evidence),
@@ -783,6 +928,21 @@ def _slot_from(
             if child_slot is not None:
                 slot.children.append(child_slot)
     return slot
+
+
+def _detail_text(raw: Any) -> str | None:
+    """模型给的 `detail` → 可落库的字符串（或 `None`）。
+
+    三件事一起做：非字符串当没给、折掉换行（`Node.detail` 与 `label` 同在导出里
+    会破坏结构）、按契约上限截断。**不判空**——纯空白在契约层也会被归一成
+    `None`，但这里提前归一能少一次无意义的校验。
+    """
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    return text[:MAX_NODE_DETAIL_CHARS]
 
 
 def _keep_new_slots(existing: list[_Slot], incoming: list[_Slot]) -> tuple[list[_Slot], int]:
@@ -915,14 +1075,22 @@ class _GrowStream:
 
     只在 `RunContext.emit` 不为 None 时才会被创建（见 `_generate_deep` 里的
     `ask_model`），所以这里不判空 —— 判空只留一处，两处各判一遍迟早有一处写反。
+
+    `quota` 是**这一路真正会被装进树里的节点数上限**（调用方传 `_trim_slots`
+    用的那个 allowance）。它存在的理由只有一条：预览必须与最终树同形。模型一次
+    多给一层时会吐出远超额度的节点，那些多出来的会在合并前被 `_trim_slots` 裁掉
+    ——如果预览照单全收，用户就会眼睁睁看着几个节点"长出来又消失"，而消失的那
+    几个从来没有进过树。
     """
 
     ctx: RunContext
     seen: set[tuple[tuple[int, ...] | None, str]]
     parent: tuple[int, ...]     # 父节点在树里的子索引链
     base_index: int = 0         # 这一路产出的第一个子项在父节点下的位置
+    quota: int | None = None    # 这一路最多报几个节点；None = 不设限
     buffer: str = ""
     reported: int = 0
+    accepted: int = 0
 
     async def feed(self, delta: str) -> None:
         """收到一段模型输出，把刚写完整的子项报出去。
@@ -945,7 +1113,13 @@ class _GrowStream:
         事件里的 `path` 指向**父节点**，所以同一路响应里的子项共用 `parent`；
         `index` 是 item 自己在 `parent` 下面的位置，只用来给它的孩子拼路径——
         模型多给的那一层，父节点就是这个 item。
+
+        额度用完就整支不再报（含它的孩子）：`_trim_slots` 是按同一顺序、同一个
+        节点计数裁的，所以这里停下的位置与最终树丢掉的位置一致。
         """
+        if self.quota is not None and self.accepted >= self.quota:
+            return
+        self.accepted += 1
         await _emit_grow(self.ctx, self.seen, parent, item.label, item.expandable)
         own = (*parent, index)
         for position, child in enumerate(item.children):
@@ -1408,9 +1582,13 @@ def _selection_scope_error(
 
 EXPAND_PROMPT = (
     "你在给思维导图的一个节点补充子要点。只返回一个 JSON 对象，不要代码围栏。"
-    '格式为 {"points":["要点一","要点二"]}。'
-    "每个要点必须是一句能独立成立的话，不超过 30 字；不要编号，不要解释，"
-    "不要重复已有子节点，不要编造具体数据、人名或文献。"
+    '格式为 {"children":[{"label":"要点一","detail":"这个要点的说明"}]}。'
+    f"每个 label 是一句话短语，不超过 {GENERATED_LABEL_MAX_CHARS} 字，不带句号；"
+    "detail 是 2–3 句说明，可以带数字与条件。"
+    "不要编号，不要解释，不要重复已有子节点，不要编造具体数据、人名或文献。"
+    # 旧格式（纯字符串数组）仍然收：老模型、老 mock、以及"模型只写了一半"
+    # 这几种情况都会退化成它，硬拒等于把一次可用的响应判死。
+    '也接受 {"points":["要点一","要点二"]} 这种旧格式，这时节点没有 detail。'
 )
 
 # 分片生成第一步：只定骨架，不写内容。一次调用同时要求模型「定框架 + 每支展开」，
@@ -1420,8 +1598,10 @@ PLAN_PROMPT = (
     "你在为一张思维导图只定一级骨架，不写任何子要点。"
     "只返回一个 JSON 对象，不要代码围栏，格式为 "
     '{"branches":["分支一","分支二"]}。'
-    "每条分支是一个能独立成立的短标题，不超过 20 字；彼此覆盖的范围不重叠，"
-    "按逻辑顺序排列；不要编号，不要解释，不要编造具体数据、人名或文献。"
+    # 16 字与 detail 的那两条是同一批改动：骨架标题**就是**画布上的一级分支，
+    # 它比任何节点都更该短。20 字的旧上限画出来已经是两行半。
+    f"每条分支是一句话短语，不超过 {GENERATED_LABEL_MAX_CHARS} 字，不带句号；"
+    "彼此覆盖的范围不重叠，按逻辑顺序排列；不要编号，不要解释，不要编造具体数据、人名或文献。"
     "材料自带章节时优先采用它们作为一级分支；目录为空或不完整时再自行归纳。"
 )
 
@@ -1503,15 +1683,20 @@ def _plan_ask(topic: str, branches: int, *, outline: str = "") -> str:
 # 节点按叶子处理。
 BRANCH_EXPAND_PROMPT = (
     "你在给思维导图的一条一级分支补充子要点。只返回一个 JSON 对象，不要代码围栏，"
-    '格式为 {"children":[{"label":"要点一","expandable":true},'
-    '{"label":"要点二","expandable":false}]}。'
+    '格式为 {"children":[{"label":"要点一","detail":"这个要点的说明","expandable":true},'
+    '{"label":"要点二","detail":"这个要点的说明","expandable":false}]}。'
     "只写一层，不要在 children 里再套 children。"
+    # 两层节点：label 短、detail 长。这一条与 `DETAIL_PROMPT` 里那句同源，但
+    # 必须各自写一遍——两份提示词是两条独立的路（整树 vs 分片），共用一句会
+    # 让其中一条在改动时被静默漏掉。
+    f"label 是一句话短语，不超过 {GENERATED_LABEL_MAX_CHARS} 字，不带句号；"
+    "detail 是 2–3 句说明，可以带数字与条件，不超过 2000 字。"
     "每个子项都必须带 expandable 字段，它是布尔值：这个子项还能不能拆出更具体的"
     "下级。如果它已经是最小可执行单元、再拆只会重复它自己，就填 false；"
     "如果它还是一句概括、下面明显还有具体内容可写，就填 true。"
     "如实判断，不要为了凑数硬拆，也不要一律填 true。"
-    "每个 label 必须是一句能独立成立的话，不超过 30 字；不要编号，不要解释，"
-    "只写这条分支范围内的内容，不要重复同级其他分支，不要编造具体数据、人名或文献。"
+    "不要编号，不要解释，只写这条分支范围内的内容，不要重复同级其他分支，"
+    "不要编造具体数据、人名或文献。"
 )
 
 # 分片生成第三层往下：展开一个已经有上下文的节点。与上面的差别只在"它是谁"——
@@ -1522,13 +1707,15 @@ BRANCH_EXPAND_PROMPT = (
 # 模型的判断决定，代码不再一律拉到上限。
 SUBNODE_EXPAND_PROMPT = (
     "你在给思维导图里一个已有的节点补充下一层子节点。只返回一个 JSON 对象，"
-    '不要代码围栏，格式为 {"children":[{"label":"要点一","expandable":true},'
-    '{"label":"要点二","expandable":false}]}。'
+    '不要代码围栏，格式为 {"children":[{"label":"要点一","detail":"这个要点的说明",'
+    '"expandable":true},{"label":"要点二","detail":"这个要点的说明","expandable":false}]}。'
     "只写一层，不要在 children 里再套 children。"
+    f"label 是一句话短语，不超过 {GENERATED_LABEL_MAX_CHARS} 字，不带句号；"
+    "detail 是 2–3 句说明，可以带数字与条件。"
     "每个子项都必须带 expandable 字段，它是布尔值：这个子项还能不能拆出更具体的"
     "下级。已经是最小可执行单元、再拆只会重复它自己的填 false；"
     "明显还有具体内容可写的填 true。如实判断，不要为了凑数硬拆。"
-    "每个 label 必须是一句能独立成立的话，不超过 30 字；不要编号，不要解释，"
+    "不要编号，不要解释，"
     "只写这个节点范围内的内容，不要重复同一父节点下其他节点的说法，"
     "不要编造具体数据、人名或文献。"
 )
@@ -1551,6 +1738,9 @@ BRANCH_EVIDENCE_RULES = (
     "内容可以自由展开：evidence 没覆盖的方面按你的知识补全，不要留空节点。"
     '每个子项可以带一个 source_refs 数组，例如 {"label":"要点二","expandable":false,'
     '"source_refs":[{"source_id":"…","start":0,"end":12,"quote":"…"}]}。'
+    # 引用是**节点**的字段，与 label / detail 平级。写进 detail 的引用不会被
+    # 收尾的逐字校验看到（它只读 `node.source_refs`），界面上也就点不开。
+    "source_refs 与 label、detail 平级，不要写进 detail 的文字里。"
     "但凡引用、转述、概括材料的，出处只能从**本支**的 evidence 里抄：source_id 照抄；"
     "优先用 evidence_* 那一组，start、end、quote 分别取它们的值；没有 evidence_* 时"
     "只抄 quote 里连续的一段（不超过 300 字），这时不要写 start 和 end。"
@@ -1816,6 +2006,29 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         # 逐条留着会把别的诊断淹掉（分片那条路同样的处理，见 `_generate_deep`）。
         # 聚成一条放在最后，明说这张图没有材料依据——用户要能一眼看出"为什么没有引用"。
         diagnostics = [item for item in diagnostics if item.code != "UNSOURCED_NODE"]
+
+    # 初次规模：整树生成没有"层"的概念，只能守节点总数。
+    #
+    # 为什么是**裁剪**而不是判失败：这一次调用已经花掉了，模型给的树里前 80 个
+    # 节点是一棵合法的、父在子前的树——裁掉尾部之后用户仍得到一张能用的图；判失败
+    # 就什么都没有，而且下一轮大概率还是给这么多。代价是尾部那几个分支会整支消失，
+    # 所以它必须作为诊断说出来（`TREE_CLIPPED_TO_INITIAL`），不能静默。
+    # 模型输出被长度上限截断时（`SalvagedOutput`），回收出来的节点已经在树里了，
+    # 但"这次少了一块"必须让用户看见——否则 `ok=true` 与完整成功长得一模一样。
+    _note_truncation(diagnostics, raw)
+
+    before_clip = _count_nodes(content.root)
+    clipped = 0
+    if before_clip > INITIAL_MAX_NODES:
+        content, clipped = _clip_tree(content, INITIAL_MAX_NODES)
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="TREE_CLIPPED_TO_INITIAL",
+            message=(
+                f"模型返回了 {before_clip} 个节点，超过初次生成的 {INITIAL_MAX_NODES} 个上限，"
+                f"已保留前 {INITIAL_MAX_NODES} 个（尾部 {clipped} 个未保留）；"
+                "想要更大的树，请生成后用 node_expand 逐支展开"
+            ),
+        ))
 
     # 结构与语义两层复核，原先只长在 `pipeline/service.run()` 的收尾里：
     #   - `check()` 只看树本身（单子节点、深度上限、同级重名），没有来源也能跑，
@@ -2128,9 +2341,14 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         深度策略等真实运行的数据出来再定。
 
     预算怎么分（不这么分，前面几支会把额度吃光）：
+      - **初次限额**：`INITIAL_MAX_NODES=80` / `INITIAL_MAX_DEPTH=3`（root 之下，
+        即 4 层含根）。满额 4 层是 1+6+18+54=79 个节点、**25 次内容调用**；再往
+        下是 241 个节点，第一次生成必然撑爆预算并交出半棵树。
       - 接口层先扣：root + 一级分支 = 1 + branches
-      - 剩下的按该层的父节点数平分；每个父节点拿到的份额再与结构上限（扇出 ×
-        「本层 + 容忍的一层」）取小，得到这一次响应最多能落多少节点
+      - 剩下的按该层的父节点数平分；每个父节点拿到的份额再与两个上限取小：
+        结构上限（扇出 ×「本层 + 容忍的一层」）与**单次输出容量**
+        （`_nodes_per_call`，由 `generation.budget` 反解）。后者是这一轮新加的：
+        额度算术允许一支写 30 个节点，不代表这一次请求装得下 30 个满额节点。
       - 额度不足就**停手**，已经展开的部分照常交出，标 `partial` 并说明原因。
         少交一层不是失败，"报完整成功却少了半棵树"才是。
 
@@ -2189,20 +2407,31 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     need = min(args.points_per_branch, MAX_CHILDREN)
     # 深度上限在参数层已经夹过一次（ge/le），这里再夹一次是防"绕过参数模型直接
     # 调函数"：递归的每一层都要靠它判停，一个异常的 max_depth 会让循环失去上界。
-    max_depth = max(2, min(args.max_depth, DEEP_MAX_DEPTH))
+    #
+    # **初次生成只有 4 层（含根）**：`INITIAL_MAX_DEPTH=3` 是按 root 之下算的，
+    # 3 + 中心主题 = 4。差一层就完全不同——4 层满额是 79 个节点、79 次调用，
+    # 5 层满额是 241 个节点、241 次调用，后者必然撑爆预算并交出半棵树。
+    # 更深的树由 `node_expand` 逐步长（那时上限回到契约的 8 层 / 1000 节点）。
+    max_depth = max(2, min(args.max_depth, DEEP_MAX_DEPTH, INITIAL_MAX_DEPTH))
     # 二级及以下的扇出。`need` 本身是 2..5，再按 DEEP_FANOUT 兜一层——将来谁把
     # `points_per_branch` 的上限调大，深度带来的节点膨胀也不会跟着翻倍。
     fanout = max(2, min(need, DEEP_FANOUT))
-    # 节点上限从契约读，绝不在这里写死：契约刚从 300 涨到 1000，工具里若留着一个
-    # 旧数字，按层预分配分的就是个过期预算，多出来的节点要到整树校验才被拒。
-    node_limit = _node_limit()
+    # 节点上限取契约与**初次规模**的较小者：契约是承载能力（1000），初次承诺是
+    # 80 个节点。取小之后，按层预分配的每一份都是"这一次真的会用到的预算"。
+    node_limit = min(_node_limit(), INITIAL_MAX_NODES)
+    # 一次调用最多要几个满额节点（三个上限取最小后反解，见 `generation.budget`）。
+    # 它夹住下面每一个"这一次要几个节点"的量，所以要求量永远装得进单次输出。
+    per_call_nodes = _nodes_per_call(ctx, system=BRANCH_EXPAND_PROMPT)
     diagnostics: list[Diagnostic] = []
     # 思维模型两条路都要拼：骨架决定怎么分块，展开决定每块怎么拆。
     thinking = thinking_block(ctx.request.thinking_model)
 
     # 根节点的标题在骨架之前就定了：它同时是树的 title，提前算出来还能在上报
     # 根节点时直接用它，不必等到最后合并那一步。
-    root_label = args.topic.strip()[:200] or "思维导图"
+    #
+    # 与节点标题同一条限制（16 字）：根也是一块画布节点，用户填的主题经常是
+    # "帮我整理这份预算管理办法"这种指令句，整句画在中心会撑满一屏。
+    root_label = clip_label(args.topic.strip()) or "思维导图"
 
     # 已上报过的 `(父路径, label)`，全局一份：预览的去重口径是"同一个父节点下
     # 同一句文字只出现一次"，跨路（不同展开调用）也成立。
@@ -2210,7 +2439,7 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
 
     async def ask_model(
         prompt: str, user: str, parent: tuple[int, ...] | None = None,
-        base_index: int = 0,
+        base_index: int = 0, quota: int | None = None,
     ) -> Any:
         """发一次模型调用，顺带把「已经写完的子项」推给事件流。
 
@@ -2219,14 +2448,24 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         `parent` 只在开了上报通道时才有意义，也只有在有通道时才会传 `on_delta`：
         通道为 None 时连流式请求都不发，这条路上工具的行为与加生长事件之前
         **逐字相同**（现有测试全靠这一点保持有效）。
+
+        `quota` 是这一路会被真正装进树的节点数（`_trim_slots` 的额度）。预览
+        按它截断，于是"长出来又消失"的节点不会出现在界面上。
         """
         system = prompt + thinking
         if ctx.emit is None or parent is None:
-            return await chat_async(system, user, max_tokens=_max_tokens(ctx))
-        stream = _GrowStream(ctx, reported_grow, parent, base_index)
-        return await chat_async(
-            system, user, max_tokens=_max_tokens(ctx), on_delta=stream.feed,
-        )
+            raw = await chat_async(system, user, max_tokens=_max_tokens(ctx))
+        else:
+            stream = _GrowStream(ctx, reported_grow, parent, base_index, quota=quota)
+            raw = await chat_async(
+                system, user, max_tokens=_max_tokens(ctx), on_delta=stream.feed,
+            )
+        # 截断在这里统一记账：四个调用点（骨架 / 分支 / 补点 / 深层）都从这里出去，
+        # 各判一次的结果是"某一条路截断了但没人说"。判定只看返回值类型，不改形状
+        # ——`raw` 仍是一个 dict，往下的 `_candidate_slots` / `_skeleton_titles`
+        # 一行都不用改。
+        _note_truncation(diagnostics, raw)
+        return raw
 
     # 第一步：出骨架。额度在调用**之前**占——请求一旦发出就是一次真实计费。
     #
@@ -2398,17 +2637,26 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     # 才轮到各支往下长。不先扣的话，一支自己就可能把额度吃到只剩两位数，后面
     # 十九支全部只剩骨架——用户看到的是"第一支很丰满、其余都是空壳"。
     branch_share = max(0, node_limit - (1 + len(skeleton))) // max(1, len(skeleton))
-    point_budget = min(need, branch_share)
+    # `per_call_nodes` 是**单次输出的物理容量**（节点数），第三个上限：额度算术
+    # 允许一支写 30 个节点，但一次调用装不下 30 个满额节点时，要求 30 个就是在
+    # 预订一次截断。三个数取小，要求量才真的装得进这一次请求。
+    point_budget = min(need, branch_share, per_call_nodes)
     if point_budget < 1:
         return _fail(
             "node_budget_too_small",
-            f"契约上限 {node_limit} 个节点，装不下中心主题 + {len(skeleton)} 条一级分支，无法分片生成。",
+            f"本次生成的节点上限 {node_limit} 与单次输出容量（约 {per_call_nodes} 个节点）"
+            f"装不下中心主题 + {len(skeleton)} 条一级分支，无法分片生成。",
             node_limit=node_limit,
+            per_call_nodes=per_call_nodes,
         )
     # 一次响应最多容忍模型多给一层。`max_depth=2` 时零容忍：那时多给的任何一层
     # 都会让产出与"改多级之前"不一致，而这正是 max_depth=2 要保证的事。
     nested_levels = 1 if max_depth > 2 else 0
-    allowance = min(point_budget * (1 + _nested_capacity(fanout, nested_levels)), branch_share)
+    allowance = min(
+        point_budget * (1 + _nested_capacity(fanout, nested_levels)),
+        branch_share,
+        per_call_nodes,
+    )
 
     # 第二步：并发展开。限流必须包住整个"占额度 + 发请求"，否则额度会被
     # 排队中的任务一次性预占，实际请求却还没发出去。
@@ -2476,7 +2724,8 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         )
         try:
             raw = await ask_model(
-                prompt_for(BRANCH_EXPAND_PROMPT, evidence), ask, parent=(branch_index,))
+                prompt_for(BRANCH_EXPAND_PROMPT, evidence), ask,
+                parent=(branch_index,), quota=allowance)
         except GenerationError:
             return slots          # 重写失败只是"仍然按原来的内容交"，不升级成失败
         more, _ = _trim_slots(
@@ -2519,7 +2768,8 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             # 这一路的产出挂在第 branch_index 条一级分支下面，所以父路径是
             # `(branch_index,)`。
             raw = await ask_model(
-                prompt_for(BRANCH_EXPAND_PROMPT, evidence), ask, parent=(branch_index,))
+                prompt_for(BRANCH_EXPAND_PROMPT, evidence), ask,
+                parent=(branch_index,), quota=allowance)
             kept, _ = _trim_slots(
                 _candidate_slots(raw, point_budget, nested_levels, evidence=evidence),
                 allowance,
@@ -2587,7 +2837,7 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             # 不带上这个偏移，预览会把补出来的节点挂到已有节点的位置上。
             raw = await ask_model(
                 prompt_for(BRANCH_EXPAND_PROMPT, evidence), ask, parent=(index,),
-                base_index=len(slots_by_branch[index]),
+                base_index=len(slots_by_branch[index]), quota=missing,
             )
         except GenerationError:
             continue  # 补调失败只是"仍然不足"，不升级成整次失败
@@ -2648,7 +2898,8 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
                 f"{evidence_suffix(evidence)}"
             )
             raw = await ask_model(
-                prompt_for(SUBNODE_EXPAND_PROMPT, evidence), ask, parent=indices)
+                prompt_for(SUBNODE_EXPAND_PROMPT, evidence), ask, parent=indices,
+                quota=count)
             return _candidate_slots(raw, count, nested_left, evidence=evidence)
 
     for depth in range(3, max_depth + 1):
@@ -2676,10 +2927,15 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             level_cut[depth] = len(parents)
             break
         nested_left = max(0, max_depth - depth)
-        # 这一次响应最多能落多少个节点：结构上限与额度份额取小，两者都不能破。
+        # 这一次响应最多能落多少个节点：结构上限、额度份额、单次输出容量三者取小。
         # 不取小的话，模型每层都多给一层时总节点会按扇出的幂次膨胀，最后撞在
-        # 整树校验上——那时额度已经花完了。
-        level_allowance = min(breadth * (1 + _nested_capacity(fanout, nested_left)), share)
+        # 整树校验上——那时额度已经花完了。第三个上限的理由见 `_nodes_per_call`：
+        # 额度算术允许 6 个节点，不代表这一次请求装得下 6 个满额节点。
+        level_allowance = min(
+            breadth * (1 + _nested_capacity(fanout, nested_left)),
+            share,
+            per_call_nodes,
+        )
         level_results = await asyncio.gather(
             *(expand_node(slot, path, indices, breadth, nested_left, evidence)
               for slot, path, indices, evidence in parents),
@@ -2739,6 +2995,9 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
                 "parent_id": parent_id,
                 "index": position,
                 "label": slot.label,
+                # `detail` 原样带上（`_slot_from` 已按契约上限截过）：两层节点的
+                # 长文本走这里落进树，画布上的 label 才可能真的短。
+                "detail": slot.detail,
                 # 引用在 `_refs_from` 里已经清洗过（本支证据、契约形状、条数），
                 # 这里原样带上：这一层再"顺手补一条"就会把校验过的引用变成没校验过的。
                 "source_refs": list(slot.source_refs),
@@ -2958,6 +3217,10 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     if shallow:
         layers = "、".join(str(depth) for depth in shallow)
         content_parts.append(f"第 {layers} 层没能展开：模型没有返回可用的下一层内容。")
+    # 截断回收过节点：这件事必须出现在 content 里。diagnostics 只有前端面板会展开，
+    # 而"这一批少了尾巴"直接影响用户对整棵树完整度的判断。
+    if any(item.code == "OUTPUT_TRUNCATED_RECOVERED" for item in diagnostics):
+        content_parts.append("其中一批模型输出撞上长度上限被截断，已保留回收到的完整节点。")
     # 两个计数都是 0 = 提示词里的字段一次都没被回应。这件事不能只留在 data 里：
     # 用户看到的是 content，排查的人第一眼看的也是它。
     if leaf_declared == 0 and expandable_declared == 0:
@@ -3010,6 +3273,10 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             "partial": partial,
             "depth_limit": max_depth,
             "node_limit": node_limit,
+            # 这一次调用最多能要几个"满额节点"（`generation.budget` 反解出来的）。
+            # 它夹住了每一次要求，所以"要求量装不进单次输出"在结构上不可能发生；
+            # 报出来是为了让"为什么某层没继续长"能被解释成预算而不是模型的锅。
+            "per_call_nodes": per_call_nodes,
             "levels": [
                 {"depth": depth, "nodes": audit.depths.get(depth, 0)}
                 for depth in range(audit.deepest + 1)
@@ -3067,6 +3334,55 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     )
 
 
+def _depth_of(root: Node, node_id: str) -> int | None:
+    """节点在第几层（root 为 1）。找不到返回 `None`。
+
+    契约的 `MAX_TREE_DEPTH = 8` 是**含根**的层数，`_audit_tree` 里 root 是第 0 层
+    ——两套计法在同一个项目里并存，所以这里把口径写死成"root = 1"并注明来源：
+    调用方拿它与 `MAX_TREE_DEPTH` 直接比较，差一层就会把第 7 层的节点判成不能
+    再加子节点（或者反过来，让树长到第 9 层再被整树校验打回）。
+    """
+    stack: list[tuple[Node, int]] = [(root, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if node.id == node_id:
+            return depth
+        stack.extend((child, depth + 1) for child in node.children)
+    return None
+
+
+def _expand_items(raw: Any) -> list[tuple[str, str | None]]:
+    """单节点展开的响应 → `[(label, detail)]`，按出现顺序。
+
+    两种形状都收，这是 `EXPAND_PROMPT` 明说的：
+      - `{"children":[{"label":…,"detail":…}]}`：新格式，带两层节点；
+      - `{"points":["…","…"]}`：旧格式，只有标题。
+
+    为什么不像分片那条路一样只用 `_candidate_slots`：那个解析器还带 `expandable`
+    与嵌套 children 的语义，而单节点展开**只写一层**（没有下一轮追问）。复用会让
+    "这条路上多层是什么意思"变成一个没人定义的问题，而它的正确答案是"不存在"。
+    """
+    if not isinstance(raw, dict):
+        return []
+    items: list[tuple[str, str | None]] = []
+    children = raw.get("children")
+    if isinstance(children, list):
+        for item in children:
+            if isinstance(item, dict):
+                label = item.get("label")
+                if isinstance(label, str) and label.strip():
+                    items.append((clip_label(label.strip()), _detail_text(item.get("detail"))))
+            elif isinstance(item, str) and item.strip():
+                items.append((clip_label(item.strip()), None))
+        return items
+    points = raw.get("points")
+    if isinstance(points, list):
+        for item in points:
+            if isinstance(item, str) and item.strip():
+                items.append((clip_label(item.strip()), None))
+    return items
+
+
 async def _expand(args: ExpandArgs, ctx: RunContext) -> ToolResult:
     content = _require_candidate(ctx)
     if isinstance(content, ToolResult):
@@ -3086,8 +3402,31 @@ async def _expand(args: ExpandArgs, ctx: RunContext) -> ToolResult:
             f"节点「{node.label}」已有 {len(node.children)} 个子节点，上限 {MAX_CHILDREN}，放不下 {args.count} 个。",
         )
 
+    # 扩展守的是**整图**的契约上限（1000 节点 / 8 层），不是初次生成的那条 80/4。
+    # 初次紧、后续松：用户明确点了这个节点要更深，那就按承载能力给。两道判断都放在
+    # 调用模型**之前**——额度一旦花掉就收不回来，而这两种情况模型再听话也改不了。
+    node_limit = _node_limit()
+    used = _count_nodes(content.root)
+    room = node_limit - used
+    wanted = min(args.count, room)
+    if wanted < 2:
+        return _fail(
+            "tree_full",
+            f"这张图已经有 {used} 个节点，接近上限 {node_limit}，放不下这一批新节点"
+            f"（剩余 {max(0, room)} 个）。请先删掉一些节点再展开。",
+            node_count=used, node_limit=node_limit,
+        )
+    depth = _depth_of(content.root, node.id)
+    if depth is not None and depth >= mindmap_contract.MAX_TREE_DEPTH:
+        return _fail(
+            "too_deep",
+            f"节点「{node.label}」已经在第 {depth} 层，导图最多 "
+            f"{mindmap_contract.MAX_TREE_DEPTH} 层，不能再往下加了。",
+            depth=depth, depth_limit=mindmap_contract.MAX_TREE_DEPTH,
+        )
+
     existing_titles = "、".join(child.label for child in node.children) or "（空）"
-    ask = f"父节点：{node.label}\n已有子节点：{existing_titles}\n请补充 {args.count} 个新的子要点。"
+    ask = f"父节点：{node.label}\n已有子节点：{existing_titles}\n请补充 {wanted} 个新的子要点。"
     if args.instruction:
         ask += f"\n补充要求：{args.instruction}"
 
@@ -3099,13 +3438,14 @@ async def _expand(args: ExpandArgs, ctx: RunContext) -> ToolResult:
     except GenerationError as exc:
         return _fail("generation_failed", f"展开失败：{exc}")
 
-    points = raw.get("points") if isinstance(raw, dict) else None
-    if not isinstance(points, list) or not points:
+    diagnostics: list[Diagnostic] = []
+    truncated = _note_truncation(diagnostics, raw)
+    items = _expand_items(raw)
+    if not items:
         return _fail("invalid_points", "模型没有返回可用的子要点，请重试。")
 
     drafts = []
-    for point in points:
-        label = str(point).strip()
+    for label, detail in items:
         if not label:
             continue
         # 索引用**已接受的数量**而不是原始下标：模型返回 [" ", "有效"] 时，
@@ -3115,9 +3455,12 @@ async def _expand(args: ExpandArgs, ctx: RunContext) -> ToolResult:
             "id": f"$e{len(drafts)}",
             "parent_id": node.id,
             "index": len(node.children) + len(drafts),
-            "label": label[:200],
+            "label": label,
+            # `detail` 与 label 一起落树：单节点展开同样是"短标题 + 长说明"，
+            # 少带这一项会让这一支的节点在画布上重新变回一句长话。
+            "detail": detail,
         })
-        if len(drafts) >= args.count:
+        if len(drafts) >= wanted:
             break
     if not drafts:
         return _fail("invalid_points", "模型返回的子要点都是空的，请重试。")
@@ -3132,15 +3475,26 @@ async def _expand(args: ExpandArgs, ctx: RunContext) -> ToolResult:
     ctx.candidate = updated
     ctx.batches.append(batch)
     ctx.revision += 1
+    summary = f"已在「{node.label}」下新增 {len(ops)} 个子节点。"
+    if truncated:
+        summary += "模型输出被长度上限截断，已保留回收到的完整子节点。"
+    if wanted < args.count:
+        summary += f"（整图节点接近上限 {node_limit}，这次只补 {wanted} 个）"
     return ToolResult(
         ok=True,
-        content=f"已在「{node.label}」下新增 {len(ops)} 个子节点。",
+        content=summary,
         data={
             "batch": batch,
             "batches": [batch],
             "id_map": id_map,
             "revision": ctx.revision,
             "labels": [op.label for op in ops],
+            "partial": truncated,
+            "truncated": truncated,
+            "node_limit": node_limit,
+            "node_count": _count_nodes(updated.root),
+            "depth": depth,
+            "diagnostics": [item.model_dump() for item in diagnostics],
         },
     )
 

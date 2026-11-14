@@ -8,6 +8,7 @@ import os
 import re
 from collections.abc import Awaitable, Callable, Sequence
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
@@ -16,12 +17,15 @@ from pydantic import ValidationError
 
 from app.contracts.diagnostic import Diagnostic, DiagnosticLevel
 from app.contracts.mindmap import (
+    GENERATED_LABEL_MAX_CHARS,
     MAX_TREE_DEPTH,
     MAX_TREE_NODES,
     MindMapContent,
     Node,
+    clip_label,
 )
 from app.contracts.source import Source, SourceUsage
+from app.generation.budget import INITIAL_MAX_DEPTH, INITIAL_MAX_NODES
 from app.optimization.source_refs import EvidenceSpan, verify_source_refs
 
 # 单次模型调用的超时（秒）与响应体上限（字节）：超时避免请求无限挂起，
@@ -39,7 +43,111 @@ _MAX_RESPONSE_BYTES = 2_000_000
 # 按每节点约 25 token 算，65536 装得下 2600 个节点，高于契约允许的 1000 个，
 # 所以输出上限不再是内容被截断的原因——真被截断时 `finish_reason=length`
 # 会明确报错，不会静默交付半棵树。
+#
+# **这个数是默认值，不是唯一值**。DeepSeek 系列接受 65536，qwen 系列的上限是
+# 32768，混元/本地部署的兼容端点各不相同。写死一个数意味着换一个模型就整条路
+# 报 400，而报错文案是"模型服务返回 HTTP 400，请检查服务配置"——用户无从知道
+# 该改哪个环境变量。所以：
+#
+#   1. `MINDMAP_LLM_MAX_TOKENS` 覆盖它（`max_tokens_cap()` 读）；
+#   2. 仍然超限时，从服务端的 400 正文里解析
+#      `Range of max_tokens should be [1, N]`，学到 N 并**自动降级重试一次**
+#      （`_chat_once`）。学到值只在进程内存里，不写任何配置文件：它是服务端的
+#      事实，不是用户的配置，落盘之后没人知道该在什么时候删掉它。
 MAX_OUTPUT_TOKENS = 65536
+
+# 覆盖上面那个默认值的环境变量。
+MAX_TOKENS_ENV = "MINDMAP_LLM_MAX_TOKENS"
+
+# 服务端在 400 里自报的上限（进程内学习值）。`None` = 还没学到任何东西。
+# 一旦学到就一直是它与配置值取小：同一进程里的每一个出口（生成、展开、agent
+# 轮次）都该发同一个数，否则"三处各写一个上限"这个老问题会以另一种形式回来。
+_LEARNED_MAX_TOKENS: int | None = None
+
+# 服务端 400 的正文形状。实测 DeepSeek 写的是
+# `Range of max_tokens should be [1, 65536]`；OpenAI 兼容端点还见过
+# `max_tokens is too large: 65536. This model supports at most 32768`。
+# 两种都认，任何一种解析不出来就不降级（宁可抛原来那个错误，也不要瞎猜一个数）。
+_MAX_TOKENS_RANGE = re.compile(r"[Rr]ange of max_tokens should be \[\s*(\d+)\s*,\s*(\d+)\s*\]")
+_MAX_TOKENS_AT_MOST = re.compile(r"supports at most (\d+)")
+
+
+def parse_max_tokens_limit(text: str) -> int | None:
+    """从服务端的错误正文里解析出它真正接受的 `max_tokens` 上界。
+
+    解析不出来返回 `None`——调用方据此**不降级**。猜一个数比报错更糟：猜大了
+    再撞一次 400（用户多等一轮），猜小了静默削掉输出能力（截断率上升，而原因
+    在日志里看不出来）。
+    """
+    body = text or ""
+    match = _MAX_TOKENS_RANGE.search(body)
+    if match:
+        upper = int(match.group(2))
+        return upper if upper > 0 else None
+    match = _MAX_TOKENS_AT_MOST.search(body)
+    if match:
+        upper = int(match.group(1))
+        return upper if upper > 0 else None
+    return None
+
+
+def configured_max_tokens() -> int:
+    """`MINDMAP_LLM_MAX_TOKENS` 的值；没配或不是正整数时回落到默认值。
+
+    非法值不抛错：这是一个可选调优项，写错时的正确处置是"按默认值继续"，而不是
+    让整次生成失败在一条环境变量上（与 `source_mode()` 对非法取值的处理同一条
+    道理）。只 warning 一次，避免每次拼请求都刷一行日志。
+    """
+    raw = os.getenv(MAX_TOKENS_ENV, "").strip()
+    if not raw:
+        return MAX_OUTPUT_TOKENS
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value > 0:
+        return value
+    if raw not in _WARNED_MAX_TOKENS:
+        _WARNED_MAX_TOKENS.add(raw)
+        logger.warning("%s=%r 不是正整数，按默认值 %d 处理",
+                       MAX_TOKENS_ENV, raw, MAX_OUTPUT_TOKENS)
+    return MAX_OUTPUT_TOKENS
+
+
+# 非法环境变量的告警去重集合（口径同 `_WARNED_SOURCE_MODES`）。
+_WARNED_MAX_TOKENS: set[str] = set()
+
+
+def max_tokens_cap() -> int:
+    """当前进程允许发出的 `max_tokens` 上限：配置值与服务端学习值取小。
+
+    三个出口都要用这一个函数：`chat_async`（工具内的生成/展开）、
+    `provider.complete_tools`（agent 轮次），以及任何将来新增的模型调用。
+    各写一处 `min(...)` 的结果，是三条路上限慢慢分叉，而分叉的表现只是
+    "某条路径偶尔 400"。
+    """
+    cap = configured_max_tokens()
+    if _LEARNED_MAX_TOKENS is not None:
+        cap = min(cap, _LEARNED_MAX_TOKENS)
+    return cap
+
+
+def learn_max_tokens(value: int) -> None:
+    """记下服务端自报的上限（只在内存里，见 `_LEARNED_MAX_TOKENS` 的注释）。"""
+    global _LEARNED_MAX_TOKENS
+    if value <= 0:
+        return
+    if _LEARNED_MAX_TOKENS is None or value < _LEARNED_MAX_TOKENS:
+        if _LEARNED_MAX_TOKENS != value:
+            logger.warning("模型服务自报 max_tokens 上限为 %d，本次进程后续请求将降到该值",
+                           value)
+        _LEARNED_MAX_TOKENS = value
+
+
+def reset_learned_max_tokens() -> None:
+    """清掉学习到的上限。只给测试用——生产里它是服务端的事实，不该被手动抹掉。"""
+    global _LEARNED_MAX_TOKENS
+    _LEARNED_MAX_TOKENS = None
 
 # 模型上下文（输入侧）上限，单位 token。**这是保守值，不是实测边界**：
 # 探测 api.deepseek.com 需要密钥，而本机没有可用密钥（占位密钥只拿到 401），
@@ -138,10 +246,28 @@ CONTENT_FREEDOM_CONTRACT = (
 DETAIL_PROMPT = (
     "把用户输入变成一张思维导图。只返回一个 JSON 对象，不要代码围栏。"
     "格式为 {\"title\":\"标题\",\"root\":{\"id\":\"唯一id\","
-    "\"label\":\"节点文字\",\"children\":[]}}。每个节点均含 id、label、children，"
+    "\"label\":\"节点文字\",\"detail\":\"节点说明\",\"children\":[]}}。"
+    "每个节点均含 id、label、detail、children，"
+    # 节点是**两层**的：label 短、detail 长。这一条不改任何结构规则，它改的是
+    # "一个字放在哪个字段"。上一版只有一个 label，模型把整句解释塞进去，实测
+    # 240 个节点的树里 label 普遍 20–30 字，画布上挤成一团——而画布只截断显示，
+    # 内容其实一个都没少，少的是"短标题 + 长正文"这个形态。
+    #
+    # 两个上限都写死成可读的字数而不是 token 数：模型对"16 字"的理解比对
+    # "11 token"稳定得多。detail 的 2–3 句同样是可执行的要求，"写详细一点"
+    # 这类形容词它只能自己发挥。
+    f"label 是一句话短语，不超过 {GENERATED_LABEL_MAX_CHARS} 字，不带句号；"
+    "detail 是给这个节点看的说明，2–3 句，可以带数字与条件；"
+    "画布上只显示 label，detail 是点开之后看到的正文。\n"
     # 这里的两个数字取自契约常量：写死过一次，结果契约从 300 放到 1000 之后
     # 提示词还在叫模型"不超过 300"，模型自我设限，契约放宽等于没生效。
     f"ID 全局唯一，层级不超过 {MAX_TREE_DEPTH}，节点不超过 {MAX_TREE_NODES}。"
+    # 上面那句是**契约**上限（承载能力），这一句是**这一次**的规模。两句都要在：
+    # 只说 1000 时模型会照着写一百多个节点，一次重响应既容易撞输出上限，画布上
+    # 也读不完；只说 80 时它会把 80 当硬边界，复杂主题上主动砍内容。
+    f"第一次生成本身请控制在 {INITIAL_MAX_NODES} 个节点、"
+    f"{INITIAL_MAX_DEPTH + 1} 层（含中心主题）以内：宁可少两层，也要让每一层都写完整。"
+    "更细的内容留给用户点开某个节点后再展开。"
     # 展开规则必须单独成段，判据只能是「还能不能再拆」。
     #
     # 早先这条规则被塞在分支数量里（「每个分支再给 2-4 个要点」），模型把它读成
@@ -215,6 +341,10 @@ SOURCED_DETAIL_PROMPT = DETAIL_PROMPT + (
     "用户输入为 sources 数组，每项含 source_id 和 text，text 是待整理的原文。"
     "每个引用到材料的节点增加 source_refs 数组，格式为"
     '[{"source_id":"输入中已有的来源ID","quote":"逐字摘录的原文片段"}]。'
+    # 引用是**节点**的字段，与 label、detail 平级。写进 detail 的引用过不了
+    # `verify_source_refs`（它只看 `node.source_refs`），而且会变成一段无法点击的
+    # 纯文本——用户看到的"有出处"和系统认为的"有出处"不是同一件事。
+    "source_refs 与 label、detail 平级，不要写进 detail 的文字里。"
     "quote 不超过 300 字，必须出自对应来源的 text：可以只截取原文里的一段，"
     "但不能改写、概括、拼接或跨来源引用。\n"
     "原文：会议决定在十月十七日发布二点零版本。\n"
@@ -324,6 +454,8 @@ RAG_SOURCE_PROMPT = DETAIL_PROMPT + (
     # 会把它整条剔掉，界面上就成了"这篇材料一个字都没被引用"。
     "引用必须来自 evidence：source_refs 里每个字段都从 evidence 的返回里抄，"
     "不要自己算。"
+    # 与 `SOURCED_DETAIL_PROMPT` 同一句：引用是节点字段，不是正文的一部分。
+    "source_refs 与 label、detail 平级，不要写进 detail 的文字里。"
     "source_id 用返回的 source_id；quote 用返回的 quote，整段照抄时连着 start、end "
     "一起照抄。"
     "引文必须逐字照抄，不要改写、不要概括、也不要自己算偏移。"
@@ -529,8 +661,193 @@ def parse_model_json(content: str) -> Any:
     raise ValueError("模型返回内容里没有可解析的 JSON")
 
 
+class SalvagedOutput(dict):
+    """被长度上限截断、但**回收出了完整节点**的解析结果。
+
+    仍然是一个 `dict`：调用方（`_generate` / `_generate_deep` / `_expand`）把它
+    当普通响应继续用，pydantic 校验、`json.dumps` 全都照常。多出来的只是一个
+    事实——"这次输出是被切断的，里面少了东西"。调用方据此标 `partial` 并告警，
+    而不是让整棵树判失败。
+
+    为什么不是普通 dict + 一个旁路参数：**预览与校验读的是同一个返回值**，
+    多一条并行通道就意味着"修复了生成路径但忘了 agent 工具"这种漏接。子类是
+    唯一不需要改所有调用方签名的做法。
+    """
+
+    #: 这次输出被截断了（内容不完整）。
+    partial: bool = True
+
+    def __init__(self, data: dict, recovered: int = 0) -> None:
+        super().__init__(data)
+        self.recovered = max(0, int(recovered))
+
+
+# 顶层的两个形状：整树生成（`root`）与分片展开（`children` / 旧格式 `points`）。
+_ROOT_KEY = re.compile(r'"root"\s*:\s*\{')
+_CHILDREN_KEY = re.compile(r'"children"\s*:\s*\[')
+_POINTS_KEY = re.compile(r'"points"\s*:\s*\[')
+_JSON_STRING = r'"((?:[^"\\]|\\.)*)"'
+
+
+def _closed_object_spans(text: str) -> tuple[list[tuple[int, int]], bool]:
+    """列出所有**已闭合**的对象片段，以及这段 JSON 是否被切断。
+
+    返回 `(spans, truncated)`。`spans` 只保留最外层那些：嵌套片段会被外层包住，
+    取外层才有完整的子树（内层单独拿出来会丢掉它自己的兄弟）。
+    `truncated=True` 表示扫描结束时还有没闭合的括号——也就是"这段 JSON 是被
+    切断的"，这是回收与"正常解析"的分界线。
+
+    **任何深度的闭合都要记**（不只是栈空时）：被切断时最外层恰恰永远不闭合，
+    真正能回收的正是它内部那些已经闭合的子树。只记栈空的话，回收函数在
+    `finish_reason=length` 这种唯一会用到它的场合永远返回 None。
+    """
+    spans: list[tuple[int, int]] = []
+    stack: list[int] = []
+    in_string = False
+    escaped = False
+    for index, ch in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append(index)
+        elif ch in "}]":
+            if not stack:
+                # 多余的闭合符：跳过它，别让偏移整体错位
+                continue
+            start = stack.pop()
+            if text[start] == "{":
+                spans.append((start, index + 1))
+
+    # 去掉被外层已闭合片段包住的内层片段（只保留最外层的完整子树）。
+    # 闭合片段之间只有两种关系：嵌套或不相交，所以按起点排序后一遍扫描就够。
+    spans.sort()
+    outermost: list[tuple[int, int]] = []
+    for span in spans:
+        if outermost and span[0] < outermost[-1][1]:
+            continue
+        outermost.append(span)
+    return outermost, bool(stack) or in_string
+
+
+def _first_json_string(pattern: re.Pattern[str], text: str) -> str | None:
+    """取第一个匹配的 JSON 字符串值（按 JSON 转义规则解码）。"""
+    match = pattern.search(text)
+    if not match:
+        return None
+    try:
+        return json.loads(f'"{match.group(1)}"')
+    except json.JSONDecodeError:
+        return None
+
+
+def salvage_model_json(content: str) -> SalvagedOutput | None:
+    """从被切断的 JSON 里回收**已经完整闭合**的节点对象。
+
+    这是"截断不再等于整棵树报废"的实现。`_balance_brackets` 那条老路会把半截
+    JSON 补成"合法"，于是缺了一块的树被当成完整结果交出去；而一律抛错又会把
+    已经写好的几十个节点一起丢掉。回收走第三条路：**只收闭合了的对象**。
+
+    做法与判据：
+
+      1. 扫描出所有已闭合的对象片段（括号收支在同一层平衡），只留最外层；
+      2. 每个片段必须能 `json.loads`，且是带非空 `label` 的对象——那才是一个
+         "完整的节点"；写了一半的 label（截在字符串中间）根本不会闭合，自然
+         进不来；
+      3. 按顶层形状重组：
+         - 有 `"root"` → 整树生成，回收出来的子树挂到 root 的 children 上；
+         - 有 `"children"` → 分片展开，直接就是 children 数组；
+         - 两者都没有 → 认不出形状，返回 None（不猜）。
+
+    返回 `None` 表示"没有任何可回收的完整节点"，调用方应当按原来的语义失败。
+    """
+    text = (content or "").strip()
+    if not text:
+        return None
+    spans, _truncated = _closed_object_spans(_FENCE_CLOSE.sub("", _FENCE_OPEN.sub("", text)))
+    if not spans:
+        return None
+
+    nodes: list[dict[str, Any]] = []
+    recovered = 0
+    for start, end in spans:
+        try:
+            parsed = json.loads(text[start:end])
+        except json.JSONDecodeError:
+            continue
+        recovered += _count_labeled(parsed)
+        if isinstance(parsed, dict) and isinstance(parsed.get("label"), str) \
+                and parsed["label"].strip():
+            nodes.append(parsed)
+    if not nodes:
+        return None
+
+    if _ROOT_KEY.search(text):
+        root = _salvage_root(text, nodes)
+        if root is None:
+            return None
+        data: dict[str, Any] = {"root": root}
+        title = _first_json_string(re.compile(r'"title"\s*:\s*' + _JSON_STRING), text)
+        if title:
+            data["title"] = title
+        return SalvagedOutput(data, recovered=recovered)
+    if _CHILDREN_KEY.search(text):
+        return SalvagedOutput({"children": nodes}, recovered=recovered)
+    if _POINTS_KEY.search(text):
+        # 旧格式的 `points` 是字符串数组：闭合的元素不在上面的对象扫描里，
+        # 回收不出东西就别硬凑（返回 None 让调用方按失败处理）。
+        return None
+    return None
+
+
+def _count_labeled(value: Any) -> int:
+    """递归数出"带非空 label 的对象"有几个。
+
+    `recovered` 报的是**节点数**，不是"回收了几个顶层片段"：整树形状下最外层
+    只可能是一个片段（`root`），按片段数报会得到恒定的 1，而用户与日志真正关心
+    的是"救回了多少个节点"。
+    """
+    if isinstance(value, dict):
+        own = 1 if isinstance(value.get("label"), str) and value["label"].strip() else 0
+        return own + sum(_count_labeled(item) for item in value.values())
+    if isinstance(value, list):
+        return sum(_count_labeled(item) for item in value)
+    return 0
+
+
+def _salvage_root(text: str, nodes: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """拼出被截断那棵树 `root` 形状：已写出的 id/label + 回收到的子树。
+
+    root 自己的 `id` / `label` 一定写在 `children` 之前（模型输出的键序，
+    以及提示词里的格式示例都是这个顺序），所以只在前半段里找。找不到 label
+    就放弃——一棵没有根的树没有任何用处。
+    """
+    start = _ROOT_KEY.search(text)
+    if start is None:
+        return None
+    body = text[start.end() - 1:]
+    children_at = _CHILDREN_KEY.search(body)
+    head = body[:children_at.start()] if children_at else body
+    label = _first_json_string(re.compile(r'"label"\s*:\s*' + _JSON_STRING), head)
+    if not label or not label.strip():
+        return None
+    node_id = _first_json_string(re.compile(r'"id"\s*:\s*' + _JSON_STRING), head)
+    return {
+        "id": node_id or "root",
+        "label": label,
+        "children": nodes,
+    }
+
+
 def _truncated_output_error() -> GenerationError:
-    """输出撞上 `max_tokens` 被硬切时的错误。
+    """输出撞上 `max_tokens` 被硬切、且一个完整节点都回收不出来时的错误。
 
     文案只有这一份：一次性响应与流式响应都会拦到同一种截断，两处各写一句的结果
     是同一个事故在日志与界面上有两种说法。
@@ -538,19 +855,19 @@ def _truncated_output_error() -> GenerationError:
     return GenerationError("模型输出撞上长度上限被截断，结果不完整，请重试")
 
 
-def _choice_content(body: Any) -> str:
-    """从响应体里取出模型 content，并拦住被长度上限截断的输出。
+def _choice_message(body: Any) -> tuple[str, bool]:
+    """从响应体里取出模型 content 与"是否被长度上限截断"。
 
-    `finish_reason == "length"` 表示输出在 max_tokens 处被硬切。不拦的话，
-    `parse_model_json` 里的 `_balance_brackets` 会把半截 JSON 的括号补齐，
-    让它"合法"——一棵缺了半边的树就这样被当成成功结果返回，比直接失败
-    难排查得多。`stop` 与字段缺失时照常解析：老版本的 mock、部分 OpenAI
-    兼容端点都不返回这个字段，那不是"被截断"，只是"没说原因"。
+    `finish_reason == "length"` 表示输出在 max_tokens 处被硬切。这个信号**不再
+    直接判失败**：调用方先试着用 `salvage_model_json` 回收完整节点，收得回来就
+    交一棵"少了尾巴但可用"的树并标 partial，一个都收不回来才失败。
+
+    `stop` 与字段缺失时按"没被截断"处理：老版本的 mock、部分 OpenAI 兼容端点
+    都不返回这个字段，那不是"被截断"，只是"没说原因"。
     """
     choice = body["choices"][0]
-    if isinstance(choice, dict) and choice.get("finish_reason") == "length":
-        raise _truncated_output_error()
-    return choice["message"]["content"]
+    truncated = isinstance(choice, dict) and choice.get("finish_reason") == "length"
+    return choice["message"]["content"], truncated
 
 
 def _config() -> tuple[str, str, str]:
@@ -643,8 +960,15 @@ async def _chat_streamed(
         raise
     except Exception:  # noqa: BLE001 — 含 httpx 各类错误，一律退回一次性请求
         return None
-    # 截断判定与一次性路径同源：宁可报错，也不要把补齐括号后的半份结果当成功。
+    # 截断判定与一次性路径同源（`_parse_choice` 是唯一实现）。
     if finish_reason == "length":
+        # 流式路径上的截断**可以回收**：`content` 里已经有模型写出来的全部正文，
+        # 只是尾巴没了。回收不出完整节点时才退回一次性请求——那条路会拿到同一份
+        # 被切的正文，结果相同，还不如在这里直接判。
+        salvaged = salvage_model_json(content)
+        if salvaged is not None:
+            logger.warning("流式输出被长度上限截断，已回收 %d 个完整节点", salvaged.recovered)
+            return salvaged
         raise _truncated_output_error()
     # 没有结束标记说明这条流被切断了。此时半截正文交给 `parse_model_json` 会被
     # 补齐括号"解析成功"，一棵缺了半边的树就这样当成功交出去——退回一次性请求，
@@ -664,12 +988,31 @@ async def _chat_once(
 
     `chat_async` 在没有预览消费者时的只有它也走这条；流式尝试被服务端拒掉
     （不认 `stream`、流中途断掉）时同样退回这里。
+
+    **`max_tokens` 超限的自动降级就在这里**：服务端用 400 回一句
+    `Range of max_tokens should be [1, N]` 时，把 N 记下来（`learn_max_tokens`）
+    并用它重试**一次**。不降级的后果是"换一个模型就整条生成路径报错"，而错
+    文案指向的是"请检查服务配置"——配置本身是对的，只是上限不同。
     """
     payload = json.dumps(request_body, ensure_ascii=False).encode("utf-8")
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS, follow_redirects=True) as client:
             async with client.stream("POST", base + "/chat/completions",
                                      content=payload, headers=headers) as response:
+                # 400 的正文里才有服务端真正的上限；流式响应必须先读出来。
+                # mock 出来的响应对象没有 `aread`，所以取不到就算了（下面那条
+                # `_error_body` 会退化成空串，降级逻辑本身不受影响）。
+                # 状态码同样按 `getattr` 取：好几个测试替身（以及某些代理包装）
+                # 根本没有这个属性，用 `response.status_code` 会抛 AttributeError，
+                # 而那个异常会被下面的 except 归成"返回内容不合法"——一条与真实
+                # 原因无关的错误文案。
+                if getattr(response, "status_code", 200) >= 400:
+                    reader = getattr(response, "aread", None)
+                    if reader is not None:
+                        try:
+                            await reader()
+                        except Exception:  # noqa: BLE001 — 读错误体失败不影响主流程
+                            pass
                 response.raise_for_status()
                 buffer = bytearray()
                 async for chunk in response.aiter_bytes():
@@ -677,16 +1020,116 @@ async def _chat_once(
                     if len(buffer) > _MAX_RESPONSE_BYTES:
                         raise GenerationError("模型响应过大")
         body = json.loads(buffer)
-        # agent 的工具（生成 / 展开）走这条路径，没有 provider 那层的
-        # finish_reason 检查，所以截断必须在这里拦住。
-        return parse_model_json(_choice_content(body))
+        return _parse_choice(body, request_body)
     except httpx.HTTPStatusError as exc:
         code = exc.response.status_code
+        downgraded = _downgrade_max_tokens(request_body, exc.response)
+        if downgraded is not None:
+            logger.warning("模型服务拒绝 max_tokens=%s（HTTP 400，%s），按服务端上限 %d 重试一次",
+                           request_body.get("max_tokens"), downgraded.reason, downgraded.cap)
+            return await _chat_once(base, downgraded.body, headers)
         raise GenerationError(f"模型服务返回 HTTP {code}，请检查服务配置") from exc
     except (httpx.RequestError, httpx.InvalidURL, OSError) as exc:
         raise GenerationError("无法连接模型服务或请求超时") from exc
     except (ValueError, KeyError, IndexError, TypeError) as exc:
         raise GenerationError("模型返回内容不是符合约定的导图 JSON，请重试") from exc
+
+
+@dataclass(frozen=True)
+class _Downgrade:
+    """一次 max_tokens 降级：新的请求体、学到的上限、以及原因（日志用）。"""
+
+    body: dict[str, Any]
+    cap: int
+    reason: str
+
+
+def _error_body(response: Any) -> str:
+    """尽力取出错误响应正文。取不到就返回空串——降级是加分项，不该自己抛。"""
+    for attr in ("text",):
+        try:
+            value = getattr(response, attr, "")
+            if isinstance(value, str) and value:
+                return value
+        except Exception:  # noqa: BLE001 — ResponseNotRead 等
+            continue
+    try:
+        content = getattr(response, "content", b"")
+        if isinstance(content, (bytes, bytearray)):
+            return content.decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def _downgrade_max_tokens(
+    request_body: dict[str, Any], response: Any,
+) -> _Downgrade | None:
+    """400 里能解析出更小的上限时，返回一次降级请求；否则 `None`（不重试）。
+
+    只降一次：重试的请求体里已经带着学到的上限，再撞 400 说明问题不在这个数
+    （密钥、模型名、账户余额都会给 400），继续重试只是多花一次网络往返。
+    """
+    if getattr(response, "status_code", None) != 400:
+        return None
+    limit = parse_max_tokens_limit(_error_body(response))
+    if limit is None:
+        return None
+    current = request_body.get("max_tokens")
+    if isinstance(current, int) and current <= limit:
+        return None
+    learn_max_tokens(limit)
+    return _Downgrade(body={**request_body, "max_tokens": limit}, cap=limit,
+                      reason=f"服务端上限 {limit}")
+
+
+def _strict_json(content: str) -> Any | None:
+    """只认**语法完整**的 JSON：不做补齐、不截取片段。失败返回 `None`。
+
+    与 `parse_model_json` 的分工是刻意的：那个函数会补括号、会从一段废话里抠对象，
+    是"尽量解析出来"；这个只有一个用途——判断"模型其实写完了，只是服务端在
+    `finish_reason` 上说了 length"。两者混用会把被切断的 JSON 判成完整。
+    """
+    text = _FENCE_CLOSE.sub("", _FENCE_OPEN.sub("", (content or "").strip()))
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+
+def _parse_choice(body: Any, request_body: dict[str, Any] | None = None) -> Any:
+    """把一次完整响应变成解析结果：正常解析，或截断时回收完整节点。
+
+    三条出口共用这一份（`_chat_once`，以及 `chat_async` 的两条路径最终都到这里）：
+    解析规则、截断判定、回收策略各写一份的结果，是同一次截断在三条路上有三种
+    结局——其中两条静默成功。
+
+    截断时的顺序不能反：
+
+      1. 先看**语法完整**的 JSON（`_strict_json`）。模型偶尔在最后一帧被切，
+         但它其实已经写完了整个对象——那时 `finish_reason=length` 只是"到点了"，
+         内容一个字没少。这一档当完整结果用，只标 `partial` 让上层知道有过截断。
+      2. 再试着从被切的文本里回收已闭合的节点（`salvage_model_json`）。
+      3. 两样都不成立才失败——那时确实没有可交付的东西。
+    """
+    content, truncated = _choice_message(body)
+    if not truncated:
+        return parse_model_json(content)
+    complete = _strict_json(content)
+    if isinstance(complete, dict):
+        logger.warning(
+            "模型输出标记为 length，但 JSON 语法完整；按完整结果使用并标 partial（%d 个节点）",
+            _count_labeled(complete),
+        )
+        return SalvagedOutput(complete, recovered=_count_labeled(complete))
+    salvaged = salvage_model_json(content)
+    if salvaged is not None:
+        logger.warning(
+            "模型输出撞上 max_tokens=%s 被截断，已回收 %d 个完整节点（标 partial，不整棵判失败）",
+            (request_body or {}).get("max_tokens"), salvaged.recovered,
+        )
+        return salvaged
+    raise _truncated_output_error()
 
 
 async def chat_async(
@@ -715,6 +1158,10 @@ async def chat_async(
     # 输入侧的物理边界，与调用方是谁无关：装不装得进模型窗口由这里统一守，
     # 否则每个出口各守一个数，迟早分叉。
     ensure_input_within_context(user, extra_tokens=estimate_input_tokens(system))
+    # 上限在**发请求之前**夹一次：`max_tokens_cap()` 是配置值与服务端学习值的
+    # 较小者（见它的 docstring）。放在这里而不是调用方，是因为工具、agent 轮次、
+    # 一次性接口都从这里出去——一处夹住，三条出口同值。
+    requested = max_tokens or MAX_OUTPUT_TOKENS
     request_body: dict[str, Any] = {
         "model": model,
         "messages": [
@@ -722,7 +1169,7 @@ async def chat_async(
             {"role": "user", "content": user},
         ],
         "temperature": 0.2,
-        "max_tokens": max_tokens or MAX_OUTPUT_TOKENS,
+        "max_tokens": min(requested, max_tokens_cap()),
     }
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     if on_delta is not None:
@@ -787,6 +1234,10 @@ def validate_generated_content(
     raw = deepcopy(result)
     diagnostics: list[Diagnostic] = []
     allowed_ids = {source.id for source in sources or []}
+    # 生成侧的标题上限（16 码点）。整树生成时模型直接给整棵树，这条归一化就是
+    # "AI 生成路径的 label 一定不超过 16 字"的唯一实现点——分片那条路在
+    # `tools._slot_from` 里裁，两条路各裁一次，但用的是同一个契约常量。
+    clipped_labels = 0
     if isinstance(raw, dict):
         raw["source_usage"] = [
             SourceUsage(source_id=source.id, kind=source.kind, filename=source.filename,
@@ -798,6 +1249,10 @@ def validate_generated_content(
             node = stack.pop()
             if not isinstance(node, dict):
                 continue
+            label = node.get("label")
+            if isinstance(label, str) and len(label) > GENERATED_LABEL_MAX_CHARS:
+                node["label"] = clip_label(label)
+                clipped_labels += 1
             if sources is None:
                 node["source_refs"] = []
             elif isinstance(node.get("source_refs"), list):
@@ -820,6 +1275,16 @@ def validate_generated_content(
         content = MindMapContent.model_validate(raw)
     except ValidationError as exc:
         raise GenerationError("模型返回内容不是符合约定的导图 JSON，请重试") from exc
+    if clipped_labels:
+        # 聚合一条而不是逐节点报告：一棵 80 节点的树里出现十几条"标题太长"会把别的
+        # 诊断淹掉，而用户能做的事只有一件——想要长内容就写进详情。
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="LABEL_CLIPPED_TO_GENERATED",
+            message=(
+                f"{clipped_labels} 个节点的标题超过 {GENERATED_LABEL_MAX_CHARS} 字，已截短；"
+                "画布上只显示标题，长内容应该在 detail 里"
+            ),
+        ))
     if enforce_min_branches and len(content.root.children) < MIN_BRANCHES:
         raise _branch_shortfall(len(content.root.children))
     if sources is not None:

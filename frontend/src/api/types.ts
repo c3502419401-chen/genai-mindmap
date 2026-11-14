@@ -9,7 +9,7 @@
  *  `contract-check.ts` 的编译期断言保持一致（见 `docs/CONTRACT_V2.md`）。 */
 export interface MindNode {
   id: string;
-  /** 一句话标题。画布上按 24 字截断显示，全文在悬停卡片与详情面板里。 */
+  /** 一句话标题（生成侧 ≤16 字）。画布上只画它；超长的旧图仍按 24 字截断显示。 */
   label: string;
   children: MindNode[];
   /**
@@ -20,6 +20,16 @@ export interface MindNode {
    * 必须与契约 v2 同批上线：v1 的 `Node` 是 `extra="forbid"`，提前出现会 422。
    */
   note?: string | null;
+  /**
+   * 生成产出的说明（契约 v2 字段，上限 2000 字）。
+   *
+   * 与 `note` **不是同一个东西**：`detail` 是模型写的（整树生成、分片展开都会填），
+   * `note` 是用户自己写的备注。两者分区展示，界面只让用户改后者——生成侧永远
+   * 碰不到 `note`，否则一次重新生成就把用户敲的字整段盖掉。
+   *
+   * 渲染回退链：`detail → note → label`。旧图没有 `detail`，因此行为与今天一致。
+   */
+  detail?: string | null;
   /**
    * 节点级引用，镜像后端 `Node.source_refs`（v1 契约里**已经存在**，不是 v2 预告）。
    *
@@ -65,18 +75,20 @@ export interface AddOp {
   index: number;
   label: string;
   source_refs?: SourceRef[];
+  /** 生成产出的说明（上限 2000 字）。与 `note` 分开：后者永远是用户写的。 */
+  detail?: string | null;
 }
 
 /**
  * 改节点。
  *
- * `label` 与 `source_refs` 缺省（undefined）表示"这一项不动"，与"清空"区分开：
- * `source_refs: []` 是显式清空。这个区别丢不得。
+ * `label`、`detail` 与 `source_refs` 缺省（undefined）表示"这一项不动"，与"清空"
+ * 区分开：`source_refs: []` 是显式清空。这个区别丢不得。
  */
 export interface UpdateOp {
   op: 'update';
   id: string;
-  changes: { label?: string; source_refs?: SourceRef[] };
+  changes: { label?: string; source_refs?: SourceRef[]; detail?: string | null };
 }
 
 /** 删节点及整棵子树。根节点不可删。 */
@@ -219,6 +231,32 @@ export interface Source {
    * 就再也用不上它。时间是从**原始录音**开头算的毫秒偏移，不是相对切片。
    */
   sentences?: AudioSentence[];
+  /**
+   * 正文指纹（去重与"同一份材料是否已入库"的依据）。
+   *
+   * 与下面两个字段同一条教训：后端的 `Source` 已经下发它们，镜像缺字段时
+   * `contract-check.ts` 的 `SameKeys` 会红（键集合必须一致），而且「把来源原样
+   * 送回后端」会把这些值丢掉。基线里这三个字段就是漏的，`npm run type-check`
+   * 因此长期失败——一个常年红的检查等于没有检查，所以顺手补齐。
+   */
+  content_hash?: string | null;
+  /** 描述性元数据：检索前过滤用（作者、时间、分类、标签）。 */
+  metadata?: SourceMetadata;
+}
+
+/**
+ * 来源的描述性元数据，镜像后端 `SourceMetadata`。
+ *
+ * 两类来源不同：`author` / `created_at` / `modified_at` 由 ingestion 层从文件
+ * 自带的元数据里读（确定性、零成本）；`category` / `tags` 只由调用方给。
+ * 时间一律是 ISO8601 UTC 秒级字符串，与 `MapRecord.updated_at` 同口径。
+ */
+export interface SourceMetadata {
+  author?: string | null;
+  created_at?: string | null;
+  modified_at?: string | null;
+  category?: string | null;
+  tags?: string[];
 }
 
 /** 音频里的一句话及其在原始录音中的位置。 */

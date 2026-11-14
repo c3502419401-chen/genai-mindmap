@@ -224,6 +224,9 @@ def _apply_add(content: MindMapContent, op: AddOp, base: str) -> None:
         # 复制一份而不是直接引用 op 里的 list：op 对象可能被调用方复用，
         # 树和 op 共享同一个可变列表迟早会出"改了 op 顺手改了树"的事。
         source_refs=list(op.source_refs),
+        # `detail` 是生成产出的说明，与用户备注 `note` 分开存：这里只带 detail，
+        # 永远不碰 note——重新生成一次就把用户敲的字盖掉是最不该发生的那种丢失。
+        detail=op.detail,
     ))
 
 
@@ -239,6 +242,11 @@ def _apply_update(content: MindMapContent, op: UpdateOp, base: str) -> None:
     # update，然后每次都"成功"但什么都没变。
     if op.changes.source_refs is not None:
         node.source_refs = list(op.changes.source_refs)
+    # `detail` 同一个约定：`None` 不动，空串归一成 `None`（"清空"）。
+    # 这里**不碰 note**：那是用户的备注，生成侧无权重写（见 `Node` 的注释）。
+    if op.changes.detail is not None:
+        detail = op.changes.detail.strip()
+        node.detail = detail or None
 
 
 def _apply_remove(content: MindMapContent, op: RemoveOp, base: str) -> None:

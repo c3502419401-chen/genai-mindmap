@@ -75,6 +75,10 @@ BEHAVIOUR = (
     # 重排模型名（`knowledge/rerank.py`）。清空 = 用默认值。不清的话宿主机上换个
     # 模型名会让 `tests/test_rerank.py` 里断言请求体的几条换一个字符串。
     "MINDMAP_RERANK_MODEL",
+    # 输出 token 上限（`generation/service.max_tokens_cap`）。清空 = 用默认值 65536。
+    # 不清的话，宿主机上为 qwen 配过 32768 的机器会把"发出去的 max_tokens"整批改小，
+    # `tests/test_budget.py` 与 `test_agent_tools.py` 里断言数值的那几条会随机器漂。
+    "MINDMAP_LLM_MAX_TOKENS",
 )
 
 SWITCHES = ("MINDMAP_HYBRID_SEARCH", "MINDMAP_QUERY_EXPANSION", "MINDMAP_PARENT_RETRIEVAL",

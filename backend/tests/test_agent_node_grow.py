@@ -309,13 +309,27 @@ class DeepGrowReportTest(unittest.TestCase):
     def test_expandable_flag_reaches_the_frame(self):
         frames = self._run_deep(
             lambda user: {"children": [{"label": "能再拆", "expandable": True},
-                                       {"label": "拆到底了", "expandable": False},
-                                       {"label": "没写"}]}
+                                       {"label": "拆到底了", "expandable": False}]}
         )
         flags = {frame["label"]: frame["expandable"] for frame in frames}
         self.assertIs(flags["能再拆"], True)
         self.assertIs(flags["拆到底了"], False)
-        self.assertIsNone(flags["没写"])
+
+    def test_nodes_cut_by_the_slot_quota_are_never_reported(self):
+        """被 `_trim_slots` 裁掉的候选**不许**上报——它们从来没进过树。
+
+        `points_per_branch=2` 时这一路只接纳前 2 个节点，模型多给的第 3 个会在
+        合并前被裁掉。旧行为是照单全收地报，界面上表现为"长出来又消失"：用户看着
+        一个节点出现，几秒后整棵树里没有它，而任何日志都不会提这件事。
+        """
+        frames = self._run_deep(
+            lambda user: {"children": [{"label": "留下的一"}, {"label": "留下的二"},
+                                       {"label": "被裁的三"}]}
+        )
+        labels = {frame["label"] for frame in frames}
+        self.assertIn("留下的一", labels)
+        self.assertIn("留下的二", labels)
+        self.assertNotIn("被裁的三", labels)
 
     def test_no_channel_means_no_streaming_request(self):
         """通道为 None：一次流式都不发，工具行为与加这个功能之前一样。"""
@@ -885,13 +899,37 @@ class ChatAsyncStreamingTest(unittest.TestCase):
         self.assertEqual(result, {"children": [{"label": "甲"}]})
         self.assertEqual(calls["n"], 1)  # 第一段之后就不再回调
 
-    def test_truncated_stream_is_rejected_without_a_second_request(self):
-        """finish_reason=length 是硬边界：与一次性路径同样判失败，不重发请求。"""
+    def test_truncated_stream_is_salvaged_without_a_second_request(self):
+        """finish_reason=length：回收已闭合的节点，并且**仍不重发请求**。
+
+        旧行为是一律抛错（"硬边界"）。现在唯一的区别是那句"能回收就不失败"：
+        被切的正文里已经有一个完整节点（`{"label":"甲"}` 闭合了），把它交出去
+        比让整次生成报废更有用。而"不重发请求"这条没有变——重发的还是同一份
+        被切的输出，多花一次钱、结果一样。
+        """
         requests: list[httpx.Request] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             requests.append(request)
             return httpx.Response(200, content=_sse(['{"children":[{"label":"甲"}'],
+                                                     finish_reason="length"))
+
+        async def on_delta(text: str) -> None:
+            return None
+
+        result = self._call(handler, on_delta)
+        self.assertEqual(list(result["children"]), [{"label": "甲"}])
+        self.assertTrue(getattr(result, "partial", False))
+        self.assertEqual(getattr(result, "recovered", 0), 1)
+        self.assertEqual(len(requests), 1)
+
+    def test_unrecoverable_truncated_stream_is_rejected(self):
+        """切在 label 中间：一个完整节点都回收不出来，才判失败（同样不重发）。"""
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, content=_sse(['{"children":[{"label":"写了一半'],
                                                      finish_reason="length"))
 
         async def on_delta(text: str) -> None:

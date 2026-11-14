@@ -117,9 +117,22 @@ class FinishReasonTest(unittest.TestCase):
         self.addCleanup(patcher.stop)
         return client_class
 
-    def test_chat_async_rejects_truncated_output(self):
-        """finish_reason=length：抛错，绝不把补全括号后的半棵树当成功。"""
+    def test_chat_async_marks_a_complete_but_truncated_response(self):
+        """`finish_reason=length` 但 JSON 语法完整：内容一个字没少，照常交付 + 标 partial。
+
+        旧行为是一律抛错——那时它守的是"别把补全括号后的半棵树当成功"。现在补齐
+        那条路已经不走了（`_strict_json` 只认语法完整的 JSON），所以这一档可以
+        安全地当完整结果用；`partial` 让上层知道服务端认为输出到点了。
+        """
         self.use_async_client(MockAsyncStreamResponse(_response_body(self.TREE, "length")))
+        result = asyncio.run(chat_async("系统", "用户"))
+        self.assertEqual(result["title"], "测试")
+        self.assertTrue(getattr(result, "partial", False))
+
+    def test_chat_async_rejects_an_unrecoverable_truncation(self):
+        """切在字符串中间、一个完整节点都回收不出来：抛错，绝不交付半棵树。"""
+        broken = '{"title":"测试","root":{"id":"1","label":"测试写成了一半'
+        self.use_async_client(MockAsyncStreamResponse(_response_body(broken, "length")))
         with self.assertRaises(GenerationError) as raised:
             asyncio.run(chat_async("系统", "用户"))
         self.assertIn("截断", str(raised.exception))

@@ -29,6 +29,40 @@ MAX_TREE_DEPTH = 8
 # 再多的画布也读不清——那时用户要的其实是子节点，不是连线。
 MAX_RELATIONS = 200
 
+# 节点标题（`label`）的**契约上限**= 200。这是给旧图留的读取口径：库里那些
+# 一句话当标题的记录（实测 20–30 字，最长的一批贴着 200）必须照常打得开。
+MAX_NODE_LABEL_CHARS = 200
+
+# AI 生成时的标题上限 = 16 码点。这是**生成侧**的约束（`generation.service` 与
+# `agent.tools` 的归一化都读它），不是契约校验：把 `Field(max_length=200)` 直接
+# 改成 16，等于让所有旧图在下一次保存时 422——用户什么都没改，图却存不回去。
+#
+# 16 这个数的依据是画布：`180px` 宽的圆角框里放 14px 字，一行约 12 个字、两行
+# 24 个字，16 字是"缩到能看见全貌"之后仍读得出的长度。超过它的内容属于详情
+# （`detail`），不属于标题。
+GENERATED_LABEL_MAX_CHARS = 16
+
+# 节点详情上限。与 `note` 同为 2000：同一块文字在界面上占同一块地方，两个字段
+# 的容量不该一个够写、一个不够写。`detail` 与 `note` 的**语义**不同（生成产出
+# vs 用户备注），所以只能分开存，不能合并（见 `Node.detail` 的注释）。
+MAX_NODE_DETAIL_CHARS = 2000
+
+
+def clip_label(text: str, limit: int = GENERATED_LABEL_MAX_CHARS) -> str:
+    """按**码点**截断标题，返回不超过 `limit` 个码点的字符串。
+
+    按码点而不是 UTF-16 下标：`Array.from` / Python 的 `str` 都以码点为单位，
+    而 JS 的 `length` 会把一个 emoji 数成 2——用码点才能让两端对"16 字"给出同
+    一个答案（前端 `edits.ts::charLength` 也是这个口径）。
+
+    省略号**不**追加：它是 1 个码点，加上去会让"16 字"变成 17 字，于是再截一次、
+    再判一次，最后谁也不知道上限到底是几。要显示省略号的地方（画布）自己加。
+    """
+    if limit <= 0:
+        return ""
+    chars = list(text or "")
+    return "".join(chars[:limit])
+
 
 def _fold(text: str) -> str:
     """把换行与连续空白折成单空格。
@@ -101,11 +135,23 @@ class LayoutKind(str, Enum):
 class Node(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: str = Field(min_length=1, max_length=100)
-    label: str = Field(min_length=1, max_length=200)
+    label: str = Field(min_length=1, max_length=MAX_NODE_LABEL_CHARS)
     children: list[Node] = Field(default_factory=list, max_length=50)
     # 正文。`label` 是短标题（画布上只放得下 200 字以内的两行），长的内容放这里。
     # 渲染取值收敛为 `note or label`，两处都空是不可能的（label 非空）。
-    note: str | None = Field(default=None, max_length=2000)
+    #
+    # **`note` 是用户自己写的备注**：`agent/ops.py` 的 add/update 之外，只有
+    # `stores/mindmap.ts::commitNote`（界面上的编辑框）会动它。所以任何"模型生成"
+    # 的内容都**不许**写进 `note`——重新生成一次就会把用户敲的字整段盖掉，而那种
+    # 丢失在界面上看不出来（它长得就像"模型又写了一遍"）。
+    note: str | None = Field(default=None, max_length=MAX_NODE_DETAIL_CHARS)
+    # 生成出来的说明。与 `note` 同容量、不同语义：`detail` 归生成（整树、分片
+    # 展开、单节点展开都会填），`note` 归用户。界面上两者分区展示。
+    #
+    # 上限 2000 与 `note` 一致；超出的部分不静默截断——`Field` 会直接拒收，
+    # 因为一条 3000 字的 detail 说明提示词本身没被遵守，该在生成侧归一化
+    # （`tools._slot_from` 已经截了），不该让契约替它兜。
+    detail: str | None = Field(default=None, max_length=MAX_NODE_DETAIL_CHARS)
     collapsed: bool = False
     style: NodeStyle | None = None
     source_refs: list[SourceRef] = Field(default_factory=list, max_length=20)
@@ -119,9 +165,14 @@ class Node(BaseModel):
             raise ValueError("节点标题不能为空")
         return folded
 
-    @field_validator("note")
+    @field_validator("note", "detail")
     @classmethod
-    def blank_note_as_none(cls, value: str | None) -> str | None:
+    def blank_text_as_none(cls, value: str | None) -> str | None:
+        """纯空白的正文等于没写。
+
+        留一个空串会让前端多一个"有正文但显示为空"的分支（详情区显示一块空白，
+        回退逻辑永远不触发），而 `null` 的语义是明确的"没有这段内容"。
+        """
         return value if value and value.strip() else None
 
 
