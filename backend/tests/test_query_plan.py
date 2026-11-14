@@ -84,15 +84,26 @@ class PlanTestBase(unittest.TestCase):
 
 
 class SwitchTest(PlanTestBase):
-    """开关：默认关，关着时零代价。"""
+    """开关：**默认开**，显式关掉时零代价。"""
 
-    def test_defaults_to_off_when_env_absent(self):
-        """没设开关就是关 —— 这是"默认关闭"的字面含义。"""
+    def test_defaults_to_on_when_env_absent(self):
+        """没设开关就是开。
+
+        默认值从 0 翻到 1 的依据写在 `query_plan._enabled` 的 docstring 里：
+        接上向量路之后 manual 套 `recall@1` 71.4%→75.0%、`mrr@3` 79.8%→81.5%，
+        而纯 BM25 下这三项是 0（同义问法共享同一批 bigram）。
+        """
         with patch.dict(os.environ, {"MINDMAP_QUERY_EXPANSION": ""}):
-            self.assertFalse(query_plan._enabled())
+            self.assertTrue(query_plan._enabled())
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("MINDMAP_QUERY_EXPANSION", None)
-            self.assertFalse(query_plan._enabled())
+            self.assertTrue(query_plan._enabled())
+
+    def test_explicit_falsy_values_still_turn_it_off(self):
+        """显式关掉仍然有效——默认开不等于关不掉。"""
+        for raw in ("0", "false", "no", "off", " FALSE "):
+            with patch.dict(os.environ, {"MINDMAP_QUERY_EXPANSION": raw}):
+                self.assertFalse(query_plan._enabled(), raw)
 
     def test_off_sends_no_request_and_never_touches_the_model(self):
         """关着时不构造客户端、不调 `chat_async`、也不解析任何东西。

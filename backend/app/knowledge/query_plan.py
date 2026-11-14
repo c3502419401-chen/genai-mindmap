@@ -146,8 +146,22 @@ _TRUTHY = {"1", "true", "yes", "on", "y", "t"}
 
 
 def _enabled() -> bool:
-    """开关，默认关。没设、设成空、设成 0 都是关。"""
-    return str(os.getenv(ENABLED_ENV, "")).strip().lower() in _TRUTHY
+    """开关，**默认开**。显式设成 0 / false / no / off / 空 才关。
+
+    默认值从 0 翻到 1 的依据是接上向量路之后的实测（manual 套 28 条手写问法）：
+    `recall@1` 71.4% → 75.0%、`mrr@3` 79.8% → 81.5%、`coverage@10` 62.0% → 63.7%。
+    纯 BM25 下这三项是 0（同义问法共享同一批 bigram，多路只在同一批块上重复投票），
+    接上向量路才体现出"语义桥接"的价值——这正是它当初被判定为负收益的原因，
+    那时没有向量路可测。
+
+    代价要认：检索延迟约翻倍（199ms → 401ms），外加一次 `plan_query` 的模型往返。
+    换来的是 recall@1 上一条 case 的翻转（28 条样本里 1/28 = 3.6pp），**样本量偏小**，
+    这个默认值应当在 manual 套扩到 100 条以上之后重新确认。
+    """
+    raw = str(os.getenv(ENABLED_ENV, "")).strip().lower()
+    if not raw:
+        return True
+    return raw in _TRUTHY
 
 
 class QueryPlan(BaseModel):
