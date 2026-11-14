@@ -326,7 +326,7 @@ def test_bm25_monotonic_in_term_frequency():
 
 
 def test_hits_dump_keeps_tool_shape(monkeypatch):
-    """`_rag` 的 `model_dump()` 路径：多了六个键，既有键一个不少。"""
+    """`_rag` 的 `model_dump()` 路径：多了七个键，既有键一个不少。"""
     _keyed(monkeypatch)
     _use(monkeypatch, VecHttp())
     hits = search_sources([_source("预算审批流程由财务部统一发起。")], QUERY)
@@ -336,13 +336,16 @@ def test_hits_dump_keeps_tool_shape(monkeypatch):
     legacy = {"source_id", "start", "end", "quote", "score"}
     assert legacy <= set(entry)
     assert set(entry) == legacy | {"score_bm25", "score_vector", "method",
-                                   "leaf_start", "leaf_end", "rerank_score"}
+                                   "leaf_start", "leaf_end", "rerank_score", "origin"}
     # `leaf_*` 只属于父块返回模式（`search_parent`）：这条路上 `start/end` 就是
     # 匹配单元，再记一遍没有信息，所以必须是 None 而不是与 start/end 相等。
     assert entry["leaf_start"] is None and entry["leaf_end"] is None
     # `rerank_score` 只在 `MINDMAP_RERANK=1` 且真调过 reranker 的路径上有值。
     # `search_sources` 上没接重排，所以这里必须逐条为 None。
     assert entry["rerank_score"] is None
+    # `origin` 只标记"这条来自图游走"（`MINDMAP_GRAPH_SEARCH`）：文本路恒为 None，
+    # 那正是"没接图"与"接了但图里没东西"无法区分的原因——两者在输出上本就该相同。
+    assert entry["origin"] is None
 
     # 新字段都有默认值：不传也能构造，旧调用方不会被破坏
     old = EvidenceHit(source_id="s", start=0, end=1, quote="字", score=0.5)

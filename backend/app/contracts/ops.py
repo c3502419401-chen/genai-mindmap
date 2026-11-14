@@ -18,7 +18,7 @@ from typing import Annotated, Literal, Union
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.contracts.source import SourceRef
-from app.contracts.mindmap import MAX_TREE_NODES
+from app.contracts.mindmap import MAX_NODE_DETAIL_CHARS, MAX_NODE_LABEL_CHARS, MAX_TREE_NODES
 
 
 class OpError(Exception):
@@ -57,25 +57,33 @@ class AddOp(_OpBase):
     id: str = Field(min_length=1, max_length=100)
     parent_id: str = Field(min_length=1, max_length=100)
     index: int = Field(ge=0)
-    label: str = Field(min_length=1, max_length=200)
+    label: str = Field(min_length=1, max_length=MAX_NODE_LABEL_CHARS)
     source_refs: list[SourceRef] = Field(default_factory=list, max_length=20)
+    # 生成产出的说明。`add` 必须能带它，否则分片生成的长文本只能塞回 label——
+    # 那正是"节点是完整句子、画布挤成一团"的成因。缺省 `None` 与"空详情"同义
+    # （契约层会把空串归一成 None，见 `mindmap.Node.blank_text_as_none`）。
+    detail: str | None = Field(default=None, max_length=MAX_NODE_DETAIL_CHARS)
 
 
 class UpdateChanges(BaseModel):
-    """只允许改这两个字段。
+    """只允许改这三个字段。
 
-    `label` 与 `source_refs` 都是 `None` 表示"这一项不动"，与"清空"区分开：
-    `source_refs=[]` 是显式清空，`source_refs=None` 是保持原样。这个区别丢不得，
-    否则模型漏写一个字段就等于把引用全删了。
+    `label` / `detail` / `source_refs` 都是 `None` 表示"这一项不动"，与"清空"
+    区分开：`source_refs=[]` 是显式清空，`source_refs=None` 是保持原样。这个区别
+    丢不得，否则模型漏写一个字段就等于把引用全删了。
+
+    `detail` 走同一个约定：`None` = 不动，空串 = 清空（执行器归一成 `None`）。
+    用户在界面上手写的 `note` 不在这三个字段里——生成侧永远碰不到它。
     """
 
     model_config = ConfigDict(extra="forbid")
-    label: str | None = Field(default=None, min_length=1, max_length=200)
+    label: str | None = Field(default=None, min_length=1, max_length=MAX_NODE_LABEL_CHARS)
+    detail: str | None = Field(default=None, max_length=MAX_NODE_DETAIL_CHARS)
     source_refs: list[SourceRef] | None = Field(default=None, max_length=20)
 
     @model_validator(mode="after")
     def at_least_one(self) -> UpdateChanges:
-        if self.label is None and self.source_refs is None:
+        if self.label is None and self.detail is None and self.source_refs is None:
             raise ValueError("update 至少要改一个字段")
         return self
 

@@ -229,6 +229,7 @@ def test_search_sources_is_byte_identical_to_baseline(tmp_path, monkeypatch):
                 entry.setdefault("leaf_start", None)
                 entry.setdefault("leaf_end", None)
                 entry.setdefault("rerank_score", None)
+                entry.setdefault("origin", None)
                 expected.append(entry)
             actual = [hit.model_dump()
                       for hit in search_sources(sources, question, top_k)]

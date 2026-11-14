@@ -29,6 +29,7 @@ from pathlib import Path
 import pytest
 
 from app.contracts.source import Source, SourceKind, SourceRef
+from app.knowledge import library as knowledge_library
 from app.knowledge import service
 from app.knowledge.service import (
     CHUNK_MAX_CHARS,
@@ -44,6 +45,7 @@ from app.knowledge.service import (
     _chunks,
     _fold_to_parents,
     _LeafCorpus,
+    _merge_batches,
     _near_duplicate,
     search_parent,
     search_sources,
@@ -546,13 +548,20 @@ def test_switch_off_keeps_leaf_fields_empty(monkeypatch):
     assert [hit.model_dump() for hit in turned_off] == [hit.model_dump() for hit in plain]
 
 
-def test_short_parents_are_not_deduped(parent_on):
+@pytest.mark.parametrize("library_mode", [False, True])
+def test_short_parents_are_not_deduped(parent_on, library_mode):
     """父块短于 `2×CHUNK_OVERLAP_CHARS` 时，两个**不同**父块都必须返回。
 
     这份材料里第一个父块只有 150 字（前面 450 字没有分隔符，`_pick_cut` 只能
     退到 `[MIN, TARGET)` 收尾），与第二个父块重叠 80 字 > 150 的一半。按重叠率
     去重（`_pick_ordered`）会把它们判成重复、静默丢掉一条；按父块区间去重
     （`_fold_to_parents`）不会。
+
+    **两个入口都要测**，因为它们在去重上的路径不同：`library=False` 只走
+    `_fold_to_parents`（按父块区间去重），根本不碰重叠率判据，所以那一半一直是
+    绿的；`library=True` 多了一次跨批融合（`_merge_batches`），那里曾在**父块
+    坐标**上再跑一遍 `_pick_ordered` 的重叠率筛——第二个父块就是在这里被静默
+    吞掉的。只测 `library=False` 的那一半，这个 bug 永远看不见。
     """
     text = _short_parent_material()
     parents = _parents(_chunk_tree(text))
@@ -565,9 +574,42 @@ def test_short_parents_are_not_deduped(parent_on):
     # 前提：这两个父块在重叠率判据下确实是"重复"的（否则这条用例测不到东西）
     assert _near_duplicate(_hit(parents[0]), _hit(parents[1]))
 
-    hits = search_parent([_source(text)], "甲乙丙丁", top_k=5)
-    assert {(hit.start, hit.end) for hit in hits} == {
-        (parents[0].start, parents[0].end), (parents[1].start, parents[1].end)}
+    source = _source(text)
+    if library_mode:
+        # 库那批必须真的给出一条命中：`_merge_batches` 在 `extra` 为空时提前
+        # 返回 `base`，跨批融合那一步根本没跑到，用例就永远绿。
+        knowledge_library.ingest(_source(
+            "甲乙丙丁由后勤处封存，编号甲乙丙丁，用途归档。" + "字" * 300))
+
+    hits = search_parent([source], "甲乙丙丁", top_k=5, library=library_mode)
+    own = {(hit.start, hit.end) for hit in hits if hit.source_id == source.id}
+    assert own == {(parents[0].start, parents[0].end),
+                   (parents[1].start, parents[1].end)}
+
+
+def test_merge_batches_keeps_near_duplicate_filter_on_block_coordinates():
+    """块坐标上 `_merge_batches` 仍按**重叠率**去重——那一半不能跟着改掉。
+
+    B1 的修法只换了父块坐标的判据（区间全等）。块坐标上"同一份证据被切成两块"
+    是真实存在的情形，`_pick_ordered` 的近重复筛在那里是对的；一刀切删掉它，
+    `top_k=5` 又会被同一段原文的两个副本占掉两格。真实材料造不出这种重叠
+    （父块 450–700 字，`CHUNK_OVERLAP_CHARS=100` 只占五分之一），所以只能用
+    合成的命中直接打这个函数。
+    """
+    base = [
+        EvidenceHit(source_id="s", start=0, end=160, quote="甲" * 160, score=1.0),
+        EvidenceHit(source_id="s", start=60, end=760, quote="乙" * 700, score=0.9),
+    ]
+    extra = [EvidenceHit(source_id="lib", start=0, end=200, quote="库" * 200,
+                         score=1.0)]
+    assert _near_duplicate(base[0], base[1]), "前提：按重叠率它们是'重复'的"
+
+    merged, reserve = _merge_batches(base, extra, 5)
+    keys = [(hit.source_id, hit.start, hit.end) for hit in merged]
+    assert ("s", 60, 760) not in keys, "块坐标上的近重复筛被误删了"
+    # 保底段里被筛掉一条之后，"池的前几条是保底段"要跟着变短——否则拿到这个数
+    # 的下游（`_rerank_top`）会把库的那条当成保底。
+    assert reserve == 1
 
 
 def test_filters_apply_before_chunking(parent_on):
@@ -651,6 +693,7 @@ def _dump(hits) -> list[dict]:
         entry.setdefault("leaf_start", None)
         entry.setdefault("leaf_end", None)
         entry.setdefault("rerank_score", None)
+        entry.setdefault("origin", None)
         payload.append(entry)
     return payload
 

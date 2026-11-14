@@ -74,6 +74,11 @@
 两种量纲无法相加。**文本路前几名保底占半数席位**——与 `_merge_batches` / `search_multi`
 同一条理由：图证据不该把文本证据挤掉，文本路才是这次检索的主证据。
 
+文本路内部去重按**坐标粒度**分流（`fuse_hits(..., parent=)`）：块坐标上用重叠率
+（同一份证据被切成两块时确实要去重），父块坐标上只用区间全等——父块之间的重叠
+来自切块器的句首吸附，按重叠率筛会把两个**不同**父块判成重复、静默少给一条。
+图块与已选条目之间无论哪种粒度都按重叠率筛：那是两条路对同一段原文各捞了一次。
+
 **不用 `_fuse` 重筛图块**：`_fuse` 会用 BM25 把图块重新打分并可能与文本块一起截断，
 而"桥接证据"（语义相关但用词不同）的词法分恰好是 0——那正是图的唯一价值所在。图块
 进融合时只带名次，不带分数。
@@ -155,6 +160,8 @@ from app.knowledge.service import (
     RRF_K,
     EvidenceHit,
     SourceFilter,
+    _dedupe_exact,
+    _near_duplicate,
     _pick_ordered,
     filter_sources,
 )
@@ -432,7 +439,8 @@ def _dedupe(hits: list[EvidenceHit]) -> list[EvidenceHit]:
 
 
 def fuse_hits(
-    text_hits: list[EvidenceHit], graph_hits: list[EvidenceHit], top_k: int,
+    text_hits: list[EvidenceHit], graph_hits: list[EvidenceHit], top_k: int, *,
+    parent: bool = False,
 ) -> list[EvidenceHit]:
     """把文本路与图路的命中按**名次 RRF** 融合，文本路前几名**保底占半数席位**。
 
@@ -450,6 +458,16 @@ def fuse_hits(
     `graph_hits` **为空时原样返回** `text_hits[:top_k]`：开关关着、图不可用、图里没
     实体命中，三种情况在输出上必须与"没接图"逐字段相同——这是接线本身唯一的回归
     契约，由 `tests/test_graph_search.py` 钉着。
+
+    `parent` 决定**文本路内部的去重判据**，由调用方按
+    `MINDMAP_PARENT_RETRIEVAL` 给出：
+
+      - `parent=False`（块坐标）：沿用 `_pick_ordered` 的重叠率筛。同一份证据被切成
+        两块时，那里确实要去重。
+      - `parent=True`（父块坐标）：文本路内部按 `(source_id, start, end)` 全等去重。
+        父块之间的重叠来自切块器的句首吸附（`_overlap_start`），不是重复证据；按
+        重叠率筛会把两个**不同**父块判成重复，静默少给一条。**图块与已选条目之间
+        仍按重叠率筛**——那是两条路对同一段原文各捞了一次，重叠就是重复。
 
     ⚠ `score` 是名次倒数而排序是"保底段 + 竞争段"，所以**分数不单调**：保底段最后
     一条的分可能低于竞争段第一条。与 `_merge_batches` 同一条告警——`score` 只用于
@@ -472,11 +490,12 @@ def fuse_hits(
     reserve = min(max(1, (top_k + 1) // 2), len(text_hits))
     kept = list(text_hits[:reserve])
 
-    contenders: list[tuple[float, EvidenceHit]] = []
+    # 第三项标出"这条来自图路"：两路的去重判据在父块坐标上不同（见 docstring）。
+    contenders: list[tuple[float, EvidenceHit, bool]] = []
     for rank, hit in enumerate(text_hits[reserve:], reserve + 1):
-        contenders.append((_rrf(rank), hit))
+        contenders.append((_rrf(rank), hit, False))
     for rank, hit in enumerate(graph, 1):
-        contenders.append((_rrf(rank), hit))
+        contenders.append((_rrf(rank), hit, True))
     contenders.sort(key=lambda item: (-item[0], item[1].end - item[1].start,
                                       item[1].source_id, item[1].start))
 
@@ -484,10 +503,28 @@ def fuse_hits(
         hit.model_copy(update={"score": round(_rrf(rank), 6)})
         for rank, hit in enumerate(kept, 1)
     ]
-    for score, hit in contenders:
-        fused.append(hit.model_copy(update={"score": round(score, 6)}))
-    # `_pick_ordered` 不排序（顺序就是保底段在前），只做近重复筛与截断。
-    return _pick_ordered(fused, top_k)
+    if not parent:
+        for score, hit, _from_graph in contenders:
+            fused.append(hit.model_copy(update={"score": round(score, 6)}))
+        # `_pick_ordered` 不排序（顺序就是保底段在前），只做近重复筛与截断。
+        return _pick_ordered(fused, top_k)
+
+    picked = _dedupe_exact(fused, top_k)
+    seen = {(hit.source_id, hit.start, hit.end) for hit in picked}
+    for score, hit, from_graph in contenders:
+        if from_graph:
+            # 跨路重叠是同一份证据被两条路各捞了一次 → 仍然按重叠率筛。
+            if any(_near_duplicate(hit, chosen) for chosen in picked):
+                continue
+        else:
+            key = (hit.source_id, hit.start, hit.end)
+            if key in seen:
+                continue
+            seen.add(key)
+        picked.append(hit.model_copy(update={"score": round(score, 6)}))
+        if len(picked) >= top_k:
+            break
+    return picked
 
 
 # 扩池倍数从 `service` 借常量：图路的候选池与文本路同一个放大规则，两处各写一份

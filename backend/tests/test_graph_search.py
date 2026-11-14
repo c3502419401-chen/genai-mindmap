@@ -36,7 +36,12 @@ from app.contracts.source import Source, SourceKind
 from app.knowledge import graph_search, graph_store, library, service
 from app.knowledge.graph_search import fuse_hits, search_graph
 from app.knowledge.graph_store import FORWARD, GraphPath
-from app.knowledge.service import EvidenceHit, SourceFilter, search_parent
+from app.knowledge.service import (
+    EvidenceHit,
+    SourceFilter,
+    _near_duplicate,
+    search_parent,
+)
 
 # 本轮改动前的 HEAD。写死而不跟随 HEAD：跟随 HEAD 等于拿自己跟自己比，永远绿。
 # 同时钉内容 sha256——只钉 rev 时，改掉常量就能悄悄换一个"基线"。
@@ -397,6 +402,33 @@ def test_fuse_keeps_the_given_graph_order():
 
     doubled = fuse_hits(text_hits, [first, first, second], 5)
     assert [hit.quote for hit in doubled].count("乙") == 1, "同一个块只投一票"
+
+
+def test_fuse_keeps_distinct_parent_blocks_in_parent_mode():
+    """父块坐标上两个**不同**父块都必须留下，图证据不该顶替掉第二个。
+
+    `MINDMAP_PARENT_RETRIEVAL=1` 时文本路递进来的是父块区间，父块之间的重叠来自
+    切块器的句首吸附（`_overlap_start`），不是"同一份证据被切成两块"。在父块坐标
+    上跑 `_pick_ordered` 的重叠率判据，会把这两个父块判成重复、静默少给一条——
+    而且只在图路给出一条桥接证据时才暴露：图路为空时 `fuse_hits` 原样返回
+    `text_hits`，`_pick_ordered` 根本没被调用。
+    """
+    first = EvidenceHit(source_id="s", start=0, end=160, quote="甲" * 160, score=0.9)
+    second = EvidenceHit(source_id="s", start=60, end=760, quote="乙" * 700, score=0.8)
+    bridging = EvidenceHit(source_id="graph", start=0, end=30, quote="图",
+                           score=0.0, origin="graph")
+    assert _near_duplicate(first, second), "前提：按重叠率它们是'重复'的"
+
+    fused = fuse_hits([first, second], [bridging], 5, parent=True)
+    keys = [(hit.source_id, hit.start, hit.end) for hit in fused]
+    assert ("s", 0, 160) in keys, "保底段的第一个父块不见了"
+    assert ("s", 60, 760) in keys, "第二个父块被重叠率判据吞掉了"
+
+    # 块坐标那条路（父块模式关着）判据不变：同一份证据被切成两块仍然只留一条。
+    # 这是"不要一刀切删掉 `_near_duplicate`"的另一半。
+    blocks = fuse_hits([first, second], [bridging], 5)
+    block_keys = [(hit.source_id, hit.start, hit.end) for hit in blocks]
+    assert ("s", 60, 760) not in block_keys, "块坐标上的近重复筛被误删了"
 
 
 # ---------------------------------------------------------------- 6 开关关着 = 没接

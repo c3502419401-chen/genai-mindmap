@@ -381,6 +381,71 @@ def test_reserved_seat_yields_when_primary_route_hits_one_parent(parent_on):
     assert any("超导体的临界温度" in hit.quote for hit in hits[1:])
 
 
+# ---------------------------------------------------------------- 5b 保底跨过重排
+
+
+def _seats_material() -> str:
+    """六个父块：**只有第一个**含原问题的词，后五个只含扩展问法的词。
+
+    这是保底席位最尖锐的形态——原 query 那一路在候选池里只命中一条，扩展路命中
+    五条且（被 mock 的）重排分更高。没有跨重排的保底约束时，交付的 `top_k` 条会
+    全是扩展路的父块，原问题那条彻底消失。
+    """
+    parts = ["预算审批由部门负责人签核，逐笔登记后归档。" + "号" * 520]
+    for index in range(5):
+        parts.append(
+            "超导体的临界温度与蛋白质折叠的错误构象，以及合同的违约金上限，"
+            f"第{index}条。" + "号" * 470)
+    return "\n\n".join(parts)
+
+
+def test_reserved_seat_survives_rerank(parent_on, monkeypatch):
+    """重排扩池之后，原问题的答案仍然占着保底席（`ceil(top_k/2)` 席之内）。
+
+    修复前的输出（同一份材料、`top_k=5`）：
+
+        MINDMAP_RERANK=0 → 第 1 条就是原问题的父块
+        MINDMAP_RERANK=1 → 5 条全是扩展路的父块，原问题那条**完全消失**
+
+    机理：保底席位只在"融合分段"那一步生效（`_fold_multi_hits`），而扩池
+    （`_rerank_depth`）之后全局按 `rerank_score` 重排、保底信息不带过去。于是
+    交付口径（`top_k`）被偷换成了候选池口径（`depth`）——`search_multi` 的
+    docstring 说"扩展路最多贡献 `top_k - ceil(top_k/2)` 条"，这里是 5 条。
+
+    只替换打分、不碰排序：`score_documents` 给含「超导体」的候选高分，重排自己
+    按这个分数排。三条断言分别钉住"重排真的生效了""保底席里是原问题那条"
+    "扩展路没有超编"。
+    """
+    sources = [_source(_seats_material())]
+    question = "预算审批流程谁核准"
+    extras = ["超导体的临界温度是多少", "蛋白质折叠的错误构象", "合同违约金上限"]
+    top_k = 5
+    seats = (top_k + 1) // 2
+
+    # 原问题的答案是哪一条：单路检索的第一条（不受多路累加与重排影响）。
+    target = run(search_multi(sources, [question], top_k))[0]
+    target_key = (target.source_id, target.start, target.end)
+    assert target.quote.startswith("预算审批")
+
+    monkeypatch.setenv("MINDMAP_RERANK", "1")
+    # `_rerank_depth` 用 `configured()` 预检：没有 key 就不扩池，整条路都不会跑。
+    monkeypatch.setenv("MINDMAP_EMBEDDING_API_KEY", "test-rerank-seat")
+
+    def fake_scores(query: str, documents: list[str]) -> list[float]:
+        # 扩展路的候选分更高；重排按这个分数排，"原问题那条掉到池尾"就被造出来了。
+        return [0.95 if "超导体" in document else 0.05 for document in documents]
+
+    monkeypatch.setattr(service.knowledge_rerank, "score_documents", fake_scores)
+
+    hits = run(search_multi(sources, [question, *extras], top_k))
+    assert len(hits) == top_k
+    keys = [(hit.source_id, hit.start, hit.end) for hit in hits]
+    assert target_key in keys[:seats], "原问题的答案被重排挤出了保底席"
+    # 扩展路最多贡献 `top_k - ceil(top_k/2)` 条：其余席位里不许再有它们的父块。
+    others = sum(1 for hit in hits[seats:] if hit.quote.startswith("超导体"))
+    assert others <= top_k - seats, "扩展路超编，保底席等于没做"
+
+
 # ---------------------------------------------------------------- 6 library 半席
 
 

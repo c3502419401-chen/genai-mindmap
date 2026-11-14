@@ -274,9 +274,9 @@ def test_library_false_matches_baseline_search_sources(tmp_path):
     传 `library=False` 的那次调用。两者都要相同——前者证明重构没动行为，后者证明
     这个参数的默认值是"关"。
 
-    基线模块的 `EvidenceHit` 没有后来加的 `leaf_start/leaf_end` 与 `rerank_score`
-    （`038e5fe` 比它们都早），所以拿它的 dump 之前先补齐三个 None：比的仍然是
-    逐键逐值，当前实现若在 `search_sources` 里把它们填成非 None，`==` 立刻会红。
+    基线模块的 `EvidenceHit` 没有后来加的 `leaf_start/leaf_end`、`rerank_score` 与
+    `origin`（`038e5fe` 比它们都早），所以拿它的 dump 之前先补齐四个 None：比的仍然
+    是逐键逐值，当前实现若在 `search_sources` 里把它们填成非 None，`==` 立刻会红。
     """
     baseline = _load_baseline_module(tmp_path)
     sources = _corpus()
@@ -288,6 +288,7 @@ def test_library_false_matches_baseline_search_sources(tmp_path):
             entry.setdefault("leaf_start", None)
             entry.setdefault("leaf_end", None)
             entry.setdefault("rerank_score", None)
+            entry.setdefault("origin", None)
             payload.append(entry)
         return payload
 

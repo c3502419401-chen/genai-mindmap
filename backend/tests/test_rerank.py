@@ -196,11 +196,17 @@ def _load_baseline_module(tmp_path):
 
 
 def _baseline_dump(hits) -> list[dict]:
-    """基线模块的 `EvidenceHit` 没有 `rerank_score`，补齐 None 再逐键比。"""
+    """基线模块的 `EvidenceHit` 没有 `rerank_score` / `origin`，补齐 None 再逐键比。
+
+    `origin` 是图游走接线加的（`MINDMAP_GRAPH_SEARCH`）：关着时它恒为 `None`，
+    所以补齐之后比的仍然是"逐键逐值"——当前实现若在图路没启用时把它填成
+    `"graph"`，这条断言立刻会红。与 `leaf_start` / `rerank_score` 同一处理。
+    """
     payload = []
     for hit in hits:
         entry = hit.model_dump()
         entry.setdefault("rerank_score", None)
+        entry.setdefault("origin", None)
         payload.append(entry)
     return payload
 

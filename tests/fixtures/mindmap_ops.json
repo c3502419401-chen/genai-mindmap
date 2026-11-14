@@ -1,5 +1,5 @@
 {
-  "_comment": "跨端 op 契约一致性用例。backend/tests/test_ops_contract_sync.py 与 frontend/tests/ops-contract.spec.ts 共读本文件，任何一端行为漂移都会让另一端红。expect_tree 用前序遍历的 [id, label] 序列表示结果，避免整棵 JSON 的噪音。",
+  "_comment": "跨端 op 契约一致性用例。backend/tests/test_ops_contract_sync.py 与 frontend/tests/ops-contract.spec.ts 共读本文件，任何一端行为漂移都会让另一端红。expect_tree 用前序遍历的 [id, label] 序列表示结果，避免整棵 JSON 的噪音；expect_details 是同一顺序的 detail 序列（null 表示没有详情），只在验证「add/update 携带并保留 detail」的那几条用例里出现。",
   "base_tree": {
     "title": "示例",
     "root": {
@@ -10,11 +10,17 @@
           "id": "a",
           "label": "甲",
           "children": [
-            { "id": "a1", "label": "甲一", "children": [] },
+            {
+              "id": "a1",
+              "label": "甲一",
+              "note": "我对甲一的备注",
+              "detail": "甲一的生成详情",
+              "children": []
+            },
             { "id": "a2", "label": "甲二", "children": [] }
           ]
         },
-        { "id": "b", "label": "乙", "children": [] }
+        { "id": "b", "label": "乙", "detail": "乙的生成详情", "children": [] }
       ]
     },
     "source_usage": [
@@ -104,6 +110,25 @@
       "name": "label 纯空白由整树校验拦下",
       "ops": [{ "op": "update", "id": "b", "changes": { "label": "   " } }],
       "expect_error": "tree_invalid"
+    },
+    {
+      "name": "add 携带 detail",
+      "ops": [{ "op": "add", "id": "n_new", "parent_id": "root", "index": 2, "label": "丙", "detail": "丙的生成详情" }],
+      "expect_tree": [["root", "根"], ["a", "甲"], ["a1", "甲一"], ["a2", "甲二"], ["b", "乙"], ["n_new", "丙"]],
+      "expect_details": [null, null, "甲一的生成详情", null, "乙的生成详情", "丙的生成详情"]
+    },
+    {
+      "name": "update 改 detail 且不动 note",
+      "ops": [{ "op": "update", "id": "a1", "changes": { "detail": "改过的说明" } }],
+      "expect_tree": [["root", "根"], ["a", "甲"], ["a1", "甲一"], ["a2", "甲二"], ["b", "乙"]],
+      "expect_details": [null, null, "改过的说明", null, "乙的生成详情"],
+      "expect_notes": [null, null, "我对甲一的备注", null, null]
+    },
+    {
+      "name": "update 用空串清空 detail",
+      "ops": [{ "op": "update", "id": "b", "changes": { "detail": "" } }],
+      "expect_tree": [["root", "根"], ["a", "甲"], ["a1", "甲一"], ["a2", "甲二"], ["b", "乙"]],
+      "expect_details": [null, null, "甲一的生成详情", null, null]
     },
     {
       "name": "update 的 changes 不能为空",
