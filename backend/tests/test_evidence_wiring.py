@@ -577,28 +577,26 @@ def test_end_to_end_rag_mode_cites_evidence_and_flags_the_rest(monkeypatch):
     def build(ref: dict[str, Any]):
         tree = _tree(ref)
         provider = _ScriptedProvider([
-            _completion(_call("rag_query", "c-rag", question=QUERY)),
             _completion(_call("mindmap_generate", "c-gen", topic="整理这些材料")),
             _completion(),
         ])
         with patch("app.agent.tools.chat_async", AsyncMock(return_value=tree)):
             events = _drain(_request([source]), provider)
         ends = [event for event in events if event.type == "tool_end"]
-        rag_end = next(event for event in ends if event.name == "rag_query")
         gen_end = next(event for event in ends if event.name == "mindmap_generate")
         done = next(event for event in events if event.type == "done")
-        return rag_end, gen_end, done
+        return gen_end, done
 
-    rag_end, gen_end_good, done_good = build(good)
-    # 前提：检索真的回了父块（否则这组用例测的是单级切块）
-    first = rag_end.result_summary["hits"][0]
-    assert first["leaf_start"] is not None and first["leaf_end"] is not None
-    assert first["end"] - first["start"] > first["leaf_end"] - first["leaf_start"]
+    gen_end_good, done_good = build(good)
+    # 前提：检索真的回了父块（否则这组用例测的是单级切块）。
+    # `_scene` 里那次 `search_parent` 就是生成工具预检索走的同一条路。
+    assert hit.leaf_start is not None and hit.leaf_end is not None
+    assert hit.end - hit.start > hit.leaf_end - hit.leaf_start
     assert "SOURCE_REF_OUTSIDE_EVIDENCE" not in {
         item["code"] for item in gen_end_good.result_summary["diagnostics"]}
     assert done_good.content.root.children[0].source_refs[0].quote == leaf
 
-    _rag_end, gen_end_bad, done_bad = build(bad)
+    gen_end_bad, done_bad = build(bad)
     assert "SOURCE_REF_OUTSIDE_EVIDENCE" in {
         item["code"] for item in gen_end_bad.result_summary["diagnostics"]}
     # 父块里、命中区之外：**保留**并标记。剔除这条口子在本轮关掉了——模型引的这段

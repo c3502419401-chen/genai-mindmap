@@ -659,7 +659,12 @@ def test_full_mode_still_discards_deep(monkeypatch):
 
 
 def test_rag_mode_registry_offers_deep_alongside_generate(monkeypatch):
-    """`rag` + 有来源：两个生成工具都在场，外加 `rag_query`。"""
+    """`rag` + 有来源：两个生成工具都在场，**没有** `rag_query`。
+
+    两条生成路都会在工具内部先检索（整树预检索、分片按支检索），再给检索工具
+    只会让模型连查八次把 `max_tool_calls` 用光、一次生成都没调。
+    """
     monkeypatch.setenv(SOURCE_MODE_ENV, "rag")
     names = build_registry("create", has_sources=True).names()
-    assert names == ["mindmap_generate", "mindmap_generate_deep", "rag_query"]
+    assert names == ["mindmap_generate", "mindmap_generate_deep"]
+    assert "rag_query" not in names

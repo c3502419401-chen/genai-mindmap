@@ -3655,9 +3655,12 @@ def build_registry(intent: str = "create", *, has_sources: bool = False,
         按主题复杂度自选（描述里写清了两者差别）
       - `expand` 只给 `node_expand`，请求带来源时再加 `rag_query`
       - `edit` 给 `mindmap_edit`，请求带来源时再加 `rag_query`
-      - `rag` 形态（`MINDMAP_SOURCE_MODE=rag`）下，**任何**带来源的意图都加
-        `rag_query`，包括 `create`：正文不在 prompt 里，没有检索工具时模型
-        只能凭标题编，而它会以 ok=True 交出一棵看起来完整的树。
+      - `expand` / `edit` 在请求带来源时加 `rag_query`：那两条路不读来源，
+        模型只能自己查。
+      - **不**给 `create`：两条生成路都会在工具内部先检索一次（`mindmap_generate`
+        做一次主题预检索、`mindmap_generate_deep` 按支检索）。早先这里是反的——
+        那时整树还不预检索，不给工具模型就只能凭标题编；现在补上预检索之后，
+        再给工具反而让模型连查八次把 `max_tool_calls` 用光、一次生成都没调。
       - **请求不带来源、但知识库非空**时，任何意图都加 `rag_query`（见下）。
 
     两个生成工具必须同时在场：只留一个，等于替用户决定了"这张图多大"。而
@@ -3696,7 +3699,12 @@ def build_registry(intent: str = "create", *, has_sources: bool = False,
     if has_sources:
         if not rag_mode:
             allowed.discard("mindmap_generate_deep")
-        if intent in _SOURCE_AWARE_INTENTS or rag_mode:
+        # `create` 在 rag 形态下**不再**补 `rag_query`：`mindmap_generate` 与
+        # `mindmap_generate_deep` 都会在工具内部先检索一次（前者主题预检索、后者
+        # 按支检索），模型再自行查是纯浪费——实测它连查 8 次把 `max_tool_calls`
+        # 用光，一次生成都没调，用户拿到"工具调用次数已用完"和 0 个节点。
+        # `expand` / `edit` 仍需要：那两条路不读来源，模型只能自己查。
+        if intent in _SOURCE_AWARE_INTENTS:
             allowed.add("rag_query")
     if has_library and not has_sources:
         allowed.add("rag_query")

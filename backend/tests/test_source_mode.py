@@ -71,7 +71,7 @@ from app.generation.service import (
     source_mode,
     thinking_block,
 )
-from app.knowledge.service import search_sources
+from app.knowledge.service import search_parent
 
 # 一级分支必须 3 条：`mindmap_generate` 走 `MIN_BRANCHES = 3` 那道关。
 TREE = {
@@ -461,21 +461,23 @@ def test_invalid_mode_falls_back_to_rag_and_warns_once():
     assert MARKER not in system + user
 
 
-def test_registry_hands_create_the_retrieval_tools_by_mode():
-    """`rag` 下 create 必须拿到 `rag_query`，否则模型一个字都写不出来。
+def test_registry_hands_create_the_generation_tools_by_mode():
+    """`rag` 下 create 拿到的是**生成工具**，不是检索工具。
 
-    `full` 下恰好相反：正文已在 prompt 里，再给检索入口只会诱导它把"先查一下"
-    当成规定动作（实测 10 次里 10 次都先查一遍）。所以这条按形态分别断言——
-    两种形态在这个点上结论相反，不能只钉一边。
+    早先这里是反的：那时整树生成不自己检索，不给 `rag_query` 模型就只能凭
+    材料标题编。补上主题预检索之后结论翻转——两条生成路都在工具内部先查一次
+    （整树预检索、分片按支检索），再给检索工具反而让模型连查八次把
+    `max_tool_calls` 用光、一次生成都没调（实测 0 个节点 + "工具调用次数已用完"）。
 
-    `mindmap_generate_deep` 同样按形态：`rag` 下放开（它自己会按支检索，
-    见 `tests/test_deep_slicing.py`），`full` 下仍然撤掉（正文已在 prompt 里，
-    分片检索是白花，而它按主题自由展开的树与材料脱钩却会 ok=True 返回）。
+    `full` 下 `rag_query` 同样不给（正文已在 prompt，给检索入口只会诱导它把
+    "先查一下"当规定动作）；`mindmap_generate_deep` 在 `full` 下仍撤掉——分片
+    检索是白花，而它按主题自由展开的树与材料脱钩却会 ok=True 返回。
     """
     with _env(SOURCE_MODE_RAG):
         names = build_registry("create", has_sources=True).names()
-    assert "rag_query" in names
-    assert "mindmap_generate_deep" in names          # 分片 + 按支检索，这一轮放开
+    assert "rag_query" not in names                  # 生成工具内部已预检索
+    assert "mindmap_generate" in names
+    assert "mindmap_generate_deep" in names          # 分片 + 按支检索
 
     with _env(SOURCE_MODE_FULL):
         names = build_registry("create", has_sources=True).names()
@@ -561,14 +563,12 @@ def test_loop_retrieves_first_then_generates_from_hits():
             "第九条 每季度末做一次预算执行分析。")
     source = _material(text, filename="预算管理办法.docx", source_id="doc-1")
 
-    # 先算一次真实命中：链路里 `rag_query` 走的就是这个函数（无网络，纯 BM25）。
-    hits = search_sources([source], "预算由谁核准", 5)
+    # 先算一次真实命中：`_generate` 的主题预检索走 `search_parent`（无网络，纯 BM25）。
+    hits = search_parent([source], "预算由谁核准", 5)
     assert hits, "样本必须能命中，否则这条用例证明不了引用来自检索"
     quote = hits[0].quote[:200]
 
     provider = _ScriptedProvider([
-        _completion([ToolCall(call_id="c-rag", name="rag_query",
-                              arguments={"question": "预算由谁核准"})], finish="tool_calls"),
         _completion([ToolCall(call_id="c-gen", name="mindmap_generate",
                               arguments={"topic": "整理预算管理办法"})], finish="tool_calls"),
         _completion(),
@@ -592,11 +592,14 @@ def test_loop_retrieves_first_then_generates_from_hits():
 
     # 第一轮的 system 里是"先检索"，不是 `full` 形态里那句"不要先去检索资料"
     assert _RAG_INTENT_RULES["create"] in provider.systems[0]
-    # `rag_query` 真跑通了（不然下面的引用无从谈起）
-    rag_ends = [event for event in events
+    # `rag_query` 不在注册表里：生成工具自己预检索（模型再查只会烧额度）
+    assert not [event for event in events
                 if event.type == "tool_end" and event.name == "rag_query"]
-    assert rag_ends and rag_ends[0].ok
-    assert rag_ends[0].result_summary["hits"], rag_ends[0].result_summary  # 有命中
+    gen_ends = [event for event in events
+                if event.type == "tool_end" and event.name == "mindmap_generate"]
+    assert gen_ends and gen_ends[0].ok
+    # 预检索真有命中（不然下面的引用无从谈起）
+    assert gen_ends[0].result_summary["retrieval"]["hits"], gen_ends[0].result_summary
 
     system, user = prompts[0]
     assert system.startswith(RAG_SOURCE_PROMPT)
