@@ -31,6 +31,20 @@ export interface MindNode {
    */
   detail?: string | null;
   /**
+   * 这一支还能不能再展开（契约字段，三态）。
+   *
+   * **给界面画按钮用的状态，不是给模型看的信号**（模型那一侧的对应物是展开响应里
+   * 的布尔 `expandable`，两回事）。判定表在 `backend/app/contracts/mindmap.py`：
+   *
+   *  - `yes`：还能展开——有子节点但没长完，或者本身就是叶子；
+   *  - `no`：已经到底——模型明确说没有更细的内容，或已经到第 8 层；
+   *  - `unknown`：不确定——**被额度截断的不算 `no`**，旧图没有这个字段时也是它。
+   *
+   * 缺省按 `unknown` 处理：旧图从来没被问过这件事，把它当成"还能展开"会让界面
+   * 替它许下一个兑现不了的承诺；当成"到头了"则会把唯一能继续的入口灰掉。
+   */
+  expandable?: NodeExpandable;
+  /**
    * 节点级引用，镜像后端 `Node.source_refs`（v1 契约里**已经存在**，不是 v2 预告）。
    *
    * 之前前端缺这个字段，`client.ts::toContractV1()` 只保留 id/label/children，
@@ -48,6 +62,14 @@ export interface MindNode {
   style?: NodeStyle | null;
   pos?: NodePosition | null;
 }
+
+/**
+ * 节点还能不能再展开。与后端 `Node.expandable` 的取值一一对应。
+ *
+ * 三态而不是布尔：`unknown` 必须与 `no` 分开。被额度截断的节点若记成 `no`，
+ * 界面上按钮灰着、说明"已经到底了"——用户被一句假话挡住了唯一能继续的入口。
+ */
+export type NodeExpandable = 'yes' | 'no' | 'unknown';
 
 /** 节点引用。与 backend/app/contracts/source.py 的 `SourceRef` 对应。 */
 export interface SourceRef {

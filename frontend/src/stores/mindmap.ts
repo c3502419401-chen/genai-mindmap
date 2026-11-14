@@ -363,6 +363,15 @@ export const useMindMapStore = defineStore('mindmap', () => {
   let candidateIntent: 'create' | 'expand' | 'edit' = 'create';
 
   /**
+   * 正在跑的这一轮是哪种意图（`agentRunning` 为假时只表示"上一次是什么"）。
+   *
+   * 与 `candidateIntent` 分开：那个是候选的归属（接受时用），这个是**这一轮在做什么**
+   * （按钮文字用）。两者在候选就绪之后会分叉——候选已经产出、运行却还在收尾，
+   * 那时按钮该说的是"展开中…"，而候选的身份早就不变了。
+   */
+  const runIntent = ref<'create' | 'expand' | 'edit'>('create');
+
+  /**
    * 候选树当前走到第几版 op。
    *
    * 每批 op 的 `base_revision` 是后端在**它那棵树**上算的序号（0 起，一批加一），
@@ -430,6 +439,16 @@ export const useMindMapStore = defineStore('mindmap', () => {
   const agentPreviewDropped = ref(0);
 
   /**
+   * 预览树的"顶部是谁"。
+   *
+   * 生成时预览从中心主题开始长，顶部就是根，面板显示它的 label 即可。展开时预览是
+   * 一条**祖先链**（见 `seedExpandPreview`）：顶部仍然是根，但用户关心的是"正在展开
+   * 哪个节点"，把根的名字摆在标题行会让他以为整张图在重生成。所以展开时把它设成
+   * 目标节点的标题，面板优先显示它。
+   */
+  const agentPreviewScope = ref<string | null>(null);
+
+  /**
    * 预览整棵作废。
    *
    * 新一轮开始、收到 snapshot / done / error、换图，都要走这里：上一轮的残留
@@ -437,6 +456,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
    */
   function clearAgentPreview() {
     agentPreview.value = null;
+    agentPreviewScope.value = null;
     previewSeen.clear();
     previewPending.clear();
     agentPreviewDropped.value = 0;
@@ -584,6 +604,65 @@ export const useMindMapStore = defineStore('mindmap', () => {
       return;
     }
     if (!mountPreviewNode(path, node)) queuePreviewNode(path, node);
+  }
+
+  /**
+   * 节点 id → 从根出发的子索引链（`[]` 是根自己）；找不到返回 null。
+   *
+   * 与后端 `tools._index_path` 同一口径：`node_grow` 的 `path` 指的是**父节点**的
+   * 索引链，而展开时父节点就是被展开的那个节点，所以两边必须用同一套编号，
+   * 否则预览会把新节点挂到别的分支下面。
+   */
+  function indexPathOf(root: MindNode, id: string): number[] | null {
+    if (root.id === id) return [];
+    const walk = (node: MindNode, path: number[]): number[] | null => {
+      for (let index = 0; index < node.children.length; index += 1) {
+        const child = node.children[index];
+        if (child.id === id) return [...path, index];
+        const found = walk(child, [...path, index]);
+        if (found) return found;
+      }
+      return null;
+    };
+    return walk(root, []);
+  }
+
+  /**
+   * 展开前把预览的**祖先链**搭起来，让 `node_grow` 帧能挂到被展开的那个节点下。
+   *
+   * 不搭这条链会怎样：后端的 `path` 是 `[0, 0]`（第三层那个叶子），而预览树此时是
+   * 空的，`findPreviewParent` 找不到父节点，帧会被攒进 `previewPending` 里永远不
+   * 出现——界面上就是"点了展开，什么预览都没有"。
+   *
+   * 只搭链上的节点（不是整棵树）：预览面板显示的是"正在展开 风险"，而不是把用户
+   * 已有的整张图复制一遍；链上每一层只有一个孩子，正是路径的形状。
+   *
+   * 返回是否搭成功。拿不到路径（节点不在 content 里、比如正在被删）时返回 false，
+   * 这一次展开就没有预览——那比画一条错的链好。
+   */
+  function seedExpandPreview(nodeId: string): boolean {
+    const root = content.value?.root;
+    if (!root) return false;
+    const path = indexPathOf(root, nodeId);
+    if (!path) return false;
+
+    const labels = [root.label.trim()];
+    let cursor = root;
+    for (const index of path) {
+      cursor = cursor.children[index];
+      labels.push(cursor.label.trim());
+    }
+
+    const build = (depth: number): PreviewNode => ({
+      label: labels[depth],
+      expandable: null,
+      // 链上只往下走一格；最后一格就是目标节点，它的 children 留给真实的帧。
+      children: depth + 1 < labels.length ? [build(depth + 1)] : [],
+    });
+
+    agentPreview.value = build(0);
+    agentPreviewScope.value = labels[labels.length - 1];
+    return true;
   }
 
   /** 记下这一帧的告警：同 kind + code + message 只留一条，两个工具报同一件事时不重复刷屏。 */
@@ -1497,6 +1576,12 @@ export const useMindMapStore = defineStore('mindmap', () => {
     candidateBaseRevision = clientRevision.value;
     candidateSession = mapSession;
     candidateIntent = intent;
+    runIntent.value = intent;
+    // 展开的预览要有一条祖先链兜着（`node_grow` 的 path 是父节点的索引链）。
+    // 生成不用：它的根帧自带 path=null，预览从中心主题开始长。
+    if (intent === 'expand' && selectedId.value) {
+      seedExpandPreview(selectedId.value);
+    }
 
     const ctrl = new AbortController();
     controller = ctrl;
@@ -1625,6 +1710,54 @@ export const useMindMapStore = defineStore('mindmap', () => {
         stageText.value = '';
       }
     }
+  }
+
+  /** 这一轮是不是"展开某个选中节点"。按钮文字与互斥判定都读它。 */
+  const expanding = computed(() => agentRunning.value && runIntent.value === 'expand');
+
+  /**
+   * 这一轮是不是"在生成"（新建 / 编辑也算），用来与展开互斥。
+   *
+   * 展开与生成互斥不是保守，是必要的：`runGeneration` 一进来就 `clearAgentPreview`
+   * 并换掉 `controller`，两轮流重叠时后到的那个会把前一个刚长出来的预览与候选一起
+   * 作废——用户看到的是"点了一下，之前的进度消失了"。
+   */
+  const generating = computed(() => agentRunning.value && runIntent.value !== 'expand');
+
+  /**
+   * 展开当前选中的节点：走同一个 `/agent/runs/stream`，只是意图换成 `expand`。
+   *
+   * 与生成的差别只有三处，其余全部复用（候选、op 帧、版本检查、接受/丢弃都还是
+   * 那一条路）：
+   *
+   *  1. `goal` 写的是"展开哪个节点"，而不是用户的主题；
+   *  2. `intent="expand"` + `selected_ids=[node_id]`（`runGeneration` 里按意图补的）；
+   *  3. `snapshot` 是**当前整棵树**——后端要从它上面挂子节点，而它也可能有一堆
+   *     没保存的编辑，重读数据库会把那些编辑丢掉。
+   *
+   * `sources` 允许为空：用户重新打开一张旧导图时前端手里没有正文，后端会按节点上
+   * 的 `source_refs` 从知识库里把材料找回来（`tools._expand_sources`）。这里不因为
+   * "没带材料"就拦下按钮——那正是这条链要打通的那个场景。
+   *
+   * `expandable === 'no'` 时不发请求：后端也会判（`too_deep` / 模型说没有更多），
+   * 但让用户先点一次再看一句"到底了"是白花一次调用。
+   */
+  async function expandSelected(sources?: Source[], count = 3): Promise<void> {
+    if (busy.value || agentRunning.value) return;
+    const node = selectedNode.value?.node;
+    if (!node) {
+      status.value = '先在画布上选中一个节点，再展开它。';
+      return;
+    }
+    if (node.expandable === 'no') {
+      status.value = `「${node.label.trim()}」已经到底了，没有更细的内容可展开。`;
+      return;
+    }
+    const label = node.label.trim();
+    // `goal` 是外层模型看到的那一句话（`_expand` 自己也拿得到选中节点与路径，
+    // 所以这里不需要把路径拼进去——拼了就有两处口径）。
+    const goal = `展开节点「${label}」，补充 ${count} 个子节点。`;
+    await runGeneration(goal, 'expand', sources);
   }
 
   /**
@@ -1777,13 +1910,18 @@ export const useMindMapStore = defineStore('mindmap', () => {
     clientRevision,
     candidate,
     agentPreview,
+    agentPreviewScope,
     agentPreviewDropped,
     agentEvents,
     agentWarnings,
     agentRunning,
     agentError,
     agentMode,
+    runIntent,
+    expanding,
+    generating,
     runGeneration,
+    expandSelected,
     acceptCandidate,
     discardCandidate,
   };

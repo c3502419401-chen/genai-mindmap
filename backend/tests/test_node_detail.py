@@ -209,7 +209,13 @@ def test_deep_generation_labels_are_short_and_carry_detail():
 
 
 def test_single_node_expand_accepts_both_shapes():
-    """`node_expand` 的新旧两种响应都要收：旧格式只有字符串，没有 detail。"""
+    """`node_expand` 的新旧两种响应都要收：旧格式只有字符串，没有 detail。
+
+    这条用例原先还顺带钉着"超长 label 被裁到 16 字"。**那一条已经反过来了**：
+    单节点展开现在对 `label` 是严格的——超长判整批失败、树不变（理由见
+    `tools._strict_label`），超长的那条改由 `test_expand_node.py` 的原子性用例
+    覆盖。这里只留"两种形状都收"。
+    """
     import asyncio
     from unittest.mock import AsyncMock, patch
 
@@ -222,8 +228,8 @@ def test_single_node_expand_accepts_both_shapes():
     })
 
     async def new_shape(system, user, *, max_tokens=None):
-        return {"children": [{"label": "要点的标题很长需要被裁掉一半以上才能放进画布",
-                              "detail": "这里是说明"}]}
+        return {"children": [{"label": "要点的标题", "detail": "这里是说明"},
+                             {"label": "另一个要点", "detail": "这里是另一段说明"}]}
 
     request = AgentRunRequest(
         goal="展开", intent="expand", selected_ids=["a"],
@@ -238,7 +244,7 @@ def test_single_node_expand_accepts_both_shapes():
         ))
     assert result.ok, result.content
     added = ctx.candidate.root.children[0].children[0]
-    assert len(added.label) <= GENERATED_LABEL_MAX_CHARS
+    assert added.label == "要点的标题"
     assert added.detail == "这里是说明"
 
     async def old_shape(system, user, *, max_tokens=None):

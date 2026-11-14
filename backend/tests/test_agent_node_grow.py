@@ -55,6 +55,22 @@ from app.generation.service import (
 TOPIC = "考研数学复习计划"
 
 
+def _walk_nodes(root):
+    """前序遍历整棵树：断言“每个节点的某个字段”时用它，不用写递归。"""
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        yield node
+        stack.extend(node.children)
+
+
+def _without(node_dump, key):
+    """逐层删掉一个键：`model_dump(exclude=…)` 只管顶层，嵌套层里的还在。"""
+    trimmed = {name: value for name, value in node_dump.items() if name != key}
+    trimmed["children"] = [_without(child, key) for child in node_dump.get("children", [])]
+    return trimmed
+
+
 class _EchoArgs(BaseModel):
     """给"会超时的工具"用的最小参数模型。"""
 
@@ -765,7 +781,18 @@ class GenerateGrowTest(unittest.TestCase):
                     self.assertEqual(user, "整理论文")
                 self.assertEqual(system, expected_system)
                 self.assertEqual(max_tokens, 1234)
-                self.assertEqual(ctx.candidate.root, MindMapContent.model_validate(self._tree()).root)
+                # `expandable` 是工具**落树时**打的标（见 `tools._stamp_expandable`），
+                # 模型给的那棵树里没有它。所以逐字段比对时把它摘掉，再单独断言它：
+                # 这棵 3 层的树离契约的 8 层还远，每个节点都该是 `yes`（"还能展开"）。
+                # 直接把它从比对里删干净而不补一条断言，等于把三态这件事从"这次改动
+                # 没影响别的东西"的证据里悄悄拿掉。
+                expected_root = MindMapContent.model_validate(self._tree()).root
+                self.assertEqual(
+                    _without(ctx.candidate.root.model_dump(), "expandable"),
+                    _without(expected_root.model_dump(), "expandable"),
+                )
+                self.assertEqual({node.expandable for node in _walk_nodes(ctx.candidate.root)},
+                                 {"yes"})
 
     def test_stream_failures_keep_sourced_generation_successful(self):
         text = json.dumps(self._tree(), ensure_ascii=False)

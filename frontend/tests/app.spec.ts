@@ -46,8 +46,14 @@ function mountApp() {
   return mount(App, { global: { plugins: [createPinia()] } });
 }
 
-/** 左侧输入区也有一个 textarea，按标签定位详情面板里的正文框。 */
-const NOTE_TEXTAREA = 'textarea[aria-label="节点正文"]';
+/**
+ * 左侧输入区也有一个 textarea，按标签定位详情面板里的备注框。
+ *
+ * 标签从「节点正文」改成「我的备注」是这一轮的分区结果：`detail` 是生成产出的
+ * 详情（只读），`note` 是用户自己写的备注。两者共用"正文"这个词会让用户以为
+ * 自己写的那段会被重新生成覆盖。
+ */
+const NOTE_TEXTAREA = 'textarea[aria-label="我的备注"]';
 
 /**
  * 按文字找按钮：开发期示例选择器会异步插入一排按钮，
@@ -406,7 +412,7 @@ describe('正文编辑', () => {
 
     const textarea = wrapper.find(NOTE_TEXTAREA);
     expect((textarea.element as HTMLTextAreaElement).value).toBe('已经写过的正文');
-    expect(wrapper.text()).toContain('正文 7 / 2000');
+    expect(wrapper.text()).toContain('我的备注 7 / 2000');
   });
 
   it('按 Esc 放弃这次输入，回到原来的正文', async () => {

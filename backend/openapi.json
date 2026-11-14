@@ -1099,6 +1099,28 @@
             ],
             "title": "Note"
           },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 2000
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
+          "expandable": {
+            "type": "string",
+            "enum": [
+              "yes",
+              "no",
+              "unknown"
+            ],
+            "title": "Expandable",
+            "default": "unknown"
+          },
           "collapsed": {
             "type": "boolean",
             "title": "Collapsed",
@@ -1174,6 +1196,28 @@
               }
             ],
             "title": "Note"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 2000
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
+          "expandable": {
+            "type": "string",
+            "enum": [
+              "yes",
+              "no",
+              "unknown"
+            ],
+            "title": "Expandable",
+            "default": "unknown"
           },
           "collapsed": {
             "type": "boolean",
@@ -1375,10 +1419,10 @@
         "properties": {
           "max_model_calls": {
             "type": "integer",
-            "maximum": 120.0,
+            "maximum": 400.0,
             "minimum": 1.0,
             "title": "Max Model Calls",
-            "default": 80
+            "default": 100
           },
           "max_tool_calls": {
             "type": "integer",

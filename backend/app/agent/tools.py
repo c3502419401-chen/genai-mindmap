@@ -494,6 +494,22 @@ def _clip_tree(content: MindMapContent, limit: int) -> tuple[MindMapContent, int
     return trimmed, total - _count_nodes(trimmed.root)
 
 
+def _shortened_ids(original: Node, trimmed: Node) -> set[str]:
+    """裁剪之后**掉了子节点**的那些节点的 id。
+
+    `_clip_tree` 只做前序裁剪，它不会增删已保留节点的其他字段，所以"子节点个数
+    变少"就是"这一支被切掉了尾巴"。这批节点随后被标成 `expandable="unknown"`：
+    它们是"没长完"，不是"到底了"——把被裁的那批标成 `no`，界面上恰好是唯一还能
+    继续长的地方灰着按钮。
+    """
+    kept = {node.id: node for node in _iter_nodes(trimmed)}
+    return {
+        node.id for node in _iter_nodes(original)
+        if (survivor := kept.get(node.id)) is not None
+        and len(survivor.children) < len(node.children)
+    }
+
+
 def _count_refs(root) -> int:
     """整棵树的引用条数。逐字校验前后各数一次，差值就是被剔除的条数。"""
     return len(root.source_refs) + sum(_count_refs(child) for child in root.children)
@@ -837,6 +853,14 @@ class _Slot:
     `detail` 是模型为这个节点写的 2–3 句说明（与 `label` 一起构成两层节点）。
     它在 `_slot_from` 里已经按 `MAX_NODE_DETAIL_CHARS` 截过，之后一路原样带到
     `add` 草案上，中间不再改写：这棵树是模型的作品，代码只负责长度与形状。
+
+    `truncated` 记的是「这一支**本来还能问**，但被额度挡住了」——节点预算不足
+    （`level_cut`）、模型调用额度用完（`level_skipped`）、展开抛错、或模型这次
+    什么都没给。它只有一个去处：落树时把这个节点的 `expandable` 写成
+    `"unknown"` 而不是 `"yes"`（判定表见 `mindmap.NODE_EXPANDABLE`）。
+    两者对用户的意思相反：`yes` 是"还能展开"，`unknown` 是"没展开完，要不要
+    再点一次由用户决定"——把被截断的那批记成 `yes` 也没错，但记成 `no` 就是
+    谎报"到头了"，而那正是这次要分开的那件事。
     """
 
     label: str
@@ -844,6 +868,7 @@ class _Slot:
     children: list["_Slot"] = field(default_factory=list)
     expandable: bool = True
     expandable_declared: bool = False
+    truncated: bool = False
     source_refs: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -2019,8 +2044,11 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
 
     before_clip = _count_nodes(content.root)
     clipped = 0
+    cut_ids: set[str] = set()
     if before_clip > INITIAL_MAX_NODES:
+        original_root = content.root
         content, clipped = _clip_tree(content, INITIAL_MAX_NODES)
+        cut_ids = _shortened_ids(original_root, content.root)
         diagnostics.append(Diagnostic(
             level=DiagnosticLevel.warn, code="TREE_CLIPPED_TO_INITIAL",
             message=(
@@ -2029,6 +2057,12 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
                 "想要更大的树，请生成后用 node_expand 逐支展开"
             ),
         ))
+
+    # `expandable` 三态：被裁掉子节点的那些是**没长完**（`unknown`），不是"到底了"。
+    # 这个区别在这里最实：裁剪只会发生在初次生成，而用户下一步就是"点开某个节点
+    # 继续展开"——把被裁的那几个标成 `no`，界面上恰好是唯一能再长的地方灰着。
+    _stamp_expandable(content, {node_id: "unknown" for node_id in cut_ids},
+                      max_depth=mindmap_contract.MAX_TREE_DEPTH)
 
     # 结构与语义两层复核，原先只长在 `pipeline/service.run()` 的收尾里：
     #   - `check()` 只看树本身（单子节点、深度上限、同级重名），没有来源也能跑，
@@ -2925,6 +2959,11 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             # 剩下的额度连两个子节点都装不下：发一次调用只换到一个节点，不值。
             # 记成"被节点预算截断"，已经展开的部分照常交出。
             level_cut[depth] = len(parents)
+            # 这几个父节点没被问过，所以它们是不是"到底了"**没有人知道**。标成
+            # `truncated`，落树时它们是 `unknown` 而不是 `no`——界面上按钮仍然可点，
+            # 用户再点一次要么成功、要么拿到明确的 `tree_full`。
+            for parent_slot, _path, _indices, _evidence in parents:
+                parent_slot.truncated = True
             break
         nested_left = max(0, max_depth - depth)
         # 这一次响应最多能落多少个节点：结构上限、额度份额、单次输出容量三者取小。
@@ -2942,17 +2981,23 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             return_exceptions=True,
         )
         for (slot, _path, _indices, _evidence), item in zip(parents, level_results):
+            # 三种"没长出来"都要在**节点自己**身上留痕：它们是 `unknown` 的来源
+            # （见 `mindmap.NODE_EXPANDABLE` 与 `_Slot.truncated`）。只看层级计数
+            # 不够——`level_cut` 只知道"这一层有几个没展开"，不知道是哪几个。
             if item is None:
                 level_skipped[depth] = level_skipped.get(depth, 0) + 1
+                slot.truncated = True
             elif isinstance(item, BaseException):
                 level_failed[depth] = level_failed.get(depth, 0) + 1
                 level_reason.setdefault(depth, _reason_text(item))
+                slot.truncated = True
             else:
                 kept, _ = _trim_slots(list(item), level_allowance)
                 if kept:
                     slot.children = kept
                 else:
                     level_empty[depth] = level_empty.get(depth, 0) + 1
+                    slot.truncated = True
 
     # 第四步：合并。骨架先成树（分支 id 已在骨架里），再把所有节点按"父在子前"
     # 的顺序作为一批 add 应用上去——整批原子，半截树不会进 ctx.candidate。
@@ -2983,12 +3028,16 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     )
 
     drafts: list[dict[str, Any]] = []
+    # 临时 id -> 这个节点落树时的 `expandable`（判定见 `_expandable_for_slot`）。
+    # 用临时 id 记是因为真实 id 由 `normalize_ops` 分配；映射在它之后才有。
+    slot_states: dict[str, str] = {}
 
     def emit(parent_id: str, key: str, slots: list[_Slot]) -> None:
         """把候选子树摊平成 add 草案：父节点一定排在它自己的子节点前面。"""
         for position, slot in enumerate(slots):
             child_key = f"{key}-{position}"
             child_id = f"{TEMP_ID_PREFIX}d{child_key}"
+            slot_states[child_id] = _expandable_for_slot(slot)
             drafts.append({
                 "op": "add",
                 "id": child_id,
@@ -3007,14 +3056,34 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
 
     for index, (_, branch_id) in enumerate(skeleton):
         emit(branch_id, str(index), slots_by_branch[index])
+        # 一级分支自己：它有没有下一层，只有"这一支展开过没有"知道。因额度被跳过
+        # （`skipped`）或整支抛错（`failed`）的那几支从没被问过，因此是 `unknown`；
+        # 展开过但模型一条要点都没给的，同样没人能断言它到底了。
+        if index in skipped_set or index in failed_set or not slots_by_branch[index]:
+            slot_states[branch_id] = "unknown"
 
     if drafts:
-        ops, _ = normalize_ops(drafts, _node_ids(content.root))
+        ops, id_map = normalize_ops(drafts, _node_ids(content.root))
         batch = OpBatch(batch_id=_batch_id(ctx), base_revision=ctx.revision, ops=ops)
         try:
             content = apply_ops(content, batch)
         except OpError as exc:
             return _fail(exc.code, f"{exc.path}：{exc.message}", path=exc.path)
+    else:
+        id_map = {}
+
+    # `expandable` 的三态在**任何**校验之前写进树里：它不是一个附加视图，而是
+    # `Node` 的字段之一，越晚写越容易漏掉某条校验路径（后面还有一次整树
+    # `model_validate`，它会把写坏的值直接判成 `invalid_tree`——那正是我们要的）。
+    #
+    # `max_depth` 传契约的 8 层，**不是**本次的 `args.max_depth`：后者是"这一次
+    # 长到哪一层"的预算，被它挡住的叶子仍然可以再展开（界面上按钮可点），把
+    # 它们记成 `no` 等于告诉用户"到头了"，而这句话只有模型或第 8 层说得出口。
+    _stamp_expandable(
+        content,
+        {id_map.get(raw_id, raw_id): state for raw_id, state in slot_states.items()},
+        max_depth=mindmap_contract.MAX_TREE_DEPTH,
+    )
 
     # 第五步：确定性验收，全部用代码，不调模型。整树重跑一次契约校验——
     # `apply_ops` 内部也做了，但"骨架没有任何要点"时不会经过它（没有 op 可应用），
@@ -3351,36 +3420,548 @@ def _depth_of(root: Node, node_id: str) -> int | None:
     return None
 
 
-def _expand_items(raw: Any) -> list[tuple[str, str | None]]:
-    """单节点展开的响应 → `[(label, detail)]`，按出现顺序。
+def _iter_nodes(root: Node):
+    """前序（父在子前）遍历整棵树。"""
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        yield node
+        stack.extend(reversed(node.children))
+
+
+def _node_path(root: Node, node_id: str) -> list[Node] | None:
+    """`根 → … → 目标节点` 的节点链；找不到返回 `None`（含目标不在树里）。
+
+    单节点展开必须拿到它，而不是只看一个孤立的标题：一个 16 字的 `label`（"实施
+    要点"、"风险"、"第三步"）几乎在任何主题下都成立，模型不知道自己在哪一层、
+    上面那层讲的是什么，展开出来的东西就会飘到别的主题上去。标题链是这次调用
+    唯一能拿到的层级上下文，而它就在树里，不需要额外检索或额外调用。
+
+    用「找父链再反转」而不是「遍历时带路径栈」：深度上限只有 8，而 `_node_path`
+    要被 `_expand` 与它的错误路径各调一次，写成两条路径（成功/失败）的遍历会让
+    "找不到时返回什么"出现两种写法。
+    """
+    parents: dict[str, Node] = {}
+    for node in _iter_nodes(root):
+        for child in node.children:
+            parents[child.id] = node
+    target = find_node(root, node_id)
+    if target is None:
+        return None
+    chain = [target]
+    cursor = target
+    while cursor.id in parents:
+        cursor = parents[cursor.id]
+        chain.append(cursor)
+    chain.reverse()
+    return chain
+
+
+def _path_text(chain: Sequence[Node]) -> str:
+    """标题链渲染成一行：给提示词看，也给日志/诊断看。"""
+    return " > ".join(node.label.strip() for node in chain)
+
+
+def _index_path(root: Node, node_id: str) -> list[int] | None:
+    """目标节点从根出发的子索引链（`[]` = 根自己）；找不到返回 `None`。
+
+    它只服务一件事：`node_grow` 帧里的 `path` 是**父节点**的索引链（见
+    `NodeGrowEvent`）。展开时新节点的父节点就是被展开的那个节点，所以路径必须
+    是它自己的位置——写成 `[]` 会把新节点画到根下面，界面上看起来像"根上又长出
+    了三个分支"，而用户明明点的是第三层的某个叶子。
+    """
+    if root.id == node_id:
+        return []
+    stack: list[tuple[Node, list[int]]] = [(root, [])]
+    while stack:
+        node, path = stack.pop()
+        for index, child in enumerate(node.children):
+            if child.id == node_id:
+                return [*path, index]
+            stack.append((child, [*path, index]))
+    return None
+
+
+# ---------------------------------------------------------------- 同级去重
+#
+# 「不要重复已有子节点」写进了提示词，但它只是提示词。模型看不到自己上一轮写过
+# 什么（单节点展开每次都是独立调用），而"同一句话挂在两个节点上"在界面上是看得
+# 见的错。所以代码这一侧要有一条**确定性**的去重：
+#
+#   - 归一化后**相同** → 必丢。折叠空白、去掉标点与编号前缀、大小写不敏感；
+#   - 归一化后**互相包含** → 也丢。这是"语义重复"里唯一能不看模型就判的一类
+#     （「实施要点」vs「实施要点三条」）。再往上的同义改写（「风险」vs「潜在
+#     隐患」）代码判不了，只能靠提示词：把它当确定性规则去做，会写出一个
+#     "有时灵有时不灵"的东西，而它坏掉时的表现是丢内容。
+#
+# 去重只发生在**同一父节点的子节点之间**：不同分支下出现同样的短标题是正常的，
+# 跨父节点去重会把"两支各有一个『风险』"这种合法结构删掉一个。
+
+# 归一化时剔掉的字符：中英文标点、编号与括号。用 `str.translate` 一次过，
+# 比一串 `replace` 快且不会有漏。
+_PUNCT_TABLE = str.maketrans({
+    char: None for char in
+    "　 \t\r\n"
+    "，。、；：？！“”‘’（）【】《》〈〉—…·"
+    ",.;:?!\"'()[]{}<>-—…·/\\|+*_=~`^#@$%&"
+})
+
+
+def _fold_title(text: str) -> str:
+    """标题的归一化形式：只用于比较，不用于显示。
+
+    `casefold` 而不是 `lower`：同一句话里出现全角/半角字母时（模型偶尔这么写），
+    只有 `casefold` 会给出同一个答案。
+    """
+    return (text or "").translate(_PUNCT_TABLE).casefold()
+
+
+def _duplicate_of(label: str, others: Sequence[str]) -> str | None:
+    """`label` 与 `others` 里的哪一个重复；不重复返回 `None`。
+
+    返回"撞上了哪一个"而不是布尔：诊断里要能写出"与已有子节点「X」重复"，否则
+    用户看到的是"这一批少了一个"，没人能判断少的是哪一个、为什么少。
+    """
+    folded = _fold_title(label)
+    if not folded:
+        return None
+    for other in others:
+        other_folded = _fold_title(other)
+        if not other_folded:
+            continue
+        if folded == other_folded:
+            return other
+        # 互相包含：短的那个是长的那个的前缀式概括。长度差 1 以内的不做包含判定
+        # （「甲一」与「甲二」互不包含，但「要点」与「要点二」会——后者该丢）。
+        if len(other_folded) >= 2 and (folded in other_folded or other_folded in folded):
+            return other
+    return None
+
+
+# ---------------------------------------------------------------- expandable 打标
+#
+# 「这个节点还能不能再展开」是**生成时**才知道的事（见 `mindmap.NODE_EXPANDABLE`），
+# 建完树之后现算只能得到"有没有子节点"，而那件事回答不了"是到头了还是没展开完"。
+# 所以打标紧跟在树定形之后、`ctx.candidate` 赋值之前，用生成过程里攒下的判断。
+
+
+def _expandable_for_slot(slot: "_Slot") -> str:
+    """一个候选节点落树时的 `expandable`。判定顺序就是优先级：
+
+    1. 模型明确说"到底了" → `no`。这是唯一有第一手依据的结论。
+    2. 被额度挡住的 → `unknown`。"没展开完"不等于"没得展开"。
+    3. 其余 → `yes`。叶子默认就是 `yes`：它当然还能再拆，只是这次没拆。
+    """
+    if slot.expandable_declared and not slot.expandable:
+        return "no"
+    return "unknown" if slot.truncated else "yes"
+
+
+def _stamp_expandable(
+    content: MindMapContent, stamps: dict[str, str], *, max_depth: int,
+) -> None:
+    """把三态写进树里：`stamps` 里查得到就用它，查不到按 `yes`。
+
+    两条覆盖规则**写在最后**，因为它们与"这一支生成到哪一步"无关，只与树的形状
+    有关：
+
+      - 深度到 `max_depth`（契约的 8 层）的节点一律 `no`：再加子节点整树就不合法，
+        这不是模型的判断，是结构事实；
+      - 已经有子节点的节点，若 `stamps` 说它 `no`，仍然照 `stamps`——模型可以说
+        "这一层就是我要写的全部"，而那与"还能不能再加"是两个问题。
+
+    就地改字段而不是 `model_copy`：`Node` 本来就带可变字段（`children` 在
+    `apply_ops` 里也是就地插的），而这里改的是刚校验过的树、马上要赋值给
+    `ctx.candidate`，多复制一次只会多一处"哪份是真的"。
+    """
+    for node, depth in _walk_depths(content.root):
+        node.expandable = "no" if depth >= max_depth else stamps.get(node.id, "yes")
+
+
+def _walk_depths(root: Node):
+    """`(节点, 层号)`，root 为 1。与 `_depth_of` 同一口径。"""
+    stack: list[tuple[Node, int]] = [(root, 1)]
+    while stack:
+        node, depth = stack.pop()
+        yield node, depth
+        stack.extend((child, depth + 1) for child in node.children)
+
+
+class _ExpandInvalid(Exception):
+    """单节点展开时某个子节点不合契约。
+
+    `code` 与 `_fail` 的码表同源，`message` 会**原样**回给模型——它得知道是第几个
+    子节点、错在哪，下一轮才改得对（与 `OpError.path` 同一条规矩）。异常只在
+    `_expand` 内部传递：解析、去重、引用清洗全部发生在落树之前，所以任何一条抛出来
+    都还没碰过树，「整批回退」是构造保证，不是回滚代码。
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+@dataclass
+class _ExpandItem:
+    """一个解析好、但还没落树的子节点。
+
+    `expandable` 是模型这次的声明（`None` = 没写）。它只决定落树时那个节点的三态
+    取值（`yes` / `no`），不参与"要不要再问一次"——单节点展开只写一层，没有下一轮。
+    """
+
+    label: str
+    detail: str | None
+    expandable: bool | None
+    source_refs: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _strict_label(raw: Any, index: int) -> str:
+    """取子节点的 `label`：空白、非字符串、超过 16 码点一律判整批失败。
+
+    **不裁剪**，与分片那条路（`_slot_from` 里的 `clip_label`）刻意不同。分片是一次
+    已经花掉的调用吐出十来个节点，截断保住的是"这一次别白花"；单节点展开只产出
+    2–4 个节点，而超长恰恰说明模型没按契约写（把一整句话塞进了标题）——截断之后
+    画布上挂着一句从中间断开的话，用户既看不出它被截了，也判断不了这一批还能不能
+    用。判失败则有明确出路：错误原样回给模型，它下一轮通常会写短。
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        raise _ExpandInvalid(
+            "invalid_label",
+            f"第 {index + 1} 个子节点的 label 是空的或不是字符串，这一批没有落树。")
+    label = " ".join(raw.split())
+    length = len(label)
+    if length > GENERATED_LABEL_MAX_CHARS:
+        raise _ExpandInvalid(
+            "label_too_long",
+            f"第 {index + 1} 个子节点的 label 有 {length} 个字符，超过"
+            f" {GENERATED_LABEL_MAX_CHARS} 个的上限（收到：「{label[:40]}」）。"
+            "请压缩成一句话短语、把长内容放进 detail；这一批没有落树。")
+    return label
+
+
+def _strict_refs(raw: Any, index: int, known: set[str],
+                 dropped: list[str] | None = None) -> list[dict[str, Any]]:
+    """子节点上的 `source_refs`：**形状**错了判失败，**依据**不足就丢掉。
+
+    两种错误分开处置，因为它们的含义不同：
+
+      - 形状错（不是对象、没有 source_id、start/end 不成对或不是整数）说明模型
+        没照格式写。留着它会在 `AddOp` 的契约校验里炸掉**整棵树**，而那条报错
+        指不到"是第几个子节点"，所以在这里就判整批失败；
+      - 依据不足（source_id 不在本次可见的来源里）不是格式问题，是"这条引用
+        证不出来"。判失败会把一次内容本身没问题的展开整批废掉，代价方向错了；
+        丢掉并记诊断才对——节点照常挂上，只是它没有出处。
+
+    `known` 是本次**真的能核验**的来源 id 集合：请求带来的 + 从库里找回来的。
+    不在这里收窄的话，一条指向本次没见过的 source_id 的引用会让
+    `MindMapContent.validate_tree` 判 `tree_invalid`——报错文本是"节点 X 引用的
+    来源 Y 不在 source_usage 中"，模型完全无处下手。
+
+    `dropped` 是被丢掉那些 `source_id` 的收集器（可选）。丢掉本来不报错，但
+    "少了几条引用"必须能被数出来：`data.refs.dropped` 与那条诊断都靠它对账，
+    否则界面上只会看到"这一支没有出处"，而说不清是被剔的还是模型压根没写。
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise _ExpandInvalid(
+            "invalid_refs",
+            f"第 {index + 1} 个子节点的 source_refs 不是数组，这一批没有落树。")
+    refs: list[dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise _ExpandInvalid(
+                "invalid_refs",
+                f"第 {index + 1} 个子节点的 source_refs 里有非对象项，这一批没有落树。")
+        source_id = entry.get("source_id")
+        if not isinstance(source_id, str) or not source_id.strip():
+            raise _ExpandInvalid(
+                "invalid_refs",
+                f"第 {index + 1} 个子节点的引用缺少 source_id，这一批没有落树。")
+        start, end = entry.get("start"), entry.get("end")
+        if start is not None or end is not None:
+            bad = (isinstance(start, bool) or isinstance(end, bool)
+                   or not isinstance(start, int) or not isinstance(end, int)
+                   or end <= start)
+            if bad:
+                raise _ExpandInvalid(
+                    "invalid_refs",
+                    f"第 {index + 1} 个子节点引用的 start/end 不成对或不是整数，"
+                    "这一批没有落树。")
+        if source_id not in known:
+            if dropped is not None:
+                dropped.append(source_id)
+            continue
+        refs.append(entry)
+    return refs
+
+
+def _parse_expand_items(raw: Any, *, known: set[str],
+                        dropped_refs: list[str] | None = None) -> list[_ExpandItem]:
+    """单节点展开的响应 → 子节点列表，按出现顺序；不合契约就抛 `_ExpandInvalid`。
 
     两种形状都收，这是 `EXPAND_PROMPT` 明说的：
-      - `{"children":[{"label":…,"detail":…}]}`：新格式，带两层节点；
+      - `{"children":[{"label":…,"detail":…,"source_refs":[…]}]}`：新格式；
       - `{"points":["…","…"]}`：旧格式，只有标题。
 
-    为什么不像分片那条路一样只用 `_candidate_slots`：那个解析器还带 `expandable`
-    与嵌套 children 的语义，而单节点展开**只写一层**（没有下一轮追问）。复用会让
-    "这条路上多层是什么意思"变成一个没人定义的问题，而它的正确答案是"不存在"。
+    **一处失败整批作废**：任何一项不合法就抛出去，调用方把整个响应扔掉。挂在
+    一半的坏处比整批失败大得多——用户看到三个新节点、其中第二个的标题是半句话，
+    而他没有任何办法知道"这批本来应该是四个"。
+
+    与分片那条路（`_candidate_slots`）的差别不只是严格：这里**没有嵌套**。分片会
+    收下模型多给的一层（`depth_left`），单节点展开只写一层，多给的那层没有下一轮
+    追问去填它，收下只会得到"上面有子节点、子节点却没有下文"的假完整。
     """
     if not isinstance(raw, dict):
-        return []
-    items: list[tuple[str, str | None]] = []
-    children = raw.get("children")
-    if isinstance(children, list):
-        for item in children:
-            if isinstance(item, dict):
-                label = item.get("label")
-                if isinstance(label, str) and label.strip():
-                    items.append((clip_label(label.strip()), _detail_text(item.get("detail"))))
-            elif isinstance(item, str) and item.strip():
-                items.append((clip_label(item.strip()), None))
-        return items
-    points = raw.get("points")
-    if isinstance(points, list):
-        for item in points:
-            if isinstance(item, str) and item.strip():
-                items.append((clip_label(item.strip()), None))
+        raise _ExpandInvalid("invalid_points", "模型返回的不是 JSON 对象，这一批没有落树。")
+    entries = raw.get("children")
+    if not isinstance(entries, list):
+        entries = raw.get("points")
+    if not isinstance(entries, list):
+        raise _ExpandInvalid(
+            "invalid_points",
+            "模型没有返回 children（或旧格式的 points）数组，这一批没有落树。")
+
+    items: list[_ExpandItem] = []
+    for index, entry in enumerate(entries):
+        if isinstance(entry, str):
+            # 旧格式的裸字符串：只有标题，没有 detail，也没有声明可展开性。
+            items.append(_ExpandItem(_strict_label(entry, index), None, None))
+            continue
+        if not isinstance(entry, dict):
+            raise _ExpandInvalid(
+                "invalid_points",
+                f"第 {index + 1} 个子节点既不是字符串也不是对象，这一批没有落树。")
+        flag = entry.get("expandable")
+        items.append(_ExpandItem(
+            label=_strict_label(entry.get("label"), index),
+            detail=_detail_text(entry.get("detail")),
+            expandable=flag if isinstance(flag, bool) else None,
+            source_refs=_strict_refs(entry.get("source_refs"), index, known,
+                                     dropped=dropped_refs),
+        ))
     return items
+
+
+def _verified_owned(refs: list[dict[str, Any]],
+                    evidence: "_BranchEvidence | None") -> list[dict[str, Any]]:
+    """只留下"属于本次命中"的引用；没有证据可依据时**一条都不收**。
+
+    没有检索结果时模型写什么引用都只能是编的（它没看到任何原文）。这一层直接清空，
+    而不是等逐字校验去剔——两者的界面表现一样，但前者能让"这一次是没有依据才空着"
+    在 `data.refs` 里看得出来。
+
+    依据按**坐标**比对、没有坐标才比文本，这套判据只该有一份实现（`_ref_from`）：
+    在这里照抄一遍，等于给"引用归属"留下第二条会漂移的真相。
+    """
+    if evidence is None or not refs:
+        return []
+    return [ref for ref in (_ref_from(entry, evidence) for entry in refs) if ref]
+
+
+def _expand_system(chain_text: str, evidence: "_BranchEvidence | None", *,
+                   attempted: bool) -> str:
+    """单节点展开的 system 消息：基础格式 + 这一支的上下文 + 证据规则。
+
+    **路径也要进 system**，不能只放在 user 里：`EXPAND_PROMPT` 是一段通用格式
+    说明，模型在写每一个子项时都会回头参考它；只在 user 里给一次路径，写到第三
+    个子项时它就只剩下"补充子节点"这个任务本身了（实测这正是"越写越跑题"的
+    起始点）。
+
+    `attempted` 与 `evidence is None` 分开判：两者说的是不同的事——"这次查过但
+    没命中"要让模型知道（否则它会把"我没拿到证据"读成"材料里大概还有"），而
+    "这次根本没查"（请求没带材料、图上也没有出处）什么都不用说，多说一句反而
+    会让它开始解释自己为什么没有引用。
+    """
+    parts = [EXPAND_PROMPT, f"这次展开的是路径「{chain_text}」的最后一个节点，只写它这一层。"]
+    if evidence is not None:
+        parts.append(BRANCH_EVIDENCE_RULES)
+    elif attempted:
+        parts.append(BRANCH_NO_EVIDENCE_RULES)
+    return "\n".join(parts)
+
+
+def _expand_ask(chain: Sequence[Node], wanted: int, *, existing: str,
+                instruction: str | None) -> str:
+    """单节点展开的 user 消息。
+
+    **路径必须在里面**：`label` 只有 16 个字，一个孤立标题在几乎任何主题下都成立
+    （"实施要点""风险""第三步"），模型不知道自己在展开哪一层，写出来的东西就会
+    飘到别的主题上去。标题链是这次调用唯一拿得到的层级上下文，而它就在树里。
+
+    `existing` 是**同级已有子节点**的标题。模型看不到自己上一轮写过什么（每次
+    展开都是独立调用），不给它这张清单却要求"不要重复"，它根本没有办法执行——
+    实测同一要点被返回两次，而数量验收还通过了（`_keep_new_slots` 的注释钉着
+    同一件事）。
+    """
+    parts = [
+        f"节点路径（根到这里）：{_path_text(chain)}",
+        f"要展开的节点：{chain[-1].label.strip()}",
+        f"它已有的子节点：{existing}",
+        f"请补充 {wanted} 个新的子节点，只写这一层。",
+    ]
+    if instruction:
+        parts.append(f"补充要求：{instruction}")
+    return "\n".join(parts)
+
+
+def _expand_sources(ctx: RunContext, node: Node) -> tuple[list[Source], dict[str, Any]]:
+    """这次展开能用的来源：**先看请求带的，再从库里按 `source_refs` 找回来**。
+
+    为什么需要这一步：正文只活在当次会话的内存里（`frontend/src/stores/sources.ts`），
+    用户重新打开一张旧导图时前端手里没有正文，`request.sources` 是空的。而节点上
+    存着 `source_refs`，里面的 `source_id` 是**持久 id**——库（`_rag` 早就接过同
+    一条路）按它就能把原文找回来。不这么做，"重新打开旧图 → 展开某个节点"这条路上
+    永远没有证据，模型只能凭标题编，节点也不会有出处。
+
+    三种结果必须分开，因为模型该说的话不同：
+
+      - 找到材料（`mode` 为 `request` / `library`）→ 正常的有证据展开；
+      - 没找到、但这张图**声称**有出处（`mode == "missing"`）→ 降级成无证据展开。
+        `content` 里必须说出来，否则用户会以为这些节点是从材料里整理出来的；
+      - 这张图本来就没有出处（`mode == "none"`）→ 普通的"无材料展开"，一句话主题
+        生成的图天天走这条，什么解释都不需要。
+
+    目标节点自己没有 `source_refs` 时，把**整棵树**声称用过的来源一起找回来：
+    证据是给"这一支"用的，而这一支的依据常常挂在它的父节点上（父节点写了出处，
+    子节点只做细分）。这一步只读不写，找不到也只是 `missing` 里多一条。
+    """
+    request_sources = list(ctx.request.sources)
+    if request_sources:
+        return request_sources, {"mode": "request", "recovered": 0, "missing": []}
+
+    wanted_ids: list[str] = []
+    for ref in node.source_refs:
+        if ref.source_id not in wanted_ids:
+            wanted_ids.append(ref.source_id)
+    if not wanted_ids and ctx.candidate is not None:
+        for other in _iter_nodes(ctx.candidate.root):
+            for ref in other.source_refs:
+                if ref.source_id not in wanted_ids:
+                    wanted_ids.append(ref.source_id)
+
+    loaded: list[Source] = []
+    missing: list[str] = []
+    for source_id in wanted_ids:
+        if source_id in ctx.sources_by_id:
+            loaded.append(ctx.sources_by_id[source_id])
+            continue
+        try:
+            source = knowledge_library.load(source_id)
+        except Exception as exc:  # noqa: BLE001 — 库坏了按"没找到"降级，理由见 docstring
+            logger.warning("展开时回查库来源 %s 失败（%s）：%s",
+                           source_id[:8], type(exc).__name__, str(exc)[:160])
+            source = None
+        # 判据与 `_verify_sources` 逐条对齐：校验器不认的来源，找回来也只会让
+        # 引用在收尾时被静默剔掉（那是整条链上最隐蔽的一种失败）。
+        if source is None or source.status != "parsed" or not (source.text or "").strip():
+            missing.append(source_id)
+            continue
+        loaded.append(source)
+    # 记进 ctx 的库来源缓存：`_verify_sources` 与 `_citable_hits` 都按它查原文。
+    ctx.record_library_sources([item for item in loaded
+                                if item.id not in ctx.sources_by_id])
+    if loaded:
+        return loaded, {"mode": "library", "recovered": len(loaded), "missing": missing}
+    return [], {"mode": "missing" if wanted_ids else "none",
+                "recovered": 0, "missing": missing}
+
+
+def _expand_query(chain: Sequence[Node]) -> str:
+    """单节点展开的检索问句：**目标节点标题 + 父路径最后一级**。
+
+    为什么不只发标题：展开的目标常常是一个很短的词（"风险""分工""第三步"），
+    短查询在 BM25 里被高频词吃掉、在向量路里也召回得泛——它会把整份材料里所有
+    带"风险"二字的段落都拉进来。加上父级那一层（"测试方案 风险"）之后，查询带上
+    了这一支的语义范围。
+
+    为什么也不发整条链：链路越长权重越平均，最后等于把根主题又查了一遍——那正是
+    `_branch_query` 的消融实验里最差的一组（8 支共用 top-1，覆盖率 3.8%）。
+    目标就是根时没有"上一级"，只发根标题。
+    """
+    labels = [node.label.strip() for node in chain if node.label.strip()]
+    if not labels:
+        return ""
+    if len(labels) >= 2:
+        return f"{labels[-1]} {labels[-2]}"
+    return labels[-1]
+
+
+def _expand_reference(ctx: RunContext, chain: Sequence[Node], sources: list[Source],
+                      ) -> tuple["_BranchEvidence | None", dict[str, Any]]:
+    """为这次展开单独检索一次：**只查选中节点**，不重跑整支。
+
+    `top_k` 用单支口径（`DEEP_BRANCH_TOP_K = 3`）：一条父块 450–700 字，三条足够
+    一次 2–4 个节点的展开，再多只是把同一段材料换个开头。
+
+    **不占 `max_tool_calls`**：检索发生在工具内部（与 `_generate_deep` 的按支检索
+    同一条规矩），模型看到的仍然只有一次 `node_expand` 调用。这不只是计费口径：
+    `max_tool_calls` 默认 8，把它算进去时一次"先查再展开"就吃掉两次，而用户点的
+    是"展开这一支"，他并不知道自己在花工具额度。
+
+    用 `search_parent` 而不是 `search_sources`：它同时给出父块区间与命中的子块区间，
+    引用才判得出"落在这段命中的原文里吗"（`_ref_from` 与
+    `verify_source_refs(evidence=)` 都靠这两级坐标）。
+    """
+    query = _expand_query(chain)
+    if not query:
+        return None, {"query": "", "hits": 0, "skipped": "空查询"}
+    hits = search_parent(sources, query, DEEP_BRANCH_TOP_K,
+                         library=library_search_enabled())
+    if not hits:
+        return None, {"query": query, "hits": 0, "top_k": DEEP_BRANCH_TOP_K}
+    # 库命中的持久 id 要先取回 `Source`：`_citable_hits` 没有正文就给不出
+    # `evidence_quote`，收尾校验也查不到原文（两条理由都写在 `_remember_library_hits`）。
+    library_used = _remember_library_hits(hits, ctx)
+    # 命中区间进本次运行的证据集：`verify_source_refs(evidence=)` 按它判
+    # "这条引用落在可见的父块里吗"。少记一条，模型照它抄的引用就会被判成编的。
+    ctx.record_evidence([
+        EvidenceSpan(hit.source_id, hit.start, hit.end, hit.leaf_start, hit.leaf_end)
+        for hit in hits
+    ])
+    evidence = _branch_evidence(hits, sources + list(ctx.library_sources.values()))
+    return evidence, {
+        "query": query,
+        "hits": len(hits),
+        "top_k": DEEP_BRANCH_TOP_K,
+        "library_sources": library_used,
+    }
+
+
+def _verify_expand_refs(nodes: list[Node], sources: list[Source],
+                        evidence: "_BranchEvidence | None") -> int:
+    """对新子节点的引用跑一遍逐字校验，返回被剔除的条数。
+
+    引用准确率不能靠提示词保证：模型的 `quote` 是"照着抄"的，抄错一个字在界面上
+    看不出来（引用摘录本来就是一段文字），而它一旦落库，用户点开抽屉对着原文就
+    发现对不上。
+
+    校验跑在**探针树**上（一个只装这批新节点的临时 `MindMapContent`），而不是整棵
+    树：整树校验会把**其他节点**的旧引用一起重判，而它们可能来自本机库里没有的
+    材料——那会因为"这次没带那份材料"把用户图里早就有的出处删掉，而用户点的是
+    "展开这一支"。"只改选中的那一支"这条约束在这里同样成立。
+
+    探针树里的 `Node` 与随后要落树的是同一批**对象**（pydantic 校验不复制实例），
+    所以 `remove_invalid=True` 剔掉的引用直接反映在它们身上，不需要再写回一遍。
+    """
+    if not nodes or not sources:
+        return 0
+    usage = [
+        SourceUsage(source_id=source.id, kind=source.kind, filename=source.filename,
+                    char_count=len((source.text or "").strip()))
+        for source in sources
+    ]
+    probe = MindMapContent(
+        title="展开校验",
+        root=Node(id="__expand_probe__", label="展开校验", children=nodes),
+        source_usage=usage,
+    )
+    before = sum(len(node.source_refs) for node in nodes)
+    verify_source_refs(probe, sources, remove_invalid=True,
+                       evidence=evidence.spans if evidence is not None else None)
+    after = sum(len(node.source_refs) for node in nodes)
+    return before - after
 
 
 async def _expand(args: ExpandArgs, ctx: RunContext) -> ToolResult:
@@ -3425,61 +4006,191 @@ async def _expand(args: ExpandArgs, ctx: RunContext) -> ToolResult:
             depth=depth, depth_limit=mindmap_contract.MAX_TREE_DEPTH,
         )
 
+    # ---- 上下文：标题链 + 材料 ----
+    #
+    # 路径从树里取（不花任何调用），材料可能要从库里找回来（理由见
+    # `_expand_sources`）。两者都在调模型之前准备好：提示词里少一样，模型就得
+    # 凭一个 16 字的孤立标题写 2–4 个节点。
+    chain = _node_path(content.root, node.id) or [node]
+    path_text = _path_text(chain)
+    sources, material = _expand_sources(ctx, node)
+    evidence: _BranchEvidence | None = None
+    retrieval: dict[str, Any] = {"query": "", "hits": 0, "skipped": "没有可检索的材料"}
+    if sources:
+        evidence, retrieval = _expand_reference(ctx, chain, sources)
+
     existing_titles = "、".join(child.label for child in node.children) or "（空）"
-    ask = f"父节点：{node.label}\n已有子节点：{existing_titles}\n请补充 {wanted} 个新的子要点。"
-    if args.instruction:
-        ask += f"\n补充要求：{args.instruction}"
+    ask = _expand_ask(chain, wanted, existing=existing_titles, instruction=args.instruction)
+    system = _expand_system(path_text, evidence, attempted=bool(sources))
+    if evidence is not None:
+        # 证据拼在 user 末尾（与 `_generate_deep` 的 `evidence_suffix` 同形）：
+        # 引用只能从这段里抄，而"那段是哪一段"要挨着问题看。
+        ask += f"\n本次对「{node.label}」单独检索到的 evidence 数组：\n{evidence.text}"
 
     try:
         if not ctx.reserve_model_call():
             return _fail("budget_exhausted", "本次运行的模型调用额度已用完，无法展开。")
         ctx.extra_model_calls += 1
-        raw = await chat_async(EXPAND_PROMPT, ask, max_tokens=_max_tokens(ctx))
+        raw = await chat_async(system, ask, max_tokens=_max_tokens(ctx))
     except GenerationError as exc:
         return _fail("generation_failed", f"展开失败：{exc}")
 
     diagnostics: list[Diagnostic] = []
     truncated = _note_truncation(diagnostics, raw)
-    items = _expand_items(raw)
+    # 只有本次真的能核验的来源才允许出现在引用里（理由见 `_strict_refs`）。
+    known = {source.id for source in sources} | set(ctx.library_sources)
+    unknown_source_refs: list[str] = []
+    try:
+        items = _parse_expand_items(raw, known=known, dropped_refs=unknown_source_refs)
+    except _ExpandInvalid as exc:
+        return _fail(exc.code, exc.message, path="children")
     if not items:
         return _fail("invalid_points", "模型没有返回可用的子要点，请重试。")
 
-    drafts = []
-    for label, detail in items:
-        if not label:
+    # ---- 同级去重：已有的 + 本批内部 ----
+    taken = [child.label for child in node.children]
+    kept: list[_ExpandItem] = []
+    duplicates: list[dict[str, str]] = []
+    for item in items:
+        clash = _duplicate_of(item.label, taken)
+        if clash is not None:
+            duplicates.append({"label": item.label, "existing": clash})
             continue
-        # 索引用**已接受的数量**而不是原始下标：模型返回 [" ", "有效"] 时，
-        # 第一条被跳过，用原始下标会往空父节点的 index 1 插，整批 index_out_of_range。
-        drafts.append({
-            "op": "add",
-            "id": f"$e{len(drafts)}",
-            "parent_id": node.id,
-            "index": len(node.children) + len(drafts),
-            "label": label,
-            # `detail` 与 label 一起落树：单节点展开同样是"短标题 + 长说明"，
-            # 少带这一项会让这一支的节点在画布上重新变回一句长话。
-            "detail": detail,
-        })
-        if len(drafts) >= wanted:
-            break
-    if not drafts:
-        return _fail("invalid_points", "模型返回的子要点都是空的，请重试。")
+        taken.append(item.label)
+        kept.append(item)
+    if not kept:
+        return _fail(
+            "duplicate_points",
+            f"模型返回的 {len(items)} 个子节点都与「{node.label}」已有的子节点重复"
+            f"（{existing_titles}），这一批没有落树。请换一个角度或补一句 instruction 再试。",
+            duplicates=duplicates,
+        )
+    # 多给的不算错：要 3 个给了 4 个，收前 3 个即可（`count` 是用户能选的量）。
+    # 少给也不算错：模型判断这一支只写得出一两个要点是它的判断，不是数据不合法——
+    # 判失败会把一次内容本身没问题的展开整批废掉。只有"一个都不剩"（全被去重掉）
+    # 才失败，那时确实没有任何东西可挂。
+    kept = kept[:wanted]
+
+    # ---- 引用：先按命中归属筛，再逐字核验 ----
+    refs_dropped = len(unknown_source_refs)
+    new_nodes: list[Node] = []
+    for index, item in enumerate(kept):
+        owned = _verified_owned(item.source_refs, evidence)
+        refs_dropped += len(item.source_refs) - len(owned)
+        new_nodes.append(Node(
+            id=f"{TEMP_ID_PREFIX}e{index}",
+            label=item.label,
+            detail=item.detail,
+            source_refs=owned,
+        ))
+    refs_dropped += _verify_expand_refs(new_nodes, sources, evidence)
+    refs_kept = sum(len(child.source_refs) for child in new_nodes)
+    if refs_dropped:
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="SOURCE_REFS_DROPPED",
+            message=(
+                f"{refs_dropped} 条引用没有通过核验（来源不在本次可核验的范围里，"
+                f"或引文与原文对不上），已剔除；保留 {refs_kept} 条"
+            ),
+        ))
+
+    drafts = [{
+        "op": "add",
+        "id": child.id,
+        "parent_id": node.id,
+        # 索引用**已接受的数量**而不是原始下标：本批被去重掉几条之后，用原始下标
+        # 会往父节点中段插，整批 index 会与"追加到末尾"的语义不符。
+        "index": len(node.children) + offset,
+        "label": child.label,
+        # `detail` 与 label 一起落树：单节点展开同样是"短标题 + 长说明"，
+        # 少带这一项会让这一支的节点在画布上重新变回一句长话。
+        "detail": child.detail,
+        "source_refs": [ref.model_dump() for ref in child.source_refs],
+    } for offset, child in enumerate(new_nodes)]
+
+    # `source_usage` 必须在 apply 之前补齐：契约要求每条 `source_ref.source_id`
+    # 都出现在里面，缺一条整棵树就是 `tree_invalid`。旧图上展开时才会走到（新加的
+    # 引用来自库里找回来的来源，而那张图的 `source_usage` 可能只列了当时那几份）。
+    used_ids = {ref.source_id for child in new_nodes for ref in child.source_refs}
+    usage_ids = {item.source_id for item in content.source_usage}
+    missing_usage = [source for source in sources
+                     if source.id in used_ids and source.id not in usage_ids]
+    base = content
+    if missing_usage:
+        base = content.model_copy(deep=True)
+        base.source_usage = [
+            *base.source_usage,
+            *[SourceUsage(source_id=source.id, kind=source.kind,
+                          filename=source.filename,
+                          char_count=len((source.text or "").strip()))
+              for source in missing_usage],
+        ]
 
     ops, id_map = normalize_ops(drafts, _node_ids(content.root))
     batch = OpBatch(batch_id=_batch_id(ctx), base_revision=ctx.revision, ops=ops)
     try:
-        updated = apply_ops(content, batch)
+        updated = apply_ops(base, batch)
     except OpError as exc:
         return _fail(exc.code, exc.message, path=exc.path)
+
+    # ---- expandable：这一批新节点 + 被展开的节点自己 ----
+    #
+    # 新节点：模型说"到底了"就是 `no`，其余是 `yes`（它是叶子，当然还能再拆）。
+    # 被展开的节点：它现在有子节点了，但"有子节点"只说明长出了一层——除非它已经
+    # 顶到单节点的上限，否则仍是 `yes`。
+    stamps: dict[str, str] = {}
+    for offset, item in enumerate(kept):
+        raw_id = drafts[offset]["id"]
+        stamps[id_map.get(raw_id, raw_id)] = "no" if item.expandable is False else "yes"
+    expanded_node = find_node(updated.root, node.id)
+    stamps[node.id] = "no" if (expanded_node is not None
+                              and len(expanded_node.children) >= MAX_CHILDREN) else "yes"
+    _stamp_expandable(updated, stamps, max_depth=mindmap_contract.MAX_TREE_DEPTH)
+
+    # 报给界面的必须是**树上真实的取值**，不是上面那张期望表：深度覆盖规则（第 8 层
+    # 一律 `no`）就发生在 `_stamp_expandable` 里，直接回期望表会给出一个"按钮可点、
+    # 点下去却报 too_deep"的分叉。
+    expandable: dict[str, str] = {}
+    for node_id in stamps:
+        found = find_node(updated.root, node_id)
+        if found is not None:
+            expandable[node_id] = found.expandable
 
     ctx.candidate = updated
     ctx.batches.append(batch)
     ctx.revision += 1
-    summary = f"已在「{node.label}」下新增 {len(ops)} 个子节点。"
+
+    # ---- 生长预览：落在**被展开的那个节点**下面 ----
+    #
+    # `path` 是父节点的子索引链，而这里的父节点就是被展开的节点本身。写成 `[]`
+    # 会把新节点画到根下面，界面上看起来像"根上又长出三个分支"，而用户点的是
+    # 第三层的某个叶子。算不出来就不发帧（宁可没有预览，也不给一个错位置）。
+    index_path = _index_path(content.root, node.id)
+    if index_path is not None:
+        seen: set[tuple[tuple[int, ...] | None, str]] = set()
+        for item in kept:
+            await _emit_grow(ctx, seen, tuple(index_path), item.label, item.expandable)
+
+    summary = f"已在「{node.label}」下新增 {len(ops)} 个子节点（路径：{path_text}）。"
+    if duplicates:
+        summary += f"其中 {len(duplicates)} 个与已有子节点重复，已跳过。"
     if truncated:
         summary += "模型输出被长度上限截断，已保留回收到的完整子节点。"
     if wanted < args.count:
         summary += f"（整图节点接近上限 {node_limit}，这次只补 {wanted} 个）"
+    if material["mode"] == "missing":
+        # 降级必须说出来：这句话既是给模型看的（下一轮别声称有出处），也是给用户
+        # 看的（界面上这行字来自工具结果）。找不到原文不等于没有原文，所以措辞是
+        # "这次没找到"，不是"这份图没有依据"。
+        summary += ("这次没找到原始材料（节点的 source_refs 里的来源在知识库里已不存在），"
+                    "本次是无证据展开：新节点没有写 source_refs。")
+    elif sources and not retrieval.get("hits"):
+        summary += "这次没有在材料里找到与这一支相关的原文，新节点没有写 source_refs。"
+    elif sources and refs_kept == 0:
+        # 有命中但一条都没留下：模型没写引用，或写了但过不了逐字校验。这两种在
+        # 界面上是同一件事（节点没有出处），区别留在 `data.refs` 里。
+        summary += "模型这次没有写出可核验的引用，新节点没有 source_refs。"
+
     return ToolResult(
         ok=True,
         content=summary,
@@ -3488,12 +4199,20 @@ async def _expand(args: ExpandArgs, ctx: RunContext) -> ToolResult:
             "batches": [batch],
             "id_map": id_map,
             "revision": ctx.revision,
-            "labels": [op.label for op in ops],
+            "labels": [item.label for item in kept],
             "partial": truncated,
             "truncated": truncated,
             "node_limit": node_limit,
             "node_count": _count_nodes(updated.root),
             "depth": depth,
+            "path": path_text,
+            # 展开之后每个新节点被判成哪一态：界面据此决定按钮的文字（`no` 就是
+            # "已经到底了"）。同时把"被展开的节点自己"也带上——它现在有子节点了。
+            "expandable": expandable,
+            "duplicates": duplicates,
+            "refs": {"kept": refs_kept, "dropped": refs_dropped},
+            "materials": material,
+            "retrieval": retrieval,
             "diagnostics": [item.model_dump() for item in diagnostics],
         },
     )
@@ -3973,7 +4692,12 @@ _TOOL_SPECS: dict[str, Callable[[], ToolSpec]] = {
     ),
     "node_expand": lambda: ToolSpec(
         name="node_expand",
-        description="把当前大纲里的某个节点展开成若干子要点，只新增子节点，不改动其他节点。",
+        description=(
+            "把当前选中的那个节点展开成 2–4 个子节点，只新增这一层，不改动其他节点。"
+            "模型会看到从根到这个节点的标题链与它已有的子节点，所以写出来的内容要落在"
+            "这一支的范围里，并且不能与已有子节点重复。"
+            "节点已经到底（第 8 层 / 模型说过没有更细内容）时它会被拒，理由会一起返回。"
+        ),
         args_model=ExpandArgs,
         fn=_expand,
     ),

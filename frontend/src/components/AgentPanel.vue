@@ -134,6 +134,18 @@ const previewBranchRows = computed(() => previewRows.value.filter(row => row.dep
 const previewTotal = computed(() => (store.agentPreview ? countPreview(store.agentPreview) : 0));
 const hiddenPreview = computed(() => previewTotal.value - previewRows.value.length);
 
+/**
+ * 预览折叠区的标题：展开与生成是两件事，标题也该分开说。
+ *
+ * `agentPreviewScope` 只在展开时被设置（那是"正在展开哪个节点"），所以它同时是
+ * "这一轮是不是展开"的判据——不必再读一次 `runIntent`。
+ */
+const previewTitle = computed(() => {
+  const expand = store.agentPreviewScope !== null;
+  if (store.agentRunning) return expand ? '展开中（预览）' : '生成中（预览）';
+  return expand ? '上次展开中断时的预览' : '上次生成中断时的预览';
+});
+
 const canAccept = computed(() => store.candidate !== null && !store.agentRunning);
 
 /**
@@ -228,9 +240,16 @@ function cancel() {
       class="mt-2 rounded bg-white px-2 py-1"
     >
       <summary class="cursor-pointer font-medium text-slate-700">
-        {{ store.agentRunning ? '生成中（预览）' : '上次生成中断时的预览' }}
+        {{ previewTitle }}
       </summary>
-      <p class="mt-1 break-words font-medium text-slate-700">{{ store.agentPreview.label }}</p>
+      <!--
+        展开时预览的顶部是「正在展开哪个节点」，不是中心主题：链上那几层祖先只是
+        为了让 `node_grow` 的索引链有落点（`seedExpandPreview`），把根的标题摆在
+        这里会让用户以为整张图在重生成。
+      -->
+      <p class="mt-1 break-words font-medium text-slate-700">
+        {{ store.agentPreviewScope ? `正在展开：${store.agentPreviewScope}` : store.agentPreview.label }}
+      </p>
       <ul
         v-if="previewBranchRows.length"
         class="mt-1 flex flex-col gap-0.5 text-[11px] leading-relaxed text-slate-600"

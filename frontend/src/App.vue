@@ -130,6 +130,49 @@ function resetNoteDraft() {
   noteDraft.value = store.selectedNode?.node.note ?? '';
 }
 
+/**
+ * 「展开这一支」按钮的状态。
+ *
+ * 三件事一起决定它能不能点，缺一条都会让用户白花一次模型调用：
+ *   - `expandable === 'no'`：后端/模型已经说过到底了，按钮禁用并**说明原因**
+ *     （灰着不解释，用户只会以为功能坏了）；
+ *   - 正在展开：转成「展开中…」，同时禁用——重复点击会发两次请求，而第二次
+ *     会被 `runGeneration` 的闸门静默丢掉，看起来像"点了没反应"；
+ *   - 正在生成 / 编辑：互斥。两轮 agent 运行重叠时后到的那个会清掉前一个的预览
+ *     与候选，用户看到的是"之前的进度消失了"。
+ *
+ * `unknown` **不禁用**：那正是"旧图，或者上次被额度截断"的情况，按钮可点才有
+ * 意义——把不确定当成"到头了"，唯一能继续长的地方就灰掉了。旧图没有这个字段
+ * （`undefined`）时与 `unknown` 同义：它从来没被问过，而不是被问过说"没有"。
+ */
+const expandState = computed(() => {
+  const node = selected.value?.node;
+  if (!node) return { disabled: true, label: '展开这一支', hint: '' };
+  const done = node.expandable === 'no';
+  const busyElsewhere = store.agentRunning || store.busy;
+  let hint = '让模型给这个节点补 2–4 个子节点；结果先落候选，确认后才进画布。';
+  if (done) {
+    hint = '已经到底了：模型说过这个节点没有更细的内容可展开。';
+  } else if (store.expanding) {
+    hint = '正在展开这一支，新节点会先出现在候选里。';
+  } else if (store.generating) {
+    hint = '正在生成，先等这一次跑完再展开。';
+  } else if (node.expandable !== 'yes') {
+    hint = '不确定还能不能再拆（旧图、或上次是被额度截断的）；可以试一次。';
+  }
+  return {
+    disabled: done || busyElsewhere,
+    label: store.expanding ? '展开中…' : '展开这一支',
+    hint,
+  };
+});
+
+function expandBranch() {
+  // 材料正文只在本次会话内存里；重新打开旧图时它是空的，后端会按节点的
+  // `source_refs` 从知识库把来源找回来，所以这里照传、传空也不拦。
+  void store.expandSelected(sources.readySources);
+}
+
 /** 标题栏右侧的保存状态：说清楚"有没有没存的东西"，而不是只显示一个保存按钮。 */
 const saveHint = computed(() => {
   if (store.saving) return '保存中…';
@@ -420,6 +463,23 @@ async function copyBody() {
             <h3 class="text-xs font-medium text-slate-500">详情</h3>
             <p class="whitespace-pre-wrap break-words rounded-md bg-slate-50 px-2 py-1.5 text-sm leading-relaxed text-slate-700">{{ bodyText }}</p>
             <p class="text-xs text-slate-400">{{ BODY_SOURCE_NOTE[bodyFrom] }}</p>
+          </section>
+
+          <!--
+            按需展开：初次只出 4 层，往下的内容由用户点哪个节点就展开哪个。
+            走的是与生成同一条 `/api/agent/runs/stream`（intent=expand），
+            结果同样是**候选**——确认与版本检查一步都没少。
+          -->
+          <section class="flex flex-col gap-1" aria-label="展开这一支">
+            <button
+              type="button"
+              class="rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-40 disabled:hover:bg-transparent"
+              :disabled="expandState.disabled"
+              @click="expandBranch"
+            >
+              {{ expandState.label }}
+            </button>
+            <p class="text-xs leading-relaxed text-slate-400">{{ expandState.hint }}</p>
           </section>
 
           <label class="flex flex-1 flex-col gap-1">

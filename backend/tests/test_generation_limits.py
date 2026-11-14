@@ -56,15 +56,15 @@ async def _fake(system: str, user: str, *, max_tokens=None, on_delta=None):
     """模型替身：6 条分支、每支 3 个要点、每个要点 3 个下一层。
 
     三种 user 形状各对应一次调用：骨架（只有主题）、分支展开（带"本条一级分支"）、
-    单节点展开（`node_expand` 的"父节点：…"）。
+    单节点展开（`node_expand` 的"要展开的节点：…"，同一行还给着从根到它的路径）。
     """
     if system.startswith(PLAN_PROMPT):
         return {"branches": [f"分支{index}" for index in range(1, 7)]}
     if "本条一级分支：" in user:
         title = user.split("本条一级分支：", 1)[1].split("\n", 1)[0]
         return _children(*[f"{title}·{i}" for i in (1, 2, 3)])
-    if "父节点：" in user:
-        parent = user.split("父节点：", 1)[1].split("\n", 1)[0]
+    if "要展开的节点：" in user:
+        parent = user.split("要展开的节点：", 1)[1].split("\n", 1)[0]
         return _children(*[f"{parent}·{i}" for i in (1, 2, 3)])
     node = user.split("本节点：", 1)[1].split("\n", 1)[0]
     return _children(*[f"{node}·{i}" for i in (1, 2, 3)])

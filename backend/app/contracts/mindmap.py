@@ -47,6 +47,24 @@ GENERATED_LABEL_MAX_CHARS = 16
 # vs 用户备注），所以只能分开存，不能合并（见 `Node.detail` 的注释）。
 MAX_NODE_DETAIL_CHARS = 2000
 
+# 一个节点还能不能再往下展开。**这是给界面画按钮用的状态，不是给模型看的信号**
+# （模型那一侧的对应物是展开响应里的布尔 `expandable`，两回事）。
+#
+# 存进树里而不是每次现算，是因为它有三件事现算不出来：
+#
+#   1. **模型说过"到底了"**。只有写那次响应的模型知道"这个要点已经是最小可执行
+#      单元"，那个判断随调用一起消失；不落库，下次打开这张图就只能猜。
+#   2. **被额度截断过**。截断发生在生成过程中，事后从形状上看与"模型说没有更多
+#      内容"完全一样（都是个叶子），而两者对用户的意思相反：一个是"到头了"，
+#      一个是"没展开完，还能再点一次"。
+#   3. **层数到顶**。第 8 层是契约硬边界（`MAX_TREE_DEPTH`），加不出子节点。
+#
+# 三态而不是布尔：`unknown` 必须与 `no` 分开。被额度截断的节点若被记成 `no`，
+# 界面上按钮灰掉、说明"已经到底了"——用户被一句假话挡住了唯一能继续的入口，
+# 而这张图看起来是完整的。反过来把真的到头的节点记成 `yes`，用户点了只有"没
+# 有更多内容"可选，白花一次调用。
+NODE_EXPANDABLE = ("yes", "no", "unknown")
+
 
 def clip_label(text: str, limit: int = GENERATED_LABEL_MAX_CHARS) -> str:
     """按**码点**截断标题，返回不超过 `limit` 个码点的字符串。
@@ -152,6 +170,16 @@ class Node(BaseModel):
     # 因为一条 3000 字的 detail 说明提示词本身没被遵守，该在生成侧归一化
     # （`tools._slot_from` 已经截了），不该让契约替它兜。
     detail: str | None = Field(default=None, max_length=MAX_NODE_DETAIL_CHARS)
+    # 这一支还能不能再展开。三态的判定表见模块顶部 `NODE_EXPANDABLE` 的注释：
+    #
+    #   - `yes`：还能展开——有子节点但没长完，或者本身就是叶子；
+    #   - `no`：已经到底——模型明确说没有更细的内容，或已经到第 8 层；
+    #   - `unknown`：不确定——**被额度截断的不算 `no`**，那是"没展开完"，不是
+    #     "没得展开"；旧图没有这个字段时也是它。
+    #
+    # 缺省取 `unknown` 而不是 `yes`：库里那些 v1/v2 记录从来没被问过这件事，
+    # 把没问过的记成"还能展开"会让界面替旧图许下一个它兑现不了的承诺。
+    expandable: Literal["yes", "no", "unknown"] = "unknown"
     collapsed: bool = False
     style: NodeStyle | None = None
     source_refs: list[SourceRef] = Field(default_factory=list, max_length=20)

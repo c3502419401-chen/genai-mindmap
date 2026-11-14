@@ -491,6 +491,12 @@ export interface components {
             /** Detail */
             detail?: string | null;
             /**
+             * Expandable
+             * @default unknown
+             * @enum {string}
+             */
+            expandable: "yes" | "no" | "unknown";
+            /**
              * Collapsed
              * @default false
              */
@@ -512,6 +518,12 @@ export interface components {
             note?: string | null;
             /** Detail */
             detail?: string | null;
+            /**
+             * Expandable
+             * @default unknown
+             * @enum {string}
+             */
+            expandable: "yes" | "no" | "unknown";
             /**
              * Collapsed
              * @default false

@@ -19,6 +19,10 @@ interface Case {
   name: string;
   ops: MindMapOp[];
   expect_tree?: Array<[string, string]>;
+  /** 与 expect_tree 同顺序的 detail 序列；null 表示没有详情。 */
+  expect_details?: Array<string | null>;
+  /** 与 expect_tree 同顺序的 note 序列。只在验证"改 detail 不碰 note"时出现。 */
+  expect_notes?: Array<string | null>;
   expect_error?: string;
   expect_base_unchanged?: boolean;
 }
@@ -45,6 +49,17 @@ function flatten(root: MindNode): Array<[string, string]> {
   return out;
 }
 
+/** 同一顺序取某个节点字段（`detail` / `note`），与 fixture 的 expect_* 同构。 */
+function flattenField(root: MindNode, field: 'detail' | 'note'): Array<string | null> {
+  const out: Array<string | null> = [];
+  const walk = (node: MindNode): void => {
+    out.push(node[field] ?? null);
+    node.children.forEach(walk);
+  };
+  walk(root);
+  return out;
+}
+
 describe('跨端 op 契约（共享 fixture）', () => {
   it.each(fixture.cases.map(item => [item.name, item] as const))('%s', (_name, item) => {
     const content = base();
@@ -58,6 +73,14 @@ describe('跨端 op 契约（共享 fixture）', () => {
         throw new Error(`预期失败 ${item.expect_error}，实际成功`);
       }
       expect(flatten(result.content.root)).toEqual(item.expect_tree);
+      // 详情与备注：两端都必须"改一个不动另一个"。`detail` 归生成、`note` 归用户，
+      // 混用会让一次重新生成把用户敲的字整段盖掉——那种丢失在界面上看不出来。
+      if (item.expect_details) {
+        expect(flattenField(result.content.root, 'detail')).toEqual(item.expect_details);
+      }
+      if (item.expect_notes) {
+        expect(flattenField(result.content.root, 'note')).toEqual(item.expect_notes);
+      }
     } catch (caught) {
       if (!(caught instanceof OpError)) throw caught;
       error = caught;
