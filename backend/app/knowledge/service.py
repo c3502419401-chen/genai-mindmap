@@ -109,10 +109,24 @@ class EvidenceHit(BaseModel):
     # 这条结果实际由哪条路支撑。`_rag` 的 data["method"] 是请求级的旧字段，
     # 逐条标注才能看出"这条是纯语义捞回来的、字面一个词都不沾"。
     method: Literal["lexical", "hybrid"] = "lexical"
-    # 这次命中**真正匹配上**的子块区间。只有父块返回模式（`search_parent`）才有
-    # 值：那里 `start/end` 是父块、`leaf_start/leaf_end` 是子块。`search_sources`
-    # 与 `search_multi` 恒为 None——它们的 `start/end` 就是匹配单元，再记一遍是
-    # 同一个数。
+    # 这条命中来自哪条**通道**：文本检索（`None`，默认）还是图游走（`"graph"`）。
+    #
+    # 为什么不复用 `method`：`method` 回答的是"哪条路支撑了这条"（词法 / 词法+向量），
+    # 而图命中既不是词法也不是向量——它的 `score_bm25` / `score_vector` 都是 `None`，
+    # `method` 恒为兼容值 `lexical`。把 `"graph"` 塞进 `method` 会让所有读
+    # `method == "hybrid"` 的下游（统计、日志、测试）多一个它们没见过的取值，而
+    # 语义上是两个正交的维度。
+    #
+    # 默认 `None` 而不是 `"text"`：**开关关着时不能留下任何痕迹**——加一个恒非空的
+    # 新键会让"与旧版本逐字节相同"（`tests/test_rerank.py` /
+    # `tests/test_parent_retrieval.py` 拿 git 里的旧模块比 `model_dump()`）当场失效，
+    # 而那个契约正是"接线没接通时不许有任何副作用"的保证。这与 `leaf_start` /
+    # `rerank_score` 当初相加时的处理一致：新字段只在真的走了那条路时才不是 None。
+    origin: Literal["graph"] | None = None
+    # 这次命中**真正匹配上**的子块区间。只有父块返回模式（`search_parent`，以及
+    # `MINDMAP_PARENT_RETRIEVAL=1` 时的 `search_multi`）才有值：那里 `start/end`
+    # 是父块、`leaf_start/leaf_end` 是子块。`search_sources` 恒为 None——它的
+    # `start/end` 就是匹配单元，再记一遍是同一个数。
     #
     # 这两个字段不是给人看的，是给引用校验用的：`quote` 变成 500 字的父块之后，
     # 模型从父块里引一句与查询无关的话也照样通过逐字校验，`verify_source_refs`
@@ -1120,6 +1134,23 @@ def _parent_retrieval_enabled() -> bool:
     return os.getenv(PARENT_RETRIEVAL_ENV, "1").strip().lower() in _PARENT_RETRIEVAL_TRUTHY
 
 
+# `MINDMAP_GRAPH_SEARCH` 控制"图游走并进检索"（`search_parent` 的两个出口）。
+#
+# **默认 0**：图值不值得进检索要由数字回答，不由设计回答。开关打开时一次检索会多
+# 一次 `entity_degrees` + 至多 `graph_search.MAX_ENTITIES` 条变长路径查询，而图里的
+# 实体精度（`graph_resolve` 的实测：合 7 / 漏 5 / 错 1）决定了这些多出来的证据里有
+# 多少是真关联。没量过之前默认关，与 `MINDMAP_RERANK` 当初"先接线、后翻默认值"的
+# 顺序一致。
+GRAPH_SEARCH_ENV = "MINDMAP_GRAPH_SEARCH"
+
+# 正列举真值，与 `_PARENT_RETRIEVAL_TRUTHY` 同一套写法：改默认值时判定逻辑不用动。
+_GRAPH_SEARCH_TRUTHY = {"1", "on", "true", "yes"}
+
+
+def _graph_search_enabled() -> bool:
+    return os.getenv(GRAPH_SEARCH_ENV, "0").strip().lower() in _GRAPH_SEARCH_TRUTHY
+
+
 def _bm25_scores(query: str, quotes: list[str]) -> list[float]:
     """对本次请求切出的所有块算 BM25。
 
@@ -1322,8 +1353,11 @@ def _pick_top(hits: list[EvidenceHit], top_k: int) -> list[EvidenceHit]:
 def _collect_chunks(sources: list[Source]) -> list[tuple[str, int, int, str]]:
     """切一遍块，返回 `(source_id, start, end, quote)`。
 
-    `search_sources` 与 `search_multi` 共用这一层：多路检索若每路各切一遍，
+    `search_sources`、`search_parent` 关着时的 `search_sources` 转发、以及
+    `parent=False` 的 `search_multi` 共用这一层：多路检索若每路各切一遍，
     5 万字材料上就是 6 倍的切块开销——纯 CPU，却也是这条路上最贵的一段。
+    `parent=True` 的那两条走 `_collect_leaves`（子块匹配 → 父块返回），
+    粒度不同但"只切一次、多路共用"这条约束相同。
     空判断用 `strip`、切块用原文：先 strip 再切块会让偏移整体前移，调用方拿它
     去切 `Source.text` 得到的就不是 quote 那段文字了。
     """
@@ -1803,6 +1837,80 @@ def _fold_to_parents(ranked: list[EvidenceHit], corpus: _LeafCorpus) -> list[Evi
     return folded
 
 
+def _fold_multi_hits(
+    hits: list[EvidenceHit],
+    collected: list[tuple[str, int, int, str]],
+    corpus: _LeafCorpus,
+    primary: dict[int, float],
+    want: int,
+) -> list[EvidenceHit]:
+    """多路子块命中 → 父块，并把**保底席位**在父块坐标上重算一次。
+
+    只在 `_search_multi_core` 的子块模式下用（`parent=True`）。两条顺序约束，
+    各对应一种能静默出错的做法：
+
+      1. **先按融合分降序、再折**。`_fold_to_parents` 靠"第一条"保证同一父块留下
+         分数最高的那个子块（那个前提写在它的 docstring 里）。先分段（保底段在
+         前）再折，会让"被保底、但子块分更低"的那条顶掉同一父块里分更高的子块，
+         于是 `leaf_start/leaf_end` 指向的不是最相关的那 200 字——引用校验会拿
+         一段错区间去比，而它不会报错，只会给出错误的判断。
+      2. **保底席位在折叠之后算**。席位是"回给调用方的一条证据"的席位，一条证据
+         是**父块**：在子块坐标上保 `ceil(want/2)` 席，折完可能只落在两三个父块
+         里，实际席位被折叠静默削掉——不变量看着还在，效果没了。
+
+    所以保底的判据换成"原 query 那一路**在这个父块里**最好的那个子块分"
+    （`parent_primary`）：子块级保底段原本要表达的也正是这件事——"这条是用户原话
+    自己找到的，别被扩展路的票数顶掉"。
+
+    `parent_primary` 取 max 而不是相加：同一父块里两个子块都被原 query 命中，
+    说明的是"这个父块被命中了两次"，不是"它有两条独立证据"。相加会让子块多的
+    长父块系统性压过子块少的短父块，而那正是这一轮要摆脱的长度偏差。
+
+    返回长度 `<= want`、每条对应**不同父块**，顺序是"保底段 + 竞争段"（与
+    `_search_multi_core` 的单级模式同一条口径）。与 `search_parent` 一样**不跑**
+    `_pick_ordered` 的近重复筛：`_fold_to_parents` 已经保证父块互不相同，再按
+    重叠率筛一遍只会把两个**不同**父块判成重复（父块短于 `2*CHUNK_OVERLAP_CHARS`
+    时必然触发），净效果是静默少给一条证据。
+    """
+    if not hits:
+        return []
+    # 折叠的前提：按分数降序。排序键与 `_fuse` 完全一致（同分时短块优先）。
+    ranked = sorted(hits, key=lambda hit: (-hit.score, hit.end - hit.start))
+    folded = _fold_to_parents(ranked, corpus)
+    # 原 query 一路都没命中（`primary` 为空）时没有"保底"可言：竞争段的顺序
+    # 就是融合分的顺序，原样截断。
+    if not folded or not primary:
+        return folded[:want]
+
+    index_of = {(item[0], item[1], item[2]): index
+                for index, item in enumerate(collected)}
+    parent_primary: dict[tuple[str, int, int], float] = {}
+    for index, value in primary.items():
+        source_id, start, end, _quote = collected[index]
+        parent_start, parent_end = corpus.parents[index_of[(source_id, start, end)]]
+        key = (source_id, parent_start, parent_end)
+        if value > parent_primary.get(key, 0.0):
+            parent_primary[key] = value
+
+    # 席位按**候选池**（`want`）而不是 `top_k` 算，理由与原实现相同：扩池后若仍只
+    # 保 `ceil(top_k/2)` 席，原始问题自己的第 2、3 名会被更多扩展路挤出去。
+    # 上界取 `len(parent_primary)`：原 query 没碰过的父块不该占保底席位。
+    reserve = min(max(1, (want + 1) // 2), len(folded), len(parent_primary))
+    order = sorted(
+        folded,
+        key=lambda hit: (
+            -parent_primary.get((hit.source_id, hit.start, hit.end), 0.0),
+            -hit.score,
+            hit.end - hit.start,
+        ),
+    )
+    kept = order[:reserve]
+    taken = {(hit.source_id, hit.start, hit.end) for hit in kept}
+    rest = [hit for hit in folded
+            if (hit.source_id, hit.start, hit.end) not in taken]
+    return [*kept, *rest][:want]
+
+
 # ---------------------------------------------------------------- 召回后的重排
 #
 # 扩池与重排是**两件事**，必须一起做才有意义：`top_k` 条候选上来就开始重排，
@@ -1956,17 +2064,79 @@ def search_parent(sources: list[Source], query: str, top_k: int = 5, *,
         还没量过，不猜。
       - 重排只改顺序、附加 `rerank_score`，`start`/`end`/`quote`/`leaf_*`
         **一个都不动**（"只重排不改变证据"由 `rerank.rerank` 的 `model_copy` 保证）。
+
+    **图游走（`MINDMAP_GRAPH_SEARCH`，默认 0）**接在本函数的两个出口上（父块模式开着
+    与关着各一个）：文本路先跑完、重排完，`_with_graph` 再用 `graph_search.search_graph`
+    捞一遍图证据并 `fuse_hits` 融合。四条边界：
+
+      - 默认关；关着时 `_with_graph` **返回同一个列表对象**，结果与没接图逐字段相同。
+      - 图路拿不到东西（没配 Neo4j / query 没有实体命中 / 没有路径）同样原样返回。
+      - 图证据在重排**之后**进来，所以这一轮的 reranker 看不到它们（图命中没有可比的
+        分数，塞进重排只会让它的 [0,1] 概率与名次混在一起）。要重排图证据是另一轮的事。
+      - 融合后 `score` 一律变成 RRF 分（图命中没有可加的原始分），`origin="graph"`
+        标出哪几条是图带来的——`method` 不动。
     """
     if not _parent_retrieval_enabled():
-        return search_sources(sources, query, top_k, filters=filters, library=library)
+        hits = search_sources(sources, query, top_k, filters=filters, library=library)
+        return _with_graph(hits, sources, query.strip(), top_k, filters)
 
     question = query.strip()
     depth = _rerank_depth(top_k)
     base = _search_parent_core(sources, question, top_k, filters, depth=depth)
     if not library:
-        return _rerank_top(question, base, top_k)
-    extra = _library_batch(question, depth, filters, exclude=sources, parent=True)
-    return _rerank_top(question, _merge_batches(base, extra, depth), top_k)
+        hits = _rerank_top(question, base, top_k)
+    else:
+        extra = _library_batch(question, depth, filters, exclude=sources, parent=True)
+        hits = _rerank_top(question, _merge_batches(base, extra, depth), top_k)
+    return _with_graph(hits, sources, question, top_k, filters)
+
+
+# ---------------------------------------------------------------- 图游走接线
+
+
+def _with_graph(
+    text_hits: list[EvidenceHit],
+    sources: list[Source],
+    question: str,
+    top_k: int,
+    filters: SourceFilter | None,
+) -> list[EvidenceHit]:
+    """文本路的命中 → （开关打开且图可用时）与图路融合；否则**同一个列表原样返回**。
+
+    三条"不做任何事"的分支刻意写成提前返回**同一个对象**（不是 `list(...)` 拷贝）：
+    "开关关着 / 图没配 / 图里没实体命中"这三种情况在输出上必须与没接图时**逐字段
+    相同**，连列表身份都相同最省事——回归用例可以拿 `is` 断言。
+
+    `graph_store` 与 `graph_search` 都是**函数内延迟 import**：`service` 是这一层的
+    入口，被 agent、脚本、几乎每个测试 import；为了一个默认关着的开关在 import 期
+    把 `neo4j` 拖进依赖图，会让"没配图"的部署在 import 阶段就承担它不需要的成本。
+    `library._chunk_rows` 对 `service._chunk_spans` 用的是同一手法，理由也相同（反向
+    import 成环）。
+
+    **异常一律降级**：Neo4j 抛错、库里读不到、区间校验失败，都只记一条 warning 然后
+    返回文本结果。图是"补证据"的通道，它坏掉不该让整次检索失败——这与
+    `graph_store` 读接口"查不到与库坏了同一个结果"的设计是同一条原则。
+    """
+    if not _graph_search_enabled() or not question:
+        return text_hits
+    from app.knowledge import graph_search, graph_store
+
+    if not graph_store.configured():
+        return text_hits
+    try:
+        graph_hits = graph_search.search_graph(
+            sources, question, graph_search.graph_pool(top_k), filters=filters)
+        if not graph_hits:
+            return text_hits
+        fused = graph_search.fuse_hits(text_hits, graph_hits, top_k)
+        logger.debug("图检索：图证据 %d 条 → 融合后 %d 条", len(graph_hits), len(fused))
+        return fused
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        # `GraphStoreError` 是 `OSError` 的子类（见 `graph_store` 模块 docstring），
+        # 所以这里不需要单独 import 它——写 `OSError` 还顺手接住了 `library.load`
+        # 的磁盘错误。
+        logger.warning("图检索降级为纯文本（%s）", type(exc).__name__)
+        return text_hits
 
 
 # ---------------------------------------------------------------- 多路并行检索
@@ -2149,6 +2319,32 @@ async def search_multi(
     材料"。**它不生成 query**——传哪些问法由调用方（`_rag`）决定，这里只管把
     它们跑完、融合、去重。
 
+    ## 粒度：与 `search_parent` 同构
+
+    `MINDMAP_PARENT_RETRIEVAL=1`（默认）时，本函数与 `search_parent` **同一个
+    匹配口径**，只是多了"多路"：
+
+      1. **匹配在子块上**（`_collect_leaves`，约 200 字）。每路 query 各自排序；
+      2. **融合也在子块上**（RRF 累加）——先把每一路各自的命中折成父块再融合，
+         就等于把"哪个父块"当成候选单位，而一个 600 字的父块里常混着三四个话题，
+         "这一小段最相关"的细粒度信号会在折叠那一步被抹掉；
+      3. **折叠在融合之后**（`_fold_multi_hits` → `_fold_to_parents`）。同父块的
+         多个子块并成一条，保留分数最高的那个叶子区间（`leaf_start/leaf_end`）；
+      4. **重排接在折叠之后**，与 `search_parent` 完全一致（`_rerank_depth` 扩池、
+         `_rerank_top` 截回 `top_k`、失败降级原顺序）。
+
+    这不是"顺手升级"，是修一个实测差异：父块当匹配单元时，同一份材料、同样 8 支、
+    纯 BM25 的覆盖率比子块口径**低 5.7pp**（23.1% vs 28.8%）。原因有两层——父块受
+    BM25 长度归一化（`b=0.75`）惩罚更重，且 600 字里混着几个话题，信号被稀释。
+    那个 -5.7pp 与"查询扩展有没有收益"混在一起量时，会把扩展的真实收益冲掉，
+    所以必须先把这个入口修平，再谈扩展。
+
+    `MINDMAP_PARENT_RETRIEVAL=0` 时本函数与加多路之前**逐字节相同**（单级块匹配、
+    `_pick_ordered` 去重、`leaf_*` 恒为 None）：粒度开关关着，多路不该单方面改变
+    返回形状。`library=True` 时库那批也跟着这个开关走（`_library_batch(parent=)`），
+    否则两批的 `quote` 粒度不同，调用方按 `end - start` 估信息密度会得到两个互相
+    矛盾的结论。
+
     `queries` 里的每条问法都会各自产出 BM25 与向量两路名次，同一块被多路命中
     就把 `1/(RRF_K+名次)` 一路一路加起来。这是多路唯一的价值来源：单路里
     排第二的块，如果在三种问法下都排第二，它比只在一种问法下排第一的块更可能
@@ -2159,10 +2355,9 @@ async def search_multi(
 
     七条硬约束，逐条对应一个具体的浪费或错误（第 6 条是实测退化之后补的，
     其余六条是设计时就定下的）：
-
-    1. **切块只做一次**。`_collect_chunks` 在分路之前跑一遍，六路共用这份块
-       集合。这也让每路的 BM25 用同一个 `N` 与 `df`——同一块在不同 query 下的
-       分数才有同一种口径。
+    1. **切块只做一次**。颗粒切分在分路之前跑一遍，六路共用这份块集合。这也让
+       每路的 BM25 用同一个 `N` 与 `df`——同一块在不同 query 下的分数才有同一种
+       口径。切哪一级由 `MINDMAP_PARENT_RETRIEVAL` 决定（见下面的"粒度"一节）。
     2. **并行只在 HTTP 上**。`embed_texts` 是同步的，靠 `asyncio.to_thread`
        离开事件循环；缓存读写留在主线程是工程选择（本地毫秒级操作，扔线程池
        没有收益还要争写锁），不是 SQLite 的连接限制（详见 `_route_vectors`）。
@@ -2173,12 +2368,16 @@ async def search_multi(
        一句同句式换中心词的改写时，只要原句还在，召回整体就不会跑偏。
     4. **最多 6 路**（`MAX_ROUTES`），超了截断并记一条 debug。
     5. **融合复用现成的 RRF**：`_bm25_ranking` / `_vector_ranking` /
-       `_rrf_value` / `_pick_ordered` / `_near_duplicate`，不另起一套。每路先按
-       `pool = max(top_k * CANDIDATE_FACTOR, top_k)` 截断再融合，与单路同规则。
+       `_rrf_value` / `_pick_ordered` / `_near_duplicate` / `_fold_to_parents`，
+       不另起一套。每路先按 `pool = max(want * CANDIDATE_FACTOR, want)` 截断再
+       融合，与单路同规则。
     6. **原 query 那一路的答案有保底席位**。纯累加会把真答案顶掉：五条跑偏的
        扩展问法各自贡献 1/61，合起来就超过原始问题自己那一路的 RRF。所以
-       「第一位那条问法」的前 `ceil(top_k/2)` 名先占位，其余名额才由累加分竞争
+       「第一位那条问法」的前 `ceil(want/2)` 名先占位，其余名额才由累加分竞争
        （详见下面的"代价"）。去掉这一层时，仓库里有可复现的退化用例。
+       **席位的单位跟着粒度走**：子块模式在父块坐标上算（`_fold_multi_hits`），
+       因为回给调用方的一条证据是父块——在子块上保 3 席，折完可能只落在 1 个
+       父块里，实际席位被折叠静默削掉。
     7. **每路都可能只剩 BM25**（没 key、embed 失败、hybrid 关）。这时多路仍然
        是多路：各路 BM25 名次照样累加，不抛错、不返回空。
 
@@ -2200,13 +2399,15 @@ async def search_multi(
     融合结构上改。
 
     `score` 的口径比单路多一种，别读错：
-      - 只有一路时：与 `search_sources` **逐字段相同**（走 `_single_search`），
-        所以 score 是 BM25 原始分或单路 RRF 分
+      - 只有一路时：与转发的那条路**逐字段相同**——`MINDMAP_PARENT_RETRIEVAL=1`
+        时是 `search_parent`（`_fuse` + `_fold_to_parents`），关着时是
+        `search_sources`（`_single_search`）。所以 score 是 BM25 原始分或单路 RRF 分
       - 多路且向量路起来：各路的 RRF 分累加，通常落在 0.02–0.08
       - 多路且只有 BM25：各路 BM25 名次的 RRF 累加（≈1/61 量级），**不是** BM25
         原始分——不同 query 的 BM25 分口径不同，相加没有意义
       三种都**只在本次检索内可比**。跨请求比较看 `method` 与
-      `score_bm25`/`score_vector`。
+      `score_bm25`/`score_vector`。子块模式下分数来自**子块**匹配、区间来自父块
+      （与 `search_parent` 同一条口径）：分数高只说明"这段原文里有一小段精准命中"。
 
     `score_bm25` 在多路里取"各条走了 BM25 的路中的最高分"，`score_vector` 取
     "各条向量路中的最高余弦"。取最大而不是相加：不同 query 的 BM25 分与余弦
@@ -2214,10 +2415,19 @@ async def search_multi(
 
     `library=True` 与 `search_sources` / `search_parent` 的同名参数逐条对齐：
     融合仍然只做一次，交给 `_merge_batches`（本次请求的命中保底占
-    `ceil(top_k/2)` 席，库的只补位）。库那批只用**第一条问法**做粗筛与检索——
-    调用方约定第一位是用户原话，而扩展问法是为"同一批材料的多个角度"服务的，
-    拿它们去筛库只会把库里真正相关的那份挤掉（`_library_sources` 的粗筛是
-    覆盖率的排序，不是多路召回）。
+    `ceil(want/2)` 席，库的只补位）。**跨批融合发生在折叠之后**，也就是父块
+    坐标上——两个理由：
+
+      - `_merge_batches` 的语义单位就是"一条回给调用方的证据"，子块模式下那是
+        父块。跨批在子块级做的话，保底的 `ceil(want/2)` 席会在随后的折叠里被
+        并成更少的父块，不变量被静默削掉；
+      - 两批来源的 `source_id` 体系不同（请求内 uuid4 / 持久 id），BM25 的 `N`
+        与 `df` 也各自一套。子块级跨批混合打分等于拿两套不可比的分布比大小；
+        `_merge_batches` 只用名次（`1/(RRF_K+名次)`），跨批才有意义。
+
+    库那批只用**第一条问法**做粗筛与检索——调用方约定第一位是用户原话，而扩展
+    问法是为"同一批材料的多个角度"服务的，拿它们去筛库只会把库里真正相关的那份
+    挤掉（`_library_sources` 的粗筛是覆盖率的排序，不是多路召回）。
 
     默认 `library=False` 时只是 `_search_multi_core` 的转发，行为与加这个参数
     之前**逐字段一致**（`tests/test_search_multi.py` 拿旧模块钉着多路那一半）。
@@ -2232,15 +2442,23 @@ async def search_multi(
     调用方放的原始问题（`_route_queries` 的约定），扩展问法只是同一批材料的不同
     角度，拿它们当重排的 query 会把"多少条问法都指向它"这件事重新混进来。
     """
+    # 粒度跟着 `search_parent`：同一个开关（`MINDMAP_PARENT_RETRIEVAL`）决定多路
+    # 是"子块匹配 → 折父块"还是"单级块匹配"。两处各判一次的话，会出现"本次那批
+    # 折父块、库里那批没折"的粒度错位，而那种错只有调用方按 `end - start` 估信息
+    # 密度时才会暴露。
+    parent = _parent_retrieval_enabled()
     depth = _rerank_depth(top_k)
-    fused = await _search_multi_core(sources, queries, top_k, filters, hyde, depth=depth)
+    fused = await _search_multi_core(sources, queries, top_k, filters, hyde,
+                                     depth=depth, parent=parent)
     question = next((text.strip() for text in queries
                      if isinstance(text, str) and text.strip()), "")
     if not question:
         return fused[:top_k]
     if not library:
         return _rerank_top(question, fused, top_k)
-    extra = _library_batch(question, depth, filters, exclude=sources, parent=False)
+    # 跨批融合在**折叠之后**做（`parent` 一致时两批都是同一粒度），理由见
+    # docstring 的 `library=True` 那一段。
+    extra = _library_batch(question, depth, filters, exclude=sources, parent=parent)
     return _rerank_top(question, _merge_batches(fused, extra, depth), top_k)
 
 
@@ -2252,6 +2470,7 @@ async def _search_multi_core(
     hyde: str | None,
     *,
     depth: int | None = None,
+    parent: bool = False,
 ) -> list[EvidenceHit]:
     """`search_multi` 在**给定来源集合内**的全部逻辑（不碰库、不做跨批融合）。
 
@@ -2260,9 +2479,19 @@ async def _search_multi_core(
     累加分、`method`）原样作为后者的输入。混在一起写就会出现"库的命中也被算进
     某一路的累加分"这种谁也说不清的名次。
 
-    `depth` 是**返回条数**（候选池），缺省等于 `top_k`；只给重排用。放大时三处
-    一起跟着走——每路截断的 `pool`、单路快路径的 `_single_search`、末尾的
-    `_pick_ordered`——少任何一处，池子都会被卡回 `top_k`。
+    `depth` 是**返回条数**（候选池），缺省等于 `top_k`；只给重排用。放大时每一处
+    截断都跟着走——每路截断的 `pool`、单路快路径（`_single_search` 或
+    `_fuse*CANDIDATE_FACTOR` + `_fold_to_parents`）、多路的 `_pick_ordered` /
+    `_fold_multi_hits`——少任何一处，池子都会被卡回 `top_k`。
+
+    `parent` 决定**匹配与融合的粒度**，由 `search_multi` 从
+    `MINDMAP_PARENT_RETRIEVAL` 读出来传进来（与本函数无关的开关判断不进这一层，
+    与 `_search_parent_core` 同一条规矩）：
+
+      - `parent=True`：`_collect_leaves` 出子块 → 每路在子块上排序 → 子块级 RRF
+        累加 → `_fold_multi_hits` 折父块（顺带在父块坐标上重排保底席位）；
+      - `parent=False`：`_collect_chunks` 出单级块 → 每路排序 → 块级 RRF 累加 →
+        `_pick_ordered` 按分段顺序去重截断。**与加多路时逐字节相同**。
     """
     want = top_k if depth is None else depth
     routes = _route_queries(queries, hyde)
@@ -2279,16 +2508,29 @@ async def _search_multi_core(
             logger.debug("检索前过滤：来源 %d→%d", len(sources), len(selected))
         sources = selected
 
-    # 约束 1：切块只做一次，六路共用同一个块集合。
-    collected = _collect_chunks(sources)
-    if not collected:
-        return []
+    # 约束 1：切块只做一次，六路共用同一个块集合。切哪一级只影响"匹配单元"：
+    # 子块模式下父块不参与打分，它只是 `_fold_to_parents` 要返回的那个窗口。
+    corpus: _LeafCorpus | None = None
+    if parent:
+        corpus = _collect_leaves(sources)
+        if not corpus.items:
+            return []
+        collected = corpus.items
+    else:
+        collected = _collect_chunks(sources)
+        if not collected:
+            return []
 
-    # 约束 3 的另一半：只有一路问法时，结果必须与 `search_sources` 逐字段相同。
-    # 这不是快路径优化，是可观测契约——开关关着与只有纠错时，用户看到的召回
-    # 与没有多路召回时一模一样。
+    # 约束 3 的另一半：只有一路问法时，结果必须与**被转发的那条路**逐字段相同。
+    # 这不是快路径优化，是可观测契约——关掉查询扩展、或只有一条纠错问法时，用户
+    # 看到的召回必须与"没有多路召回"时一模一样。两条转发目标：
+    #   - 子块模式 → `_search_parent_core` 的尾巴（`search_parent` 的全部逻辑）；
+    #   - 单级模式 → `_single_search`（`search_sources` 的全部打分逻辑）。
     if len(routes) == 1 and routes[0][1]:
-        return _single_search(collected, routes[0][0], want)
+        if corpus is None:
+            return _single_search(collected, routes[0][0], want)
+        return _fold_to_parents(
+            _fuse(collected, routes[0][0], want * CANDIDATE_FACTOR), corpus)[:want]
 
     quotes = [item[3] for item in collected]
     lengths = [item[2] - item[1] for item in collected]
@@ -2374,4 +2616,8 @@ async def _search_multi_core(
                   key=lambda index: (-fused[index], lengths[index]))
     hits = [_to_hit(index, fused[index], collected, bm25_values, vector_values, method)
             for index in [*reserved, *rest]]
-    return _pick_ordered(hits, want)
+    if corpus is None:
+        return _pick_ordered(hits, want)
+    # 子块模式：分段顺序在子块坐标上不作数（折叠只留每个父块的最优叶子，那一步
+    # 必须按分数降序），所以保底席位在 `_fold_multi_hits` 里按父块重排一次。
+    return _fold_multi_hits(hits, collected, corpus, primary, want)

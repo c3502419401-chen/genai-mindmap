@@ -1330,6 +1330,11 @@ def _parser() -> argparse.ArgumentParser:
                              "固定这一维，否则同一份配置在有凭证的机器上会读出另一个数，"
                              "`--check` 会莫名其妙地挂。要看重排的收益就用 --rerank 1 跑一遍"
                              "再与 --rerank 0 比（两份结果不会自动并列，手工对比）。")
+    parser.add_argument("--graph", choices=("0", "1"), default="0", metavar="0,1",
+                        help="图游走开关（`MINDMAP_GRAPH_SEARCH`，默认 0）。默认关的理由与"
+                             "`--rerank` 相同，加上一条：图是**跨机器的外部状态**（Neo4j 在不在、"
+                             "图里有什么），不钉住这一维，`--check` 会在配了图的机器上悄悄多一条"
+                             "召回通道。Neo4j 不通时 --graph 1 与 --graph 0 逐位相同（降级契约）。")
     parser.add_argument("--top-k", default=",".join(str(k) for k in DEFAULT_TOP_K))
     parser.add_argument("--json", metavar="PATH", help="报告落盘（- 表示 stdout）")
     parser.add_argument("--markdown", nargs="?", const="-", metavar="PATH",
@@ -1352,6 +1357,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     # 重排是**环境变量**驱动的（`rerank.enabled()`），而且线上已默认开。评估必须把它
     # 显式钉住：不钉的话，同一份配置在有凭证的机器上会多跑一次重排、读出另一个数。
     os.environ["MINDMAP_RERANK"] = args.rerank
+    # 图游走同理，而且更尖锐：`MINDMAP_GRAPH_SEARCH` 的读数依赖**图里有什么**，而图是
+    # 一个跨机器的外部状态（Neo4j 可能在某台机器上跑着、在另一台上没有）。不钉住它，
+    # `--check` 会在"配了图"的机器上悄悄多一条召回通道，基线对比立刻漂 1–2pp 而看不出
+    # 原因。要看图的收益就 `--graph 1` 跑一遍再与默认那遍比，与 `--rerank` 完全相同。
+    os.environ["MINDMAP_GRAPH_SEARCH"] = args.graph
     # 默认值分两种情形：平时两套都跑（要看见真实那套），--check 只跑 title（回归门槛）。
     suite = args.suite or ("title" if args.check else "both")
     if args.check and suite == "manual":

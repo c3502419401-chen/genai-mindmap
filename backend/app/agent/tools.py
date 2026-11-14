@@ -2146,9 +2146,11 @@ async def _search_branch(
       - `intents` 为空（开关关着、`plan_branches` 降级成 `{}`、或这一支模型没给
         问法）→ 与这个能力上线之前**逐字节相同**：`to_thread(search_parent, ...)`，
         父块返回、子块匹配。这一条是本次改动的降级契约。
-      - `intents` 非空 → `search_multi`（多路 + RRF + 原 query 保底席位）。它返回
-        的是**单级块**（`start/end` 就是匹配单元，`leaf_*` 为 None），与 `_rag`
-        的多路分支同一口径；父块折叠只接在单路上（理由见 `_citable_hits`）。
+      - `intents` 非空 → `search_multi`（多路 + RRF + 原 query 保底席位）。它的
+        粒度**跟着 `MINDMAP_PARENT_RETRIEVAL` 走**，与单路那条完全同构：关着时是
+        单级块（`start/end` 就是匹配单元、`leaf_*` 为 None），打开时是"子块匹配 →
+        子块级融合 → 折父块 → 重排"（`leaf_*` 是命中的那 200 字）。所以两条路径
+        返回的证据形状一致，`_citable_hits` 不需要第二套定义。
 
     不另写融合：RRF、去重、保底席位、`MAX_ROUTES` 全在 `search_multi` 里，这里
     再实现一遍等于让同一件事有两处真相，而两处迟早分叉。
@@ -4287,6 +4289,10 @@ _EVIDENCE_QUOTE_MAX_CHARS = 300
 def _citable_hits(hits: list[EvidenceHit], sources: list[Source]) -> list[dict[str, Any]]:
     """把命中翻成回给模型的结构：单级模式下与原来逐字段相同，父块模式多一组证据。
 
+    两种形状由 `MINDMAP_PARENT_RETRIEVAL` 决定，**四条检索入口一致**：
+    `search_sources` 恒为单级；`search_parent` 与 `search_multi` 跟着开关走
+    （关着时分别转发/退化成单级块），所以这里不需要知道这次是单路还是多路。
+
     子块现在**恒不超过** `LEAF_MAX_CHARS = 300`（`knowledge.service` 把它压到与
     这里同一口径，末块合并也一样压），所以在父块模式下**每一条带叶子区间的命中
     都会给出** `evidence_*`。这条不变量是引用证据链的前提，不是巧合：一旦某个
@@ -4441,8 +4447,9 @@ async def _rag(args: RagArgs, ctx: RunContext) -> ToolResult:
         # 单路走 `search_parent`：**不在这里再判一次开关**。关着时它内部直接返回
         # `search_sources(...)` 的结果（同一个函数，逐字段相同由
         # `tests/test_parent_retrieval.py` 对着 `f72c14c` 钉着），两处各判一次只会
-        # 多出"回了父块却没记叶子区间"这类半开状态。多路那条分支仍是单级切块：
-        # 父块只接在单路上，理由见 `_citable_hits` 的注释。
+        # 多出"回了父块却没记叶子区间"这类半开状态。多路那条分支的粒度由同一个
+        # 开关决定（见 `search_multi` 的 docstring），所以两条分支返回同一种证据
+        # 形状——这是这一轮修掉的那个入口差异（父块级匹配比子块级低 5.7pp）。
         #
         # `library=` 是知识库那条唯一的入口：它让这次检索同时看"请求带来的"与
         # "库里存着的"两批来源，融合规则（本次命中保底占半数席位）在

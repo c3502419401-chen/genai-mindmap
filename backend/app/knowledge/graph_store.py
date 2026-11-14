@@ -149,6 +149,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -518,6 +519,75 @@ def _config() -> tuple[str, str, str, str]:
     return uri, user, password, database
 
 
+def configured() -> bool:
+    """有没有配 Neo4j 密码（= 这个部署到底用不用图）。
+
+    **只看配置，不发起连接**——与 `embedding.configured()` / `rerank.configured()`
+    同一口径，理由也相同：检索层需要在一个请求内**多次**做这个判断（每次检索一次、
+    融合前一次），而 `stats()` 那种"连一次、失败返回全 0"的探测没法区分"图是空的"
+    与"库坏了"，也不该按请求付连接超时。
+
+    返回 `False` 时调用方应当**整条图路都不走**：这与"图里没东西"在检索结果上等值
+    （都退回纯文本），但省掉每条查询一次注定失败的 `neighbors` 与它那行 warning
+    ——没配图是部署选择，不是故障，不该在日志里刷成告警。
+    """
+    return bool(_config()[2])
+
+
+# ---------------------------------------------------------------- 可用性熔断
+#
+# **为什么需要它**（实测，本机 Neo4j 没起、密码配成假的）：
+#
+#     第 1 次 entity_degrees   10.70s    ← 含建约束的失败 + 事务重试
+#     第 2 次 entity_degrees    2.04s    ← 事务重试循环（RETRY_TIME_SECONDS）
+#     neighbors                 2.04s
+#
+# 读接口把连接失败折成"空值"是对的（调用方不必为"库坏了"准备第二个分支），但折完
+# 之后**上层分不出"图里没东西"与"连不上"**，于是每次检索都要重付一次 2 秒起的
+# 连接超时：一次图检索 = 1 次 `entity_degrees` + 最多 4 次 `neighbors` ≈ 10 秒。
+# 那已经不算"降级"，算"这个开关让检索不可用"。
+#
+# 所以失败一次之后进冷却：冷却期内的读接口直接返回空（不连库），冷却时间按连续失败
+# 次数翻倍（30s → 60s → … 上限 300s），一次成功立刻清零。代价是库刚恢复时最多晚
+# `FAILURE_COOLDOWN_MAX_SECONDS` 才发现——对"补证据"的通道，这个代价远小于把一个
+# 检索请求挂十秒。
+#
+# `close_driver()` 会重置它（测试每个用例换一套环境变量，不重置会把上一个用例的
+# 失败带到下一个）。
+FAILURE_COOLDOWN_SECONDS = 30.0
+FAILURE_COOLDOWN_MAX_SECONDS = 300.0
+
+_FAILURES = 0
+_FAILED_AT = 0.0          # `time.monotonic()` 的时刻；0 表示"还没失败过"
+
+
+def _note_failure() -> None:
+    """记一次连接级失败（在 `_session` / `_ensure_constraint` 的异常分支里调用）。"""
+    global _FAILURES, _FAILED_AT
+    _FAILURES += 1
+    _FAILED_AT = time.monotonic()
+
+
+def _note_success() -> None:
+    """一次事务正常结束：清零连续失败计数。"""
+    global _FAILURES
+    _FAILURES = 0
+
+
+def available() -> bool:
+    """现在值不值得发一条图查询。**不连库**，纯读熔断状态。
+
+    从没失败过 → `True`。失败过 → 看冷却是否已过（按连续失败次数指数退避）。
+    调用方（`graph_search.search_graph`）在发第一条 Cypher 之前查它：返回 `False`
+    就直接当作"图里没有东西"，不付连接超时。
+    """
+    if _FAILURES <= 0:
+        return True
+    backoff = min(FAILURE_COOLDOWN_SECONDS * 2 ** (_FAILURES - 1),
+                  FAILURE_COOLDOWN_MAX_SECONDS)
+    return time.monotonic() - _FAILED_AT >= backoff
+
+
 _DRIVER: Driver | None = None
 _DRIVER_LOCK = threading.Lock()
 _CONSTRAINT_READY = False
@@ -538,6 +608,9 @@ def _ensure_constraint(driver: Driver, database: str) -> None:
         driver.execute_query(CYPHER_CONSTRAINT, database_=database)
     except (Neo4jError, DriverError, OSError) as exc:
         logger.warning("图谱约束创建失败（继续运行）：%s", type(exc).__name__)
+        # 建约束失败就是"连不上"的最早信号（它扫在所有查询之前）：记一次失败，
+        # 让第一次检索之后立刻进冷却，而不是每条查询各付一遍超时。
+        _note_failure()
     _CONSTRAINT_READY = True
 
 
@@ -574,10 +647,14 @@ def _driver() -> Driver:
 
 def close_driver() -> None:
     """关掉单例并允许下次重建。测试用它切换环境变量，进程退出也调它。"""
-    global _DRIVER, _CONSTRAINT_READY
+    global _DRIVER, _CONSTRAINT_READY, _FAILURES, _FAILED_AT
     with _DRIVER_LOCK:
         driver, _DRIVER = _DRIVER, None
         _CONSTRAINT_READY = False
+        # 熔断状态跟着连接走：换了一套环境变量（测试用例之间就是这样）之后，
+        # 上一个用例的失败不该让下一个用例的第一个查询被跳过。
+        _FAILURES = 0
+        _FAILED_AT = 0.0
     if driver is None:
         return
     try:
@@ -607,11 +684,16 @@ def _session(read_only: bool = False) -> Iterator[Any]:
     try:
         with driver.session(database=database, default_access_mode=mode) as session:
             yield session
+        # 事务正常结束：熔断清零。放在 `with` 之后而不是每条语句之后，是因为
+        # `_transaction` 是整块提交/回滚的单位——中途成功、末尾失败的那次不该算成功。
+        _note_success()
     except GraphStoreError:
         raise
     except (Neo4jError, DriverError) as exc:
+        _note_failure()
         raise GraphStoreError(f"图存储不可用：{type(exc).__name__}") from exc
     except OSError as exc:
+        _note_failure()
         raise GraphStoreError(f"图存储连接失败：{type(exc).__name__}") from exc
 
 
