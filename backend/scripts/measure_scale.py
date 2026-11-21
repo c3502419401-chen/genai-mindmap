@@ -11,6 +11,17 @@
     中 ~5,600 字 16 份短摘要（`measure_graph_outline` 那批）
     大 ~66,000 字 4 份长文档（`measure_graph_two_pass` 那批）
 
+## 第一瓶颈那一轮加的 A/B：`--arm`
+
+`--arm a` 是**骨架只看主题**（加材料清单之前的行为），`--arm b` 是骨架看到清单
+（`_material_inventory`），`--arm both` 在**同一个进程里交替**跑两臂——本组指标有
+±5 的采样噪声（上一轮 A 臂重跑是 37 与 33 条），分组跑会把模型/网络的漂移算进差里，
+交替跑把它同时摊到两臂上。
+
+A 臂不是"另一份代码"：它只是把 `tools._material_inventory` 临时换成一个恒返回空串
+的函数，`_plan_ask` 收到 `materials=""` 后一个字都不加——与加清单之前**逐字节相同**
+（那条不变量有 `tests/test_plan_inventory.py` 钉着）。其余链路完全一致。
+
 ## 固定住的开关（否则量到的是别的东西）
 
     MINDMAP_SECTION_SLICE=0      12 章 → 12 次调用，变量太多（用户明确要求关）
@@ -18,26 +29,32 @@
     MINDMAP_GRAPH_SKELETON=0     两段式，同上
     MINDMAP_EXTERNAL_KNOWLEDGE=0 材料已定死，不许再补
     MINDMAP_RERANK=0             少一次网络往返，只影响选题
+    MINDMAP_NODE_SCALE           不设（= 关）：这一轮验的是"骨架给对分支数"能不能在
+                                 **不改节点配额**的前提下改善结果
 
 ## 指标
 
   材料：字数 / 份数 / `heading_outline` 条数 / 目录覆盖率
   图：  节点数 / 一级分支 / 深度分布 / 说明总字数 / 说明均长
   压缩比 = 材料字数 / 说明总字数（用户表的口径：`ab-two-pass.a1` = 66,532/11,924 = 5.6）
-  另外记：要点覆盖率（材料句子被节点文本覆盖的比例）——它是"压缩比"唯一缺的那一半，
-          见 `docs/` 自评一节。
+  另外记：要点覆盖率（材料句子被节点文本覆盖的比例）与**锚定率**（`source_refs`
+          区间并集 / 材料字数）——前者是"压缩比"缺的那一半，后者是唯一能区分
+          "这段是材料的"与"这段是模型自己的"的指标（见 `docs/GRAPH-SCALE.md` 第 6 节）。
 
 ## 用法
 
     python scripts/measure_scale.py --probe               # 只量材料，不跑模型
     python scripts/measure_scale.py                       # 三批 × 各 2 次
     python scripts/measure_scale.py --only small --repeat 1
+    python scripts/measure_scale.py --only medium --repeat 3 --arm both \\
+        --save data/scale-stock-medium.json                # 清单 A/B（交替）
     python scripts/measure_scale.py --save data/scale.json
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import sys
@@ -175,10 +192,33 @@ def _text_budget(content) -> dict:
     }
 
 
-async def _run_once(*, topic: str, branches: int, sources: list, scale: bool) -> dict:
+@contextlib.contextmanager
+def _arm(arm: str):
+    """A 臂 = 把材料清单摘掉（骨架只看主题）。
+
+    换掉的是**渲染器**而不是 `_plan_ask`：`_plan_ask` 拿到空串后的行为就是"加清单
+    之前"的行为（逐字节，有回归用例），所以 A 臂不需要第二份提示词代码。
+    """
+    if arm != "a":
+        yield
+        return
+    from app.agent import tools as tools_module
+
+    original = tools_module._material_inventory
+    tools_module._material_inventory = lambda *_args, **_kwargs: ""
+    try:
+        yield
+    finally:
+        tools_module._material_inventory = original
+
+
+async def _run_once(
+    *, topic: str, branches: int, sources: list, scale: bool, arm: str = "b",
+) -> dict:
     """跑一次整树生成。开关全部显式关掉——三批之间只许材料量变。
 
     `scale=True` 打开 `MINDMAP_NODE_SCALE`（节点数按材料伸缩）；默认关 = 现状。
+    `arm` 见 `_arm`：`a` = 骨架只看主题，`b` = 骨架看到材料清单。
     """
     from app.agent import tools as tools_module
     from app.agent.contracts import AgentRunRequest, RunBudget, RunContext, ToolCall
@@ -203,7 +243,8 @@ async def _run_once(*, topic: str, branches: int, sources: list, scale: bool) ->
                     arguments={"topic": topic, "branches": branches})
 
     started = time.perf_counter()
-    result = await registry.execute(call, ctx)
+    with _arm(arm):
+        result = await registry.execute(call, ctx)
     elapsed = time.perf_counter() - started
     if not result.ok:
         return {"ok": False, "content": result.content, "seconds": round(elapsed, 2)}
@@ -225,6 +266,9 @@ async def main(argv: list[str]) -> int:
     parser.add_argument("--probe", action="store_true")
     parser.add_argument("--scale", action="store_true",
                         help="打开 MINDMAP_NODE_SCALE（节点数按材料伸缩）；不设 = 现状")
+    parser.add_argument("--arm", default="b", choices=("a", "b", "both"),
+                        help="a=骨架只看主题（现状）；b=骨架看到材料清单；"
+                             "both=同一进程里交替跑两臂")
     parser.add_argument("--save", default="")
     args = parser.parse_args(argv)
 
@@ -240,7 +284,7 @@ async def main(argv: list[str]) -> int:
     wanted = [args.only] if args.only else ["small", "medium", "large"]
 
     report: dict = {"branches": args.branches, "scale": args.scale,
-                    "batches": {}, "runs": []}
+                    "arm": args.arm, "batches": {}, "runs": []}
     for key in wanted:
         batch = batches[key]
         probe = _materials_probe(batch["sources"])
@@ -271,54 +315,62 @@ async def main(argv: list[str]) -> int:
                 entities=200, links=400, scope=[source.id for source in batch["sources"]])
             entity_names = [item.name for item in entities]
 
+        # 交替跑：同一轮里先 A 后 B，再下一轮——漂移同时摊到两臂（见模块 docstring）。
+        arms = ["a", "b"] if args.arm == "both" else [args.arm]
         for index in range(1, args.repeat + 1):
-            print(f"\n=== {key} 第 {index} 次 ===", flush=True)
-            outcome = await _run_once(topic=batch["topic"], branches=args.branches,
-                                      sources=batch["sources"], scale=args.scale)
-            if not outcome["ok"]:
-                print(f"失败：{outcome['content']}", flush=True)
-                report["runs"].append({"batch": key, "sample": index, **outcome})
-                continue
-            content = outcome["content"]
-            data = outcome["data"]
-            depth = _depth_hist(content)
-            text = _text_budget(content)
-            cover = coverage_of(content, batch["sources"], entity_names)
-            stats = tree_stats(content)
-            codes = [item["code"] for item in (data.get("diagnostics") or [])]
-            chars = probe["chars"]
-            row = {
-                "batch": key, "sample": index, "ok": True,
-                "material_chars": chars,
-                "sources": probe["sources"],
-                "outline_entries": probe["outline_entries"],
-                "outline_usable": probe["outline_usable"],
-                "seconds": outcome["seconds"],
-                "nodes": stats["nodes"],
-                "branches": stats["branches"],
-                **depth, **text, **cover,
-                "compression": round(chars / text["detail_total"], 2) if text["detail_total"] else None,
-                "chars_per_node": round(chars / stats["nodes"], 1) if stats["nodes"] else None,
-                "node_limit": data.get("node_limit"),
-                "scaled": "NODE_SCALE_APPLIED" in codes,
-                "cut": "TREE_CLIPPED_TO_INITIAL" in codes,
-                "partial": bool(data.get("partial")),
-                "diagnostics": codes[:12],
-            }
-            report["runs"].append(row)
-            print(
-                f"节点 {row['nodes']}（{row['branches']} 支）｜层 {row['depth']} "
-                f"{row['depth_hist']}｜说明 {row['detail_total']:,} 字"
-                f"（均 {row['detail_avg']}，空 {row['detail_empty']}）"
-                f"｜上限 {row['node_limit']}"
-                f"｜**压缩比 {row['compression']}:1**"
-                f"｜要点覆盖 {row['point_coverage']:.1%}"
-                f"｜{row['seconds']}s", flush=True)
-            if args.save:
-                tree_path = Path(args.save).with_suffix(f".{key}{index}.json")
-                tree_path.write_text(
-                    json.dumps(content.model_dump(), ensure_ascii=False, indent=1),
-                    encoding="utf-8")
+            for arm in arms:
+                print(f"\n=== {key} 第 {index} 次 · {arm.upper()} 臂 ===", flush=True)
+                outcome = await _run_once(topic=batch["topic"], branches=args.branches,
+                                          sources=batch["sources"], scale=args.scale,
+                                          arm=arm)
+                if not outcome["ok"]:
+                    print(f"失败：{outcome['content']}", flush=True)
+                    report["runs"].append(
+                        {"batch": key, "sample": index, "arm": arm, **outcome})
+                    continue
+                content = outcome["content"]
+                data = outcome["data"]
+                depth = _depth_hist(content)
+                text = _text_budget(content)
+                cover = coverage_of(content, batch["sources"], entity_names)
+                stats = tree_stats(content)
+                codes = [item["code"] for item in (data.get("diagnostics") or [])]
+                chars = probe["chars"]
+                row = {
+                    "batch": key, "sample": index, "arm": arm, "ok": True,
+                    "material_chars": chars,
+                    "sources": probe["sources"],
+                    "outline_entries": probe["outline_entries"],
+                    "outline_usable": probe["outline_usable"],
+                    "seconds": outcome["seconds"],
+                    "nodes": stats["nodes"],
+                    "branches": stats["branches"],
+                    "branch_titles": [child.label for child in content.root.children],
+                    **depth, **text, **cover,
+                    "compression": round(chars / text["detail_total"], 2) if text["detail_total"] else None,
+                    "chars_per_node": round(chars / stats["nodes"], 1) if stats["nodes"] else None,
+                    "node_limit": data.get("node_limit"),
+                    "scaled": "NODE_SCALE_APPLIED" in codes,
+                    "cut": "TREE_CLIPPED_TO_INITIAL" in codes,
+                    "partial": bool(data.get("partial")),
+                    "diagnostics": codes[:12],
+                }
+                report["runs"].append(row)
+                print(
+                    f"节点 {row['nodes']}（{row['branches']} 支）｜层 {row['depth']} "
+                    f"{row['depth_hist']}｜说明 {row['detail_total']:,} 字"
+                    f"（均 {row['detail_avg']}，空 {row['detail_empty']}）"
+                    f"｜上限 {row['node_limit']}"
+                    f"｜**压缩比 {row['compression']}:1**"
+                    f"｜要点覆盖 {row['point_coverage']:.1%}"
+                    f"｜锚定 {row['chars_coverage']:.1%}"
+                    f"｜{row['seconds']}s", flush=True)
+                print(f"    一级分支：{row['branch_titles']}", flush=True)
+                if args.save:
+                    tree_path = Path(args.save).with_suffix(f".{key}{index}{arm}.json")
+                    tree_path.write_text(
+                        json.dumps(content.model_dump(), ensure_ascii=False, indent=1),
+                        encoding="utf-8")
 
     if args.save:
         Path(args.save).write_text(

@@ -4,6 +4,10 @@
 
     python scripts/summarize_scale.py            # 全部报告
     python scripts/summarize_scale.py --md       # 输出 markdown 表
+
+行里的 `arm` 是材料清单那一轮的 A/B（`a` = 骨架只看主题，`b` = 骨架看到清单）；
+更早的报告没有这个字段，显示成 `-`。`anchor`（锚定率）= `chars_coverage`：
+`source_refs` 的区间并集 / 材料字数，辨别"这段是材料的"与"这段是模型自己的"。
 """
 from __future__ import annotations
 
@@ -23,7 +27,17 @@ REPORTS = [
     ("scaled", "data/scale-scaled-medium.json"),
     ("branches16", "data/scale-medium-b16.json"),
     ("branches16+scaled", "data/scale-medium-b16-scaled.json"),
+    # 材料清单那一轮：中批（16 份 / 5,616 字，核心场景）与小批（1 份 / 492 字）。
+    ("inventory", "data/scale-stock-medium.json"),
+    ("inventory", "data/scale-stock-small.json"),
+    # 有抬头空间的那一档（请求 8 支）：验"清单能不能把宽度抬起来"，答案是不能。
+    ("inventory·b8", "data/scale-stock-medium-b8.json"),
 ]
+
+
+def _anchor(row: dict) -> str:
+    value = row.get("chars_coverage")
+    return f"{value:.1%}" if isinstance(value, (int, float)) else "-"
 
 
 def main(argv: list[str]) -> int:
@@ -32,9 +46,9 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
 
     if args.md:
-        print("| 组 | 批 | 材料字数 | 份 | 章 | 节点上限 | 节点 | 一级分支 | 层 | 说明总字数 "
-              "| 说明均长 | 压缩比 | 要点覆盖 | 秒 |")
-        print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+        print("| 组 | 臂 | 批 | 材料字数 | 份 | 章 | 节点上限 | 节点 | 一级分支 | 层 "
+              "| 说明总字数 | 说明均长 | 压缩比 | 要点覆盖 | 锚定率 | 秒 |")
+        print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for label, name in REPORTS:
         path = BACKEND / name
         if not path.exists():
@@ -44,24 +58,26 @@ def main(argv: list[str]) -> int:
             if not row.get("ok"):
                 continue
             hist = "-".join(str(value) for value in row["depth_hist"].values())
+            arm = (row.get("arm") or "-").upper()
             # 最早那份报告（`scale-smoke.json`）是在加 `node_limit` 字段之前跑的。
             limit = row.get("node_limit")
             limit_text = f"{limit:2d}" if isinstance(limit, int) else "  -"
             if args.md:
-                print(f"| {label} | {row['batch']} | {row['material_chars']:,} | "
+                print(f"| {label} | {arm} | {row['batch']} | {row['material_chars']:,} | "
                       f"{row['sources']} | {row['outline_entries']} | {limit_text} | "
                       f"{row['nodes']} | {row['branches']} | {row['depth']} | "
                       f"{row['detail_total']:,} | {row['detail_avg']} | "
                       f"{row['compression']}:1 | {row['point_coverage']:.1%} | "
-                      f"{row['seconds']} |")
+                      f"{_anchor(row)} | {row['seconds']} |")
             else:
-                print(f"{label:18s} {row['batch']:6s}#{row['sample']} "
+                print(f"{label:18s} {arm:2s} {row['batch']:6s}#{row['sample']} "
                       f"字数 {row['material_chars']:6,d} 份 {row['sources']:2d} "
                       f"章 {row['outline_entries']:2d} 上限 {limit_text} "
                       f"节点 {row['nodes']:2d} 支 {row['branches']} 层 {row['depth']} "
                       f"[{hist}] 说明 {row['detail_total']:5,d} 均 {row['detail_avg']:5.1f} "
                       f"压缩比 {row['compression']:5.2f} 覆盖 {row['point_coverage']:.1%} "
-                      f"裁剪 {'是' if row['cut'] else '否'} {row['seconds']}s")
+                      f"锚定 {_anchor(row):>6s} 裁剪 {'是' if row['cut'] else '否'} "
+                      f"{row['seconds']}s")
     return 0
 
 
