@@ -114,6 +114,7 @@ from app.mindmaps.edges import UNRESOLVED_ENDPOINT, clean_edges
 from app.knowledge.service import (
     EXTERNAL_SOURCE_KINDS,
     LEAF_MAX_CHARS,
+    OUTLINE_MAX_ITEMS,
     EvidenceHit,
     SourceFilter,
     filter_sources,
@@ -6156,6 +6157,11 @@ async def _slice_one(
     失败**不抛**（与第三段同一条原则）：这一章写不出来时，它的一级分支照样在树上
     （只是一个还没有要点的分支），别的章一个字都不受影响。整条路因为第 7 章失败而
     交出半张图，比"这一章空着"糟得多。
+
+    接的**不只有 `GenerationError`**：这条路把一次调用换成了 N 次，任何一次抛个别的
+    异常（httpx 超时、解析器意外的 TypeError）都会被 `gather` 原样抛出去，把另外
+    N-1 次已经付过钱的产出一起丢掉。所以这里兜 `Exception` 并记下类型——与
+    `_settle_halves` 在第三段做的同一件事（那里也只兜住非取消的那一半）。
     """
     if not ctx.reserve_model_call():
         report["skipped"] += 1
@@ -6165,7 +6171,7 @@ async def _slice_one(
     system = SECTION_SLICE_PROMPT + SECTION_SLICE_REF_RULES
     try:
         raw = await _chat(ctx, system, ask, max_tokens=_max_tokens(ctx))
-    except GenerationError as exc:
+    except Exception as exc:  # noqa: BLE001 — 失败的原因要回给人看，见 docstring
         report["failed"].append({"chapter": chapter.index, "title": chapter.title,
                                  "reason": _reason_text(exc)})
         return []
@@ -6226,6 +6232,19 @@ async def _slice_structure(
                 f"多出的 {len(plan.flat) - len(chapters)} 条没有原文可写，已丢弃"
             ),
         ))
+    covered = sum(chapter.chars for chapter in chapters)
+    if covered < len(text):
+        # 目录被 `_trim_outline` 裁过（`OUTLINE_MAX_ITEMS = 30`，40 章的材料会撞上），
+        # 于是有一截正文不属于任何一章。**不阻断**（切出来的章仍然正确、互不相交），
+        # 但要说出来：那一段的覆盖率恒为 0，不说明的话它就是"模型没写"。
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.info, code="SECTION_SLICE_PARTIAL_COVERAGE",
+            message=(
+                f"目录只切出 {len(chapters)} 章、覆盖 {covered}/{len(text)} 字"
+                f"（目录上限 {OUTLINE_MAX_ITEMS} 条），剩下 {len(text) - covered} 字"
+                "不属于任何一章，这部分不会有节点引用它"
+            ),
+        ))
     budget = _slice_budget(len(chapters))
     report: dict[str, Any] = {
         "chapters": len(chapters),
@@ -6253,6 +6272,12 @@ async def _slice_structure(
     subtrees = await asyncio.gather(*(run(chapter) for chapter, _ in aligned))
     report["seconds"] = round(time.perf_counter() - started, 3)
     report["calls"] = len(chapters) - report["skipped"]
+    # 结束帧与开始帧配对（`_emit_stage` 的既有约定，第三段与外部检索都是这么做的）：
+    # 只在开始那一帧，界面会把"正在按 12 章分别写结构"一直挂到第三段开始。
+    await _emit_stage(
+        ctx, SECTION_SLICE_STAGE,
+        f"已写完 {len(subtrees) - len(report['failed']) - report['skipped']}"
+        f"/{len(chapters)} 章的子树", count=report["calls"])
 
     children: list[dict[str, Any]] = []
     for (chapter, branch), subtree in zip(aligned, subtrees):

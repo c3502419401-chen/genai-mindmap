@@ -429,6 +429,53 @@ def test_switch_on_records_failed_chapters_without_dropping_the_tree(monkeypatch
     assert result.data["planned_branches"] == 12
 
 
+def test_switch_on_survives_a_non_generation_error_in_one_chapter(monkeypatch):
+    """某一章抛的不是 `GenerationError`：另外 11 章的结果必须落地。
+
+    这条路把一次调用换成 N 次，任何一次抛个别的异常（超时包装、解析器意外）都会被
+    `gather` 原样抛出去，把已经付过钱的产出一起丢掉——所以兜的是 `Exception`。
+    """
+    monkeypatch.setenv("MINDMAP_SECTION_SLICE", "1")
+
+    async def chat(system: str, user: str, *, max_tokens=None, on_delta=None) -> dict:
+        if system.startswith(PLAN_PROMPT):
+            return _skeleton()
+        if system.startswith(SECTION_SLICE_PROMPT):
+            if "第 3 章" in user:
+                raise ValueError("解析器意外")
+            return {"children": [{"label": "要点"}]}
+        if system.startswith(DETAIL_ONLY_PROMPT):
+            return {}
+        return {}
+
+    result = _run(chat)
+    assert result.ok, result.content
+    assert result.data["section_slice"]["failed_chapters"] == [3]
+    assert "ValueError" in result.data["diagnostics"][0]["message"]
+    assert result.data["planned_branches"] == 12
+
+
+def test_switch_on_says_so_when_the_outline_is_trimmed(monkeypatch):
+    """目录被 `OUTLINE_MAX_ITEMS` 裁掉几章时：切出来的章仍正确，但要说清有一截没归属。
+
+    不说的话，那几章的覆盖率恒为 0，读起来像"模型没写"。
+    """
+    monkeypatch.setenv("MINDMAP_SECTION_SLICE", "1")
+    body = ["# 四十章"]
+    for index in range(1, 41):
+        # 章越长越靠前（`_trim_outline` 按 coverage 降序保留前 30 条）
+        body.append(f"## 章{index}\n\n" + "正文。" * (60 - index))
+    source = Source(id="s-40", kind=SourceKind.markdown, status="parsed",
+                    filename="forty.md", text="\n".join(body))
+    chapters = _chapter_slices([source])
+    assert 2 <= len(chapters) <= 30, "切出来的章数不该超过目录上限"
+    assert sum(chapter.chars for chapter in chapters) < len(source.text)
+
+    result = _run(_chat(), source=source)
+    assert result.ok, result.content
+    assert "SECTION_SLICE_PARTIAL_COVERAGE" in _codes(result)
+
+
 @pytest.mark.parametrize("depth", [SECTION_SLICE_DEPTH])
 def test_depth_constant_is_two_so_a_chapter_gets_two_levels(depth):
     """`INITIAL_MAX_DEPTH=3`：root → 分支 → 两层。新路不分组，所以这一笔账是干净的。"""
