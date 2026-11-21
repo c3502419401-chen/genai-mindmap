@@ -453,6 +453,17 @@ EXTERNAL_OFF_NOTE = "你在设置里关掉了联网检索"
 # `count`、结束一帧带条数），所以前端不用为它分叉。
 DETAIL_STAGE = "detail"
 
+# 「按章切」那条路的结构 `stage` 帧标识。它与 `DETAIL_STAGE` 是**两段不同的等待**：
+# 这条路把结构那一次调用换成了 N 次（实测 12 章 15–25 秒），而界面在这段时间里同样
+# 一个节点都不长（`node_grow` 只服务整树那一次的输出流）。文案由 `detail` 承载，
+# 这个标识只用于前端与日志区分"卡在哪一段"。
+SECTION_SLICE_STAGE = "section_slice"
+
+# 一条引文的上限。与 `SourceRef.quote` 的 `max_length=300` 同源（那边是硬边界）：
+# 模型偶尔会抄一整段，超过 300 时**截断**而不是整条丢掉——截断留下的是真原文，
+# 丢掉留下的是零引用。提示词里写的也是这个数（`SECTION_SLICE_REF_RULES`）。
+SECTION_SLICE_QUOTE_CHARS = 300
+
 # 用户**自己把联网检索关掉**时的那句话。单独提成常量有两个理由：
 #
 #   - 它与"搜了但没搜到"是两件事（那条说"联网检索没有找到相关资料"），而两条路
@@ -2920,6 +2931,153 @@ def _full_text_sections(sources: list[Source]) -> list[str]:
     return sections
 
 
+# ------------------------------------------ 按章切：每支只给它那一章的原文（实验开关）
+#
+# 这条路做的是什么，一句话：**骨架定好之后，每支一次调用，输入里只有它自己那一章的
+# 原文**。第二段（结构）的产物仍然是一棵树，第三段（`_fill_details`）一个字都没改。
+#
+# 与既有三条路的差别只有一处，但那一处正是这次要考的：
+#
+#   - 一次生成 + 全塞（现状）：整份 14,120 字都进同一个 prompt，一次写整棵树。模型
+#     能看住全局（跨支重复 0），但几十段内容挤在一次输出里，注意力被摊薄；
+#   - 分片（已删）：每支各自【检索】top_k=3。那是**全局检索**，兄弟支的内容会被
+#     捞进它的输入，于是它能写出别人已经写过的话——库里那 6 处跨支重复就是这么来的；
+#   - **按章切（本开关）**：每支只看见自己那一章。兄弟支的内容不在它的输入里，
+#     它写不出重复——这不是"提示词让它别重复"，是**机制上没有可重复的材料**。
+#
+# 为什么切得动：`OutlineEntry.start` / `coverage` 天生就是这个章节在原文里的区间
+# （`text[start : start + coverage]`）。而 `_outline_lines` **只收一个级别**——markdown
+# 取"井号最少且至少 `OUTLINE_MIN_ITEMS` 条"的那一级，编号行取最高频的那一级——所以
+# 切出来的章**互相不相交**，每章包含它自己的 `###` 子节。实测 `docs/RAG-DECISIONS.md`：
+# `#`×1 / `##`×12 / `###`×18 → 取 `##` 这一级收到 12 条，Σ coverage = 13,959 / 14,120
+# = 98.9%（缺的 161 字是文件导语，见 `_chapter_slices` 怎么处理它）。
+#
+# 默认**关**（写法与 `MINDMAP_GRAPH_SKELETON` 一致）：它是 A/B 的一臂，而且这条路把
+# 结构那一次调用换成 N 次，代价是实打实的 token。翻默认值之前先要有一组数字。
+SECTION_SLICE_ENV = "MINDMAP_SECTION_SLICE"
+
+# 每章进 prompt 的原文字数上限。取值不是配平，是两个数：
+#
+#   - 这份材料的章长是 144–2,894 字（实测 `docs/RAG-DECISIONS.md` 的 12 章），所以这个
+#     上限在真实材料上**基本不触发**；它防的是"一章一万多字"那种极端章（`docs/PLAN.md`
+#     最长一章 11,697 字）；
+#   - 8,000 字按 `estimate_input_tokens` 的 1.5 字/token 折算是约 5.3k token，加上
+#     system 与主题，一次调用约 7k token 输入——离 `CONTEXT_TOKEN_LIMIT`（二十万）很远。
+#     所以这个上限守的不是"装不下"，而是"给一章 5k token 的原文已经够它写出这一章的
+#     所有要点，再多买到的是注意力分散"。
+SECTION_SLICE_MAX_CHARS = 8_000
+
+# 每支（每章）能写几个节点：**平分**，不是"自由写然后裁"。
+#
+# `INITIAL_MAX_NODES = 80` 是全树的上限，而 12 支各写一棵子树时谁都不知道别人写了
+# 多少——自由写的总量会到 200+，然后 `_clip_tree` **按前序裁尾巴**：被整支砍掉的恰好
+# 是最后几章，于是"每章覆盖率"在尾部直接归零，而尾部归零正是这次要消掉的失效形态。
+# 平分让每章先拿到确定的份额（80 - 1 根 - 12 支 = 67，67 // 12 = 5 个后代/支），
+# 总量恒在上限之内，覆盖率也就有了可解释的分母。
+SECTION_SLICE_MIN_PER_BRANCH = 3
+
+# 每支子树最多几层（**不含分支本身**，即分支下还能有几层后代）。
+# `INITIAL_MAX_DEPTH = 3` 是 root 之下的层数：root(第 0 层) → 分支(第 1 层) → 两层
+# 后代正好用完。新路不请求两级骨架（分组会再吃一层），所以这一笔账是干净的。
+SECTION_SLICE_DEPTH = 2
+
+# 同时发几条请求。12 章串行按单次 5 秒算是 60 秒；四路并发是 3 轮。不取更大：
+# DeepSeek 有 RPM 约束，而这条路本来就要付 N 次调用的钱——把并发拉到 8 换来的墙钟
+# 收益，抵不上被限流之后重试的代价。
+SECTION_SLICE_CONCURRENCY = 4
+
+
+def section_slice_enabled() -> bool:
+    """按章切开关。默认**关**：A/B 要能同一条命令切换（`MINDMAP_SECTION_SLICE=1`）。
+
+    默认关的第二个理由与 `graph_skeleton_enabled` 不同：这条路不依赖任何外部服务，
+    但它**改变调用次数**（4 次变 4+N 次）。一个改变账单的默认值不该悄悄生效。
+    """
+    return os.getenv(SECTION_SLICE_ENV, "").strip().lower() in GRAPH_SKELETON_TRUTHY
+
+
+@dataclass(frozen=True)
+class _Chapter:
+    """一章原文——这条路**唯一**的输入单位。
+
+    `start` / `end` 是**原文里的绝对偏移**（码点），与 `SourceRef.start` 同一口径，
+    所以模型抄回来的 quote 可以直接在这一段里定位、直接写成引用坐标。
+    """
+
+    index: int          # 1 起：提示词里的"第 N 章"与节点 id 的序号都用它
+    title: str
+    source_id: str
+    start: int
+    end: int
+    chars: int          # 这一章原始字数（`end - start`，含被截掉的那部分）
+    prompt_text: str    # 实际进 prompt 的那一段（超上限时是前缀）
+    truncated: bool
+
+
+def _chapter_slices(sources: Sequence[Source]) -> list[_Chapter]:
+    """把材料切成**每章一段**。空列表 = 这条路这次走不了（调用方退回现状）。
+
+    三条前置条件，任一条不成立都返回空，**不报错**（与 `_graph_outline` 的降级同一条
+    原则：能力不可用时沉默退回改动之前的行为）：
+
+      - **恰好一份材料**：`OutlineEntry.start` 是"那一段文本内部"的偏移，多份材料时
+        这个数无法归属——拿 B 材料的偏移去切 A 材料，切出来的是一段随机文本；
+      - 目录可用：`heading_outline` 非空，覆盖率 ≥ `OUTLINE_MIN_COVERAGE`——与
+        `_skeleton_outline` 拼进骨架 prompt 的是**同一份**判据，否则"骨架按目录分、
+        按章切按另一份目录切"，两边对不上；
+      - 至少两章：一章就是"整份材料"，那不叫切章。
+
+    **第 1 章吃掉文件导语**（`[0, 第 1 章标题)` 那 161 字）：`coverage` 从标题算起，
+    导语不属于任何一章，而它常常写着"本文的结论是…"。不补的话全文总有 1% 的内容
+    任何一支都拿不到——`outline_coverage` 报的 98.9% 就是这么来的，这个函数把它补成
+    100%，于是"每章覆盖率"的分母是全文而不是"被目录管住的那部分"。
+    """
+    usable = [source for source in sources if (source.text or "").strip()]
+    if len(usable) != 1:
+        return []
+    source = usable[0]
+    text = source.text or ""
+    entries = heading_outline([source])
+    if len(entries) < 2:
+        return []
+    if outline_coverage([source], entries) < OUTLINE_MIN_COVERAGE:
+        return []
+    chapters: list[_Chapter] = []
+    for index, entry in enumerate(entries):
+        # 第 1 章从 0 开始（吃掉导语），其余从自己的标题行开始。
+        start = 0 if index == 0 else entry.start
+        end = min(len(text), entry.start + entry.coverage)
+        if end <= start:
+            continue
+        body = text[start:end]
+        truncated = len(body) > SECTION_SLICE_MAX_CHARS
+        chapters.append(_Chapter(
+            index=len(chapters) + 1,
+            title=entry.title,
+            source_id=source.id,
+            start=start,
+            end=end,
+            chars=end - start,
+            prompt_text=body[:SECTION_SLICE_MAX_CHARS],
+            truncated=truncated,
+        ))
+    return chapters
+
+
+def _slice_budget(chapters: int) -> int:
+    """每支子树能写几个节点（含分支节点自己）：平分 `INITIAL_MAX_NODES`。
+
+    `80 - 1 - N` 是"扣掉根与 N 个分支之后剩下的"，再按 N 平分——所以 12 章时每支拿到
+    6 个（分支 + 5 个后代），12 × 6 + 1 = 73 ≤ 80。下限 `SECTION_SLICE_MIN_PER_BRANCH`
+    兜的是"章多到平分下来不够写"的情形（30 章时平分只有 1 个），这时宁可口子略大、
+    交给既有的 `_clip_tree` 收尾，也不让某一章只剩一个光秃秃的标题。
+    """
+    if chapters <= 0:
+        return SECTION_SLICE_MIN_PER_BRANCH
+    share = (INITIAL_MAX_NODES - 1 - chapters) // chapters
+    return max(SECTION_SLICE_MIN_PER_BRANCH, share)
+
+
 def _plan_ask(
     topic: str, branches: int, *, outline: str = "", diagram_type: str = "tree",
 ) -> str:
@@ -2962,6 +3120,85 @@ def _plan_ask(
             "同时给出 problem——**主骨上那一句**「为什么 X 会 Y」，40 字以内，"
             "不要复读主题，也不要写成原因或名词短语。")
     return "\n".join(parts)
+
+
+# 按章切第二步：**一次调用只写一章的子树**。
+#
+# 与 `BRANCH_EXPAND_PROMPT`（分片那条路的逐支展开）的差别是输入侧，不是输出侧：
+# 那边给的是"这一支的检索命中"，这里给的是"这一章的完整原文"。产出形状也不同——
+# 那边只要一层（`{"children":[...]}`，字符串或对象都收），这里要能表达"这一章里
+# 还有下级"，所以是嵌套的 `children`，层数由 `SECTION_SLICE_DEPTH` 夹住。
+#
+# 三条硬要求都写在 system 里而不是 user 末尾，除了**引用**那一段：引用规则必须紧挨着
+# 输出位置说（`_generate` 的"全塞"那一段与 `_detail_ask` 的自查句是同一个教训——
+# system 里那句距离输出隔着一万字时，模型一条引用都不写）。
+SECTION_SLICE_PROMPT = (
+    "你在为一棵思维导图的**一条一级分支**写它下面的结构。这一次只写这一支，"
+    "别的分支由别的调用各自去写，你看不到、也不需要管它们。"
+    "只返回一个 JSON 对象，不要代码围栏，格式为 "
+    '{"children":[{"label":"要点一","children":[{"label":"细节"}]},'
+    '{"label":"要点二"}]}。'
+    # 层级与深度必须说清：给的是"这一章"的原文，而一章里通常有一个 `###` 级的结构，
+    # 模型不被告知上限时会一路拆到叶子，把一层的预算摊成四层。
+    "children 里可以再套 children 表达下级，但**最多两层**："
+    "第一层是这一章的主要方面，第二层是那方面的具体要点。"
+    "每个节点的 label 是一句话短语，不超过 "
+    f"{GENERATED_LABEL_MAX_CHARS} 字，不带句号。"
+    # 与 `_SKELETON_BODY` 逐字同源的那一条：这一轮不写说明，说明由第三段统一写。
+    "**这一轮不要写 detail**：每个节点都不要带 detail 字段，说明由紧接着的一次调用"
+    "统一补写。省下来的输出额度用在层级与要点上。\n"
+    # "只写这一章有依据的内容"是这条路与分片最大的行为差别，必须明写：模型知道输入
+    # 是"某一章的原文"之后，倾向会把这一章里没提的东西也按自己的知识补进来（补出来
+    # 的内容没有引用可挂，覆盖率的分母就白算了）。
+    "只写这一章原文里**确有依据**的内容：原文没提到的方面不要凭印象补，"
+    "宁可这一支少几个节点，也不要把别处的内容搬进来。"
+    "同级之间不要写同一个标题（重复的说法会被画成两块）。\n"
+)
+
+# 引用规则：**拼在** system 之后。与 `FULL_TEXT_EVIDENCE_RULES` 同源，只改一处——
+# 范围从"全部材料"收窄到"这一章"，因为模型的输入本来就是这一章，而"只能从本章抄"
+# 是这条路唯一能在机制上成立的引用约束（跨章的句子它根本看不见）。
+SECTION_SLICE_REF_RULES = (
+    "\nuser 消息末尾是**这一章的完整原文**（不是检索片段）。"
+    '引用写在节点自己的 source_refs 数组里，例如 {"source_id":"…","quote":"…"}；'
+    "source_refs 与 label 平级，不要写进任何文字字段。"
+    "quote 必须**逐字**照抄上面原文里连续的一段（不超过 300 字），"
+    "不要改写、不要概括；start / end 不用写（服务端会按这一章的范围定位并补上），"
+    "page 不用写。**凡是内容出自这一章，就必须给这个节点挂一条 source_refs**；"
+    "只有你自己补充的内容才给空数组——不挂引用是对的，编造不是。\n"
+)
+
+
+def _slice_ask(
+    topic: str, chapter: _Chapter, *, budget: int, depth: int,
+) -> str:
+    """按章切的 user 消息：主题 + 这一支是第几章 + 这一章的原文。
+
+    顺序刻意是「主题 → 这一支是谁 → 原文 → 收尾要求」：与 `_plan_ask` 把目录放在
+    主题之后同一条理由——先给它身份与范围，再给它材料。收尾要求（预算与引用）放在
+    原文**之后**，因为模型对紧挨着输出位置的那句话最敏感。
+
+    `budget` 是**含这一支自己**的节点数上限，`depth` 是分支下还能有几层：两个数都
+    来自代码侧的预算（`_slice_budget` / `SECTION_SLICE_DEPTH`），不写进提示词时模型
+    会按"这一章看起来有多少内容"自由发挥，12 支的总量就没人守得住。
+    """
+    descendants = max(1, budget - 1)
+    tail = [
+        f"\n这一支（含它自己）最多 {budget} 个节点，也就是下面最多写 {descendants} 个，"
+        f"最多 {depth} 层；宁可少写几个，也不要把一个要点拆成两句。",
+    ]
+    if chapter.truncated:
+        tail.append(
+            f"（这一章原文共 {chapter.chars} 字，为控制单次输入只给了前 "
+            f"{SECTION_SLICE_MAX_CHARS} 字；没给到的部分不要凭空补。）")
+    return (
+        f"主题：{topic}\n\n"
+        f"这一支是材料「第 {chapter.index} 章」：{chapter.title}\n"
+        f"（本章 {chapter.chars} 字，source_id={chapter.source_id}）\n\n"
+        "下面是这一章的全部原文：\n\n"
+        f"{chapter.prompt_text}\n"
+        + "\n".join(tail)
+    )
 
 
 # 分片生成第二步：按骨架逐支展开。与 `EXPAND_PROMPT` 的差别只有上下文——
@@ -5765,6 +6002,314 @@ def _graph_outline(
     return GRAPH_OUTLINE_HEADER + "\n" + _graph_block(entities, links), len(entities)
 
 
+def _count_dict_nodes(nodes: list[dict[str, Any]]) -> int:
+    """还没过契约校验的裸 dict 树里有多少个节点（含它们自己）。"""
+    return sum(1 + _count_dict_nodes(node.get("children") or []) for node in nodes)
+
+
+def _slice_nodes(
+    raw: Any, *, prefix: str, budget: int, depth: int,
+) -> list[dict[str, Any]]:
+    """模型返回的 `children` → 组装用的节点列表（id 由这里给，label 由这里裁）。
+
+    **宽容解析**（与 `_skeleton_branches` 收两种形状同一条理由）：模型可能给
+    `{"children":[...]}`、`{"points":[...]}`，也可能直接给一个数组。三样都收——
+    形状不对时把它整支判废，代价是这一章白花一次调用，而收下来的信息是好的。
+
+    **id 在这里生成**（`{prefix}-1-2` 这样的路径编号）：模型写 id 会让 12 支各写一遍
+    `n1`、`n2`，撞号之后 `MindMapContent` 的 id 唯一性校验会把整棵树判废。确定性
+    编号同时让"重跑一次"可复现。
+
+    **两个上限都在这里落**：`depth`（分支下还能有几层）与 `budget`（含分支自己的
+    节点数）。超预算的节点按前序丢掉——与 `_clip_tree` 的方向一致，只是发生在**每一
+    支内部**，所以不会出现"整支被砍掉"。
+    """
+    if isinstance(raw, dict):
+        children = raw.get("children")
+        if not isinstance(children, list):
+            children = raw.get("points")
+    elif isinstance(raw, list):
+        children = raw
+    else:
+        children = None
+    if not isinstance(children, list):
+        return []
+    remaining = [max(0, budget - 1)]
+
+    def walk(items: list[Any], path: tuple[int, ...], level: int) -> list[dict[str, Any]]:
+        built: list[dict[str, Any]] = []
+        for item in items:
+            if remaining[0] <= 0 or level > depth:
+                break
+            if isinstance(item, str):
+                label, refs, nested = item, [], []
+            elif isinstance(item, dict):
+                label = item.get("label")
+                refs = item.get("source_refs")
+                nested = item.get("children") if isinstance(item.get("children"), list) else []
+            else:
+                continue
+            title = clip_label(label.strip()) if isinstance(label, str) else ""
+            if not title:
+                continue
+            remaining[0] -= 1
+            index = len(built) + 1
+            node = {
+                "id": f"{prefix}-{'-'.join(str(part) for part in (*path, index))}",
+                "label": title,
+                "children": walk(nested, (*path, index), level + 1),
+            }
+            # **这一轮不写 detail**：组装时一律留空，第三段统一补（与
+            # `_SKELETON_BODY` 的约定同一条）。模型偶尔仍会写，直接丢掉——
+            # 保留它会让"结构那一轮写了 30 字"混进 detail 统计，那是另一类问题。
+            if isinstance(refs, list) and refs:
+                node["source_refs"] = refs
+            built.append(node)
+        return built
+
+    return walk(children, (), 1)
+
+
+def _locate_in_chapter(
+    text: str, quote: str, window: tuple[int, int],
+) -> tuple[str, tuple[int, int] | None]:
+    """在**这一章的范围里**定位引文：`("unique", (start,end))` / `("ambiguous", None)`
+    / `("missing", None)`。
+
+    与 `optimization.source_refs._locate_quote` 是同一个判据，只多一条范围限制——
+    这正是"start / end **从这一章里算**"的实现：模型只抄 quote，偏移由服务端在
+    `[章首, 章末)` 内数出来。让模型自己数偏移是行不通的（`_full_text_sections` 的
+    注释里已经踩过一次：一万字进 prompt 之后它的坐标感不可靠）。
+
+    多处命中不猜：猜一个坐标比没有坐标更糟（`_locate_quote` 的原话）。这时把 quote
+    留着、不带偏移，下游的逐字校验会把它标成「待核」并保留。
+    """
+    if not quote:
+        return "missing", None
+    low, high = window
+    positions: list[int] = []
+    position = text.find(quote, low)
+    while 0 <= position and position + len(quote) <= high:
+        positions.append(position)
+        position = text.find(quote, position + 1)
+    if len(positions) == 1:
+        return "unique", (positions[0], positions[0] + len(quote))
+    return ("ambiguous", None) if positions else ("missing", None)
+
+
+def _slice_refs(
+    nodes: list[dict[str, Any]], chapter: _Chapter, text: str, report: dict[str, Any],
+) -> None:
+    """把每支子树的 `source_refs` 落到本章坐标上（就地改）。
+
+    三件事，都只在这一处做：
+
+      - `source_id` **强制**成这一章的来源：模型只看到一个来源，写错就是笔误，纠正它
+        比丢一条真引用好；
+      - `quote` 截到 `SECTION_SLICE_QUOTE_CHARS` 以内（与提示词里那句"不超过 300 字"同源，
+        模型写长了不该整条作废）；
+      - 偏移由 `_locate_in_chapter` 在本章范围内数出来：唯一就写 `start/end`，
+        多处就只留 quote，找不到就**丢掉这条引用**（节点保留）并记数。
+
+    最后那一条是这条路的机制保证：引用只可能落在它自己那一章里，所以"每章覆盖率"
+    这个指标不会被跨章引用污染。
+    """
+    window = (chapter.start, chapter.end)
+    stack = list(nodes)
+    while stack:
+        node = stack.pop()
+        refs = node.get("source_refs")
+        if isinstance(refs, list):
+            kept: list[dict[str, Any]] = []
+            for ref in refs:
+                quote = ref.get("quote") if isinstance(ref, dict) else None
+                if not isinstance(quote, str) or not quote.strip():
+                    report["refs_dropped"] += 1
+                    continue
+                quote = quote.strip()[:SECTION_SLICE_QUOTE_CHARS]
+                outcome, fix = _locate_in_chapter(text, quote, window)
+                if outcome == "missing":
+                    report["refs_dropped"] += 1
+                    continue
+                entry: dict[str, Any] = {"source_id": chapter.source_id, "quote": quote}
+                if fix is not None:
+                    entry["start"], entry["end"] = fix
+                    report["refs_located"] += 1
+                else:
+                    report["refs_ambiguous"] += 1
+                kept.append(entry)
+            if kept:
+                node["source_refs"] = kept
+            else:
+                node.pop("source_refs", None)
+        children = node.get("children")
+        if isinstance(children, list):
+            stack.extend(children)
+
+
+async def _slice_one(
+    chapter: _Chapter, *, topic: str, budget: int, ctx: RunContext,
+    text: str, report: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """一章一次调用：发出去、解析、把引用落到本章坐标上。失败时返回空列表。
+
+    失败**不抛**（与第三段同一条原则）：这一章写不出来时，它的一级分支照样在树上
+    （只是一个还没有要点的分支），别的章一个字都不受影响。整条路因为第 7 章失败而
+    交出半张图，比"这一章空着"糟得多。
+    """
+    if not ctx.reserve_model_call():
+        report["skipped"] += 1
+        return []
+    ctx.extra_model_calls += 1
+    ask = _slice_ask(topic, chapter, budget=budget, depth=SECTION_SLICE_DEPTH)
+    system = SECTION_SLICE_PROMPT + SECTION_SLICE_REF_RULES
+    try:
+        raw = await _chat(ctx, system, ask, max_tokens=_max_tokens(ctx))
+    except GenerationError as exc:
+        report["failed"].append({"chapter": chapter.index, "title": chapter.title,
+                                 "reason": _reason_text(exc)})
+        return []
+    nodes = _slice_nodes(
+        raw, prefix=f"s{chapter.index}", budget=budget, depth=SECTION_SLICE_DEPTH)
+    _slice_refs(nodes, chapter, text, report)
+    return nodes
+
+
+def _align_chapters(
+    plan: _SkeletonPlan, chapters: Sequence[_Chapter],
+) -> list[tuple[_Chapter, _SkeletonBranch | None]]:
+    """把骨架的分支与材料的章对起来：`[(章, 骨架分支或 None)]`，**按章的顺序**返回。
+
+    对齐规则只有一条：**按标题匹配优先，序号兜底**（与 `_apply_skeleton` 套颜色时
+    同一条判据——那里也是 label 优先、序号兜底）。三条边界各自有归宿：
+
+      - 骨架给了 12 支、材料 12 章：名字能对上就按名字，对不上按序号（模型可能真的
+        换了顺序，也可能只是改了一个字）；
+      - 骨架给的比章少：缺的那几章补出来（`branch=None`，只少一个颜色/图标，
+        内容照写）——**宁可多一支，也不要让某一章没有支**，那正是"每章覆盖率"要防的；
+      - 骨架给的比章多：多出来的支没有章可给，丢弃并让调用方记一条诊断。给一支
+        无内容的空分支比丢掉它更糟：画布上会多一个点不开的节点。
+    """
+    by_key = {_skeleton_key(branch.label): branch for branch in plan.flat}
+    used: set[str] = set()
+    aligned: list[tuple[_Chapter, _SkeletonBranch | None]] = []
+    ordered = list(plan.flat)
+    for index, chapter in enumerate(chapters):
+        key = _skeleton_key(chapter.title)
+        branch = by_key.get(key)
+        if branch is not None and key not in used:
+            used.add(key)
+        elif index < len(ordered) and _skeleton_key(ordered[index].label) not in used:
+            branch = ordered[index]
+            used.add(_skeleton_key(branch.label))
+        else:
+            branch = None
+        aligned.append((chapter, branch))
+    return aligned
+
+
+async def _slice_structure(
+    *, topic: str, chapters: Sequence[_Chapter], plan: _SkeletonPlan,
+    ctx: RunContext, text: str, diagnostics: list[Diagnostic],
+) -> tuple[Any, dict[str, Any]]:
+    """第二段的替代实现：**每章一次调用**，返回组装好的整树 `raw` 与这一段的账。
+
+    返回的形状（`{"title":…, "root":{…}}`）与"一次写完"那条路**完全一样**，所以
+    它下面的收尾（校验 / 套色 / 裁剪 / 第三段 / 重复检测）一行都不用改。
+    """
+    aligned = _align_chapters(plan, chapters)
+    if len(plan.flat) > len(chapters):
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.info, code="SECTION_SLICE_BRANCH_DROPPED",
+            message=(
+                f"骨架给了 {len(plan.flat)} 条一级分支，材料只有 {len(chapters)} 章，"
+                f"多出的 {len(plan.flat) - len(chapters)} 条没有原文可写，已丢弃"
+            ),
+        ))
+    budget = _slice_budget(len(chapters))
+    report: dict[str, Any] = {
+        "chapters": len(chapters),
+        "per_branch_nodes": budget,
+        "depth": SECTION_SLICE_DEPTH,
+        "truncated": [chapter.index for chapter in chapters if chapter.truncated],
+        "failed": [],
+        "skipped": 0,
+        "nodes": 1,                 # 根节点
+        "refs_located": 0,
+        "refs_ambiguous": 0,
+        "refs_dropped": 0,
+    }
+    started = time.perf_counter()
+    await _emit_stage(
+        ctx, SECTION_SLICE_STAGE,
+        f"正在按 {len(chapters)} 章分别写结构（每次只给它这一章的原文）…")
+    limit = asyncio.Semaphore(SECTION_SLICE_CONCURRENCY)
+
+    async def run(chapter: _Chapter) -> list[dict[str, Any]]:
+        async with limit:
+            return await _slice_one(
+                chapter, topic=topic, budget=budget, ctx=ctx, text=text, report=report)
+
+    subtrees = await asyncio.gather(*(run(chapter) for chapter, _ in aligned))
+    report["seconds"] = round(time.perf_counter() - started, 3)
+    report["calls"] = len(chapters) - report["skipped"]
+
+    children: list[dict[str, Any]] = []
+    for (chapter, branch), subtree in zip(aligned, subtrees):
+        node: dict[str, Any] = {
+            "id": f"s{chapter.index}",
+            "label": clip_label(chapter.title),
+            "children": subtree or [],
+        }
+        # 颜色/图标照骨架那一份给：`_apply_skeleton` 后面还会按 label / 序号套一次，
+        # 但那时它读的是**落树后的一级分支顺序**，而这里正是那个顺序的来源。
+        if branch is not None and branch.color is not None:
+            node["color"] = branch.color
+        children.append(node)
+    # 这一段的节点数是**组装后的真实数**（含每支的两层后代），不是各支顶层要点之和
+    # ——后者会少算一层，读 `data.section_slice.nodes` 的人会以为这条路只写了三十几个。
+    report["nodes"] = 1 + sum(1 + _count_dict_nodes(child["children"]) for child in children)
+    if report["failed"]:
+        failed = report["failed"]
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="SECTION_SLICE_CALL_FAILED",
+            message=(
+                f"{len(failed)} 章的子树没有写出来（"
+                + "、".join(f"第 {item['chapter']} 章" for item in failed[:5])
+                + ("…" if len(failed) > 5 else "")
+                + "）：这些章的一级分支仍在树上，只是还没有要点。原因："
+                + failed[0]["reason"]
+            ),
+        ))
+    if report["skipped"]:
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="SECTION_SLICE_NO_BUDGET",
+            message=(
+                f"模型调用额度不够：{report['skipped']} 章的结构没有生成请求，"
+                "这些章的一级分支仍是空的"
+            ),
+        ))
+    if report["refs_dropped"]:
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.info, code="SECTION_SLICE_REF_DROPPED",
+            message=(
+                f"{report['refs_dropped']} 条引用写的内容不在它自己那一章的原文里，"
+                "已丢弃（引用必须落在本章内，否则「每章覆盖率」就没有意义）；"
+                f"另有 {report['refs_ambiguous']} 条在本章内出现多次，只保留了引文"
+            ),
+        ))
+    raw = {
+        "title": topic,
+        "diagram_type": "tree",
+        "root": {
+            "id": "root",
+            "label": topic,
+            "children": children,
+        },
+    }
+    return raw, report
+
+
 async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     """整树生成：**骨架一次、每支检索一次、结构一次、只写说明一到两次**。
 
@@ -5903,6 +6448,32 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     # 的边没有时间轴），鱼骨是六个固定类别（换一套分类就不再是鱼骨图）。两条路继续
     # 走三段式——这不是偷懒，是那两种图型的"一级分支"根本不由概念决定。
     graph_mode = graph_skeleton_enabled() and diagram_type == "tree"
+    # ---- 按章切：先切章（只读原文，不发请求）-----------------------------------
+    #
+    # **必须在骨架之前**：骨架那一次要知道"这次按这份材料的 N 章分"，否则它按自己的
+    # 直觉给 6 条，而材料有 12 章，"每支给它这一章"这个前提从一开始就不成立——那时
+    # 每一支拿到的都会是半章，覆盖率的分母也就说不清了。
+    #
+    # 只在 `tree` 上开：流程图的一级是**阶段**、鱼骨的一级是固定六类，章的边界与它们
+    # 没有对应关系。
+    slice_chapters = (
+        _chapter_slices(sources)
+        if section_slice_enabled() and diagram_type == "tree" and not graph_mode
+        else []
+    )
+    if section_slice_enabled() and not slice_chapters:
+        # 开关开了却没切成：**必须说出来**。不说的话，用户以为自己在看 A/B 的 B 组，
+        # 而实际跑的是一次完全一样的现状——那是最坏的一种"实验"。
+        reason = (
+            "这次没有可切章的材料" if not sources else
+            f"材料有 {len(sources)} 份（切章要求恰好一份：`OutlineEntry.start` 是"
+            "单份文本内部的偏移）" if len(sources) != 1 else
+            "材料抽不出可用的章节标题（目录为空或覆盖率不足）"
+        )
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.info, code="SECTION_SLICE_UNAVAILABLE",
+            message=f"{reason}，这一次退回原来那条路（一次写完）。",
+        ))
     graph_entities: list[graph_store.GraphEntity] = []
     graph_links: list[graph_store.GraphLink] = []
     raw_plan: Any = None
@@ -5983,9 +6554,13 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         #
         # 只有 `tree` 分组：流程图的一级是**阶段**（分组会打断顺序），鱼骨图的一级是
         # 固定的六类（换一套分类就不再是鱼骨图）。
-        sections_expected = max(args.branches, len(outline_entries))
+        sections_expected = max(args.branches, len(outline_entries), len(slice_chapters))
+        # 按章切**不请求分组**：这条路的一级分支就是章，本来是一维序列；而分组会多
+        # 吃一层深度（`INITIAL_MAX_DEPTH=3`：root → 组 → 章 → 章内要点，章里只剩
+        # 一层），把"这一章有 ### 子节"这件事挤没。
         grouped_request = (
-            diagram_type == "tree" and sections_expected > SKELETON_GROUP_THRESHOLD)
+            diagram_type == "tree" and not slice_chapters
+            and sections_expected > SKELETON_GROUP_THRESHOLD)
         plan_system = base_plan + (
             _group_plan_rules(sections_expected) if grouped_request else "")
         # 第三档的规则尾巴接在 base_plan 之后、分组规则之后：它说的是"一级分支从
@@ -5999,14 +6574,26 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         if not sources:
             plan_system += "\n" + CONTENT_FREEDOM_CONTRACT + DETAIL_NO_SOURCE_RULES
         plan_started = time.perf_counter()
+        ask = _plan_ask(
+            args.topic,
+            # 按章切时请求的条数**就是章数**：这条路按"一条分支 = 一章"组装，
+            # 少一条就有一章没有支（那一章的覆盖率恒为 0）。
+            len(slice_chapters) if slice_chapters else args.branches,
+            outline=outline,
+            diagram_type=diagram_type,
+        )
+        if slice_chapters:
+            # 拼在 `_plan_ask` 的返回值**之后**，不改进那个函数：它与
+            # `PLAN_PROMPT` 一起被逐字节回归用例钉着（`test_outline.py`）。
+            ask += (
+                f"\n这次的一级分支**就是这份材料的 {len(slice_chapters)} 章**："
+                "一条分支对应一章，顺序按材料里的顺序，标题照抄章节标题，不增不减。"
+            )
         try:
             raw_plan = await _chat(
                 ctx,
                 plan_system,
-                _plan_ask(
-                    args.topic, args.branches, outline=outline,
-                    diagram_type=diagram_type,
-                ) + hint_block,
+                ask + hint_block,
                 max_tokens=_max_tokens(ctx),
             )
         except GenerationError as exc:
@@ -6018,6 +6605,11 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         # 判据与上面的 `grouped_request` 同源（分支数 > `SKELETON_GROUP_THRESHOLD`）：
         # 这里判"要不要问"，那里判"回来的东西够不够两级"。
         plan = _cap_plan(_skeleton_plan(raw_plan))
+        if slice_chapters and plan.grouped:
+            # 按章切**不分组**（理由见 `grouped_request`）：模型自发给了分组时压平，
+            # 否则 `_apply_groups` 会把 12 条章摆到 5 个组下面，章内就只剩一层
+            # ——而这一章里明明有 `###` 子节可写。
+            plan = _SkeletonPlan(flat=plan.flat)
         if len(plan.flat) < MIN_BRANCHES:
             return _fail(
                 "too_few_branches",
@@ -6031,10 +6623,14 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         if not prefs.icons_enabled():
             plan = _strip_plan_icons(plan)
         titles = [branch.label for branch in plan.flat]
-        if not args.branches - 1 <= len(titles) <= args.branches + 1:
+        # 请求的条数在按章切时是**章数**（上面 `_plan_ask` 用的就是它）：拿
+        # `args.branches`（界面上选的 5）去比 12 章，每次都会误报一条"少了 7 条"。
+        requested_branches = len(slice_chapters) if slice_chapters else args.branches
+        if not requested_branches - 1 <= len(titles) <= requested_branches + 1:
             diagnostics.append(Diagnostic(
                 level=DiagnosticLevel.warn, code="SKELETON_SIZE_OFF",
-                message=f"请求 {args.branches} 条一级分支，模型给了 {len(titles)} 条，已按实际条数继续。",
+                message=f"请求 {requested_branches} 条一级分支，模型给了 {len(titles)} 条，"
+                        "已按实际条数继续。",
             ))
 
     # ---- 第二步：每支各检索一次（并行，第一支预热）------------------------------
@@ -6099,161 +6695,180 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         ]
     )
 
-    if graph_mode:
-        # 两段式：一级分支还没定，要给的是**图谱**。`_skeleton_block(plan)` 在这里
-        # 拿不到东西（plan 是 None）——那正是这个分支存在的理由。
-        skeleton_intro = (
-            "\n\n这次**不按材料章节分**：一级分支请从下面这张图谱里挑"
-            "（挑法与关系的写法见 system 的规则）：\n"
-        )
-        skeleton_block = _graph_block(graph_entities, graph_links)
-    else:
-        skeleton_block = _skeleton_block(plan)
-        # 两级的开头那句必须跟着变：它说的是"这是一层还是两层"，与清单的形状必须一致，
-        # 否则模型看到缩进却读到"一级分支"，会按扁平的根规则摆（那就白分组了）。
-        skeleton_intro = (
-            "\n\n这次的两级骨架（已定好；缩进的是分组下面的二级分支，按此顺序，不要增删改名）：\n"
-            if plan.grouped else
-            "\n\n这次的一级分支（已定好，按此顺序，不要增删改名）：\n"
-        )
-    user = f"主题：{args.topic}" + hint_block + skeleton_intro + skeleton_block
-    # 流程图的 `role` 必须**在 user 末尾**再说一遍（system 里已有 `FLOW_TREE_RULES`，
-    # 但实测第一版把它只写在 system 里时，两次采样一个 `decision` 都没标出来，
-    # 而那份流程里明明有「校验信息完整性」「验证账号唯一性」这种判定步骤）。
+    # ---- 第三步（按章切）：每章一次调用，组装成整棵树 ---------------------------
     #
-    # 位置的理由与 `_detail_ask` 结尾那句自查同源：模型对**紧挨着输出位置**的
-    # 那句话最敏感，而 system 里的 role 说明夹在 `DETAIL_PROMPT` 的格式定义与
-    # 「这一轮不要写 detail」之间，被读成了一段泛泛的附加要求。
-    if diagram_type == "flowchart":
-        user += (
-            "\n\n**每个阶段里凡是需要判断走哪一条路的那一步**（校验 / 审核 / 检查 / "
-            "是否通过 / 是否超限这类），在它的节点对象上加一个字段 "
-            '"role": "decision"；流程的第一步加 "role": "start"，最后收尾的那一步加 '
-            '"role": "end"，普通步骤不用加。例如：'
-            '{"id":"…","label":"校验信息完整性","role":"decision","children":[]}。'
-            # 两条出口与 role 写在同一处：它们是**同一个决定**的两半——标了判定却
-            # 没写出口，那个节点在画布上就只有一个出口（甚至零个），比不标还费解。
-            # 实测（`docs`/阶段 2 的记录）：只要求 role 时模型会标出 3–5 个判定节点，
-            # 而它们的出边数为 0——因为契约当时没有位置。
-            '\n**标了 decision 的节点，紧接着把它的两条出口一起写出来**：'
-            '在同一个节点对象上加 "branch" 字段，'
-            '{"yes":"走「是」时到的那个节点的标题","no":"走「否」时到的那个节点的标题"}。'
-            "标题要**逐字**抄这份响应里另一个节点的 label（可以是本阶段后面的某一步，"
-            '也可以是另一个阶段里的一步）；这条路到此结束时写 "结束"。'
-            # 新形状（平行四边形 / 圆柱）的判据必须写在这里，理由与上面那段 `role`
-            # 完全相同：系统提示词里的 `_FLOW_BODY` 有一段一样的说明，而 stage 2 的
-            # 实测是"同一句话写在 system 里，两次采样一个都没标出来"。
-            #
-            # 措辞刻意用**对象是数据本身**这一条判据，而不是"读写数据"——后者太宽，
-            # 模型会把每个填单子的步骤都标成 data（实测见
-            # `scripts/measure_flow_data_roles.py` 的报告），平行四边形于是变成装饰。
-            '\n**哪一步在跟数据打交道，就把它标出来**（这两种形状在画布上是平行四边形'
-            '与圆柱，读图的人靠它分清算数据与干活）：'
-            '这一步**产出了数据**（录入 / 填单 / 出具 / 生成报表）、或者**交出了数据**'
-            '（提交 / 上报 / 发送回执）就加 "role": "data"；'
-            '这一步**写进存储**（落库 / 入台账 / 归档 / 记账）或**从存储里取**'
-            '（查询 / 调取档案 / 读取余额）就加 "role": "database"。'
-            '判据是这一步**对象就是数据本身**，在数据之上做业务判断的那一步仍然是普通步骤'
-            "（那样的一步如果确实要选路，它才该标 decision）。"
-            '例如：{"id":"…","label":"录入报销单","role":"data","children":[]}、'
-            '{"id":"…","label":"写入审批台账","role":"database","children":[]}。'
-        )
-    if sections and full_text:
-        user += ("\n\n下面是**材料的完整正文**（按材料分节，每节标题写明文件名与字数）；"
-                 "它不是检索片段——写任何一支时都先在这些正文里找对应内容，"
-                 "引用逐字从里面抄：\n\n" + "\n\n".join(sections))
-        # 引用要求必须在**正文之后**再说一遍，不能只留在 system 里。
-        #
-        # 这不是"多提醒一遍更保险"，而是位置问题：全塞把上万个字的正文放在 user 末尾，
-        # system 里那句"凡是内容出自材料就挂 source_refs"距离输出位置隔了一万字。
-        # 实测（`scripts/measure_incontext.py`，1 万字档）只写在 system 里时模型
-        # **一条引用都不写**（declared=0），而同一次调用里它明明把中间的备案号抄进了
-        # detail——内容用上了、出处没标。同一个教训在 `_detail_ask` 的自查句与 flowchart
-        # 的 role 说明上都出现过：模型对紧挨着输出位置的那句话最敏感。
-        user += (
-            '\n\n写结构时每个节点的引用字段一起写：内容出自上面正文的，挂 source_refs'
-            '（[{"source_id":"…","quote":"逐字抄原文连续一段"}]，source_id 照抄那一节'
-            "标题里的值）；自己补充的内容给空数组 []。"
-        )
-    elif sections and graph_mode:
-        # 两段式的证据是按**概念**检索的（query 就是图谱里的实体名），不是按分支。
-        # 说"按分支分组"会让模型去找一条它没见过的一级分支，然后从第一组里挑内容。
-        user += ("\n\n下面每个概念都各自检索过一次（查询串就是那个概念名），结果按概念分组；"
-                 "引用只能从本组的 evidence 里抄：\n\n" + "\n\n".join(sections))
-    elif sections:
-        user += ("\n\n下面每条一级分支都各自检索过一次，结果按分支分组；"
-                 "引用只能从本组的 evidence 里抄：\n\n" + "\n\n".join(sections))
+    # 这一段把"一次写完"换成 N 次（每章一次）。除了调用方式，**下游一个字都没改**：
+    # 组装的 `raw` 形状与"一次写完"那条路完全相同（`{"title","root"}`），所以校验 /
+    # 套色 / 裁剪 / 第三段 / 重复检测走的还是同一套。这也是它能当干净 A/B 一臂的
+    # 前提——两组的差异只可能来自第二段，不可能来自收尾。
+    structure_seconds = 0.0
+    slice_report: dict[str, Any] | None = None
+    # 外部来源的可信度提示：两条路共用（第三段也用它），所以必须在 if/else **之前**
+    # 定下来。判据只看 `sections` 与来源类型，与"结构那一次怎么发"无关。
     external_rules = (
         EXTERNAL_TRUST_RULES
         if sections and any(source.kind in (SourceKind.web, SourceKind.paper)
                             for source in sources)
         else ""
     )
-    # 形状规则按**实际形态**选（不是按"问没问过分组"）：问了但回来只有 8 支时
-    # `_skeleton_plan` 已经压平，这里也必须用扁平那份规则，否则 system 要求根下挂
-    # 分组、user 里列的却是八条分支，模型只能二选一地写错。
-    #
-    # 图型也在这里分叉：流程图与鱼骨的"一级分支"分别是阶段与类别，它们的根规则
-    # 与树不同（阶段要在阶段内部说出谁是判定，类别下面要写原因而不是词条定义）。
-    # 三份规则共用 `_SKELETON_BODY`（不跨支重复 / 这一轮不写 detail），差别只在
-    # 根规则与那一段专属说明。
-    shape_rules = (
-        # 两段式用自己那份：`SKELETON_TREE_RULES` 开头就说"一级分支已经定好了…顺序、
-        # 名称都不改"，而两段式的一级分支**正是这一次要模型定的**。给错规则时模型会
-        # 等一份它没收到的清单，然后按自己最早读到的"3-6 条分支"随手拆。
-        GRAPH_TREE_RULES if graph_mode
-        else GROUPED_TREE_RULES if plan.grouped
-        else FLOW_TREE_RULES if diagram_type == "flowchart"
-        else FISHBONE_TREE_RULES if diagram_type == "fishbone"
-        else SKELETON_TREE_RULES
-    )
-    if sections and full_text:
-        # 全塞：引用规则换成"这是全文"那一套。**不能复用 `BRANCHED_EVIDENCE_RULES`**
-        # ——它开头就说"已经按一级分支各做过一次检索"，与这次真的没检索相矛盾；
-        # 模型会据此推断"没被检索到的内容不存在"，然后只写第一份材料覆盖的部分。
-        system = (DETAIL_PROMPT + thinking + shape_rules
-                  + FULL_TEXT_EVIDENCE_RULES + external_rules)
-    elif sources and sections and graph_mode:
-        # 两段式的证据是按概念检索的（同 `user` 那一段的理由），所以引用规约也要自己
-        # 一份：`BRANCHED_EVIDENCE_RULES` 说的是"按一级分支分组"。
-        system = (DETAIL_PROMPT + thinking + shape_rules
-                  + GRAPH_EVIDENCE_RULES + external_rules)
-    elif sources and sections:
-        system = (DETAIL_PROMPT + thinking + shape_rules
-                  + BRANCHED_EVIDENCE_RULES + external_rules)
-
-    elif sources:
-        # 有材料但这一轮一条都没命中：与旧的整树路径同一条降级——按无来源写满，
-        # 引用留空。**不把 `sources` 判成 None**：模型在本次运行前几轮可能已经
-        # `rag_query` 到过真片段，逐字校验照跑，留下的只可能是真依据。
-        system = DETAIL_PROMPT + thinking + shape_rules + DETAIL_NO_SOURCE_RULES
+    if slice_chapters:
+        raw, slice_report = await _slice_structure(
+            topic=args.topic, chapters=slice_chapters,
+            plan=plan if plan is not None else _SkeletonPlan(flat=()),
+            ctx=ctx, text=(sources[0].text or ""), diagnostics=diagnostics,
+        )
+        structure_seconds = slice_report["seconds"]
     else:
-        system = DETAIL_PROMPT + thinking + DETAIL_NO_SOURCE_RULES
         if graph_mode:
-            # 没有可检索材料时上面四条分支都不带 `shape_rules`——三段式在这条路上也
-            # 不需要它（没有分支要摆）。两段式仍然需要：那一段正是"一级分支从图谱里
-            # 挑"的规则，少了它模型拿到的是一张没有图谱的普通整树提示词，而 user 里
-            # 那段实体清单会被它当成参考信息随手引用。
-            system += shape_rules
-    if graph_mode:
-        # 关系规则放在**最后**：它与输出形状（`relations` 数组）绑在一起，而模型对
-        # 紧挨着输出位置的那段话最敏感（同 `_detail_ask` 末尾那句自查）。
-        system += GRAPH_RELATION_RULES
+            # 两段式：一级分支还没定，要给的是**图谱**。`_skeleton_block(plan)` 在这里
+            # 拿不到东西（plan 是 None）——那正是这个分支存在的理由。
+            skeleton_intro = (
+                "\n\n这次**不按材料章节分**：一级分支请从下面这张图谱里挑"
+                "（挑法与关系的写法见 system 的规则）：\n"
+            )
+            skeleton_block = _graph_block(graph_entities, graph_links)
+        else:
+            skeleton_block = _skeleton_block(plan)
+            # 两级的开头那句必须跟着变：它说的是"这是一层还是两层"，与清单的形状必须一致，
+            # 否则模型看到缩进却读到"一级分支"，会按扁平的根规则摆（那就白分组了）。
+            skeleton_intro = (
+                "\n\n这次的两级骨架（已定好；缩进的是分组下面的二级分支，按此顺序，不要增删改名）：\n"
+                if plan.grouped else
+                "\n\n这次的一级分支（已定好，按此顺序，不要增删改名）：\n"
+            )
+        user = f"主题：{args.topic}" + hint_block + skeleton_intro + skeleton_block
+        # 流程图的 `role` 必须**在 user 末尾**再说一遍（system 里已有 `FLOW_TREE_RULES`，
+        # 但实测第一版把它只写在 system 里时，两次采样一个 `decision` 都没标出来，
+        # 而那份流程里明明有「校验信息完整性」「验证账号唯一性」这种判定步骤）。
+        #
+        # 位置的理由与 `_detail_ask` 结尾那句自查同源：模型对**紧挨着输出位置**的
+        # 那句话最敏感，而 system 里的 role 说明夹在 `DETAIL_PROMPT` 的格式定义与
+        # 「这一轮不要写 detail」之间，被读成了一段泛泛的附加要求。
+        if diagram_type == "flowchart":
+            user += (
+                "\n\n**每个阶段里凡是需要判断走哪一条路的那一步**（校验 / 审核 / 检查 / "
+                "是否通过 / 是否超限这类），在它的节点对象上加一个字段 "
+                '"role": "decision"；流程的第一步加 "role": "start"，最后收尾的那一步加 '
+                '"role": "end"，普通步骤不用加。例如：'
+                '{"id":"…","label":"校验信息完整性","role":"decision","children":[]}。'
+                # 两条出口与 role 写在同一处：它们是**同一个决定**的两半——标了判定却
+                # 没写出口，那个节点在画布上就只有一个出口（甚至零个），比不标还费解。
+                # 实测（`docs`/阶段 2 的记录）：只要求 role 时模型会标出 3–5 个判定节点，
+                # 而它们的出边数为 0——因为契约当时没有位置。
+                '\n**标了 decision 的节点，紧接着把它的两条出口一起写出来**：'
+                '在同一个节点对象上加 "branch" 字段，'
+                '{"yes":"走「是」时到的那个节点的标题","no":"走「否」时到的那个节点的标题"}。'
+                "标题要**逐字**抄这份响应里另一个节点的 label（可以是本阶段后面的某一步，"
+                '也可以是另一个阶段里的一步）；这条路到此结束时写 "结束"。'
+                # 新形状（平行四边形 / 圆柱）的判据必须写在这里，理由与上面那段 `role`
+                # 完全相同：系统提示词里的 `_FLOW_BODY` 有一段一样的说明，而 stage 2 的
+                # 实测是"同一句话写在 system 里，两次采样一个都没标出来"。
+                #
+                # 措辞刻意用**对象是数据本身**这一条判据，而不是"读写数据"——后者太宽，
+                # 模型会把每个填单子的步骤都标成 data（实测见
+                # `scripts/measure_flow_data_roles.py` 的报告），平行四边形于是变成装饰。
+                '\n**哪一步在跟数据打交道，就把它标出来**（这两种形状在画布上是平行四边形'
+                '与圆柱，读图的人靠它分清算数据与干活）：'
+                '这一步**产出了数据**（录入 / 填单 / 出具 / 生成报表）、或者**交出了数据**'
+                '（提交 / 上报 / 发送回执）就加 "role": "data"；'
+                '这一步**写进存储**（落库 / 入台账 / 归档 / 记账）或**从存储里取**'
+                '（查询 / 调取档案 / 读取余额）就加 "role": "database"。'
+                '判据是这一步**对象就是数据本身**，在数据之上做业务判断的那一步仍然是普通步骤'
+                "（那样的一步如果确实要选路，它才该标 decision）。"
+                '例如：{"id":"…","label":"录入报销单","role":"data","children":[]}、'
+                '{"id":"…","label":"写入审批台账","role":"database","children":[]}。'
+            )
+        if sections and full_text:
+            user += ("\n\n下面是**材料的完整正文**（按材料分节，每节标题写明文件名与字数）；"
+                     "它不是检索片段——写任何一支时都先在这些正文里找对应内容，"
+                     "引用逐字从里面抄：\n\n" + "\n\n".join(sections))
+            # 引用要求必须在**正文之后**再说一遍，不能只留在 system 里。
+            #
+            # 这不是"多提醒一遍更保险"，而是位置问题：全塞把上万个字的正文放在 user 末尾，
+            # system 里那句"凡是内容出自材料就挂 source_refs"距离输出位置隔了一万字。
+            # 实测（`scripts/measure_incontext.py`，1 万字档）只写在 system 里时模型
+            # **一条引用都不写**（declared=0），而同一次调用里它明明把中间的备案号抄进了
+            # detail——内容用上了、出处没标。同一个教训在 `_detail_ask` 的自查句与 flowchart
+            # 的 role 说明上都出现过：模型对紧挨着输出位置的那句话最敏感。
+            user += (
+                '\n\n写结构时每个节点的引用字段一起写：内容出自上面正文的，挂 source_refs'
+                '（[{"source_id":"…","quote":"逐字抄原文连续一段"}]，source_id 照抄那一节'
+                "标题里的值）；自己补充的内容给空数组 []。"
+            )
+        elif sections and graph_mode:
+            # 两段式的证据是按**概念**检索的（query 就是图谱里的实体名），不是按分支。
+            # 说"按分支分组"会让模型去找一条它没见过的一级分支，然后从第一组里挑内容。
+            user += ("\n\n下面每个概念都各自检索过一次（查询串就是那个概念名），结果按概念分组；"
+                     "引用只能从本组的 evidence 里抄：\n\n" + "\n\n".join(sections))
+        elif sections:
+            user += ("\n\n下面每条一级分支都各自检索过一次，结果按分支分组；"
+                     "引用只能从本组的 evidence 里抄：\n\n" + "\n\n".join(sections))
 
-    if not ctx.reserve_model_call():
-        return _fail("budget_exhausted", "本次运行的模型调用额度已用完，无法生成导图内容。")
-    ctx.extra_model_calls += 1
-    # 通道为 None 时连 `on_delta` 都不传：这条路上工具行为与加生长事件之前逐字
-    # 相同（`_GenerateGrowStream` 根本不会被创建）。
-    stream_kwargs = {}
-    if ctx.emit is not None:
-        stream_kwargs["on_delta"] = _GenerateGrowStream(ctx).feed
-    structure_started = time.perf_counter()
-    try:
-        raw = await _chat(ctx, system, user, max_tokens=_max_tokens(ctx), **stream_kwargs)
-    except GenerationError as exc:
-        return _fail("generation_failed", f"生成失败：{exc}")
-    structure_seconds = time.perf_counter() - structure_started
+        # 形状规则按**实际形态**选（不是按"问没问过分组"）：问了但回来只有 8 支时
+        # `_skeleton_plan` 已经压平，这里也必须用扁平那份规则，否则 system 要求根下挂
+        # 分组、user 里列的却是八条分支，模型只能二选一地写错。
+        #
+        # 图型也在这里分叉：流程图与鱼骨的"一级分支"分别是阶段与类别，它们的根规则
+        # 与树不同（阶段要在阶段内部说出谁是判定，类别下面要写原因而不是词条定义）。
+        # 三份规则共用 `_SKELETON_BODY`（不跨支重复 / 这一轮不写 detail），差别只在
+        # 根规则与那一段专属说明。
+        shape_rules = (
+            # 两段式用自己那份：`SKELETON_TREE_RULES` 开头就说"一级分支已经定好了…顺序、
+            # 名称都不改"，而两段式的一级分支**正是这一次要模型定的**。给错规则时模型会
+            # 等一份它没收到的清单，然后按自己最早读到的"3-6 条分支"随手拆。
+            GRAPH_TREE_RULES if graph_mode
+            else GROUPED_TREE_RULES if plan.grouped
+            else FLOW_TREE_RULES if diagram_type == "flowchart"
+            else FISHBONE_TREE_RULES if diagram_type == "fishbone"
+            else SKELETON_TREE_RULES
+        )
+        if sections and full_text:
+            # 全塞：引用规则换成"这是全文"那一套。**不能复用 `BRANCHED_EVIDENCE_RULES`**
+            # ——它开头就说"已经按一级分支各做过一次检索"，与这次真的没检索相矛盾；
+            # 模型会据此推断"没被检索到的内容不存在"，然后只写第一份材料覆盖的部分。
+            system = (DETAIL_PROMPT + thinking + shape_rules
+                      + FULL_TEXT_EVIDENCE_RULES + external_rules)
+        elif sources and sections and graph_mode:
+            # 两段式的证据是按概念检索的（同 `user` 那一段的理由），所以引用规约也要自己
+            # 一份：`BRANCHED_EVIDENCE_RULES` 说的是"按一级分支分组"。
+            system = (DETAIL_PROMPT + thinking + shape_rules
+                      + GRAPH_EVIDENCE_RULES + external_rules)
+        elif sources and sections:
+            system = (DETAIL_PROMPT + thinking + shape_rules
+                      + BRANCHED_EVIDENCE_RULES + external_rules)
+
+        elif sources:
+            # 有材料但这一轮一条都没命中：与旧的整树路径同一条降级——按无来源写满，
+            # 引用留空。**不把 `sources` 判成 None**：模型在本次运行前几轮可能已经
+            # `rag_query` 到过真片段，逐字校验照跑，留下的只可能是真依据。
+            system = DETAIL_PROMPT + thinking + shape_rules + DETAIL_NO_SOURCE_RULES
+        else:
+            system = DETAIL_PROMPT + thinking + DETAIL_NO_SOURCE_RULES
+            if graph_mode:
+                # 没有可检索材料时上面四条分支都不带 `shape_rules`——三段式在这条路上也
+                # 不需要它（没有分支要摆）。两段式仍然需要：那一段正是"一级分支从图谱里
+                # 挑"的规则，少了它模型拿到的是一张没有图谱的普通整树提示词，而 user 里
+                # 那段实体清单会被它当成参考信息随手引用。
+                system += shape_rules
+        if graph_mode:
+            # 关系规则放在**最后**：它与输出形状（`relations` 数组）绑在一起，而模型对
+            # 紧挨着输出位置的那段话最敏感（同 `_detail_ask` 末尾那句自查）。
+            system += GRAPH_RELATION_RULES
+
+        if not ctx.reserve_model_call():
+            return _fail("budget_exhausted", "本次运行的模型调用额度已用完，无法生成导图内容。")
+        ctx.extra_model_calls += 1
+        # 通道为 None 时连 `on_delta` 都不传：这条路上工具行为与加生长事件之前逐字
+        # 相同（`_GenerateGrowStream` 根本不会被创建）。
+        stream_kwargs = {}
+        if ctx.emit is not None:
+            stream_kwargs["on_delta"] = _GenerateGrowStream(ctx).feed
+        structure_started = time.perf_counter()
+        try:
+            raw = await _chat(ctx, system, user, max_tokens=_max_tokens(ctx), **stream_kwargs)
+        except GenerationError as exc:
+            return _fail("generation_failed", f"生成失败：{exc}")
+        structure_seconds = time.perf_counter() - structure_started
 
     # 两段式的树与关系在**同一次响应**里。关系先摘出来，理由不是洁癖：
     # `MindMapContent.model_validate` 走 `_validate_relations`，对 dangling 端点是
@@ -6842,6 +7457,27 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             "full_text": True,
             "token_estimate": estimate_input_tokens(
                 "".join((source.text or "") for source in sources)),
+        }
+
+    if slice_report is not None:
+        # 只有真的走了按章切才有这个键（开关关着 / 没切成时 `data` 的键集与加这条路
+        # 之前逐字节相同）。三个数回答三个不同的问题：切了几章（分母）、每章给了
+        # 几个节点的预算（分子）、引用在哪一步被丢掉（覆盖率为什么不是 100%）。
+        data["section_slice"] = {
+            "chapters": slice_report["chapters"],
+            "calls": slice_report["calls"],
+            "per_branch_nodes": slice_report["per_branch_nodes"],
+            "depth": slice_report["depth"],
+            "truncated_chapters": slice_report["truncated"],
+            "failed_chapters": [item["chapter"] for item in slice_report["failed"]],
+            "skipped_chapters": slice_report["skipped"],
+            "nodes": slice_report["nodes"],
+            "refs": {
+                "located": slice_report["refs_located"],
+                "ambiguous": slice_report["refs_ambiguous"],
+                "dropped": slice_report["refs_dropped"],
+            },
+            "seconds": slice_report["seconds"],
         }
 
     if diagram_type != "tree":
