@@ -183,6 +183,73 @@ def scaled_initial_nodes(
     return max(MIN_INITIAL_NODES, min(max(1, ceiling), int(round(target))))
 
 
+# ---------------------------------------------------------------- 手动配额（实验用）
+#
+# `scaled_initial_nodes` 把配额绑在"材料有多大"上，于是它**问不出**"配额本身是不是
+# 损失的来源"：中批上它永远给 32，改不出 48。而"配额 × 材料清单"这组实验要的正是
+# 同一批材料上只动配额——
+#
+#     格 1  32 + 清单关      格 2  32 + 清单开
+#     格 3  48 + 清单关      格 4  48 + 清单开
+#
+# 所以要有一个人为的旋钮。**它只接管"要求几个节点"这一个数**，其余链路（提示词里
+# 那句要求、`_clip_tree` 的上限、`data["node_limit"]`）仍走同一个 `initial_nodes`，
+# 否则又会造出"要 32 / 裁 80 / 报 80"那种自相矛盾的产物。
+#
+# 默认不设 = 现状：这一格连 `scaled_initial_nodes` 都不查（开关关着时它不参与），
+# 逐字节回到 `INITIAL_MAX_NODES`。实验用的旋钮，不该改变任何人已有的行为。
+NODE_CAP_ENV = "MINDMAP_NODE_CAP"
+
+
+def node_cap() -> int | None:
+    """`MINDMAP_NODE_CAP` 的值；不设、空、非整数、非正数时 `None`（= 不接管）。
+
+    边界与 `scaled_initial_nodes` 用同一套 `[MIN_INITIAL_NODES, INITIAL_MAX_NODES]`：
+    手动配额不是绕过可读性上限的通道（超过 `INITIAL_MAX_NODES` 的部分没有输出预算
+    装它，见 `batch_output_tokens` 那套算术），也不该低到装不下 `MIN_BRANCHES`
+    的结构算术。**不设时返回 `None` 而不是 80**——`None` 才是"没接管"，80 是"接管
+    成 80"，两者在 `initial_nodes` 里要走不同的分支，混成一个值就没法证明默认路径
+    没变。
+    """
+    raw = os.getenv(NODE_CAP_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    if value <= 0:
+        return None
+    return max(MIN_INITIAL_NODES, min(value, INITIAL_MAX_NODES))
+
+
+def initial_nodes(
+    *,
+    material_chars: int,
+    sources: int,
+    chapters: int,
+    ceiling: int = INITIAL_MAX_NODES,
+) -> int:
+    """本次初次生成要求几个节点。三个来源按**优先级**取，不是取最小值：
+
+        1. `MINDMAP_NODE_CAP` 设了 → 就是它（手动配额压过一切，实验需要）；
+        2. 否则 `MINDMAP_NODE_SCALE` 开着 → `scaled_initial_nodes`（按材料伸缩）；
+        3. 否则 → `INITIAL_MAX_NODES`（80，现状，与加伸缩之前逐字节相同）。
+
+    优先级而不是"谁小听谁"：配额是**实验变量**，它必须能在同一批材料上取任意值，
+    否则四格里的 48 那一列根本跑不出来（伸缩判据只会给 32）。不设开关时第一个
+    分支不成立，第二个也不成立，返回值就是 `ceiling`——那条路径与改动前逐字节相同。
+    """
+    cap = node_cap()
+    if cap is not None:
+        return cap
+    if node_scale_enabled():
+        return scaled_initial_nodes(
+            material_chars=material_chars, sources=sources, chapters=chapters,
+            ceiling=ceiling)
+    return ceiling
+
+
 def _tokens(chars: int) -> int:
     """按汉字密度折算 token 数（输出侧几乎全是中文）。"""
     return math.ceil(max(0, chars) * _CJK_TOKENS_PER_CHAR)
@@ -335,6 +402,7 @@ __all__ = [
     "ENVELOPE_TOKENS",
     "MIN_INITIAL_NODES",
     "MIN_NODES_PER_CALL",
+    "NODE_CAP_ENV",
     "NODE_SCALE_ENV",
     "NODE_STRUCTURE_TOKENS",
     "PROMPT_DETAIL_MAX_CHARS",
@@ -344,8 +412,10 @@ __all__ = [
     "available_output_tokens",
     "batch_output_tokens",
     "calls_for_levels",
+    "initial_nodes",
     "level_sizes",
     "max_nodes_for_tokens",
+    "node_cap",
     "node_scale_enabled",
     "nodes_per_call",
     "per_node_tokens",

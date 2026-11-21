@@ -414,3 +414,66 @@ def test_detail_prompt_only_swaps_the_scale_line():
     # 除了那一个数字，逐字节相同
     assert len(scaled) == len(DETAIL_PROMPT)
     assert scaled.replace("32 个节点", f"{INITIAL_MAX_NODES} 个节点") == DETAIL_PROMPT
+
+
+# ------------------------------------------------------- 6. 手动配额（四格实验的旋钮）
+
+
+def test_node_cap_is_unset_by_default(monkeypatch):
+    """不设 = `None`（没接管），不是 80。
+
+    混成 80 会让"默认路径没变"这件事无法证明：`None` 走的是"两个开关都不成立 →
+    返回 ceiling"那条分支，80 走的是"cap 接管成 80"——后者是这次新增的代码路径。
+    """
+    monkeypatch.delenv(budget.NODE_CAP_ENV, raising=False)
+    assert budget.node_cap() is None
+    for value in ("", "   ", "abc", "0", "-1", "32.5"):
+        monkeypatch.setenv(budget.NODE_CAP_ENV, value)
+        assert budget.node_cap() is None, value
+
+
+def test_node_cap_reads_a_positive_integer(monkeypatch):
+    monkeypatch.setenv(budget.NODE_CAP_ENV, "32")
+    assert budget.node_cap() == 32
+    for value in ("48", " 48 ", "+48"):
+        monkeypatch.setenv(budget.NODE_CAP_ENV, value)
+        assert budget.node_cap() == 48, value
+
+
+def test_node_cap_never_escapes_the_readability_ceiling(monkeypatch):
+    """手动配额与 `scaled_initial_nodes` 同一套边界：超过 80 装不下，低于 10 装不下结构。"""
+    monkeypatch.setenv(budget.NODE_CAP_ENV, "500")
+    assert budget.node_cap() == INITIAL_MAX_NODES
+    monkeypatch.setenv(budget.NODE_CAP_ENV, "3")
+    assert budget.node_cap() == budget.MIN_INITIAL_NODES
+
+
+def test_initial_nodes_default_path_is_unchanged(monkeypatch):
+    """**两个开关都不设时逐字节等于改动前**：就是那个常数 80，一个判据都不查。"""
+    monkeypatch.delenv(budget.NODE_CAP_ENV, raising=False)
+    monkeypatch.delenv(budget.NODE_SCALE_ENV, raising=False)
+    for chars, count, chapters in ((0, 0, 0), (492, 1, 0), (5616, 16, 0),
+                                   (66536, 4, 30), (10_000_000, 40, 200)):
+        assert budget.initial_nodes(material_chars=chars, sources=count,
+                                    chapters=chapters) == INITIAL_MAX_NODES
+
+
+def test_initial_nodes_scale_still_works_without_a_cap(monkeypatch):
+    """只开伸缩：与改动前那三个点位一致（10 / 32 / 80）。"""
+    monkeypatch.delenv(budget.NODE_CAP_ENV, raising=False)
+    monkeypatch.setenv(budget.NODE_SCALE_ENV, "1")
+    assert budget.initial_nodes(material_chars=492, sources=1, chapters=0) == 10
+    assert budget.initial_nodes(material_chars=5616, sources=16, chapters=0) == 32
+    assert budget.initial_nodes(material_chars=66536, sources=4, chapters=30) == 80
+
+
+def test_node_cap_wins_over_the_scale_vote(monkeypatch):
+    """配额是实验变量：同一批材料上它必须能取到 48（伸缩判据只会给 32）。"""
+    monkeypatch.setenv(budget.NODE_SCALE_ENV, "1")
+    monkeypatch.setenv(budget.NODE_CAP_ENV, "32")
+    assert budget.initial_nodes(material_chars=5616, sources=16, chapters=0) == 32
+    monkeypatch.setenv(budget.NODE_CAP_ENV, "48")
+    assert budget.initial_nodes(material_chars=5616, sources=16, chapters=0) == 48
+    # 关掉伸缩也还是 48：配额不依赖另一个开关的状态
+    monkeypatch.setenv(budget.NODE_SCALE_ENV, "0")
+    assert budget.initial_nodes(material_chars=5616, sources=16, chapters=0) == 48

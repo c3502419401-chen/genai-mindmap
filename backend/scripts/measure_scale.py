@@ -196,28 +196,34 @@ def _text_budget(content) -> dict:
 def _arm(arm: str):
     """A 臂 = 把材料清单摘掉（骨架只看主题）。
 
-    换掉的是**渲染器**而不是 `_plan_ask`：`_plan_ask` 拿到空串后的行为就是"加清单
-    之前"的行为（逐字节，有回归用例），所以 A 臂不需要第二份提示词代码。
+    现在是**环境变量**而不是 monkeypatch：`MINDMAP_PLAN_INVENTORY=0` 会让
+    `_material_inventory` 自己早退成空串，结果与"加清单之前"逐字节相同（有回归
+    用例钉着）。换实现的原因很实际——四格实验要在同一个进程里反复横跳两个开关，
+    monkeypatch 得记住原函数并在每次进出后恢复，而环境变量是进程状态的显式入口，
+    退出时删掉就回到了默认（开）。
     """
-    if arm != "a":
-        yield
-        return
     from app.agent import tools as tools_module
 
-    original = tools_module._material_inventory
-    tools_module._material_inventory = lambda *_args, **_kwargs: ""
+    original = os.environ.get(tools_module.PLAN_INVENTORY_ENV)
+    if arm == "a":
+        os.environ[tools_module.PLAN_INVENTORY_ENV] = "0"
     try:
         yield
     finally:
-        tools_module._material_inventory = original
+        if original is None:
+            os.environ.pop(tools_module.PLAN_INVENTORY_ENV, None)
+        else:
+            os.environ[tools_module.PLAN_INVENTORY_ENV] = original
 
 
 async def _run_once(
     *, topic: str, branches: int, sources: list, scale: bool, arm: str = "b",
+    cap: int | None = None,
 ) -> dict:
-    """跑一次整树生成。开关全部显式关掉——三批之间只许材料量变。
+    """跑一次整树生成。开关全部显式设置——四格之间只许配额与清单两件事变。
 
     `scale=True` 打开 `MINDMAP_NODE_SCALE`（节点数按材料伸缩）；默认关 = 现状。
+    `cap=N` 打开 `MINDMAP_NODE_CAP`（人为配额，优先于伸缩）；不设 = 现状。
     `arm` 见 `_arm`：`a` = 骨架只看主题，`b` = 骨架看到材料清单。
     """
     from app.agent import tools as tools_module
@@ -226,10 +232,13 @@ async def _run_once(
     os.environ["MINDMAP_SECTION_SLICE"] = "0"
     os.environ[tools_module.GRAPH_OUTLINE_ENV] = "0"
     os.environ.pop("MINDMAP_GRAPH_SKELETON", None)
-    if scale:
-        os.environ[tools_module.budget.NODE_SCALE_ENV] = "1"
-    else:
-        os.environ.pop(tools_module.budget.NODE_SCALE_ENV, None)
+    for name, value in ((tools_module.budget.NODE_SCALE_ENV, "1" if scale else None),
+                        (tools_module.budget.NODE_CAP_ENV,
+                         str(cap) if cap is not None else None)):
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
 
     request = AgentRunRequest(
         goal=topic, intent="create", thinking_model="default", sources=sources,
@@ -244,6 +253,10 @@ async def _run_once(
 
     started = time.perf_counter()
     with _arm(arm):
+        # 开关的**自证**：同一批材料在两个臂上给出的清单长度不同，这是"确实切了"
+        # 的唯一进程内证据（不看 env，看它的产物）。
+        inventory_chars = len(tools_module._material_inventory(
+            sources, has_structure=False))
         result = await registry.execute(call, ctx)
     elapsed = time.perf_counter() - started
     if not result.ok:
@@ -254,6 +267,8 @@ async def _run_once(
         "data": result.data or {},
         "content": ctx.candidate,
         "model_calls": getattr(ctx, "model_calls_used", None),
+        "inventory_chars": inventory_chars,
+        "node_cap": tools_module.budget.node_cap(),
     }
 
 
@@ -266,9 +281,11 @@ async def main(argv: list[str]) -> int:
     parser.add_argument("--probe", action="store_true")
     parser.add_argument("--scale", action="store_true",
                         help="打开 MINDMAP_NODE_SCALE（节点数按材料伸缩）；不设 = 现状")
+    parser.add_argument("--cap", type=int, default=None,
+                        help="MINDMAP_NODE_CAP 的值（人为配额，优先于伸缩）；不设 = 现状")
     parser.add_argument("--arm", default="b", choices=("a", "b", "both"),
-                        help="a=骨架只看主题（现状）；b=骨架看到材料清单；"
-                             "both=同一进程里交替跑两臂")
+                        help="a=骨架只看主题（清单关）；b=骨架看到材料清单（清单开，"
+                             "默认）；both=同一进程里交替跑两臂")
     parser.add_argument("--save", default="")
     args = parser.parse_args(argv)
 
@@ -322,7 +339,7 @@ async def main(argv: list[str]) -> int:
                 print(f"\n=== {key} 第 {index} 次 · {arm.upper()} 臂 ===", flush=True)
                 outcome = await _run_once(topic=batch["topic"], branches=args.branches,
                                           sources=batch["sources"], scale=args.scale,
-                                          arm=arm)
+                                          arm=arm, cap=args.cap)
                 if not outcome["ok"]:
                     print(f"失败：{outcome['content']}", flush=True)
                     report["runs"].append(
@@ -350,7 +367,10 @@ async def main(argv: list[str]) -> int:
                     "compression": round(chars / text["detail_total"], 2) if text["detail_total"] else None,
                     "chars_per_node": round(chars / stats["nodes"], 1) if stats["nodes"] else None,
                     "node_limit": data.get("node_limit"),
+                    "cap": outcome.get("node_cap"),
+                    "inventory_chars": outcome.get("inventory_chars"),
                     "scaled": "NODE_SCALE_APPLIED" in codes,
+                    "capped": "NODE_CAP_APPLIED" in codes,
                     "cut": "TREE_CLIPPED_TO_INITIAL" in codes,
                     "partial": bool(data.get("partial")),
                     "diagnostics": codes[:12],

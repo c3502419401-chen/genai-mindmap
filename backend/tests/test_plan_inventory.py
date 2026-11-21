@@ -21,8 +21,10 @@ from app.agent.tools import (
     INVENTORY_NO_STRUCTURE,
     INVENTORY_RULES,
     OUTLINE_HEADER,
+    PLAN_INVENTORY_ENV,
     _material_inventory,
     _plan_ask,
+    plan_inventory_enabled,
 )
 from app.contracts.source import Source, SourceKind
 
@@ -127,3 +129,32 @@ def test_empty_filename_is_named():
     block = _material_inventory(
         [_source("", "正文", source_id="s-anon")], has_structure=True)
     assert "  1. （未命名）（2 字）" in block
+
+
+# --------------------------------------------------- 实验开关：`MINDMAP_PLAN_INVENTORY`
+
+
+def test_inventory_is_on_when_the_switch_is_unset(monkeypatch):
+    """**不设 = 开**，且与显式开**逐字节相同**——默认路径必须一个字都不变。"""
+    monkeypatch.delenv(PLAN_INVENTORY_ENV, raising=False)
+    sources = [_source("openalex: 心血管.pdf", "冠心病与心衰的预测模型。" * 5),
+              _source("crossref: 电力负荷.pdf", "短期负荷预测用 LSTM。" * 3)]
+    unset = _material_inventory(sources, has_structure=False)
+    assert unset  # 不是空串
+    for value in ("1", "on", "true", "yes", ""):
+        monkeypatch.setenv(PLAN_INVENTORY_ENV, value)
+        assert plan_inventory_enabled() is True, value
+        assert _material_inventory(sources, has_structure=False) == unset, value
+
+
+def test_inventory_switch_off_renders_nothing(monkeypatch):
+    """关掉之后与"没有材料"逐字节相同：`_plan_ask` 一字不加。"""
+    monkeypatch.setenv(PLAN_INVENTORY_ENV, "0")
+    sources = [_source("a.md", "正文" * 10)]
+    assert plan_inventory_enabled() is False
+    assert _material_inventory(sources, has_structure=False) == ""
+    assert _material_inventory(sources, has_structure=True) == ""
+    assert _plan_ask("机器学习", 6, materials="") == _plan_ask("机器学习", 6)
+    for value in ("off", "FALSE", "no"):
+        monkeypatch.setenv(PLAN_INVENTORY_ENV, value)
+        assert _material_inventory(sources, has_structure=False) == "", value

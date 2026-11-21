@@ -2942,6 +2942,27 @@ INVENTORY_NO_STRUCTURE = "，没有可用的章节标题"
 # （骨架这一侧每条都短且必须自解释）。
 INVENTORY_MAX_LINES = 20
 
+#: 清单的**实验开关**（默认开，不设 = 现行行为，逐字节相同）。
+#:
+#: 为什么需要能关：清单那一轮的 A/B 是把 `_material_inventory` 换成一个恒返回空串的
+#: 函数（monkeypatch），那只在进程内有效——"配额 × 清单"这组联合实验要在**同一个
+#: 进程里交替**四格（否则模型/网络的漂移会被算进格差），而 monkeypatch 的换法是
+#: 每次进出都要记住原函数，稍有 other 代码引用就漏。环境变量是进程状态的显式入口，
+#: 关闭值就是 `_material_inventory` 早退、`_plan_ask` 一字不加——与加清单之前相同。
+PLAN_INVENTORY_ENV = "MINDMAP_PLAN_INVENTORY"
+
+
+def plan_inventory_enabled() -> bool:
+    """只有显式的假值（`0`/`off`/`false`/`no`）才关；**不设 = 开**。
+
+    这个方向必须与 `budget.node_scale_enabled` 反过来：那个开关默认关（它改的是
+    每一次生成的规模，翻它之前得先有数字），这个默认**开**——它已经在生产路径上
+    跑过了（`8a4f5a8` 起），关它只是为了把"骨架看不看得见清单"重新变成一个变量。
+    写成"不设 = 开"而不是"不设 = 关"，默认路径才不需要任何人记得去设一个变量。
+    """
+    return os.getenv(PLAN_INVENTORY_ENV, "").strip().lower() not in (
+        "0", "off", "false", "no")
+
 
 def _material_inventory(sources: list[Source], *, has_structure: bool) -> str:
     """拼给骨架的材料清单；没有材料时返回空串（那一支逐字节不变）。
@@ -2956,7 +2977,12 @@ def _material_inventory(sources: list[Source], *, has_structure: bool) -> str:
     顺序按 `sources` 原序（与 `_full_text_sections` 同一条理由：材料在请求里的次序
     是用户表达"哪份更重要"的方式，重排会让清单与界面上的清单对不上）。被截掉的
     永远是**尾巴**，不是按长度挑——挑大的会把"还有 N 份"变成一句无法解释的话。
+
+    `MINDMAP_PLAN_INVENTORY=0` 时直接返回空串（见 `plan_inventory_enabled`）：那
+    一支走的是 `_plan_ask` 的"没有清单"分支，与加清单之前逐字节相同。
     """
+    if not plan_inventory_enabled():
+        return ""
     rows = [(source, (source.text or "").strip()) for source in sources]
     if not rows:
         return ""
@@ -7305,27 +7331,42 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     #
     # 字数取 `max(material_chars, full_text_chars)`：后者含外部检索补进来的量，那部分
     # 也在这一次的 prompt 里，规模该把它算进去。
-    initial_nodes = (
-        budget.scaled_initial_nodes(
-            material_chars=max(material_chars, full_text_chars),
-            sources=len(sources),
-            chapters=len(outline_entries),
-        )
-        if budget.node_scale_enabled()
-        else INITIAL_MAX_NODES
+    initial_nodes = budget.initial_nodes(
+        material_chars=max(material_chars, full_text_chars),
+        sources=len(sources),
+        chapters=len(outline_entries),
+        # `ceiling` 必须显式传**本模块**的那个常量：它是"这一次的上限"的唯一出口，
+        # 用例会 patch `tools.INITIAL_MAX_NODES` 来把上限压到 5 验裁剪。用
+        # `budget.initial_nodes` 的默认参数会绕过那次 patch（两个模块各有一个 80）。
+        ceiling=INITIAL_MAX_NODES,
     )
     if initial_nodes != INITIAL_MAX_NODES:
         # 只说这一次是多大，以及为什么：用户看到一棵 32 节点的树时，得能分辨"模型
         # 没写完"与"这次就是这么要的"。
-        diagnostics.append(Diagnostic(
-            level=DiagnosticLevel.info, code="NODE_SCALE_APPLIED",
-            message=(
-                f"这次按材料规模要求 {initial_nodes} 个节点"
-                f"（材料 {max(material_chars, full_text_chars)} 字 / {len(sources)} 份 /"
-                f" {len(outline_entries)} 章；开关 `{budget.NODE_SCALE_ENV}`）；"
-                f"不设该开关时恒为 {INITIAL_MAX_NODES}"
-            ),
-        ))
+        #
+        # 两条来源分开报：`NODE_CAP_APPLIED` 是**人为设定的配额**（实验旋钮），
+        # `NODE_SCALE_APPLIED` 是**按材料算出来的**。混成一个 code 会让报告里的
+        # "这次为什么是 32" 说不清——四格实验里两格走同一句话就没法归因。
+        cap = budget.node_cap()
+        if cap is not None:
+            diagnostics.append(Diagnostic(
+                level=DiagnosticLevel.info, code="NODE_CAP_APPLIED",
+                message=(
+                    f"这次按 `{budget.NODE_CAP_ENV}={cap}` 手动设定的配额要求 "
+                    f"{initial_nodes} 个节点（优先于 `{budget.NODE_SCALE_ENV}`；"
+                    f"不设该开关时按材料规模或恒为 {INITIAL_MAX_NODES}）"
+                ),
+            ))
+        else:
+            diagnostics.append(Diagnostic(
+                level=DiagnosticLevel.info, code="NODE_SCALE_APPLIED",
+                message=(
+                    f"这次按材料规模要求 {initial_nodes} 个节点"
+                    f"（材料 {max(material_chars, full_text_chars)} 字 / {len(sources)} 份 /"
+                    f" {len(outline_entries)} 章；开关 `{budget.NODE_SCALE_ENV}`）；"
+                    f"不设该开关时恒为 {INITIAL_MAX_NODES}"
+                ),
+            ))
     # 外部来源的可信度提示：两条路共用（第三段也用它），所以必须在 if/else **之前**
     # 定下来。判据只看 `sections` 与来源类型，与"结构那一次怎么发"无关。
     external_rules = (
