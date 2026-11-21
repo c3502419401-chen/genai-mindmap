@@ -38,7 +38,9 @@ import re
 import time
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
-from typing import Any, Callable, Collection, Iterator, Literal, Protocol, Sequence, TypeVar
+from typing import (
+    Any, Callable, Collection, Iterator, Literal, Mapping, Protocol, Sequence, TypeVar,
+)
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -120,6 +122,7 @@ from app.knowledge.service import (
     filter_sources,
     heading_outline,
     outline_coverage,
+    search_exact_blocks,
     search_multi,
     search_parent,
 )
@@ -3596,6 +3599,26 @@ DETAIL_ONLY_FULL_TEXT_RULES = (
 )
 
 
+# 第三段的第三种证据形态（`MINDMAP_DETAIL_RETRIEVAL=1`）：每个节点只拿到**它自己
+# 那一章里**命中的那几块原文。三条边界都必须写出来，缺一条就是一类静默走样：
+#
+#   - "块里标着第几章"：模型据此知道这一块属于谁，也才不会把两章的块缝成一句；
+#   - "没列到的节点按你的知识写"：不给这一句，模型会把"这一章里没命中"读成"材料里
+#     没有"，然后写一句"材料中未提及"——`DETAIL_NO_SOURCE_RULES` 挡的是同一个失效，
+#     但那条说"本次没有材料"，与"有材料、只是这个节点没命中"是两件事；
+#   - "不要新增或改动引用"：引用是第二段的产物（`_slice_refs` 在章内定位），这一轮
+#     连 `source_refs` 都不该出现。少这一句时模型会顺手写引用，而 `_detail_map` 只
+#     认 `detail`——那些引用会被静默丢掉，用户端看不出任何异常。
+DETAIL_ONLY_RETRIEVED_RULES = (
+    "\nuser 消息末尾分两部分：**原文块**（每条都标着它属于第几章，按文档顺序编号），"
+    "以及**各节点命中的块**（每个 id 对应它自己那一章里命中的那几块）。"
+    "写某个节点的说明时，只以它命中的那几块为依据，不要用别的 id 命中的块，"
+    "也不要把两章的块拼成一句；没列到的节点说明它那一章里没有直接对应的段落，"
+    "那种情况按你的知识写，不要因此说「材料中没有」。"
+    "原文与你的知识冲突时按原文写。不要新增或改动引用。\n"
+)
+
+
 # ---------------------------------------------------------------- 第三段：只写 detail
 #
 # 为什么要有这一段：把"骨架 + 每支的结构 + 每段说明"塞进一次输出时，模型的注意力
@@ -3704,6 +3727,385 @@ def _detail_targets(
             if node.id not in skipped and _needs_detail(node)]
 
 
+# ------------------------------ 第三段的证据：每个节点在**它自己那一章**内检索
+#
+# 这条路把第三段（`_fill_details`）的**证据范围**从"整支/整份"改成"这一章"。
+#
+# 为什么：原来的证据范围与节点范围不一致。全塞时每个节点都在读 14,120 字的整份材料
+# （`FULL_TEXT_MATERIAL_CHARS = 50_000`，本仓库的真实材料都在闸内），按支时读的是
+# 12 组 × 约 2,000 字的全局检索片段。而一个节点要说的是**一点具体做什么**——8–16 字
+# 的 label 在那两万字里找自己那一段，注意力摊在大半与它无关的章上。
+#
+# 按章切（`MINDMAP_SECTION_SLICE=1`）之后，**章节边界本身就是最有效的限定**：每个
+# 节点能从祖先链上唯一确定"我在第几章"，而那一章是 1,300–2,900 字的连续原文。于是
+# 证据可以按节点分层：
+#
+#   - 一级分支（就是章标题）→ 它那一章的原文（`chapter.prompt_text`，8,000 字上限与
+#                              第二段同一条闸）。说明要概括"这一章在讲什么"，证据
+#                              只能是整章，切小了反而写不出跨度；
+#   - 章内节点              → label 在**本章范围内**检索 2–3 段（每段一个父块，
+#                              450–700 字）。说明只讲"这一点具体做什么"。
+#
+# **不要拿"层级路径"来替代这件事**：那条理由是为"整份 14,120 字进同一个 prompt"
+# 写的——在那个尺度上 16 字的 label 会飘；在 1,300 字的一章里它不会。层级路径本身
+# **照旧保留**（`_detail_ask` 清单里那一列），全塞那条路仍然需要它。
+#
+# 范围是怎么限定的：**不用过滤候选块，而是把来源本身切成这一章**。`_chapter_source`
+# 造一个 `text = 原文[章首:章末]` 的来源副本，检索只能在章的正文里切块——于是"命中
+# 落在本章内"是构造保证，不是事后过滤（事后过滤要先取一个更深的池子，被剔掉的候选
+# 仍然占掉了 top_k 的名额）。偏移再整体平移 `chapter.start` 回到全文坐标，`quote`
+# 逐字等于 `原文[start:end]`，与 `SourceRef` 同一口径。
+DETAIL_RETRIEVAL_ENV = "MINDMAP_DETAIL_RETRIEVAL"
+
+# 每个节点取几段：3。一章切出来只有 3–5 个父块（144–2,894 字 / 450–700 字一块），
+# 取 3 段基本就是"这一章里与它最相关的三处"；取 1 段时模型常写不满 3 句。
+DETAIL_RETRIEVAL_TOP_K = 3
+
+# 检索并发。检索本身是 `asyncio.to_thread` 里的同步函数（BM25 + 向量缓存），61 个
+# 节点串行发完是十几秒。取 6 而不是更大：真正的等待只在每章第一个节点（块向量要
+# 现算，之后同章的块全走 `vector_cache`），再高只是把峰值并发堆在那一小段上。
+DETAIL_RETRIEVAL_CONCURRENCY = 6
+
+# 半次调用里原文块的总字数上限。取值依据（`docs/RAG-DECISIONS.md` 实测）：12 章
+# 61 个节点、每节点 3 段，**跨节点去重之后**的并集就是这 12 章各自的父块并集
+# ≈ 全文 14,120 字，两半各拿一半 ≈ 7,000 字。16,000 字给"一章一万多字"那种形状
+# （`docs/PLAN.md` 最长 11,697 字）留一倍余量，按 `estimate_input_tokens` 折算约
+# 10.7k token——仍小于现状那"整份材料 × 两半"的 28,240 字。
+DETAIL_RETRIEVAL_MAX_CHARS = 16_000
+
+
+def detail_retrieval_enabled() -> bool:
+    """第三段按节点章内检索的开关。默认**关**：它是 A/B 的一臂，也是另一笔 token。
+
+    与 `section_slice_enabled` 同一种写法与同一条理由：一个改变 prompt 范围与
+    检索次数的默认值不该悄悄生效——它要有一组数字撑着才配翻默认值。
+    """
+    return os.getenv(DETAIL_RETRIEVAL_ENV, "").strip().lower() in GRAPH_SKELETON_TRUTHY
+
+
+@dataclass
+class _DetailBlock:
+    """一段可引用的原文块：**章内的一个父块**，坐标已平移回全文口径。"""
+
+    chapter_index: int
+    chapter_title: str
+    source_id: str
+    start: int
+    end: int
+    quote: str
+    score: float
+
+
+@dataclass
+class _DetailEvidence:
+    """第三段这一次检索的全部产物：块池 + 节点 → 块的指针 + 一笔账。
+
+    为什么是**块池 + 指针**而不是"每个节点各渲染一遍"：同一章的 5 个节点命中的是
+    同一批父块，逐个渲染会把这一章复制 5 遍——那正是要消灭的"注意力摊薄"，只是换成
+    了浪费 token 的版本。块按 `(source_id, start, end)` 去重，节点只记编号；两半各渲染
+    自己节点用到的那部分（`_detail_evidence_section`），所以"这一半的 prompt 里只有
+    这一半的章"。
+    """
+
+    blocks: list[_DetailBlock] = field(default_factory=list)
+    by_node: dict[str, list[int]] = field(default_factory=dict)
+    queries: int = 0        # 真发出去的检索次数（= 有 label 又有章的节点数）
+    hits: int = 0           # 检索返回的条数（去重前）
+    failed: int = 0         # 抛错的检索次数（那一个节点退回"没有证据"）
+    chapters: int = 0       # 覆盖到几章
+    seconds: float = 0.0
+
+    def empty(self) -> bool:
+        return not self.blocks
+
+    def report(self) -> dict[str, Any]:
+        """进 `data["detail"]["evidence"]` 的那笔账（只在开关打开时存在）。"""
+        return {
+            "queries": self.queries,
+            "hits": self.hits,
+            "failed": self.failed,
+            "blocks": len(self.blocks),
+            "chapters": self.chapters,
+            "chars": sum(len(block.quote) for block in self.blocks),
+            "nodes_with_evidence": len(self.by_node),
+            "top_k": DETAIL_RETRIEVAL_TOP_K,
+            "seconds": self.seconds,
+        }
+
+
+def _node_chapters(root: Node, chapters: Sequence[_Chapter]) -> dict[str, _Chapter]:
+    """节点 id → 它所在的那一章。根节点**不在**里面（它不属于任何一章）。
+
+    判据按可靠性排序，三条都要（与 `_align_chapters` / `_apply_skeleton` 的"label
+    优先、序号兜底"同源，只是这里的优先项是 **id**）：
+
+      1. `s{章号}`：`_slice_structure` 组装时给一级分支的唯一 id，最确定；
+      2. 章标题：模型若把分支名改了一个字，id 仍是它，但一道兜底不多花钱；
+      3. 位置：只有前两条都对不上时才用（那份树不是这条路产出的），宁可给错一个
+         章也不要不给——错章的代价是证据偏，不给的代价是这一段完全没有依据。
+
+    返回的是**整棵子树**的映射：章内节点不会有别的归属来源，逐层判一次只是多花
+    几十次字典写入。
+    """
+    if not chapters:
+        return {}
+    by_id = {f"s{chapter.index}": chapter for chapter in chapters}
+    by_key = {_skeleton_key(chapter.title): chapter for chapter in chapters}
+    mapping: dict[str, _Chapter] = {}
+    for position, child in enumerate(root.children):
+        chapter = by_id.get(child.id) or by_key.get(_skeleton_key(child.label))
+        if chapter is None and position < len(chapters):
+            chapter = chapters[position]
+        if chapter is None:
+            continue
+        stack = [child]
+        while stack:
+            node = stack.pop()
+            mapping[node.id] = chapter
+            stack.extend(node.children)
+    return mapping
+
+
+def _detail_queries(
+    targets: Sequence[tuple[Node, tuple[str, ...]]],
+    mapping: Mapping[str, _Chapter],
+) -> dict[str, str]:
+    """节点 id → 检索问句。**label 为主**，同章内重名时才补父 label。
+
+    为什么不一律拼父 label：父是这一章的方面名，拼上去等于把每一句都往"这一章"
+    的方向再拉一遍，而章内检索的范围**本来就只有这一章**——多出来的是噪声。
+    但同一个 label 在一章里出现两次时（"实施要点"在两个方面下各一个）两者会拿到
+    完全相同的证据，那一章的 5 个节点就有一对写出同一段话。这时用「父 + 自己」，
+    差别的正是它们真正的区别。
+
+    父 label 取 `path[-1]`（`_iter_paths` 给的"根 → 父"链的最后一项）：一级分支的
+    path 是空的，它自己不重名（章标题就是它）。
+    """
+    seen: dict[tuple[int, str], int] = {}
+    for node, _path in targets:
+        chapter = mapping.get(node.id)
+        label = (node.label or "").strip()
+        if chapter is None or not label:
+            continue
+        key = (chapter.index, _skeleton_key(label))
+        seen[key] = seen.get(key, 0) + 1
+    questions: dict[str, str] = {}
+    for node, path in targets:
+        chapter = mapping.get(node.id)
+        label = (node.label or "").strip()
+        if chapter is None or not label:
+            continue
+        parent = (path[-1].strip() if path else "")
+        repeated = seen[(chapter.index, _skeleton_key(label))] > 1
+        # 父与子同名时不拼（"一句话结论 一句话结论"只是把同一个词发两遍，白白拉长了
+        # 词面匹配的 query）：那种形状下它们本来就分不开，拼了也不加分。
+        if repeated and parent and _skeleton_key(parent) != _skeleton_key(label):
+            questions[node.id] = f"{parent} {label}"
+        else:
+            questions[node.id] = label
+    return questions
+
+
+def _chapter_source(source: Source, chapter: _Chapter, text: str) -> Source:
+    """把一份来源**裁成这一章**：检索的候选块只可能从这段正文里切出来。
+
+    这就是"范围过滤"的实现：不做候选块的事后过滤（那要先取更深的池子，被剔掉的
+    候选仍占着 `top_k` 的名额），而是让切块这件事只看得见这一章。命中坐标因此是
+    **章内相对**的，由调用方 `+chapter.start` 平移回全文口径。
+
+    只改 `text`：`id` 必须留着（引用、证据集、界面高亮共用这个键），`kind` /
+    `filename` / `metadata` 与检索无关但也不该凭空改——这份副本不落库、不出函数。
+    """
+    return source.model_copy(update={"text": text[chapter.start:chapter.end]})
+
+
+async def _detail_evidence(
+    targets: Sequence[tuple[Node, tuple[str, ...]]], *,
+    mapping: Mapping[str, _Chapter], source: Source,
+) -> _DetailEvidence:
+    """每个节点在**它自己那一章**里检索 `DETAIL_RETRIEVAL_TOP_K` 段 → 块池 + 指针。
+
+    两段并发（与 `_retrieve_branches` 的"第一支先串一条"同一个理由，只是按章分）：
+    块向量按文本哈希缓存，同一章的 5 个节点若同时发出，每个都会认为自己是第一次
+    （5 × 15 条块文本现算）；先每章发一个，缓存填上之后其余节点只需要 embed 自己
+    那一条 query。**每章**而不是全局一条：章与章之间块文本不重叠，预热第一章对
+    第二章是白费。
+
+    失败**不抛**（与 `_fill_details` 同一条原则）：某一次检索抛错只让那个节点退回
+    "没有证据"，不能让整段说明写不出来。整棵树一次都没命中时由调用方退回现状
+    （`_fill_details` 那一边判 `empty()` 并保留原来的 `sections`）。
+    """
+    evidence = _DetailEvidence()
+    started = time.perf_counter()
+    questions = _detail_queries(targets, mapping)
+    if not questions:
+        return evidence
+
+    evidence.queries = len(questions)
+    evidence.chapters = len({mapping[node_id].index for node_id in questions})
+    chapters = {chapter.index: chapter for chapter in mapping.values()}
+    limit = asyncio.Semaphore(DETAIL_RETRIEVAL_CONCURRENCY)
+
+    async def run(node_id: str) -> list[tuple[str, EvidenceHit]]:
+        chapter = chapters[mapping[node_id].index]
+        async with limit:
+            try:
+                hits = await asyncio.to_thread(
+                    search_exact_blocks,
+                    [_chapter_source(source, chapter, source.text or "")],
+                    questions[node_id], DETAIL_RETRIEVAL_TOP_K)
+            except Exception as exc:  # noqa: BLE001 — 检索失败只降级，理由见 docstring
+                logger.warning("第三段按节点检索失败（%s）：%s: %s",
+                               questions[node_id][:40], type(exc).__name__, str(exc)[:160])
+                return []
+        return [(node_id, hit) for hit in hits]
+
+    # 第一段：每章一个节点，把这一章的块向量填进缓存。章按序发，互不等待。
+    first: dict[int, str] = {}
+    for node_id in questions:
+        first.setdefault(mapping[node_id].index, node_id)
+    results = list(await asyncio.gather(*(run(node_id) for node_id in first.values())))
+    # 第二段：其余节点。同章第一轮已经结束，这里不需要再分章。
+    rest = [node_id for node_id in questions if node_id not in set(first.values())]
+    results.extend(await asyncio.gather(*(run(node_id) for node_id in rest)))
+
+    index_of: dict[tuple[str, int, int], int] = {}
+    per_node: dict[str, list[EvidenceHit]] = {}
+    text = source.text or ""
+    for group in results:
+        for node_id, hit in group:
+            evidence.hits += 1
+            per_node.setdefault(node_id, []).append(hit)
+            start, end = hit.start + mapping[node_id].start, hit.end + mapping[node_id].start
+            key = (hit.source_id, start, end)
+            if key in index_of:
+                continue
+            if start < 0 or end > len(text) or end <= start:
+                # 章内相对坐标平移之后越界：只可能是上游换了切块口径。丢掉这条而
+                # 不是把它塞进块池——`quote` 与坐标对不上的证据比没有证据更糟。
+                continue
+            chapter = chapters[mapping[node_id].index]
+            index_of[key] = len(evidence.blocks)
+            evidence.blocks.append(_DetailBlock(
+                chapter_index=chapter.index,
+                chapter_title=chapter.title,
+                source_id=hit.source_id,
+                start=start,
+                end=end,
+                quote=text[start:end],
+                score=hit.score,
+            ))
+    for node_id, hits in per_node.items():
+        picked = [index_of[(hit.source_id,
+                            hit.start + mapping[node_id].start,
+                            hit.end + mapping[node_id].start)]
+                  for hit in hits
+                  if (hit.source_id, hit.start + mapping[node_id].start,
+                      hit.end + mapping[node_id].start) in index_of]
+        if picked:
+            evidence.by_node[node_id] = picked
+    _budget_blocks(evidence)
+    evidence.seconds = round(time.perf_counter() - started, 3)
+    return evidence
+
+
+def _budget_blocks(evidence: _DetailEvidence) -> None:
+    """按分数从高到低留块，总字数封顶 `DETAIL_RETRIEVAL_MAX_CHARS`（就地改）。
+
+    真实材料上这个闸**不触发**（12 章的块并集约 7,000 字 / 半），它守的是"一章
+    一万多字 × 十几章"那种形状：不定闸就等于把整份材料又塞回 prompt，而这条路
+    的全部意义是把范围收窄。
+
+    为什么按分数而从文档序留：块池是按节点命中拼出来的，尾部节点的块在文档序上
+    靠后——按文档序截断等于系统性地饿死最后几章（`_clip_tree` 那个失效形态的翻版）。
+    留下的块**重新按文档序编号**，因为 `_detail_evidence_section` 要让模型按阅读
+    顺序看到它们。
+    """
+    if not evidence.blocks:
+        return
+    total = sum(len(block.quote) for block in evidence.blocks)
+    if total > DETAIL_RETRIEVAL_MAX_CHARS:
+        order = sorted(range(len(evidence.blocks)),
+                       key=lambda index: (-evidence.blocks[index].score, index))
+        kept: set[int] = set()
+        used = 0
+        for index in order:
+            size = len(evidence.blocks[index].quote)
+            if kept and used + size > DETAIL_RETRIEVAL_MAX_CHARS:
+                continue
+            kept.add(index)
+            used += size
+        index_of = {old: new for new, old in enumerate(sorted(kept))}
+        evidence.blocks = [evidence.blocks[old] for old in sorted(kept)]
+        evidence.by_node = {
+            node_id: [index_of[index] for index in indices if index in index_of]
+            for node_id, indices in evidence.by_node.items()
+        }
+    # 一块都没留下的节点从指针表里摘掉：留着空列表会让 `nodes_with_evidence` 把
+    # "这个节点其实没有证据"数成有证据。
+    evidence.by_node = {node_id: indices for node_id, indices in evidence.by_node.items()
+                        if indices}
+    # 块池按文档序排好（章号 → 章内偏移），渲染时的编号就是"读下去的第几块"。
+    order = sorted(range(len(evidence.blocks)),
+                   key=lambda index: (evidence.blocks[index].chapter_index,
+                                      evidence.blocks[index].start))
+    if order != list(range(len(evidence.blocks))):
+        index_of = {old: new for new, old in enumerate(order)}
+        evidence.blocks = [evidence.blocks[old] for old in order]
+        evidence.by_node = {
+            node_id: sorted(index_of[index] for index in indices if index in index_of)
+            for node_id, indices in evidence.by_node.items()
+        }
+
+
+def _detail_evidence_section(
+    targets: Sequence[tuple[Node, tuple[str, ...]]], evidence: _DetailEvidence,
+) -> str:
+    """这一半节点的证据：块池（每块带它属于哪一章）+ "哪个节点命中了哪几块"。
+
+    只渲染**这一半节点用到的块**：两半各跑一次调用，把另一半的章也塞进来等于把
+    "按章限定"这件事在最后一步又取消掉。
+
+    指针表必须在块的**后面**且紧挨着清单：模型对紧挨着输出位置的那段话最敏感
+    （同 `_detail_ask` 末尾那句自查）。块与指针分两次读也不冲突——编号是唯一锚点。
+    """
+    if not evidence.blocks:
+        return ""
+    picked: list[int] = []
+    seen: set[int] = set()
+    for node, _path in targets:
+        for index in evidence.by_node.get(node.id, ()):
+            if index not in seen:
+                seen.add(index)
+                picked.append(index)
+    if not picked:
+        return ""
+    picked.sort()
+    renumber = {old: new for new, old in enumerate(picked, start=1)}
+    lines = [
+        "下面是每个节点**在它自己那一章里**命中的原文段落（块按文档顺序编号，"
+        "每条都标着它属于第几章）：",
+    ]
+    for old in picked:
+        block = evidence.blocks[old]
+        lines.append(
+            f"\n[块 {renumber[old]}｜第 {block.chapter_index} 章"
+            f"「{block.chapter_title}」]")
+        lines.append(block.quote)
+    pointers = [
+        f"id={node.id} → " + "、".join(f"块 {renumber[index]}"
+                                      for index in evidence.by_node.get(node.id, ())
+                                      if index in renumber)
+        for node, _path in targets
+        if any(index in renumber for index in evidence.by_node.get(node.id, ()))
+    ]
+    if pointers:
+        lines.append("\n各节点命中的块（没列到的节点，它的那一章里没有与它直接对应的段落，"
+                     "按你的知识写，不要因此说「材料中没有」）：")
+        lines.extend(pointers)
+    return "\n".join(lines)
+
+
 def _split_nodes(
     targets: Sequence[tuple[Node, tuple[str, ...]]],
 ) -> list[list[tuple[Node, tuple[str, ...]]]]:
@@ -3750,13 +4152,15 @@ def _split_nodes(
 def _detail_ask(
     topic: str, targets: Sequence[tuple[Node, tuple[str, ...]]],
     sections: Sequence[str], *, full_text: bool = False,
-    instruction: str | None = None,
+    instruction: str | None = None, evidence: str = "",
 ) -> str:
     """第三段的 user 消息：主题 + 节点清单（id / label / 位置）+ 可选的原文。
 
     清单必须带**层级路径**：一个 16 字的 label（"实施要点""风险"）几乎在任何主题下
     都成立，模型不知道它在哪一层、上面那层讲的是什么，写出来的说明会飘到别的主题上
-    （与 `_node_path` 对 `node_expand` 的理由同源）。
+    （与 `_node_path` 对 `node_expand` 的理由同源）。**这条路径与"哪个节点的证据在
+    哪一章"是两件事**：后者由 `evidence` 那一节给（见 `_detail_evidence_section`），
+    而全塞那条路（没有章节边界可用）仍然只能靠它。
 
     带 id 是这一段唯一能对上号的东西：**不靠顺序**——顺序错一位，整棵树的说明就会
     整体串行错位，而且从产出上看不出来（每段话本身都通顺）。
@@ -3764,6 +4168,11 @@ def _detail_ask(
     `full_text` 只影响末尾那段**引导句**，`sections` 本身的形状决定了它们是"按支分组
     的检索结果"还是"按材料分节的完整正文"：同一份内容配上错的引导句（"以本组为准"
     挂在全文上）会让模型以为每组之间互不相干。
+
+    `evidence` 是第三种形态（按节点章内检索）：它是**已经渲染好的块池 + 指针表**，
+    与 `sections` 互斥（调用了这条路就不再拼整支/整份）。空串表示这条路没走，此时
+    本函数的输出与加这个参数之前**逐字节相同**——`tests/test_detail_round.py` 与
+    `test_fill_details_tool.py` 里的回归断言比的就是那些 case。
     """
     lines = [
         f"{index}. id={node.id}｜{node.label}｜位置：{' / '.join(path) or '中心主题'}"
@@ -3782,6 +4191,10 @@ def _detail_ask(
             if full_text else
             "\n\n结构那一轮用过的原文（按一级分支分组；写说明时以本组为准）：\n\n")
         user += guide + "\n\n".join(sections)
+    # 按节点章内检索那一条路：`sections` 此时是空的（两件事互斥，见 `_fill_details`），
+    # 引导句因此写在这一节自己的开头（`_detail_evidence_section` 的第一行）。
+    if evidence:
+        user += "\n\n" + evidence
     # 补充要求挨着清单、在自查句**之前**（与 `_expand_ask` 同一个位置）：它约束的是
     # "这些段话怎么写"，自查句约束的是"写完有没有漏"。放在自查句之后会被读成
     # 自查的一部分（模型已经在准备输出了，那行字只当成格式提醒）。
@@ -3913,6 +4326,7 @@ async def _fill_details_half(
     external_rules: str,
     full_text: bool = False,
     instruction: str | None = None,
+    evidence: _DetailEvidence | None = None,
 ) -> _DetailHalf:
     """发这一次「只写说明」的请求并解析。**预算是调用方的事**（见 `_fill_details`）。
 
@@ -3924,11 +4338,19 @@ async def _fill_details_half(
       - **不往共享的 `diagnostics` 里写**：两半并发，谁先 append 不确定，而诊断是
         给人按顺序读的（"第 1 半缺了 2 个"应该排在"第 2 半缺了 3 个"前面）。诊断
         因此由 `_fill_details` 在合并时按半序生成。
+
+    `evidence` 非空时走第三种形态（按节点章内检索）：块池是**全树共享**的，但每一半
+    只渲染自己节点用到的那部分——两半各跑一次调用，"另一半的章"对它就是无关材料，
+    这正是这条路要减掉的东西。三份 system 互斥：全塞 / 按支分组 / 按节点章内，
+    引导句与给的证据形状必须成对，错配会让模型把"这一章的块"读成"整份材料"。
     """
     half = _DetailHalf(requested=len(targets),
                        target_ids=[node.id for node, _ in targets])
+    section = _detail_evidence_section(targets, evidence) if evidence is not None else ""
     system = DETAIL_ONLY_PROMPT
-    if sections and full_text:
+    if section:
+        system += DETAIL_ONLY_RETRIEVED_RULES + external_rules
+    elif sections and full_text:
         # 全塞：给的是完整正文，没有"本组"这个概念（分组来自按支检索）。用错引导句
         # 会让模型以为每份材料各管一支、跨份的内容不写——那正好浪费掉全塞的覆盖优势。
         system += DETAIL_ONLY_FULL_TEXT_RULES + external_rules
@@ -3941,7 +4363,7 @@ async def _fill_details_half(
         raw = await _chat(
             ctx, system,
             _detail_ask(topic, targets, sections, full_text=full_text,
-                        instruction=instruction),
+                        instruction=instruction, evidence=section),
             max_tokens=_max_tokens(ctx))
 
     except GenerationError as exc:
@@ -4043,6 +4465,8 @@ async def _fill_details(
     diagnostics: list[Diagnostic], skip_ids: Collection[str] = (),
     full_text: bool = False,
     instruction: str | None = None,
+    chapters: Sequence[_Chapter] = (),
+    source: Source | None = None,
 ) -> tuple[MindMapContent, dict[str, Any]]:
     """第三段：给缺说明的节点补 detail。**只读结构、只写 detail**。
 
@@ -4070,6 +4494,12 @@ async def _fill_details(
     `instruction` 是**从检查点续写**那条路专用的（`_fill_details_tool`）：用户在
     界面上说"说明写长一点/口语一点"时，它进 `_detail_ask` 的补充要求那一段。生成
     路径永远不传，所以那条路上的 user 与加这个参数之前逐字节相同。
+
+    `chapters` / `source` 是**按节点章内检索**那条路的输入（`MINDMAP_DETAIL_RETRIEVAL`）：
+    有了章才谈得上"这一章"。两个都为空的调用方（`_fill_details_tool` 的续写路径、
+    多份材料、没开按章切）走的仍是原来那条"整支/整份"证据——**prompt 与 data 逐
+    字节相同**。给了章但一次命中都没有时同样退回原来那条（见下面的 `fallback`），
+    因为"检索没成"不该把本来能用的证据一起丢掉。
     """
     targets = _detail_targets(content.root, skip=skip_ids)
     report: dict[str, Any] = {
@@ -4080,6 +4510,26 @@ async def _fill_details(
         # 结构那一轮自己就写够了说明（或被裁到只剩几个节点）：不花这次调用。
         report["skipped"] = "nothing_to_fill"
         return content, report
+
+    # ---- 证据：每个节点在它自己那一章里检索（开关 + 两种输入都齐了才走）---------
+    #
+    # 检索放在**切半之前**：两半的节点天然不相交，但块池必须共享（同一章的 5 个
+    # 节点命中的是同一批父块），在这里算一次、两半各渲染自己那部分。
+    evidence: _DetailEvidence | None = None
+    if chapters and source is not None and detail_retrieval_enabled():
+        evidence = await _detail_evidence(
+            targets, mapping=_node_chapters(content.root, chapters), source=source)
+        # 一条都没命中（材料不是这份来源、检索全部抛错、标签全是模型造的词）时不
+        # 把 `sections` 丢掉：那是**已有**的证据，换成一个空块池等于把这一段退化成
+        # "凭知识写"。账里留 `fallback`，否则"这条路这次没生效"在产出上无从分辨。
+        report["evidence"] = {**evidence.report(),
+                              "fallback": "" if not evidence.empty() else "no_hits"}
+        if evidence.empty():
+            evidence = None
+        else:
+            # 块池已经是逐节点的章内证据，整支/整份那份不必再进 prompt——两份并存
+            # 等于把范围重新放大，这条路就没有意义了。
+            sections = ()
 
     halves = _split_nodes(targets)
     # ---- 额度：一次占完，两半只负责花 -------------------------------------
@@ -4114,7 +4564,7 @@ async def _fill_details(
     results = await asyncio.gather(*(
         _fill_details_half(half, ctx=ctx, topic=topic, sections=sections,
                            external_rules=external_rules, full_text=full_text,
-                           instruction=instruction)
+                           instruction=instruction, evidence=evidence)
         for half in pending
     ), return_exceptions=True)
     settled = _settle_halves(results, pending)
@@ -7081,12 +7531,18 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     # `annotate_nli()` 都还没跑——那两个函数读的是**最终**的 detail，说明必须在它们
     # 之前落地。
     # 第三段：**分组节点不进清单**（`skip_ids`）。分组是分类名、没有内容，给它写一段
-    # 说明只会得到一句"这一组讲的是…"的空话，而它占掉的正是那二十节里某一节的输出
+    # 说明只会得到一句"这一组在讲什么"的空话，而它占掉的正是那二十节里某一节的输出
     # 预算。这一步因此**不因为分组多花一次调用**——它本来就是按节点数切两半的。
+    #
+    # `chapters` / `source` 只在按章切真的生效时才传：这条路唯一的输入是"哪一章"，
+    # 没有章就退回"整支/整份"那份证据（`MINDMAP_DETAIL_RETRIEVAL` 的两条前置条件）。
+    # 传的是**单份材料本身**：`_chapter_slices` 只在恰好一份材料时才产出章，两者同源。
     content, detail_report = await _fill_details(
         content, ctx=ctx, topic=args.topic, sections=sections,
         external_rules=external_rules, diagnostics=diagnostics,
-        skip_ids=group_ids, full_text=full_text)
+        skip_ids=group_ids, full_text=full_text,
+        chapters=tuple(slice_chapters or ()),
+        source=sources[0] if slice_chapters else None)
 
     # `expandable` 三态：被裁掉子节点的那些是**没长完**（`unknown`），不是"到底了"
     # ——这个区别在这里最实，用户下一步就是点开某个节点继续展开，而把被裁的那几个

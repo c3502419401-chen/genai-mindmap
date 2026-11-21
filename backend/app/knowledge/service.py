@@ -2242,6 +2242,39 @@ def search_parent(sources: list[Source], query: str, top_k: int = 5, *,
     return _with_graph(hits, sources, question, top_k, filters, parent=True)
 
 
+def search_exact_blocks(sources: list[Source], query: str, top_k: int = 3,
+                        ) -> list[EvidenceHit]:
+    """**父块粒度、但不重排也不查库**的检索：给"用短语去定位原文"的调用方。
+
+    与 `search_parent` 的差别只有两处，都是刻意去掉的：
+
+      - **不重排**（不走 `_rerank_depth` / `_rerank_top`，候选池不扩）；
+      - **不查知识库**（`library` 那一路不存在）。
+
+    为什么这条路**该**关掉重排：`knowledge/rerank.py` 的注释写着那个前提——重排的
+    默认值是按"自然语言问法"评估出来的（`R@1` 67.9% → 82.1%），而对"标题定位"
+    "关键词跳到某章"这类**字面检索**，开着它是负收益，且是**静默**的负收益
+    （结果照样返回，只是顺序变差）。本函数的调用方（第三段的按节点检索）正是
+    那种形态：query 是章节内一个节点的 label（几个词的名词短语），候选池是同**一章**
+    里切出的三五个父块——这个尺度上重排模型没有可加的语义信号，只剩一次网络往返。
+    所以它不复用 `search_parent`：那里没有"这次别重排"的口子，而**改开关是全局的**
+    （`MINDMAP_RERANK` 同时管着 `rag_query` 那条自然语言路），不能为一个调用方翻。
+
+    不查库的理由是"范围即承诺"：这个函数的调用方只允许看见**它自己那一章**的原文
+    （`MINDMAP_DETAIL_RETRIEVAL` 的机制保证），库里别的材料一旦被捞进来，那句话就
+    不成立了，而产出上看不出区别。
+
+    粒度仍是父块（`CHUNK_*`，450–700 字），`start/end/quote` 与 `search_parent`
+    同口径；`leaf_*` 记命中的那一小段（父块模式下恒有值，理由见 `search_parent`）。
+    `score` 是 RRF 分（两路）或 BM25 分（单路），**只在本次检索内可比**——与所有
+    其它入口同一条约定。
+    """
+    question = (query or "").strip()
+    if top_k <= 0 or not question:
+        return []
+    return _search_parent_core(sources, question, top_k, None)
+
+
 # ---------------------------------------------------------------- 图游走接线
 
 
