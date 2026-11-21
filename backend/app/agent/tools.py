@@ -105,6 +105,8 @@ from app.generation.service import (
 )
 from app.generation.stream_partial import collect_new_nodes, parse_partial
 from app.knowledge import external as external_knowledge
+from app.knowledge import graph_extract
+from app.knowledge import graph_ingest
 from app.knowledge import graph_store
 from app.knowledge import library as knowledge_library
 from app.knowledge.query_plan import _material_snippets, plan_branches, plan_query
@@ -4562,6 +4564,10 @@ class _Intake:
     那批（`picked`），而前者是 `sources` 的合计——外部检索补进来的几份也在里面。
     用 `material_chars` 判闸会漏掉整条外部检索路：那条路上 `material_chars` 恒为 0
     （用户没给材料），于是"0 字，装得下"会让每一次外部检索结果都被整份塞进 prompt。
+
+    `ingested` 是"这一步顺手把检索材料抽进图"的那笔账（见 `_ingest_external_graph`），
+    None 表示没做（开关关着 / 没有外部材料 / 图不可用）。它**只用来上报**：不改
+    `sources`、不改任何既有分支——这一步的产物在图里，不在这个 dataclass 里。
     """
 
     sources: list[Source]
@@ -4571,6 +4577,7 @@ class _Intake:
     external: _ExternalFetch | None
     full_text: bool = False
     full_text_chars: int = 0
+    ingested: dict[str, Any] | None = None
 
 
 async def _intake(topic: str, ctx: RunContext) -> _Intake:
@@ -4588,6 +4595,11 @@ async def _intake(topic: str, ctx: RunContext) -> _Intake:
 
     外部检索排在额度预探**之后**（调用方先判额度再调这里）：额度已经用光时，
     白等一次 6 秒的外网往返没有意义。
+
+    **入图排在外部检索之后、`full_text` 判定之前**（`_ingest_external_graph`）：它只
+    处理检索回来的那批（用户自己上传的材料不归这一步管——那批已经随请求带着走完整条
+    链），产物在图里而不在这里，所以对下面三行**一个字都不改**。默认关着，关着时
+    这一行是一次函数调用、零查询、零网络（理由见那个函数的注释）。
 
     **全塞的判定放在最后一行**：材料总量不超过 `FULL_TEXT_MATERIAL_CHARS` 时才为真。
     它必须排在短材料那道闸之后（太短的材料先被换成 `hint_block`，`sources` 已经是
@@ -4617,10 +4629,14 @@ async def _intake(topic: str, ctx: RunContext) -> _Intake:
             count=len(external.sources),
         )
         sources = external.sources
+    # 只入"这次要用的"：`external` 为 None 说明这次没走检索（有材料或开关关着），
+    # 那批材料与图这一档无关，一个字节都不该花在它上面。
+    ingested = (await _ingest_external_graph(sources)
+                if external is not None else None)
     full_text_chars = sum(len((source.text or "").strip()) for source in sources)
     full_text = bool(sources) and 0 < full_text_chars <= FULL_TEXT_MATERIAL_CHARS
     return _Intake(sources, short_material, material_chars, hint_block, external,
-                   full_text, full_text_chars)
+                   full_text, full_text_chars, ingested)
 
 
 
@@ -5353,6 +5369,238 @@ def _relations_from(
     return kept, drops
 
 
+# -------------------------------------- 外部检索材料入图（`_intake` 的那一步）
+#
+# ## 缺口在哪
+#
+# 图谱在生成侧有两处出口（两段式 `MINDMAP_GRAPH_SKELETON` 与第三档 `_graph_outline`），
+# 两处吃的是同一个前提：**这批材料在图里**。而材料进图只有一条路
+# ——`scripts/ingest_graph_corpus.py`（离线、人工、整库重灌）。生成链路自己从不建图：
+#
+#     外部检索（`_external_sources`）→ library.ingest 入库（快，无模型）   ✅ 有
+#     library_sources → 建图（抽取，慢，每条材料一块一次 LLM）             ⚠️ 只有脚本
+#
+# 于是"全新主题 + 联网搜索"这条真实流程永远过不了第三档的第 4 道闸
+# （`GRAPH_OUTLINE_MIN_ENTITIES`）：图里没有这批材料的边，`scoped_entity_count`
+# 恒为 0，`_graph_outline` 每次返回空。这一档在有材料的场景里实际上**从未生效过**，
+# 生效过的只有那 22 份被脚本重灌过的旧材料。
+#
+# 同样的道理也落在两段式上（`MINDMAP_GRAPH_SKELETON` 的 `GRAPH_SKELETON_UNAVAILABLE`），
+# 但这一档**只补第三档**：两段式换的是"一级分支从哪来"，是另一个开关的事。
+#
+# ## 只入这一次要用的
+#
+# 不是全库、不是后台补历史：`_external_sources` 的命中已经过词面门
+# （`external._relevant_hits`），那 3 条就是这次生成要用的 3 条。入别的东西等于拿用户的
+# 钱替下一次请求铺路，而"下一次"是不是同一批材料没人知道。
+#
+# ## 幂等靠三把锁，第三把省的是钱
+#
+#   1. `library.ingest` 按 `content_hash` 去重——同一份正文只落一行（外部来源在
+#      `_external_sources` 里已经过了这一步，所以这里直接把 `source.id` 显式传给
+#      `ingest_graph(..., source_id=)`，不再写一次库）；
+#   2. `graph_store` 的边 `UNIQUE (src, dst, relation, source_id, chunk_start)`——
+#      重复抽同一块不会长出新边；
+#   3. **`scoped_entity_count([source.id]) > 0` 就跳过这份**。前两把锁保证"重复不写"，
+#      但保证不了"重复不抽"：抽取是每块一次 LLM 调用，第二把锁要等**抽完**才生效。
+#      实测同一主题连续生成两次时，外部检索大概率命中缓存（`external_cache` 24 小时），
+#      材料一模一样——少了这一把，第二次生成要原价再付一遍抽取的钱，换来的边还全是
+#      重复的。
+#
+# 第三把锁的代价写在明处：**部分入过图的材料会被整体跳过**。熔断在中途（第 3 块写库
+# 失败）之后再生成一次，剩下那几块不会补。这里选了"宁可少几块，不要每次重付"：
+# 那些块本来也只能靠人工重灌补齐，而"每次生成偷偷多花一遍钱"没有任何人看得见。
+#
+# ## 成本与默认值（实测，`scripts/measure_graph_ingest.py`）
+#
+# 主题「海绵城市」，真实检索 3 条 / 2 816 字 / 7 块（维基 2 427 字 5 块 + 两份纯摘要
+# 各 1 块）：
+#
+#     串行 7 块            20.86 秒      （长维基那 5 块占 17.29 秒，摘要各 1.8 秒）
+#     并发 7 块（产品实现） 17.53 秒      95 实体 / 79 边
+#     抽取那一层            7 次调用    输入 6 827 token + 输出 6 385 token = 13 212
+#
+# 单块 2.5–3.4 秒、约 1.9k token，与"179 块 / 610 秒 / 306k token"的离线口径一致
+# （`data/graph-ingest-report.json`）。而一次生成是 38–97 秒——**入图这一下等于
+# +17.5 秒，也就是 +40% 左右**，并发已经把串行那 20.9 秒压掉了 16%。
+#
+# ## 它到底改好了什么（这才是默认值取关的真正理由）
+#
+# 同一个主题的 A/B 跑了两种材料形状，结果完全不同：
+#
+#   - **真实检索形状**（维基 1 份 + 摘要 2 份）：全批目录 7 条 / 覆盖率 0.718，
+#     过得了 `OUTLINE_MIN_COVERAGE`，于是 `_graph_outline` 那道 `if not outline_entries`
+#     根本不进——两组的一级分支**逐字相同**（背景 / 历史 / 六大措施 / 争议 / 相关条目 /
+#     参考资料与外部链接），骨架忠实度同为 66.7%。**入图贡献 0，代价 +17.5 秒。**
+#   - **目录不可用**（只喂那两份摘要）：A 组是「建设背景与理念 / 技术措施与设施 /
+#     规划设计与标准 / 运行维护与管理 / 效益评估与成效 / 问题挑战与展望」，**忠实度
+#     0%**——一条都不在原文里；B 组是「海绵城市理念 / 海绵城市建设试点 / 汉阳四新示范区
+#     / 海绵+升级理念 / 海绵城市设施措施 / 自然排水雨洪管理系统」，**忠实度 66.7%，
+#     其中 4 条只能来自那两份摘要**。这一档的真实作用域就是这个形状。
+#
+# 所以默认值是**关**：收益只在"这批检索材料一份能用的目录都没有"时出现，而"维基命中
+# 一条"在真实检索里很常见（一命中就把覆盖率撑到 0.7）。翻默认值之前，要先有办法把那
+# 种形状认出来（或者把入图挪到"用户本来就在等"的那一刻，比如上传解析时预抽）。
+GRAPH_INGEST_ENV = "MINDMAP_GRAPH_INGEST"
+
+# 与 `MINDMAP_GRAPH_EXTRACTION`（`graph_extract.ENABLED_ENV`）的关系：**两个开关都要
+# 开**才真的抽。抽取那一个管"要不要花 LLM 的钱抽"，默认关；这一个管"生成时要不要顺手
+# 建图"。这里**不读**抽取的开关——多一处开关判断就多一处会与 `graph_extract` 分叉的
+# 地方（同 `graph_ingest` 模块 docstring 那条规矩）。关着时的表现是 `chunks > 0` 而
+# `entities == 0`，那笔账如实记在日志里（一条 warning），不假装成功。
+_GRAPH_INGEST_TRUTHY = {"1", "true", "yes", "on", "y", "t"}
+
+GRAPH_INGEST_MAX_CHUNKS = 6
+"""每份材料最多抽多少块。`graph_ingest.DEFAULT_MAX_CHUNKS`（20）是给"上传一份文件"
+那条路定的；这里是**每次生成都要付**的钱，闸要更紧。
+
+6 块 ≈ 4 200 字（`CHUNK_MAX_CHARS` 700 + 重叠），而外部命中的单份上限是
+`external.TEXT_MAX_CHARS` = 8000 字（约 12 块）——所以长维基条目只能进前一半。
+这个取舍是刻意的：骨架只需要"这份材料讲了哪几件事"，那只在前几段里；而截断
+**只影响长材料**，摘要类的 1 块就全进了（那正是上一轮"论文摘要一条标题都没贡献"
+的那批）。"""
+
+GRAPH_INGEST_CONCURRENCY = 3
+"""并发入图的材料数。外部命中上限就是 3 条（`EXTERNAL_HIT_LIMIT`），所以常规情况下
+一次 `gather` 全部发出去；写 3 而不是 6 是给"将来命中上限调大"留的闸——抽取是
+LLM 调用，并发越多越容易撞限流，而多等一轮比 429 之后全体重试便宜。"""
+
+
+def graph_ingest_enabled() -> bool:
+    """入图那一步是否启用（**默认 `False`**）。
+
+    默认关的理由与 `docs/GRAPH-OUTLINE.md` 那一档相反：那一档是"补一个缺口、不额外
+    花钱"，所以默认开；这一步要为每次生成多付十几秒与一万多 token，所以默认关，
+    由实测（`scripts/measure_graph_ingest.py` 的 A/B）决定要不要翻。
+    """
+    return os.getenv(GRAPH_INGEST_ENV, "").strip().lower() in _GRAPH_INGEST_TRUTHY
+
+
+def _graph_ingest_pending(sources: Sequence[Source]) -> list[Source]:
+    """这批材料里**还没入过图**的那些。
+
+    先查一次并集再逐份查，而不是直接逐份：全新主题（= 这一档真正要服务的场景）里
+    并集恒为 0，一次只读 Cypher 就能判定"全都要入"，省掉 N 次往返；命中过的那条路
+    才逐份定位。两种情况的判据是同一个函数（`scoped_entity_count`），不会出现
+    "并集说有、逐份说没有"这种自相矛盾——它的口径就是 `source_id` 上的边。
+    """
+    if not sources:
+        return []
+    if graph_store.scoped_entity_count([source.id for source in sources]) <= 0:
+        return list(sources)
+    return [source for source in sources
+            if graph_store.scoped_entity_count([source.id]) <= 0]
+
+
+async def _ingest_external_graph(
+    sources: Sequence[Source],
+) -> dict[str, Any] | None:
+    """把这次检索回来的材料抽进图；不做时返回 `None`。
+
+    四道闸与 `_graph_outline` 同构（代价从低到高），因为它们问的是同一个部署问题：
+
+      0. `graph_ingest_enabled()` 为假（默认）→ None，一次查询都不发；
+      1. 没有材料 → None；
+      2. `configured()` 为假（没配密码）→ None，**不发起任何连接**；
+      3. `available()` 为假（刚连失败、冷却中）→ None，同样不连——库不在时把
+         3 份材料各付一遍 15 秒连接超时，等于让用户为一次注定失败的建图等一分钟。
+         这一条比 `_graph_outline` 更要紧：那边只付一次，这边是 N 份并行。
+
+    返回值是**这一趟的账**（不是抽取结果）：`materials` / `skipped` / `chunks` /
+    `entities` / `edges` / `failed` / `aborted` / `seconds`。它进诊断与日志——
+    "入图到底跑了没有、跑了多久"必须能从 `data` 与日志里看出来，否则用户只会说
+    "图谱好像没生效"，而这正是上一轮最难查的那件事。
+
+    **失败一律降级**：任何一份抛错（写库失败、切块异常）只记 warning 并从统计里
+    剔除，生成照常继续。这一整步是"让骨架更好"的加分项，它失败不该让用户拿不到图。
+    """
+    if not graph_ingest_enabled() or not sources:
+        return None
+    if not graph_store.configured() or not graph_store.available():
+        return None
+
+    pending = _graph_ingest_pending(sources)
+    stats: dict[str, Any] = {
+        "materials": len(sources), "skipped": len(sources) - len(pending),
+        "chunks": 0, "entities": 0, "edges": 0, "failed": 0, "aborted": False,
+        "seconds": 0.0,
+    }
+    if not pending:
+        # 全都入过了：这不是"没做"，是"做过"。返回统计而不是 None，诊断里那一行
+        # 才有得说（"3 份材料已在图里，跳过"），否则用户看到的是一片沉默。
+        logger.info("检索材料入图：%d 份都已在图里，跳过（零成本）", len(sources))
+        return stats
+
+    started = time.perf_counter()
+    semaphore = asyncio.Semaphore(GRAPH_INGEST_CONCURRENCY)
+
+    async def _one(source: Source) -> dict | Exception:
+        async with semaphore:
+            try:
+                return await graph_ingest.ingest_graph(
+                    source, max_chunks=GRAPH_INGEST_MAX_CHUNKS, source_id=source.id)
+            except Exception as exc:  # noqa: BLE001 — 单份失败不废整次入图
+                logger.warning(
+                    "检索材料入图失败（%s）：%s：%s",
+                    (source.filename or source.id)[:40], type(exc).__name__,
+                    str(exc)[:160])
+                return exc
+
+    outcomes = await asyncio.gather(*(_one(source) for source in pending))
+    for outcome in outcomes:
+        if isinstance(outcome, Exception):
+            continue
+        for key in ("chunks", "entities", "edges", "failed"):
+            stats[key] += int(outcome.get(key) or 0)
+        stats["aborted"] = stats["aborted"] or bool(outcome.get("aborted"))
+    stats["seconds"] = round(time.perf_counter() - started, 2)
+
+    logger.info(
+        "检索材料入图：%d 份（跳过 %d 份已在图里的）→ %d 块 / 实体 %d / 边 %d / "
+        "失败 %d%s，耗时 %.2fs",
+        len(pending), stats["skipped"], stats["chunks"], stats["entities"],
+        stats["edges"], stats["failed"], "（中止）" if stats["aborted"] else "",
+        stats["seconds"],
+    )
+    if stats["chunks"] and not stats["entities"]:
+        # 抽取开关（`graph_extract.ENABLED_ENV`）关着时就是这个形状：块切了、一次
+        # 调用都没发、实体为 0。说清楚，否则"入图开着却什么都没进图"只能靠翻代码解释。
+        logger.warning(
+            "检索材料入图：%d 块一条实体都没抽到——检查 %s 是否打开",
+            stats["chunks"], graph_extract.ENABLED_ENV)
+    return stats
+
+
+def _graph_ingest_diagnostic(stats: dict[str, Any]) -> Diagnostic:
+    """入图那一步给人看的那一行。三种出口三句话。
+
+    "跑了几块 / 花了多久"是这一档唯一的可见成本，必须报出来：用户等的那十几秒
+    除了诊断与日志之外没有任何痕迹（前端只认 `external_search` 那一对 stage 帧）。
+    "全都已在图里"也必须是一句独立的结论——它和"什么都没抽到"在界面上长得一样，
+    而前者是零成本命中、后者是配置错了。
+    """
+    if stats.get("chunks"):
+        materials = int(stats.get("materials") or 0) - int(stats.get("skipped") or 0)
+        notes = "（中止）" if stats.get("aborted") else ""
+        return Diagnostic(
+            level=DiagnosticLevel.info, code="GRAPH_INGEST_DONE",
+            message=(
+                f"这次把 {materials} 份检索材料抽进了图谱（{stats['chunks']} 块 / "
+                f"{stats['entities']} 实体 / {stats['edges']} 边，耗时 "
+                f"{float(stats.get('seconds') or 0):.1f} 秒）{notes}。"),
+        )
+    if stats.get("skipped"):
+        return Diagnostic(
+            level=DiagnosticLevel.info, code="GRAPH_INGEST_DONE",
+            message=(f"{stats['skipped']} 份检索材料已经在图谱里，这次跳过抽取"
+                     "（零成本）。"),
+        )
+    return Diagnostic(
+        level=DiagnosticLevel.info, code="GRAPH_INGEST_DONE",
+        message="这次没有可入图的检索材料。",
+    )
+
+
 # ------------------------------------------- 第三档：没有章节标题时用图谱定骨架
 #
 # ## 缺口在哪
@@ -5610,6 +5858,9 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     full_text_chars = intake.full_text_chars
 
     diagnostics: list[Diagnostic] = []
+    # 入图那一步的账（开关关着时恒为 None，什么都不加——键集与加它之前逐字节相同）。
+    if intake.ingested is not None:
+        diagnostics.append(_graph_ingest_diagnostic(intake.ingested))
     thinking = thinking_block(ctx.request.thinking_model)
     # 图型：请求层权威（理由与 `_generate_deep` 同一段注释——模型看不见界面，
     # `diagram_type` 只要默认值存在它就会走默认值）。
@@ -6778,6 +7029,9 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     # 它夹住下面每一个"这一次要几个节点"的量，所以要求量永远装得进单次输出。
     per_call_nodes = _nodes_per_call(ctx, system=BRANCH_EXPAND_PROMPT)
     diagnostics: list[Diagnostic] = []
+    # 入图那一步的账。与 `_generate` 同一份判断（开关关着时恒为 None）。
+    if intake.ingested is not None:
+        diagnostics.append(_graph_ingest_diagnostic(intake.ingested))
     # 思维模型两条路都要拼：骨架决定怎么分块，展开决定每块怎么拆。
     thinking = thinking_block(ctx.request.thinking_model)
 
