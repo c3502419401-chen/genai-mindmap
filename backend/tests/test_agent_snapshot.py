@@ -256,7 +256,7 @@ class TestEditOnNonTreeShapes:
         """
         ctx = _ctx(_flow_payload())
         # a1 与 b1 分属两个阶段 → 阶段之间的连线，端点换成 s_1 → s_2。
-        result = _add_edge(AddEdgeArgs(source="a1", target="b1", label="否"), ctx)
+        result = asyncio.run(_add_edge(AddEdgeArgs(source="a1", target="b1", label="否"), ctx))
 
         assert result.ok, result.content
         assert isinstance(ctx.candidate, FlowContent)
@@ -268,7 +268,7 @@ class TestEditOnNonTreeShapes:
     def test_add_edge_inside_one_stage_lands_in_that_stage(self):
         """同一阶段里的两个步骤 → 那个阶段的 `edges`，端点**保持节点 id**。"""
         ctx = _ctx(_flow_payload())
-        result = _add_edge(AddEdgeArgs(source="a1", target="a", label="退回"), ctx)
+        result = asyncio.run(_add_edge(AddEdgeArgs(source="a1", target="a", label="退回"), ctx))
 
         assert result.ok, result.content
         assert isinstance(ctx.candidate, FlowContent)

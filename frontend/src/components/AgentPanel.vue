@@ -333,6 +333,44 @@ const hiddenDiagnostics = computed(() => diagnostics.value.length - shownDiagnos
 const canExpandDiagnostics = computed(() => diagnostics.value.length > DIAGNOSTIC_LIMIT);
 
 /**
+ * 失败卡片：标题 + 下一步 + 按钮（判据在 `mindmap/failures.ts`）。
+ *
+ * 这里不再直接把后端那句原话当文案。那句话是写给写代码的人看的——「这次运行
+ * 超过了时间上限」读完既不知道要不要重试，也不知道该改什么。原话仍然留在卡片
+ * 里（折在 `<details>` 后面），因为排障时它是唯一的线索，但它不该是用户读到的
+ * 第一句话。
+ */
+const guide = computed(() => store.failureGuide);
+
+/** `agentRunning` 期间按钮要禁用：连点两次会开两轮生成（互相作废）。 */
+function actionDisabled(action: { disabledReason?: string }): boolean {
+  return !!action.disabledReason;
+}
+
+function runAction(kind: 'retry' | 'copy'): void {
+  if (kind === 'retry') {
+    void store.retryLastRun();
+    return;
+  }
+  // 复制失败时**不弹任何提示**：能点这个按钮的人正在排障，剪贴板被浏览器拒绝
+  // （非 HTTPS、无用户手势以外的原因）他也只好手工选中——再多一条错误提示只是噪音。
+  void navigator.clipboard?.writeText(rawFailure.value).catch(() => {});
+}
+
+/**
+ * 复制走的那段文字：后端原话 + 分类码。
+ *
+ * 只复制原话不够——"模型调用次数已用完"这七个字在日志里搜不到，`code` 与
+ * `limit` 才是能对上后端记录的键。
+ */
+const rawFailure = computed(() => {
+  const parts = [store.agentError];
+  if (store.agentErrorCode) parts.push(`code=${store.agentErrorCode}`);
+  if (store.agentErrorLimit) parts.push(`limit=${store.agentErrorLimit}`);
+  return parts.join(' · ');
+});
+
+/**
  * 冲突裁决：`generated` = 用模型的结果，`mine` = 保留画布。
  *
  * 这条分支正常永远不出现（生成期间画布被 `busy` 锁着），它是数据要丢时的兜底。
@@ -387,9 +425,47 @@ function cancel() {
       </li>
     </ol>
 
-    <p v-if="store.agentError" role="alert" class="mt-2 leading-relaxed text-rose-700">
-      {{ store.agentError }}
-    </p>
+    <!-- 失败卡片：说清发生了什么、下一步能做什么。
+         从前这里就是后端那句原话，没有标题、没有下一步、也没有按钮——用户读完
+         既不知道要不要重试，也不知道该改什么。原话折在下面给排障的人看。 -->
+    <div
+      v-if="guide"
+      role="alert"
+      class="mt-2 rounded border border-rose-200 bg-rose-50 px-2 py-1.5 leading-relaxed text-rose-900"
+    >
+      <p class="font-medium">{{ guide.title }}</p>
+      <p class="mt-1 break-words text-[11px]">{{ guide.next }}</p>
+      <div class="mt-1.5 flex flex-wrap items-center gap-1.5">
+        <button
+          v-for="action in guide.actions"
+          :key="action.kind"
+          type="button"
+          class="rounded border px-2 py-0.5 text-[11px] disabled:cursor-not-allowed disabled:opacity-50"
+          :class="action.kind === 'retry'
+            ? 'border-rose-300 bg-white text-rose-800 hover:bg-rose-100'
+            : 'border-slate-300 bg-white text-slate-600 hover:bg-slate-100'"
+          :disabled="actionDisabled(action)"
+          :data-test="`failure-${action.kind}`"
+          @click="runAction(action.kind)"
+        >{{ action.label }}</button>
+      </div>
+      <!-- 禁用原因必须写出来。只把按钮置灰等于沉默：用户看着一个点不动的「重试」，
+           只能猜是自己点错了。被禁用的按钮在多数浏览器里连 title 悬停提示都不弹。 -->
+      <p
+        v-for="action in guide.actions.filter(item => item.disabledReason)"
+        :key="`why-${action.kind}`"
+        class="mt-1 text-[11px] text-rose-700"
+        :data-test="`failure-why-${action.kind}`"
+      >{{ action.disabledReason }}</p>
+      <!-- 原话与分类码：排障时唯一的线索，但不该是用户读到的第一句话。
+           开关只交给 `<details>` 自己管：`:open` 绑一个 ref、`@toggle` 再写回这个
+           ref，等于两个源同时决定它开不开——点开一次会触发两轮更新，收起时浏览器
+           与状态还可能各说各话。默认收起本来就是我们要的初始态，不需要 ref 代劳。 -->
+      <details class="mt-1">
+        <summary class="cursor-pointer text-[11px] text-slate-500">后端原话</summary>
+        <p class="mt-1 whitespace-pre-wrap break-words text-[11px] text-slate-600">{{ rawFailure }}</p>
+      </details>
+    </div>
 
     <!--
       模型的思考过程：**与有没有产出无关**，独立成块。

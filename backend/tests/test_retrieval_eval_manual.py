@@ -148,45 +148,103 @@ def test_title_suite_overlap_stays_at_one(module, materials):
 # ---------------------------------------------------------------- 3. 指纹与标注失效
 
 
-def test_manual_source_hashes_match_the_real_materials(dataset, manual):
-    """四份材料的指纹与登记值一致。
+def test_manual_source_hashes_match_the_real_materials(dataset, manual, module):
+    """四份材料**已标注章节**的指纹与登记值一致。
 
-    这条红掉只有一种含义：`docs/` 里那四份正文被改了，手写标注需要复核。改法写在
-    `MANUAL_SOURCE_HASHES` 的注释与脚本报错里。
+    这条红掉只有一种含义：`docs/` 里那四份材料**被 case 标注过的章节**被改了，
+    手写标注需要复核。只追加变更记录、改没人标注的小节不会红——指纹不覆盖那些地方。
+    改法写在 `MANUAL_SOURCE_HASHES` 的注释与脚本报错里。
     """
-    actual = {material.ref: material.content_hash for material in dataset.materials}
+    actual = module.annotated_hashes(dataset.materials)
     for ref, expected in manual.MANUAL_SOURCE_HASHES.items():
         assert ref in actual, f"材料集里没有 {ref}"
         assert actual[ref] == expected, (
-            f"{ref} 的正文变了（登记 {expected[:12]}… 实际 {actual[ref][:12]}…）："
-            "请重读该材料、复核 relevant 区间与问法，再把新指纹写回 "
+            f"{ref} 已标注章节的正文变了（登记 {expected[:12]}… 实际 {actual[ref][:12]}…）："
+            "请重读这些章节、复核 relevant 区间与问法，再把新指纹写回 "
             "scripts/eval_cases_manual.py")
 
 
 def _fake_material(module, ref: str, *, body: str = "正文" * 200):
-    text = f"# 汇编\n\n## 预算审批的层级\n\n{body}\n"
+    # 两章起：`heading_outline` 少于 `OUTLINE_MIN_ITEMS`(2) 个标题时返回空表，
+    # 只写一章会让"已标注章节"解析不出来，测的就不是漂移而是另一条报错路径。
+    text = f"# 汇编\n\n## 预算审批的层级\n\n{body}\n\n## 另一章\n\n另一段正文。\n"
     source = parse_text(text, kind="markdown")
     return module.Material(ref=ref, source=source,
                            content_hash=library.content_hash(source.text or ""))
 
 
+def _only_section(module, monkeypatch, refs):
+    """把"已标注章节"缩到假材料里那一章，好让指纹算得出来（真 case 的章节名在假材料里没有）。"""
+    prefixes = {ref: ("预算审批的层级",) for ref in refs}
+    monkeypatch.setattr(module, "annotated_prefixes", lambda: prefixes)
+
+
 def test_hash_drift_is_fatal_not_skipped(module, manual, monkeypatch):
-    """材料正文变了 → 明确报错（不跳过）。
+    """已标注章节的正文变了 → 明确报错（不跳过）。
 
     跳过是最坏的选项：指标会掉 10pp 而输出里只有一行提示，事后看起来像"检索退步"。
     """
     refs = list(manual.MANUAL_SOURCE_HASHES)
     fakes = [_fake_material(module, ref) for ref in refs]
-    registered = {material.ref: material.content_hash for material in fakes}
+    _only_section(module, monkeypatch, refs)
+    registered = module.annotated_hashes(fakes)
     drifted = {**registered, refs[-1]: "0" * 64}
     monkeypatch.setattr(module.manual_cases, "MANUAL_SOURCE_HASHES", drifted)
 
     with pytest.raises(SystemExit) as info:
         module.build_manual_dataset(fakes)
     message = str(info.value)
-    assert "材料正文变了" in message
+    assert "已标注章节" in message
     assert "不跳过" in message
     assert refs[-1] in message
+
+
+def _rebuilt(module, *, ref: str, transform) -> list:
+    """把真材料按 `transform` 改一份（其余原样），重新装成 `Material` 列表。"""
+    originals = module.load_materials(list(module.DEFAULT_MATERIALS), [])
+    out = []
+    for material in originals:
+        text = material.text
+        if material.ref == ref:
+            text = transform(material, text)
+        source = parse_text(text, kind="markdown")
+        out.append(module.Material(ref=material.ref, source=source,
+                                   content_hash=library.content_hash(source.text or "")))
+    return out
+
+
+def test_appending_a_change_log_line_is_not_a_drift(manual, module):
+    """在没人标注的尾部追加一行变更记录 → 不报错，指纹也不变。
+
+    这是这次改口径的**唯一理由**：整份文件钉死时，这种零风险动作也会红，红多了人
+    就会闭着眼睛更新指纹，于是真正该复核的那次也一起滑过去。
+    """
+    ref = "docs/PLAN.md"          # 末章「12 变更记录」不在标注范围内
+    assert ref in manual.MANUAL_SOURCE_HASHES
+    rebuilt = _rebuilt(module, ref=ref,
+                       transform=lambda material, text: text + "\n\n追加一行变更记录。\n")
+    module.build_manual_dataset(rebuilt)          # 不抛就是通过
+    assert module.annotated_hashes(rebuilt) == dict(manual.MANUAL_SOURCE_HASHES)
+
+
+def test_editing_an_annotated_section_is_a_drift(manual, module):
+    """往已标注章节的正文里插一段话 → 报错，并锁定是哪份材料。"""
+    ref = "docs/PLAN.md"
+    prefixes = module.annotated_prefixes()[ref]
+
+    def splice(material, text: str) -> str:
+        entries = module.heading_outline([material.source], max_items=10 ** 6)
+        start, end = module._annotated_spans(ref, material, entries, prefixes)[0]
+        cut = text.find("\n\n", start)
+        cut = cut + 2 if cut != -1 and cut + 2 < end else min(start + 10, end)
+        return text[:cut] + "插进来的一段话。" + text[cut:]
+
+    rebuilt = _rebuilt(module, ref=ref, transform=splice)
+    with pytest.raises(SystemExit) as info:
+        module.build_manual_dataset(rebuilt)
+    message = str(info.value)
+    assert "已标注章节" in message
+    assert ref in message
 
 
 def test_missing_material_is_fatal_too(module, manual, monkeypatch):

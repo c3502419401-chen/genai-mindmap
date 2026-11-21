@@ -12,8 +12,9 @@
 ## 与 manual 套共用同一套标注纪律
 
 区间写在**章节前缀**上（唯一匹配），`focus` 是可选锚点（全文唯一、落在该章内、向后
-取 `FOCUS_CHARS` 字）。材料一改（`content_hash` 变）这里与 manual 套一起报错——两套
-钉的是同一批正文，不能一套报错一套静默跑。
+取 `FOCUS_CHARS` 字）。已标注章节的正文一改（`MANUAL_SOURCE_HASHES` 变）这里与
+manual 套一起报错——两套钉的是同一批正文，不能一套报错一套静默跑；只追加变更记录、
+改没人标注的小节不报错，因为指纹只覆盖两套 case 标注过的章节。
 
 ## 词面重合：挡「抄材料」的那道闸
 
@@ -59,7 +60,7 @@ MAX_OVERLAP = 0.50
 
 
 CROSSDOC_SOURCE_HASHES: dict[str, str] = dict(manual_cases.MANUAL_SOURCE_HASHES)
-"""四份材料的 `sha256(正文)`。与 manual 套共用一张表：两套标的是同一批正文。"""
+"""四份材料**已标注章节正文**的 `sha256`（口径见 `eval_cases_manual.MANUAL_SOURCE_HASHES`）。与 manual 套共用一张表：两套标的是同一批正文。"""
 
 
 @dataclass(frozen=True)

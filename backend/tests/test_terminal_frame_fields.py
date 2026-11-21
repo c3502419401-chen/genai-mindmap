@@ -102,12 +102,27 @@ def _grow_registry() -> ToolRegistry:
     registry = ToolRegistry()
 
     def grow(args: _NoopArgs, ctx) -> ToolResult:
-        ctx.candidate = TREE
-        ctx.revision += 1
+        ctx.publish_tree(TREE)
         return ToolResult(ok=True, content="已生成", data={})
 
     registry.register(ToolSpec(
         name="grow", description="写候选树", args_model=_NoopArgs, fn=grow))
+    return registry
+
+
+def _grow_then_noop_registry() -> ToolRegistry:
+    """先长一次树，然后就开始空转（`peek` 什么都不改）。
+
+    空转判据要"连续 16 次没改动"才中止，而那 16 次里树已经被产出过了——只有这样
+    中止才落在"有东西可交付"的收尾路径上。
+    """
+    registry = _grow_registry()
+
+    def peek(args: _NoopArgs, ctx) -> ToolResult:
+        return ToolResult(ok=True, content="看过了", data={})
+
+    registry.register(ToolSpec(
+        name="peek", description="只看不改", args_model=_NoopArgs, fn=peek, readonly=True))
     return registry
 
 
@@ -155,15 +170,22 @@ def test_budget_exhausted_done_carries_model_and_reasoning():
 
 
 def test_no_progress_stop_done_carries_model_and_reasoning():
-    """连续不改树到硬阈值：同样是一条成功（有候选），字段一个都不能少。"""
+    """连续不改树到硬阈值：同样是"交付"，字段一个都不能少。
+
+    这棵空转的树必须是**这一轮长出来的**：`snapshot` 是用户带来的原树，
+    只有它、没有产出时收尾要报 `no_progress` 错误（见
+    `test_agent_guards.test_no_progress_without_a_candidate_ends_with_an_error`），
+    那与"跑完一轮、可以交付"不是同一件事。
+    """
     provider = _NamedProvider(
-        [_completion_with_call("peek") for _ in range(NO_PROGRESS_ABORT + 2)])
+        [_completion_with_call("grow")]
+        + [_completion_with_call("peek") for _ in range(NO_PROGRESS_ABORT + 2)])
     request = AgentRunRequest(
         goal="整理",
         budget=RunBudget(max_model_calls=NO_PROGRESS_ABORT + 4, max_tool_calls=50),
         snapshot=TREE,
     )
-    done = _last_done(_collect(request, provider, _noop_registry()))
+    done = _last_done(_collect(request, provider, _grow_then_noop_registry()))
 
     assert isinstance(done.content, MindMapContent)
     assert done.model == "deepseek-reasoner"

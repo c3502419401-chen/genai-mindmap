@@ -222,13 +222,13 @@ def test_in_scope_edit_carries_no_out_of_scope_hint():
 # ---------------------------------------------------------------- 3. 不回归
 
 
-def test_edit_intent_still_offers_all_seven_tools():
-    """选中信息不该改变工具集：批量 + 六个细粒度，一个都不能少。"""
+def test_edit_intent_still_offers_all_eight_tools():
+    """选中信息不该改变工具集：批量 + 六个细粒度 + 补说明，一个都不能少。"""
     names = build_registry("edit", has_library=False).names()
-    assert len(names) == 7
+    assert len(names) == 8
     assert set(names) == {
         "add_node", "update_node", "remove_node", "move_node",
-        "add_edge", "remove_edge", "mindmap_edit",
+        "add_edge", "remove_edge", "mindmap_fill_details", "mindmap_edit",
     }
 
 

@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -251,7 +252,7 @@ class TestEdgeTools:
             {"id": "e_i1", "source": "a", "target": "a2", "label": "否"}]
         ctx = _ctx(content)
 
-        result = _remove_edge(RemoveEdgeArgs(edge_id="e_i1"), ctx)
+        result = asyncio.run(_remove_edge(RemoveEdgeArgs(edge_id="e_i1"), ctx))
 
         assert result.ok, result.content
         assert isinstance(ctx.candidate, FlowContent)
@@ -261,7 +262,7 @@ class TestEdgeTools:
 
     def test_add_edge_reports_the_layer_it_landed_in(self):
         ctx = _ctx(_flow_payload())
-        result = _add_edge(AddEdgeArgs(source="a", target="a2", label="退回"), ctx)
+        result = asyncio.run(_add_edge(AddEdgeArgs(source="a", target="a2", label="退回"), ctx))
 
         assert result.ok, result.content
         assert result.data["edge_layer"] == INNER_LAYER
@@ -269,7 +270,7 @@ class TestEdgeTools:
 
     def test_add_edge_across_stages_says_it_demoted(self):
         ctx = _ctx(_flow_payload())
-        result = _add_edge(AddEdgeArgs(source="a1", target="b1", label="跳过"), ctx)
+        result = asyncio.run(_add_edge(AddEdgeArgs(source="a1", target="b1", label="跳过"), ctx))
 
         assert result.ok, result.content
         assert result.data["edge_layer"] == STAGE_LAYER
@@ -282,7 +283,7 @@ class TestEdgeTools:
             {"id": "e_i1", "source": "a", "target": "a2", "label": "否"}]
         ctx = _ctx(content)
 
-        result = _add_edge(AddEdgeArgs(source="a", target="a2", label="否"), ctx)
+        result = asyncio.run(_add_edge(AddEdgeArgs(source="a", target="a2", label="否"), ctx))
 
         assert not result.ok
         assert result.data["code"] == "duplicate_edge"

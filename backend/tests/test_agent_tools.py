@@ -1441,14 +1441,14 @@ class RegistryTest(unittest.TestCase):
     def test_edit_without_sources_has_no_rag(self):
         """没有来源时的检索必然返回"没找到"，注册它只会诱导模型乱查。
 
-        `edit` 有七个写工具（四个节点 + 两个边 + 批量）。这里断言的是**集合**：顺序由
-        `_TOOL_ORDER` 决定，另有专门的用例钉它，不该让"多一个工具"把这条判断
-        变成一个数字游戏。
+        `edit` 有八个写工具（四个节点 + 两个边 + 补说明 + 批量）。这里断言的是
+        **集合**：顺序由 `_TOOL_ORDER` 决定，另有专门的用例钉它，不该让"多一个工具"
+        把这条判断变成一个数字游戏。
         """
         self.assertEqual(
             set(build_registry("edit").names()),
             {"add_node", "update_node", "remove_node", "move_node",
-             "add_edge", "remove_edge", "mindmap_edit"},
+             "add_edge", "remove_edge", "mindmap_fill_details", "mindmap_edit"},
         )
         self.assertNotIn("rag_query", build_registry("edit").names())
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import threading
 import pytest
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -213,6 +214,61 @@ def test_finish_rejects_non_terminal_status():
         runs.finish("r1", runs.STATUS_RUNNING)
 
 
+def test_reopening_a_run_clears_the_previous_partial_flag():
+    """重开一轮就把上一轮那个"没长完"擦掉：它说的是上一轮的产出。
+
+    不清的后果不是"多一个陈旧字段"这么轻：`finish` 用 `COALESCE` 写 partial，值一旦
+    留下就再也不会被 NULL 覆盖——这一轮如果完整跑完（正常收尾根本不传 partial），
+    记录里仍然是 `partial = 1`，前端据此把一次完整生成标成"部分分支未完成"，
+    而且下一次载入草稿也照着这个错标记渲染。
+    """
+    runs.begin("retry-1", {"goal": "再来一次"})
+    runs.finish("retry-1", runs.STATUS_CANCELLED, candidate=CANDIDATE,
+                partial=True, partial_reason="工具卡住了")
+
+    assert runs.get("retry-1").partial is True
+
+    runs.begin("retry-1", {"goal": "再来一次"})
+    record = runs.get("retry-1")
+    assert record.status == runs.STATUS_RUNNING
+    assert record.partial is None, "重开之后上一轮的标记必须消失"
+    assert record.partial_reason is None
+
+    runs.finish("retry-1", runs.STATUS_DONE, candidate=CANDIDATE)
+    assert runs.get("retry-1").partial is None, "完整跑完的那一轮不该带着旧标记"
+
+
+def test_reopening_a_run_swaps_in_the_new_request_summary():
+    """重开要换掉 `request`：台账上"这一行在做什么"只有这一列说得清。
+
+    「补齐说明」就是拿检查点那行的 id 发一次 `intent="edit"`（见
+    `stores/mindmap.ts` 的 `fillMissingDetails`）。如果重开不改 `request`，
+    `router._summary()` 返回的 `intent` 仍是上一轮的 `create`，前端
+    `commitGenerated` 据此走"重置身份"分支——用户在改一张已保存的图，载入结果后
+    再点保存就变成新建一条。
+    """
+    runs.begin("resume-1", {"goal": "原来的主题", "intent": "create"})
+    runs.finish("resume-1", runs.STATUS_FAILED,
+                candidate=CANDIDATE, failure={"code": "agent_failed", "message": "断了"})
+
+    claim = runs.begin("resume-1", {"goal": "给这张导图补说明", "intent": "edit"})
+
+    assert claim.claimed is True
+    assert claim.record.request == {"goal": "给这张导图补说明", "intent": "edit"}
+    assert claim.record.candidate is not None, "续写的起点不能被抹掉"
+
+
+def test_reopening_with_an_empty_summary_keeps_the_old_request():
+    """内部调用方传空摘要时保留旧值：那表示"这次没带摘要"，不是"摘要为空"。"""
+    runs.begin("keep-req", {"goal": "原来的主题", "intent": "create"})
+    runs.finish("keep-req", runs.STATUS_FAILED, failure={"code": "agent_failed", "message": "断了"})
+
+    claim = runs.begin("keep-req", {})
+
+    assert claim.claimed is True
+    assert claim.record.request == {"goal": "原来的主题", "intent": "create"}
+
+
 def test_pending_only_returns_done_runs_that_were_never_applied():
     """`pending()` 的字面含义：**done** 且没应用过。"""
     runs.begin("done-unapplied", {})
@@ -387,6 +443,50 @@ def test_replay_keeps_demo_mode():
     assert _frames(response.text)[-1]["mode"] == "demo"
 
 
+def test_replay_keeps_the_partial_flag():
+    """重放出来的帧要带原来那个"没长完"的标记与原因。
+
+    同一份产出，重连后若变成"完整生成"，用户会以为上一轮真的一次跑完了——
+    而他断开之前看到的明明是"部分完成"。标记必须落库，正是为了这一刻。
+    """
+    runs.begin("partial-1", {"goal": "g"})
+    runs.finish("partial-1", runs.STATUS_DONE, candidate=CANDIDATE, mode="model",
+                partial=True, partial_reason="模型调用次数已用完（已执行 6 次工具调用）")
+
+    def should_not_start(*_args, **_kwargs):
+        raise AssertionError("不该重新跑")
+
+    with patch("app.agent.router.run", new=should_not_start):
+        response = client.post(URL, json={"goal": "g", "intent": "create",
+                                          "run_id": "partial-1"})
+
+    done = _frames(response.text)[-1]
+    assert done["type"] == "done"
+    assert done["partial"] is True
+    assert done["partial_reason"] == "模型调用次数已用完（已执行 6 次工具调用）"
+
+
+def test_completed_run_replays_without_a_partial_flag():
+    """完整跑完的那次重放时不该凭空多出 `partial`。
+
+    正常收尾根本不传 `partial`（`DoneEvent.partial` 是 None），`COALESCE` 让它留
+    在 NULL 上；重放时读到 None，`exclude_none` 就把它抹掉——帧与加字段之前一样。
+    """
+    runs.begin("full-1", {"goal": "g"})
+    runs.finish("full-1", runs.STATUS_DONE, candidate=CANDIDATE, mode="model")
+
+    def should_not_start(*_args, **_kwargs):
+        raise AssertionError("不该重新跑")
+
+    with patch("app.agent.router.run", new=should_not_start):
+        response = client.post(URL, json={"goal": "g", "intent": "create",
+                                          "run_id": "full-1"})
+
+    done = _frames(response.text)[-1]
+    assert "partial" not in done
+    assert "partial_reason" not in done
+
+
 def test_cancelled_run_is_reopened_instead_of_being_replayed():
     """取消过的 run 允许用同一个 id 重跑：那是用户主动重试，不是重复投递。"""
     runs.begin("retry-1", {"goal": "g"})
@@ -415,8 +515,9 @@ def test_run_id_is_validated_and_extra_fields_still_forbidden():
 def _routed_with(provider, registry):
     """把 `_frames` 调用的 `run` 换成"真循环 + 假 provider"。"""
 
-    def routed(request, *, on_close=None, first_seq=None):
-        return service_run(request, provider=provider, tools=registry, on_close=on_close)
+    def routed(request, *, on_close=None, on_checkpoint=None, first_seq=None):
+        return service_run(request, provider=provider, tools=registry,
+                           on_close=on_close, on_checkpoint=on_checkpoint)
 
     return routed
 
@@ -453,7 +554,7 @@ def test_cancel_mid_run_still_writes_the_draft():
     ])
 
     def generate(_args, ctx):
-        ctx.candidate = CANDIDATE.model_copy(deep=True)
+        ctx.publish_tree(CANDIDATE.model_copy(deep=True))
         return ToolResult(ok=True, content="已生成")
 
     async def fake_chat(system, user, **kwargs):
@@ -486,7 +587,7 @@ def test_cancelled_edit_run_keeps_the_tree_that_only_the_context_knows():
         assert ctx.candidate is not None
         grown = ctx.candidate.model_copy(deep=True)
         grown.root.children.append(type(grown.root)(id="new", label="新加的一支", children=[]))
-        ctx.candidate = grown
+        ctx.publish_tree(grown)
         return ToolResult(ok=True, content="已改")
 
     request = AgentRunRequest(goal="改一下", intent="edit", snapshot=snapshot)
@@ -577,6 +678,40 @@ def test_detail_endpoint_returns_the_tree_and_the_failure_reason():
     assert client.get("/api/agent/runs/nope").status_code == 404
 
 
+def test_detail_endpoint_carries_the_partial_flag():
+    """"半棵树"这个事实必须随台账一起下发，不能只在实时流里出现过一次。
+
+    `GET /agent/runs/{id}` 是前端点「载入」时唯一的信息来源。少了这个标记，一份
+    半棵树与一次完整生成在界面上完全同形：没有告警、状态行照旧写"记得保存"，
+    用户会以为上次真的跑完了。列表接口同理——它决定"要不要提示还有草稿可捡"。
+    """
+    runs.begin("half-1", {"goal": "跑到一半", "intent": "create"})
+    runs.finish("half-1", runs.STATUS_DONE, candidate=CANDIDATE, mode="model",
+                partial=True, partial_reason="模型调用次数已用完")
+
+    detail = client.get("/api/agent/runs/half-1").json()
+    assert detail["partial"] is True
+    assert detail["partial_reason"] == "模型调用次数已用完"
+
+    listed = client.get("/api/agent/runs").json()
+    assert [item["run_id"] for item in listed] == ["half-1"]
+    assert listed[0]["partial"] is True
+
+
+def test_detail_endpoint_leaves_partial_empty_for_a_finished_run():
+    """完整跑完的记录里 `partial` 是 null，不是 false：两者含义不同。
+
+    null = 这条记录没记过（老库、或那一轮没走交付标记），false 会被读成"确定是完整的"。
+    前端判断一律写 `partial === true`，所以这里只钉住"不该凭空变成 false"。
+    """
+    runs.begin("whole-1", {"goal": "跑完了", "intent": "create"})
+    runs.finish("whole-1", runs.STATUS_DONE, candidate=CANDIDATE, mode="model")
+
+    detail = client.get("/api/agent/runs/whole-1").json()
+    assert detail["partial"] is None
+    assert detail["partial_reason"] is None
+
+
 def test_applied_endpoint_is_idempotent_and_404_for_unknown():
     runs.begin("r1", {})
     runs.finish("r1", runs.STATUS_DONE, candidate=CANDIDATE)
@@ -602,6 +737,294 @@ def test_dismissed_endpoint_is_gone():
     # 列表/详情里也不该再出现这个列：前端镜像着它，留着就会有人去读。
     schemas = document["components"]["schemas"]
     assert "dismissed_at" not in schemas["RunSummary"]["properties"]
+
+
+# ---------------------------------------------------------------- 检查点
+
+
+def test_checkpoint_saves_the_half_tree_while_running():
+    """跑到一半落的那棵树，收尾之前就能从台账里读回来。"""
+    runs.begin("cp-1", {"goal": "g", "intent": "create"})
+
+    assert runs.checkpoint("cp-1", CANDIDATE) is True
+
+    record = runs.get("cp-1")
+    assert record.status == runs.STATUS_RUNNING
+    assert record.candidate is not None
+    assert record.candidate.root.children[0].label == "甲"
+    assert record.checkpointed_at is not None
+
+
+def test_checkpoint_does_not_touch_a_finished_run():
+    """收尾之后迟到的检查点不许把成品盖成半棵树。
+
+    这是 `WHERE status = 'running'` 唯一的用途：写说明那 26 秒里进程可能刚好在被
+    取消之后，工具里的检查点调用会晚一步到达。
+    """
+    runs.begin("cp-2", {"goal": "g"})
+    full = MindMapContent.model_validate({**TREE,
+                                          "root": {**TREE["root"], "children": [
+                                              *TREE["root"]["children"],
+                                              {"id": "d", "label": "丁", "children": []}]}})
+    runs.finish("cp-2", runs.STATUS_DONE, candidate=full, mode="model")
+
+    assert runs.checkpoint("cp-2", CANDIDATE) is False
+    record = runs.get("cp-2")
+    assert record.status == runs.STATUS_DONE
+    assert record.checkpointed_at is None
+    assert len(record.candidate.root.children) == 4
+
+
+def test_finish_clears_the_checkpoint_mark():
+    """交出成品那一刻，"这只是半棵树"的标记要清掉。
+
+    不清的话，界面会一直按"说明还没写"提示一份完整的生成结果。
+    """
+    runs.begin("cp-3", {"goal": "g"})
+    runs.checkpoint("cp-3", CANDIDATE)
+    assert runs.get("cp-3").checkpointed_at is not None
+
+    runs.finish("cp-3", runs.STATUS_DONE, candidate=CANDIDATE, mode="model")
+
+    record = runs.get("cp-3")
+    assert record.checkpointed_at is None
+    assert record.status == runs.STATUS_DONE
+
+
+def test_finish_without_a_candidate_keeps_the_checkpoint():
+    """收尾没交出候选时，检查点那份要留着（`COALESCE`）。
+
+    取消路径就是这样：树还在生成，客户端断了，`finish(candidate=None)` 只写库状态，
+    这份检查点正是用户下次进来能捡到的东西。
+    """
+    runs.begin("cp-4", {"goal": "g"})
+    runs.checkpoint("cp-4", CANDIDATE)
+
+    runs.finish("cp-4", runs.STATUS_CANCELLED)
+
+    record = runs.get("cp-4")
+    assert record.candidate is not None
+    assert record.checkpointed_at is not None
+
+
+def test_sweep_turns_a_stale_running_row_into_a_recoverable_failure():
+    """崩溃留下的 `running` 化石要么永远 409、要么永远没人捡，必须清掉。
+
+    清成 `failed` 之后 `begin()` 才认领得动它，`pending()` 也才列得出来——清理的
+    意义不是"让表干净"，是让那棵树重新变成用户能看见的东西。
+    """
+    runs.begin("stale-1", {"goal": "g"})
+    runs.checkpoint("stale-1", CANDIDATE)
+    # 把 `updated_at` 推到很久以前，模拟"进程在那之后再没动过"。
+    conn = runs._connect()
+    try:
+        conn.execute("UPDATE runs SET updated_at = '2020-01-01T00:00:00.000Z' "
+                     "WHERE run_id = 'stale-1'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    swept = runs.sweep_abandoned()
+
+    assert "stale-1" in swept
+    record = runs.get("stale-1")
+    assert record.status == runs.STATUS_FAILED
+    assert record.failure["code"] == "run_abandoned"
+    # 检查点本身不动：清理的是状态，不是那棵树。
+    assert record.candidate is not None
+    assert record.checkpointed_at is not None
+
+
+def test_sweep_leaves_a_fresh_running_row_alone():
+    """刚开的那一轮不许被当成化石清掉。"""
+    runs.begin("fresh-1", {"goal": "g"})
+
+    assert runs.sweep_abandoned() == []
+    assert runs.get("fresh-1").status == runs.STATUS_RUNNING
+
+
+def test_abandoned_run_shows_up_in_the_list_with_its_node_count():
+    """被清掉的那一行要能在列表里看到，并且带上"已经存了多少节点"。"""
+    runs.begin("stale-2", {"goal": "崩溃前那次", "intent": "create"})
+    runs.checkpoint("stale-2", CANDIDATE)
+    conn = runs._connect()
+    try:
+        conn.execute("UPDATE runs SET updated_at = '2020-01-01T00:00:00.000Z' "
+                     "WHERE run_id = 'stale-2'")
+        conn.commit()
+    finally:
+        conn.close()
+    runs.sweep_abandoned()
+
+    rows = client.get("/api/agent/runs").json()
+
+    row = next(item for item in rows if item["run_id"] == "stale-2")
+    assert row["status"] == "failed"
+    assert row["checkpointed_at"] is not None
+    assert row["node_count"] == 4
+    # 它不是半棵树：结构是全的，缺的只是说明。
+    assert row["partial"] is None
+
+
+def test_beginning_a_fresh_run_cleans_up_abandoned_ones():
+    """开新 run 时顺手清理，不需要后台任务也不需要启动钩子。"""
+    runs.begin("stale-3", {"goal": "g"})
+    conn = runs._connect()
+    try:
+        conn.execute("UPDATE runs SET updated_at = '2020-01-01T00:00:00.000Z' "
+                     "WHERE run_id = 'stale-3'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    runs.begin("brand-new", {"goal": "g"})
+
+    assert runs.get("stale-3").status == runs.STATUS_FAILED
+    assert runs.get("brand-new").status == runs.STATUS_RUNNING
+
+
+def test_reopening_a_run_clears_the_checkpoint_mark():
+    """用户重试同一轮时，上一轮留下的检查点标记不能再挂着。
+
+    不清的话，新一轮跑到收尾之前界面会按"说明是空的"提示，而那时的树是新一轮的。
+    """
+    runs.begin("cp-5", {"goal": "g"})
+    runs.checkpoint("cp-5", CANDIDATE)
+    runs.finish("cp-5", runs.STATUS_CANCELLED)
+
+    claim = runs.begin("cp-5", {"goal": "g"})
+
+    assert claim.claimed is True
+    assert claim.record.checkpointed_at is None
+    assert claim.record.status == runs.STATUS_RUNNING
+
+
+def _age(run_id: str) -> None:
+    """把一行推成"很久没动过"的化石（真按时间等是等不起的）。"""
+    conn = runs._connect()
+    try:
+        conn.execute("UPDATE runs SET updated_at = '2020-01-01T00:00:00.000Z' "
+                     f"WHERE run_id = '{run_id}'")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_sweep_leaves_an_active_run_alone():
+    """本进程还在跑的那一轮，`updated_at` 再旧也不许判成化石。
+
+    一轮生成长时间不出帧是正常的：单次模型调用受 `max_seconds` 约束（上限 3600
+    秒），比 `RUN_ABANDONED_SECONDS`(1800) 还长。只按时间判就会把这种轮次误杀，
+    而误杀之后它后面的 `checkpoint()` 带 `WHERE status = 'running'`，从此全部
+    静默失效——用户下次进来看到的是一棵停在某一刻、再也不会更新的树。
+    """
+    runs.begin("live-1", {"goal": "g"})
+    runs.active("live-1")
+    try:
+        _age("live-1")
+
+        assert runs.sweep_abandoned() == []
+        assert runs.get("live-1").status == runs.STATUS_RUNNING
+        # 误杀之后这一句会返回 False：检查点只能写 running 的行。
+        assert runs.checkpoint("live-1", CANDIDATE) is True
+    finally:
+        runs.inactive("live-1")
+
+    # 注销之后它就只是一行普通的化石，该被扫到。
+    # （先重新推老：上面那个成功的 `checkpoint()` 刚把 `updated_at` 刷新过。）
+    _age("live-1")
+    assert "live-1" in runs.sweep_abandoned()
+    assert runs.get("live-1").status == runs.STATUS_FAILED
+
+
+def test_sweep_keeps_cleaning_other_rows_while_one_is_active():
+    """排除活跃的只是那几行，不是整次清理——僵尸行仍要被收掉。"""
+    runs.begin("live-2", {"goal": "g"})
+    runs.begin("dead-1", {"goal": "g"})
+    runs.active("live-2")
+    try:
+        _age("live-2")
+        _age("dead-1")
+
+        assert runs.sweep_abandoned() == ["dead-1"]
+    finally:
+        runs.inactive("live-2")
+
+
+def test_the_stream_registers_the_run_and_unregisters_it_on_the_way_out():
+    """`_frames` 自己登记、自己注销：漏了注销，那一行就永远不会被清理。"""
+    request = AgentRunRequest(goal="g", intent="create")
+    seen_active: list[bool] = []
+
+    async def fake_run(body, *, on_close=None, on_checkpoint=None, first_seq=1):
+        # 跑到一半时应当已经登记过了——清扫正是可能在别处此刻发生的。
+        seen_active.append("stream-1" in runs._active_ids())
+        yield DoneEvent(seq=1, content=CANDIDATE, mode="model")
+
+    async def scenario() -> None:
+        agen = agent_router._frames(request, "stream-1")
+        async for _chunk in agen:
+            pass
+
+    _open_run("stream-1", request)
+    with patch("app.agent.router.run", new=fake_run):
+        asyncio.run(scenario())
+
+    assert seen_active == [True], "生成期间这一轮必须在活跃登记里"
+    assert "stream-1" not in runs._active_ids(), "收尾之后必须注销，否则永远不会被清理"
+    assert runs.get("stream-1").status == runs.STATUS_DONE
+
+
+def test_a_stream_that_never_starts_leaves_no_registration():
+    """开流前就断开时生成器一次都不跑，不能留下一条永远没人注销的登记。"""
+    request = AgentRunRequest(goal="g", intent="create")
+    _open_run("stream-2", request)
+
+    async def scenario() -> None:
+        agen = agent_router._frames(request, "stream-2")
+        # 一次都不迭代就直接关掉（uvicorn 收到断开时就是这样）。
+        await agen.aclose()
+
+    with patch("app.agent.router.run", new=lambda *a, **k: None):
+        asyncio.run(scenario())
+
+    assert "stream-2" not in runs._active_ids()
+
+
+def test_checkpoint_is_written_off_the_event_loop():
+    """检查点那次写库必须落在工作线程上。
+
+    工具是 async 的、跑在事件循环上；同步写 SQLite 等于拿整个循环去等一把写锁
+    （`BEGIN IMMEDIATE` 撞上别的写入时最长等满忙等上限），同一进程里别的 SSE 流
+    会跟着一帧都发不出来。这条用例钉的是"没在主线程写"，不是"写成功了"。
+    """
+    request = AgentRunRequest(goal="g", intent="create")
+    threads: list[str] = []
+    real_checkpoint = runs.checkpoint
+
+    def spy(run_id: str, content: Any) -> bool:
+        threads.append(threading.current_thread().name)
+        return real_checkpoint(run_id, content)
+
+    async def fake_run(body, *, on_close=None, on_checkpoint=None, first_seq=1):
+        assert on_checkpoint is not None, "路由层必须把检查点通道接上"
+        await on_checkpoint(CANDIDATE)
+        yield DoneEvent(seq=1, content=CANDIDATE, mode="model")
+
+    async def scenario() -> None:
+        agen = agent_router._frames(request, "cp-thread-1")
+        async for _chunk in agen:
+            pass
+
+    _open_run("cp-thread-1", request)
+    loop_thread = threading.current_thread().name
+    with patch("app.agent.router.run", new=fake_run), \
+            patch("app.agent.runs.checkpoint", new=spy):
+        asyncio.run(scenario())
+
+    assert len(threads) == 1
+    assert threads[0] != loop_thread, "检查点写库落在了事件循环线程上"
+    assert runs.get("cp-thread-1").status == runs.STATUS_DONE
 
 
 if __name__ == "__main__":

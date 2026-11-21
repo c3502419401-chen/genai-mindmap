@@ -27,7 +27,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
+import threading
 from contextlib import closing
 from dataclasses import dataclass
 from typing import Any, Sequence
@@ -36,6 +38,8 @@ from pydantic import TypeAdapter
 
 from app.contracts.mindmap import DiagramContent
 from app.mindmaps import repository
+
+logger = logging.getLogger(__name__)
 
 STATUS_RUNNING = "running"
 STATUS_DONE = "done"
@@ -47,6 +51,58 @@ TERMINAL_STATUSES = (STATUS_DONE, STATUS_CANCELLED, STATUS_FAILED)
 
 #: 允许用同一个 run_id 重开的终态：用户主动重试。
 RESTARTABLE_STATUSES = (STATUS_CANCELLED, STATUS_FAILED)
+
+#: 一行 `running` 安静多久之后，可以断定它背后已经没有进程在跑了。
+#:
+#: 判据只能是 `updated_at`：这张表没有心跳列，而 run 最长能活 `max_seconds`
+#: （请求上限 3600 秒，线上默认 600 秒）。取 1800 秒是"比线上默认最长的那一轮
+#: 还多一倍"：活着的运行在 10 分钟内一定已经写过检查点（`checkpoint()` 会顺手
+#: 刷新 `updated_at`），再往后还没有动静的，要么进程没了，要么前端早就放弃它了。
+#:
+#: 单靠这个数字**不足以**判定"活着"：一轮生成里最长的静默是**单次模型调用**，
+#: 它受 `max_seconds` 约束，最长能到 3600 秒——比这个阈值还长。所以真正的第一道
+#: 判据是本进程的活跃登记（`active()`）：自己还在跑的 run 一律不扫。1800 秒只对
+#: "登记表里没有、又很久没动"的行生效，那种行要么属于已经死掉的进程，要么属于
+#: 另一个进程——而部署是单 worker（见 `AGENTS.md`：不要引入多 worker 写假设）。
+#:
+#: 判错的代价是自愈的：把一个其实还活着的运行误判成 `failed` 之后，那一轮真正
+#: 收尾时 `finish` 仍能改动（它只对 `done` 冻结），终态与最终那棵树都会盖回来。
+RUN_ABANDONED_SECONDS = 1800
+
+#: 本进程里正在跑的 run_id。`sweep_abandoned()` 跳过它们。
+#:
+#: 没有这张表，"活跃"就只能靠 `updated_at` 猜，而猜错的代价很实：一轮正在写说明的
+#: 生成被判成 `failed` 之后，它后面的 `checkpoint()` 全部静默失效（那条 UPDATE 带
+#: `WHERE status = 'running'`），用户下次进来看到的是一棵不再更新的树。
+#:
+#: 加锁是因为 `sweep_abandoned()` 可能从线程池里被调用（检查点那条路就是这么做的），
+#: 而登记来自事件循环线程。
+_ACTIVE: set[str] = set()
+_ACTIVE_LOCK = threading.Lock()
+
+
+def active(run_id: str) -> None:
+    """登记一个正在跑的 run。调用方必须在 `finally` 里配 `inactive()`。"""
+    with _ACTIVE_LOCK:
+        _ACTIVE.add(run_id)
+
+
+def inactive(run_id: str) -> None:
+    with _ACTIVE_LOCK:
+        _ACTIVE.discard(run_id)
+
+
+def _active_ids() -> tuple[str, ...]:
+    with _ACTIVE_LOCK:
+        return tuple(_ACTIVE)
+
+
+#: 进程没了的那种收尾。它只进台账（`failure`），不会作为 SSE 帧发给浏览器——
+#: 断掉的那条连接早就没有读者了。
+ABANDONED_FAILURE = {
+    "code": "run_abandoned",
+    "message": "上一轮生成没有跑完就断了（进程或连接中断），留下的是它当时已经生成的结构。",
+}
 
 #: 时间格式与 `mindmaps` / `library_*` 完全一致（SQLite 的 `%f` 是毫秒）。
 #: 三处格式不同就会在"谁更晚"的比较上错一天。
@@ -92,6 +148,23 @@ class RunRecord:
     #: 「请求 X → 服务 Y」不能只剩半句。老行上它是 NULL，重放时字段整条不存在。
     served_model: str | None = None
     reasoning: str | None = None
+    #: 这次收尾**交出的树没长完**（预算耗尽、工具超时、连续失败、空转），以及为什么。
+    #:
+    #: 落库的理由与 `model` / `reasoning` 一样，都是为了让 `_replay` 与第一次
+    #: 完全同形：重连后拿到的若是"完整生成"，用户会以为自己上一轮真的成功了。
+    #:
+    #: `partial` 用 `bool | None` 而不是 `bool`：老行上是 NULL，意思是"这条记录
+    #: 早于这个字段"——与"明确知道它是完整的"（False）不是一回事。
+    partial: bool | None = None
+    partial_reason: str | None = None
+    #: 这条记录里的 `candidate` 是**跑到一半截下来的检查点**，不是收尾交出的成品。
+    #:
+    #: 有值就说明那一轮在写完说明之前就断了（进程被杀、机器重启、连接永久断开），
+    #: 树的结构已经长好、说明还是空的。没有这一列，界面只能说"生成完的导图还没
+    #: 保存"——那句话对一棵结构完整但一句说明都没有的树是错的。
+    #:
+    #: `finish` 交出新的候选时会把它清掉：那一刻 `candidate` 不再是被截下来的半成品。
+    checkpointed_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -107,15 +180,23 @@ class Claim:
     claimed: bool
 
 
-def _connect() -> sqlite3.Connection:
+#: 落检查点时等写锁的上限（秒）。比默认的 10 秒短得多：检查点是"跑不完就少丢
+#: 一点"的东西，它等锁的每一秒都是这一轮真正在跑的时间。拿不到锁就放弃，本轮
+#: 照常往下走——收尾时 `finish()` 还会再写一次。
+CHECKPOINT_LOCK_TIMEOUT = 2.0
+
+
+def _connect(*, timeout: float = 10) -> sqlite3.Connection:
     """连接 + 关掉 Python 的隐式事务。
 
     `isolation_level=None` 是必需的：`begin()` 要显式开 `BEGIN IMMEDIATE` 才能让
     "读到的状态"和"写下的状态"在同一把写锁里。留在默认的隐式事务模式下，
     `BEGIN` 会撞上 Python 自己刚开的那条，抛 `cannot start a transaction within
     a transaction`——而那条错误只在并发时才出现，平时一点痕迹都没有。
+
+    `timeout` 透传给 `repository.connect()`：只有检查点那条路会调短它。
     """
-    conn = repository.connect()
+    conn = repository.connect(timeout=timeout)
     conn.isolation_level = None
     return conn
 
@@ -154,6 +235,10 @@ def _record(row: sqlite3.Row) -> RunRecord:
             candidate = None
     request = _loads(row["request"])
     failure = _loads(row["failure"])
+    # `row["partial"]` 只在补过列的新库上有；老库这一行读出来会是 NULL。
+    # `sqlite3.Row` 对不存在的列会抛 `IndexError`，所以取值要按列名列表判一下——
+    # 但 `_ensure_columns` 在每次连接时都跑，正常路径上列一定在。
+    raw_partial = row["partial"] if "partial" in row.keys() else None
     return RunRecord(
         run_id=row["run_id"],
         status=row["status"],
@@ -167,6 +252,9 @@ def _record(row: sqlite3.Row) -> RunRecord:
         model=row["model"],
         served_model=row["served_model"],
         reasoning=row["reasoning"],
+        partial=None if raw_partial is None else bool(raw_partial),
+        partial_reason=row["partial_reason"] if "partial_reason" in row.keys() else None,
+        checkpointed_at=row["checkpointed_at"] if "checkpointed_at" in row.keys() else None,
     )
 
 
@@ -182,8 +270,29 @@ def begin(run_id: str, request: dict[str, Any]) -> Claim:
     **任何分支都不碰 `candidate`**：同一 id 重复 `begin`（两个标签页同时点）不能把
     上一轮已经产出的草稿抹掉；重跑期间用户回来查，仍能看见那份草稿，直到新的
     终态写进新的一份。
+
+    **重开时清 `partial` / `partial_reason`**：这两列描述的是"上一次那一轮交付了
+    什么"，新一轮开始后就不再成立。不清的话，`finish` 的 `COALESCE` 会把上一轮的
+    `partial` 保住，于是"这一轮什么都没产出、报错收尾"的台账上仍写着
+    `partial=1`——前端点「载入」时按半棵树提示，而那份内容早就不是半棵树了。
+
+    **重开时还要换掉 `request`**：重开意味着**另一个请求**在用这行跑（「补齐说明」
+    就是拿检查点那行的 id 发 `intent="edit"`）。`request` 是台账上"这一行在做什么"
+    的唯一来源——`router._summary()` 的 `intent` / `goal` 都从它取，前端据此决定把
+    结果当"新作品"还是"改现有图"。不换的话，编辑一轮跑完，台账上还写着上一轮的
+    `{"intent": "create"}`，前端载入时按 create 重置 `mapId`，用户点保存会变成新建
+    一条而不是覆盖原记录。`candidate` 反过来**必须**留着：重开跑的是"在已有树上
+    继续"，抹掉它等于把这次续写的起点删了。
     """
     payload = None if not request else json.dumps(request, ensure_ascii=False)
+    # 先把僵住的 `running` 行收掉，再认领。顺序不能反：这一行如果是上一次崩溃
+    # 留下的化石，先 `sweep` 才能把它判成 `failed`，下面那条 `UPDATE` 才有资格
+    # 重开它。放在事务外面，是因为 `sweep_abandoned` 自己开一条 `BEGIN IMMEDIATE`，
+    # 套在这里面的 `BEGIN IMMEDIATE` 里会直接报"事务里不能开事务"。
+    try:
+        sweep_abandoned()
+    except Exception:  # noqa: BLE001 — 清理是维护动作，坏掉不该挡住用户这一次生成
+        logger.warning("超龄 running 的清理没有跑成，这次照常认领", exc_info=True)
     with closing(_connect()) as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -195,9 +304,13 @@ def begin(run_id: str, request: dict[str, Any]) -> Claim:
             claimed = created.rowcount == 1
             if not claimed:
                 reopened = conn.execute(
-                    f"UPDATE runs SET status = ?, failure = NULL, updated_at = {_NOW} "
+                    f"UPDATE runs SET status = ?, failure = NULL, "
+                    f"partial = NULL, partial_reason = NULL, checkpointed_at = NULL, "
+                    # 重开是**另一个请求**在用这行跑，`request` 必须换成这一轮的摘要；
+                    # 空摘要（内部调用方不传）用 COALESCE 保住旧值，等于"这次没带摘要"。
+                    f"request = COALESCE(?, request), updated_at = {_NOW} "
                     "WHERE run_id = ? AND status IN (?, ?)",
-                    (STATUS_RUNNING, run_id, *RESTARTABLE_STATUSES),
+                    (STATUS_RUNNING, payload, run_id, *RESTARTABLE_STATUSES),
                 )
                 claimed = reopened.rowcount == 1
             conn.execute("COMMIT")
@@ -220,6 +333,8 @@ def finish(
     model: str | None = None,
     served_model: str | None = None,
     reasoning: str | None = None,
+    partial: bool | None = None,
+    partial_reason: str | None = None,
 ) -> bool:
     """写终态。返回这一行有没有真的被改动。
 
@@ -238,9 +353,16 @@ def finish(
     `model` / `served_model` / `reasoning` 用 `COALESCE`，与 `mode` 同一档：它们是
     **观察值**，缺了只说明这次没收尾到那一步（比如取消），不该把上一轮已经记下的值
     抹成 NULL——那一行代表的始终是同一次运行的结果。
+
+    `partial` / `partial_reason` 也走 `COALESCE`：同一次运行的终态只可能写一次
+    （`done` 之后冻结），传 None 的含义是"这次没说"，不是"这次是完整的"。
+
+    `checkpointed_at` 在**这次真的交出候选**时被清掉：那一刻 `candidate` 已经是
+    收尾交出的成品，不再是被截下来的半成品，界面不该还按"说明是空的"提示。
     """
     if status not in TERMINAL_STATUSES:
         raise ValueError(f"finish 只接受终态，收到 {status!r}")
+    dumped = _dump_candidate(candidate)
     with closing(_connect()) as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -249,17 +371,121 @@ def finish(
                 "failure = ?, mode = COALESCE(?, mode), "
                 "model = COALESCE(?, model), served_model = COALESCE(?, served_model), "
                 "reasoning = COALESCE(?, reasoning), "
+                "partial = COALESCE(?, partial), "
+                "partial_reason = COALESCE(?, partial_reason), "
+                "checkpointed_at = CASE WHEN ? IS NULL THEN checkpointed_at ELSE NULL END, "
                 "updated_at = " + _NOW +
                 " WHERE run_id = ? AND status <> ?",
-                (status, _dump_candidate(candidate),
+                (status, dumped,
                  None if failure is None else json.dumps(failure, ensure_ascii=False),
-                 mode, model, served_model, reasoning, run_id, STATUS_DONE),
+                 mode, model, served_model, reasoning,
+                 None if partial is None else int(partial),
+                 partial_reason,
+                 dumped,
+                 run_id, STATUS_DONE),
             )
             conn.execute("COMMIT")
         except BaseException:
             conn.execute("ROLLBACK")
             raise
     return changed.rowcount == 1
+
+
+def checkpoint(run_id: str, content: DiagramContent) -> bool:
+    """把**跑到一半的树**存进这一行，别等收尾。
+
+    存在的理由是一段实测过的空窗：结构那一次模型调用返回之后，树已经能读了
+    （过了契约校验、裁剪完、骨架套上），但紧接着要发两次并发调用去写说明，实测
+    这是整轮里最长的一段（56 个节点 26 秒上下，见 `_fill_details` 的 docstring）。
+    这段时间里进程被杀、机器重启、笔记本合盖，那一整轮就白跑了——`finish()` 只在
+    `finally` 里写一次，而 `finally` 根本没跑到。
+
+    落库的时机选在"结构就绪、说明之前"，因为只有这一刻的树是**契约合法的完整树**：
+    中途的预览帧只有 id 与 label（没有 detail、没有引用、没有 `expandable`），
+    把它们当检查点存下来，读回来是一棵不合法也不完整的树，续写还得认第二套格式。
+
+    只对 `running` 的行生效（`WHERE status = 'running'`）：一轮已经收尾了，这个迟到的
+    检查点不该把终态的结果盖成半棵树。
+
+    返回这一行有没有真的被写。写不进去不抛异常——调用方在生成的中途，为了一个
+    "存不上就算了"的保险不该让整轮失败。
+
+    等写锁的上限是 `CHECKPOINT_LOCK_TIMEOUT`（2 秒），不是默认的 10 秒：这条路上
+    的阻塞发生在事件循环里（调用方在线程池里跑它，但等的是这一轮生成的时间），
+    一把慢锁不值得陪满十秒。超时抛的 `sqlite3.OperationalError` 照常往外抛——由
+    调用方决定记日志还是继续，这里不替它吞。
+    """
+    with closing(_connect(timeout=CHECKPOINT_LOCK_TIMEOUT)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            changed = conn.execute(
+                "UPDATE runs SET candidate = ?, checkpointed_at = " + _NOW + ", "
+                "updated_at = " + _NOW + " "
+                "WHERE run_id = ? AND status = ?",
+                (_dump_candidate(content), run_id, STATUS_RUNNING),
+            )
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+    return changed.rowcount == 1
+
+
+def sweep_abandoned(*, seconds: int = RUN_ABANDONED_SECONDS) -> list[str]:
+    """把"说是在跑、其实早没人跑"的行判成 `failed`，返回被清扫的 run_id。
+
+    这些行是崩溃的化石：进程在 `finish()` 之前没了，那一行就永远停在 `running`。
+    它有两个后果，都不是"看起来不干净"而已：
+
+    - **同一个 run_id 永远 409**：`begin()` 见到 `running` 就拒绝认领，用户重发
+      那一轮会一直被告知"已经在跑了"，而他既看不到结果也没有可点的东西。
+    - **台账里那棵树没人能捡**：`pending()` 只看 `done` / `cancelled`，`running`
+      不在其中，所以检查点存得再好也没人读得到。
+
+    判据是**两条**，缺一不可：
+
+    1. 不在本进程的活跃登记里（`_ACTIVE`）。自己还在跑的 run 一律不碰——这一条
+       才是"活着"的硬证据。
+    2. `updated_at` 比阈值更旧。
+
+    只靠第 2 条不够：一轮生成里最长的静默是**单次模型调用**，它受 `max_seconds`
+    约束（请求上限 3600 秒），比阈值还长。只按时间来猜，这种轮次会被判成 `failed`，
+    而它后面的 `checkpoint()` 带 `WHERE status = 'running'`，从此全部静默失效——
+    用户下次进来看到的是一棵停在某一刻、再也不会更新的树。
+
+    第 1 条只在单进程里有效，这与部署一致（`AGENTS.md`：不要引入多 worker 写假设）。
+    多 worker 部署时，另一进程的活跃 run 只能靠时间兜——那也正是阈值取到 1800 秒
+    这么宽的原因。
+
+    截止时刻由 **SQLite 自己算**（`strftime(..., 'now', '-N seconds')`），不在这里
+    用 Python 拼时间串：`updated_at` 是 SQLite 按 UTC 写下的同一格式，两边各算一次
+    就有时区与精度两个地方会分叉，而分叉的表现是"清理要么一直不触发、要么清掉刚开
+    的那一轮"，两种都很难从日志上认出来。
+    """
+    protected = _active_ids()
+    with closing(_connect()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = conn.execute(
+                "SELECT run_id FROM runs WHERE status = ? AND updated_at < "
+                "strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)",
+                (STATUS_RUNNING, f"-{max(1, seconds)} seconds"),
+            ).fetchall()
+            swept = [row["run_id"] for row in rows if row["run_id"] not in protected]
+            if swept:
+                placeholders = ", ".join("?" for _ in swept)
+                conn.execute(
+                    f"UPDATE runs SET status = ?, failure = ?, updated_at = {_NOW} "
+                    f"WHERE run_id IN ({placeholders})",
+                    (STATUS_FAILED,
+                     json.dumps(ABANDONED_FAILURE, ensure_ascii=False),
+                     *swept),
+                )
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+    return swept
 
 
 def get(run_id: str) -> RunRecord | None:
@@ -276,9 +502,10 @@ def pending(
 ) -> list[RunRecord]:
     """有结果、而且后来没被保存过的运行，最新的在前。
 
-    默认只要 `done`。前端展示时传 `(done, cancelled)`：被取消但已经产出结果的运行
-    同样值得捡起来（那 40 秒就是这么省回来的），只是措辞不同（"上次被中断了"而不是
-    "上次完成了"）。
+    默认只要 `done`。前端展示时传 `(done, cancelled, failed)`：后两种里也可能有
+    值得捡回来的东西——被取消但已经产出结果的运行（那 40 秒就是这么省回来的），
+    以及被 `sweep_abandoned()` 判死的运行（它留下的是崩溃前那个检查点）。两种措辞
+    与"上次完成了"不同，但"有没有东西可捡"由 `candidate IS NOT NULL` 判，不由状态判。
 
     判据是 `applied_at`，不是"结果有没有写进 `mindmaps` 表"：那份内容可能被 PUT 到
     一张已有导图上（推不出新记录），也可能用户存成了另一张——用 `mindmaps` 反推
@@ -335,17 +562,24 @@ def _mark(run_id: str, column: str) -> bool:
 
 
 __all__ = [
+    "ABANDONED_FAILURE",
+    "CHECKPOINT_LOCK_TIMEOUT",
     "Claim",
     "RESTARTABLE_STATUSES",
+    "RUN_ABANDONED_SECONDS",
     "RunRecord",
     "STATUS_CANCELLED",
     "STATUS_DONE",
     "STATUS_FAILED",
     "STATUS_RUNNING",
     "TERMINAL_STATUSES",
+    "active",
     "begin",
+    "checkpoint",
     "finish",
     "get",
+    "inactive",
     "mark_applied",
     "pending",
+    "sweep_abandoned",
 ]

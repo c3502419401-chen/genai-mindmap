@@ -299,6 +299,143 @@ describe('底部对话框的状态机', () => {
     await wrapper.vm.$nextTick();
     expect(wrapper.find('[data-test="resumable-notice"]').exists()).toBe(false);
   });
+
+  it('检查点说"结构还在、已存 N 个节点"，不说"只完成了一部分"', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.preview(TREE, 'right');
+    store.resumableRun = {
+      run_id: 'run-cp', status: 'failed', intent: 'create', goal: '崩掉的那张',
+      created_at: '2024-01-01T03:00:00Z', updated_at: '2024-01-01T03:12:00Z', applied_at: null,
+      checkpointed_at: '2024-01-01T03:05:00Z', node_count: 37,
+    };
+    await wrapper.vm.$nextTick();
+
+    const notice = wrapper.get('[data-test="resumable-notice"]').text();
+    // 结构是完整的，缺的只是说明——说成"只完成了一部分"会让用户以为要重跑。
+    expect(notice).toContain('结构还在');
+    expect(notice).toContain('37 个节点');
+    expect(notice).not.toContain('只完成了一部分');
+    expect(notice).not.toContain('被中断');
+  });
+
+  it('检查点里是 0 个节点时照样说"0 个节点"，不吞成没存下', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.preview(TREE, 'right');
+    store.resumableRun = {
+      run_id: 'run-cp0', status: 'failed', intent: 'create', goal: '空树那张',
+      created_at: '2024-01-01T03:00:00Z', updated_at: '2024-01-01T03:12:00Z', applied_at: null,
+      checkpointed_at: '2024-01-01T03:05:00Z', node_count: 0,
+    };
+    await wrapper.vm.$nextTick();
+
+    // 0 是合法读数（检查点落在裁剪之后、恰好空树）。`node_count ? ...` 会把它当成
+    // 「没存下节点」，于是用户看到一句"结构还在"，却不知道结构是空的。
+    const notice = wrapper.get('[data-test="resumable-notice"]').text();
+    expect(notice).toContain('0 个节点');
+  });
+
+  it('检查点上多一个「补齐说明」，别的形态没有', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.preview(TREE, 'right');
+
+    // 半棵树且已经 done：缺的是内容，补说明帮不上（结构本身没长完），而且 done
+    // 那一行 `begin()` 只会幂等重放，点了也不会真补。两次判据同向，按钮都不该有。
+    store.resumableRun = {
+      run_id: 'run-partial', status: 'done', intent: 'create', goal: '半棵',
+      created_at: '2024-01-01T03:00:00Z', updated_at: '2024-01-01T03:12:00Z', applied_at: null,
+      partial: true,
+    };
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find('[data-test="run-status-fill"]').exists()).toBe(false);
+
+    // 检查点：结构完整、只缺说明 —— 补说明是唯一"更便宜"的补救
+    store.resumableRun = {
+      run_id: 'run-cp', status: 'failed', intent: 'create', goal: '崩掉的那张',
+      created_at: '2024-01-01T03:00:00Z', updated_at: '2024-01-01T03:12:00Z', applied_at: null,
+      checkpointed_at: '2024-01-01T03:05:00Z', node_count: 5,
+    };
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find('[data-test="run-status-fill"]').exists()).toBe(true);
+  });
+
+  it('补说明失败一次之后，入口还在（时间戳被清掉不算"不用补了"）', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.preview(TREE, 'right');
+
+    // 这一行是「补说明」自己跑坏留下的：`begin()` 重开时清 `checkpointed_at`，
+    // `finish()` 又在交出候选（edit 的快照仍非空）时再清一次。树上还缺说明，
+    // 可那个时间戳已经没了 —— 用时间戳当判据，用户就永久失去了补救入口。
+    store.resumableRun = {
+      run_id: 'run-fill-failed', status: 'failed', intent: 'edit', goal: '补说明',
+      created_at: '2024-01-01T03:00:00Z', updated_at: '2024-01-01T03:20:00Z', applied_at: null,
+      checkpointed_at: null, node_count: null,
+    };
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.find('[data-test="run-status-fill"]').exists()).toBe(true);
+  });
+
+  it('点「补齐说明」先载入、再用**同一条** run_id 发 edit 请求', async () => {
+    const calls: { url: string; body: Record<string, unknown> }[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (isPrefsRequest(url)) return prefsReply(url);
+      // 画布内容一变，前端就自动跑一次只读结构检查（`ChatDock` 那条 watch）：
+      // 这一条用例里内容会变两回（先 `preview` 载入检查点、再收 `done` 帧），
+      // 于是多出两条背景请求。它们与"点了这个入口发出什么"无关，不进 `calls`。
+      if (isOptimizationRequest(url)) return optimizationReply();
+      if (url.endsWith('/health')) {
+        return { ok: true, status: 200, json: async () => ({ version: 'test' }) } as unknown as Response;
+      }
+      if (url.includes('/api/agent/runs/run-cp') && !url.includes('stream')) {
+        // 台账详情：检查点里那棵树（结构在、说明空）
+        return {
+          ok: true, status: 200,
+          json: async () => ({
+            run_id: 'run-cp', status: 'failed', intent: 'create', goal: '崩掉的那张',
+            created_at: '2024-01-01T03:00:00Z', updated_at: '2024-01-01T03:12:00Z',
+            applied_at: null, candidate: TREE, mode: 'model',
+            checkpointed_at: '2024-01-01T03:05:00Z', partial: null,
+          }),
+        } as unknown as Response;
+      }
+      calls.push({ url, body: JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown> });
+      return streamReply([{ type: 'done', seq: 3, content: TREE, mode: 'model' }]);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    store.preview(TREE, 'right');
+    store.resumableRun = {
+      run_id: 'run-cp', status: 'failed', intent: 'create', goal: '崩掉的那张',
+      created_at: '2024-01-01T03:00:00Z', updated_at: '2024-01-01T03:12:00Z', applied_at: null,
+      checkpointed_at: '2024-01-01T03:05:00Z', node_count: 5,
+    };
+    await wrapper.vm.$nextTick();
+
+    await wrapper.get('[data-test="run-status-fill"]').trigger('click');
+    await flushPromises();
+
+    expect(calls).toHaveLength(1);
+    const sent = calls[0]!.body;
+    // 沿用那条 run_id：服务端 `begin()` 对 failed/cancelled 是重开同一行，
+    // 换新 id 会让一次生成在台账上变成两次运行。
+    expect(sent.run_id).toBe('run-cp');
+    expect(sent.intent).toBe('edit');
+    // 补说明要的是"画布上的这棵树"，`edit` 必须带快照
+    expect(sent.snapshot).toBeTruthy();
+    // 选区显式给空：补说明按整棵树的长度数，不是"只补我圈的"
+    expect(sent.selected_ids).toEqual([]);
+  });
 });
 
 describe('材料缩略图', () => {

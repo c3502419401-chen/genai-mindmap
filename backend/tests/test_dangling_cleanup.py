@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from app.agent.contracts import AgentRunRequest, RunBudget, RunContext
@@ -115,7 +116,7 @@ class TestTreeRemoveKeepsRelationsValid:
     def test_remove_node_clears_dangling_relations(self):
         ctx = _ctx(_tree_payload())
 
-        result = _remove_node(RemoveNodeArgs(node_id="a"), ctx)
+        result = asyncio.run(_remove_node(RemoveNodeArgs(node_id="a"), ctx))
 
         assert result.ok, result.content
         assert result.data.get("code") is None
@@ -136,7 +137,7 @@ class TestTreeRemoveKeepsRelationsValid:
     def test_untouched_relations_survive(self):
         ctx = _ctx(_tree_payload())
 
-        result = _remove_node(RemoveNodeArgs(node_id="b"), ctx)
+        result = asyncio.run(_remove_node(RemoveNodeArgs(node_id="b"), ctx))
 
         assert result.ok, result.content
         # 删 b：r1 与 r3 都以 b 为端点，r2 与 b 无关
@@ -149,7 +150,7 @@ class TestFlowRemoveKeepsRelationsValid:
     def test_remove_step_clears_inner_edges_and_relations(self):
         ctx = _ctx(_flow_payload())
 
-        result = _remove_node(RemoveNodeArgs(node_id="a2"), ctx)
+        result = asyncio.run(_remove_node(RemoveNodeArgs(node_id="a2"), ctx))
 
         assert result.ok, result.content
         content = ctx.candidate
@@ -171,7 +172,7 @@ class TestFlowRemoveKeepsRelationsValid:
         before = [edge.id for stage in content.stages for edge in stage.edges]
         before += [edge.id for edge in content.edges]
 
-        result = _remove_node(RemoveNodeArgs(node_id="a2"), ctx)
+        result = asyncio.run(_remove_node(RemoveNodeArgs(node_id="a2"), ctx))
 
         assert result.ok, result.content
         content = ctx.candidate
@@ -186,7 +187,7 @@ class TestFlowRemoveKeepsRelationsValid:
         """顺手清掉的关系也要说：`relations` 界面不渲染，不说模型就查不到。"""
         ctx = _ctx(_flow_payload())
 
-        result = _remove_node(RemoveNodeArgs(node_id="a2"), ctx)
+        result = asyncio.run(_remove_node(RemoveNodeArgs(node_id="a2"), ctx))
 
         assert result.ok, result.content
         assert result.data["removed_relations"] == ["r1"]
@@ -204,7 +205,7 @@ class TestFlowRemoveKeepsRelationsValid:
             "edges": [{"id": "e1", "source": "s_1", "target": "s_2"}],
         })
 
-        result = _remove_node(RemoveNodeArgs(node_id="a2"), ctx)
+        result = asyncio.run(_remove_node(RemoveNodeArgs(node_id="a2"), ctx))
 
         assert result.ok, result.content
         assert result.data["removed_edge_count"] == 0
@@ -217,7 +218,7 @@ class TestFishboneRemoveKeepsRelationsValid:
     def test_remove_bone_child_clears_relations(self):
         ctx = _ctx(_fishbone_payload())
 
-        result = _remove_node(RemoveNodeArgs(node_id="h1"), ctx)
+        result = asyncio.run(_remove_node(RemoveNodeArgs(node_id="h1"), ctx))
 
         assert result.ok, result.content
         content = ctx.candidate

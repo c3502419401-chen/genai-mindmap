@@ -269,8 +269,10 @@ def test_overlong_or_too_short_directions_are_dropped(monkeypatch):
 def test_directions_are_searched_in_parallel(monkeypatch):
     """多方向的检索窗口**有交集**：串行时三个窗口首尾相接，不会有交集。
 
-    用 `_search_one` 那个替身记录每个方向进入/离开的时刻，再求交集。sleep 0.15、
-    串行需要 0.45 秒；这里同时断言总耗时 < 0.4 秒，两种证据互相印证。
+    用 `_search_one` 那个替身记录每个方向进入/离开的时刻，再求交集——交集本身就把
+    "同时有不止一个在飞"证完了。**不再断言总耗时**：它包含线程池起线程、调度与
+    机器负载，0.4 秒这种绝对阈值在 CI 上会抖（实测 0.437 也红过），而那和"并行不并行"
+    是两件事。
     """
     monkeypatch.setattr(external, "chat_async", _fake_chat({"directions": [
         "碳中和政策", "碳中和技术路径", "碳中和企业案例"]}))
@@ -288,13 +290,10 @@ def test_directions_are_searched_in_parallel(monkeypatch):
 
     monkeypatch.setattr(external, "_search_one", fake_search_one)
 
-    started = time.perf_counter()
     external.search_external("碳中和")
-    elapsed = time.perf_counter() - started
 
     assert len(windows) == 3
     assert max(start for start, _ in windows) < min(end for _, end in windows), windows
-    assert elapsed < 0.4, elapsed
 
 
 # ---------------------------------------------------------------- 5 合并去重

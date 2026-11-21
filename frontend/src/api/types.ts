@@ -738,6 +738,24 @@ export interface RunSummary {
   updated_at: string;
   /** 这份结果后来被保存了。空值 = 生成过、还没存下来，下次进页面会提醒一次。 */
   applied_at?: string | null;
+  /**
+   * 这份结果是"跑到一半停下"交出来的半棵树。
+   *
+   * 判断一律写 `partial === true`：字段缺省 / `null` 表示**这条记录没记过**（老库、
+   * 或那一轮根本没走交付标记），不是"确定完整"。列表也带它，否则点「载入」时
+   * 半棵树与完整生成长得一模一样。
+   */
+  partial?: boolean | null;
+  /**
+   * 这份结果不是收尾交的，而是跑到一半截下来的检查点。
+   *
+   * 有值 = **结构长全了、说明还没写**（`detail` 是空的）。它与 `partial` 是两件事：
+   * `partial` 说"树没长完"，这一条说"树长全了、描述没来得及写"。下一步也不同——
+   * 前者要补内容，后者只是缺描述，直接载入接着改就行。
+   */
+  checkpointed_at?: string | null;
+  /** 检查点那份里有多少个节点。只为一句"已保存 N 个节点"，不值得再拉整棵树。 */
+  node_count?: number | null;
 }
 
 /** 单条运行的详情（镜像后端 `RunDetail`）：多出结果正文、失败原因与来历。 */
@@ -746,6 +764,8 @@ export interface RunDetail extends RunSummary {
   failure?: { code?: string; message?: string } | null;
   /** `demo` 是占位树、`model` 是模型产出。重放时按它标来源，不能一律写成模型。 */
   mode?: 'demo' | 'model' | null;
+  /** 半棵树的来历：哪条闸把这一轮停下的那一句解释，与实时流上的 `partial_reason` 同源。 */
+  partial_reason?: string | null;
 }
 
 /**
@@ -853,6 +873,24 @@ export type AgentEvent =
        * 区别只在思不思考）。缺字段＝服务端没说，界面写"未知"。
        */
       served_model?: string | null;
+      /**
+       * 交出来的这棵树**没长完**：预算耗尽、工具超时、连续失败、空转收尾。
+       *
+       * 从前这些收尾一律发 `error`，前端清掉预览、画布也不动，用户跑了三分钟什么
+       * 都没拿到。现在改成"有树就交树"，但必须让用户知道它不是一次完整生成——
+       * 否则半棵树会被当成模型认为的完整答案。
+       *
+       * 缺字段＝没说（正常收尾、以及加这个字段之前的老帧），与 `false`（明确完整）
+       * 不是一回事，所以判的时候用 `=== true`。
+       */
+      partial?: boolean | null;
+      /**
+       * 为什么没长完，一句人话（与 `error.message` 同源，可直接显示）。
+       *
+       * 与 `partial` 成对出现：只给布尔值的话，界面只能说"不完整"却说不出原因，
+       * 而"额度用完"与"工具卡死"对用户意味着完全不同的下一步。
+       */
+      partial_reason?: string | null;
     }
   | { type: 'error'; seq: number; code: string; message: string; limit?: string };
 

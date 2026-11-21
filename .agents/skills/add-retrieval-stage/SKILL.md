@@ -154,9 +154,9 @@ python scripts/evaluate_retrieval.py --suite manual
 docs/AGENT_PLAN.md  docs/RAG-DECISIONS.md  docs/PLAN.md  docs/ARCHITECTURE.md
 ```
 
-改它们的正文会让 28 条手工标注失效。`load_manual_dataset` 会**当场报错**而不是静默跳过（`test_hash_drift_is_fatal_not_skipped` 钉着这一点）。改法是重读那一章、复核区间与问法，再把新指纹写回 `eval_cases_manual.py`。
+改它们**被 case 标注过的章节正文**会让 28 条手工标注失效——指纹只覆盖 `sections` / `targets` 指向的那几章（`evaluate_retrieval.annotated_hashes`），追加变更记录、改别的小节不会红。改到标注章节时 `load_manual_dataset` 会**当场报错**而不是静默跳过（`test_hash_drift_is_fatal_not_skipped` 钉着这一点）。改法是重读那一章、复核区间与问法，再把新指纹写回 `eval_cases_manual.py`。
 
-**这是本仓库最容易被无意触发的一条**：写检索文档时顺手改了 `RAG-DECISIONS.md` 的正文，评估套件就红了。
+**这是本仓库最容易被无意触发的一条**：写检索文档时顺手改了 `RAG-DECISIONS.md` 已被标注的章节正文，评估套件就红了（只改别的章节不再触发）。
 
 ## 自检清单
 

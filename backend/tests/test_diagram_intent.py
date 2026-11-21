@@ -447,7 +447,7 @@ class TestRouterWiring:
         request = _request("机器学习，用鱼骨图")
         request.run_id = "diagram-1"
 
-        async def fake_run(body, *, on_close=None, first_seq=None):
+        async def fake_run(body, *, on_close=None, on_checkpoint=None, first_seq=None):
             yield DoneEvent(seq=1, content=None, mode="model")
 
         async def scenario():
@@ -470,7 +470,7 @@ class TestRouterWiring:
         request = _request("做一张导图")
         request.run_id = "diagram-2"
 
-        async def fake_run(body, *, on_close=None, first_seq=None):
+        async def fake_run(body, *, on_close=None, on_checkpoint=None, first_seq=None):
             yield DoneEvent(seq=1, content=None, mode="model")
 
         async def scenario():

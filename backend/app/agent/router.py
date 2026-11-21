@@ -27,7 +27,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
-from app.agent import runs
+from app.agent import runs, shapes
 from app.agent.contracts import (
     AgentEvent,
     AgentRunRequest,
@@ -40,7 +40,7 @@ from app.agent.diagram_intent import apply as apply_diagram_intent
 from app.agent.service import AgentPlan, AgentTaskRequest, plan, run
 from app.agent.stream import DONE_FRAME, encode_event
 from app.core.errors import AppError
-from app.generation.service import GenerationError
+from app.generation.service import GenerationError, ModelNotConfigured
 from app.knowledge.remember import remember_sources
 from app.memory import summarize as memory_summarize
 
@@ -151,6 +151,9 @@ async def _replay(record: runs.RunRecord) -> AsyncIterator[str]:
     `done` 但没有结果的 run 同样重放（内容是空）：它在服务端已经是一次有结论的
     运行，重跑一次并不比"如实说没产出"更可能成功。用户真想重试时，前端每次点击
     都会生成新的 run_id，走的是另外一条路。
+
+    `partial` / `partial_reason` 也照落库的值回填：重放若是"完整生成"，用户会以为
+    上一轮真的一次跑完了——而他重连之前看到的明明是"部分完成"。
     """
     mode = record.mode if record.mode in ("demo", "model") else None
     seq = 0
@@ -161,12 +164,14 @@ async def _replay(record: runs.RunRecord) -> AsyncIterator[str]:
         yield encode_event(DoneEvent(
             seq=seq, content=record.candidate, mode=mode,
             model=record.model, served_model=record.served_model,
-            reasoning=record.reasoning or ""))
+            reasoning=record.reasoning or "",
+            partial=record.partial, partial_reason=record.partial_reason))
     else:
         yield encode_event(DoneEvent(
             seq=1, content=None, mode=mode,
             model=record.model, served_model=record.served_model,
-            reasoning=record.reasoning or ""))
+            reasoning=record.reasoning or "",
+            partial=record.partial, partial_reason=record.partial_reason))
     yield DONE_FRAME
 
 
@@ -187,6 +192,15 @@ async def _frames(body: AgentRunRequest, run_id: str) -> AsyncIterator[str]:
     接不到；用帧作判据，取消、断开、超时被掐这三条路自动归进同一格。
     """
     seq = 0
+    # 登记"本进程正在跑这一轮"。`sweep_abandoned()` 靠它分清"活着但静默"与"进程
+    # 已经没了"：一轮生成长时间不出帧是正常的（单次模型调用最长能到 `max_seconds`
+    # 上限 3600 秒），只按 `updated_at` 判会把这种轮次误杀，而误杀之后它后面的
+    # `checkpoint()` 会因为 `WHERE status = 'running'` 全部静默失效。
+    #
+    # 登记点在本生成器的第一行、而不是 `stream_run()` 里：生成器要到第一次迭代才
+    # 执行，客户端在开流前断开时它一次都不跑——登记在这里就不会留下一条永远没人
+    # 注销的活跃记录。注销在 `finally` 里，紧挨着 `finish()`。
+    runs.active(run_id)
     # 只在正常收尾或已处理过的错误之后补 [DONE]。放在 finally 里会在 aclose()
     # 触发 GeneratorExit 时也去 yield，Python 直接抛
     # "async generator ignored GeneratorExit"，底层生成器的清理也被跳过。
@@ -202,6 +216,10 @@ async def _frames(body: AgentRunRequest, run_id: str) -> AsyncIterator[str]:
     # 的整句，少一半等于同一个 run 两条路径给两种说法。
     served_model: str | None = None
     reasoning: str | None = None
+    # "这棵树没长完"（预算耗尽、工具超时、连续失败、空转收尾）与原因。同上，
+    # 落库是为了让重放与第一次同形：不存它，重连后拿到的帧会说"完整生成"。
+    partial: bool | None = None
+    partial_reason: str | None = None
     # 候选的两个来源，按可信度排：`ctx` 是权威（含 edit/expand 那些只走 op 批次的
     # 改动），`observed` 是兜底（只在 `run()` 的收尾回调没能执行时才有用，比如
     # 任务被硬取消导致内层生成器没能跑完 finally）。多这一层不重复：一个来源是
@@ -211,6 +229,18 @@ async def _frames(body: AgentRunRequest, run_id: str) -> AsyncIterator[str]:
     def on_close(candidate: Any) -> None:
         # 同步、只做赋值：取消路径上第一个 await 会立刻再抛一次 CancelledError。
         captured["ctx"] = candidate
+
+    async def on_checkpoint(content: Any) -> None:
+        # 中途那次落库。**异步**：工具是 async 的、跑在事件循环上，同步写 SQLite
+        # 会把整个循环拿去等写锁——同一个进程里别的 SSE 流会跟着一帧都发不出来。
+        # 交给线程池，阻塞关在那个 worker 里，这一轮生成照常推进。
+        #
+        # 写失败**不抛**：检查点是"跑不完时少丢一点"的补丁，它自己出错不该让一轮
+        # 本来能成功的生成失败。真正常态收尾时 `finish()` 会再写一次并清掉这个标记。
+        try:
+            await run_in_threadpool(runs.checkpoint, run_id, content)
+        except Exception:
+            logger.warning("run %s 的检查点没有落库", run_id, exc_info=True)
 
     try:
         # 材料入库排在事件流之前：入库会把临时 id 换成库里的持久 id，换完的
@@ -232,7 +262,7 @@ async def _frames(body: AgentRunRequest, run_id: str) -> AsyncIterator[str]:
         # 的模型请求还在跑、还在计费。
         # `first_seq=seq+1`：`sources` 帧已占掉 seq，循环里的编号接着往下发。
         async with contextlib.aclosing(
-            run(body, on_close=on_close, first_seq=seq + 1)
+            run(body, on_close=on_close, on_checkpoint=on_checkpoint, first_seq=seq + 1)
         ) as events:
             async for event in events:
                 seq = max(seq, getattr(event, "seq", 0))
@@ -244,6 +274,8 @@ async def _frames(body: AgentRunRequest, run_id: str) -> AsyncIterator[str]:
                     # 空串按"没说"落库：`runs.finish()` 用 COALESCE，写成空串会把
                     # 上一轮已经记下的思考过程盖成空。
                     reasoning = event.reasoning or None
+                    partial = event.partial
+                    partial_reason = event.partial_reason
                     captured["observed"] = event.content
                 elif isinstance(event, ErrorEvent):
                     resolved = runs.STATUS_FAILED
@@ -251,6 +283,14 @@ async def _frames(body: AgentRunRequest, run_id: str) -> AsyncIterator[str]:
                 elif isinstance(event, SnapshotEvent):
                     captured["observed"] = event.content
                 yield encode_event(event)
+        finished = True
+    except ModelNotConfigured as exc:
+        # 必须排在 `except GenerationError` 之前（它是子类）：这条错误的下一步
+        # 不是"重试"，界面上要显示成"去配模型"。
+        resolved = runs.STATUS_FAILED
+        failure = {"code": "model_not_configured", "message": str(exc)}
+        yield encode_event(ErrorEvent(
+            seq=seq + 1, code="model_not_configured", message=str(exc)))
         finished = True
     except GenerationError as exc:
         resolved = runs.STATUS_FAILED
@@ -276,9 +316,13 @@ async def _frames(body: AgentRunRequest, run_id: str) -> AsyncIterator[str]:
         # 拦下它并留下日志，用户至少还能从 done 帧拿到候选。
         try:
             runs.finish(run_id, resolved, candidate=candidate, failure=failure, mode=mode,
-                        model=model, served_model=served_model, reasoning=reasoning)
+                        model=model, served_model=served_model, reasoning=reasoning,
+                        partial=partial, partial_reason=partial_reason)
         except Exception:  # noqa: BLE001 — 见上
             logger.exception("run %s 的终态没有落库", run_id)
+        # 注销活跃登记：必须放在 `finish` 之后——先注销再落终态，中间那一瞬间
+        # 别的请求的 `sweep_abandoned()` 就有机会把这一行判成化石。
+        runs.inactive(run_id)
     if finished:
         yield DONE_FRAME
 
@@ -368,6 +412,22 @@ class RunSummary(BaseModel):
     updated_at: str
     #: 这份结果后来被保存了。空值 = 生成过、还没存下来，下次进页面会提醒一次。
     applied_at: str | None = None
+    #: 半棵树（有产出但没跑完）。**None 是"这条记录没记过"**，不是"完整"——
+    #: 老行上这列是 NULL，判"是否半棵"必须写 `is True`。
+    #:
+    #: 列表里也要带：前端靠它决定"捡回上次结果"时该不该提示"有分支没生成完整"。
+    #: 只在 `done` 帧上带过、读接口丢掉的那一版，用户点「载入」拿到的半棵树与一次
+    #: 完整生成长得一模一样——而这恰恰是本 PR 想消灭的那种"坏了和本来就没有长得一样"。
+    partial: bool | None = None
+    #: 这份结果不是收尾交的，而是跑到一半截下来的检查点（`runs.checkpoint`）。
+    #:
+    #: 有值 = "说明还没写、`detail` 是空的，结构是完整的"。它不进 `partial`：
+    #: `partial` 说的是"树没长完"，这里说的是"树长全了、说明没来得及写"，
+    #: 两件事的下一步不一样（前者补内容，后者只是缺描述）。
+    checkpointed_at: str | None = None
+    #: 这份结果有多少个节点。前端拿它说"已保存 N 个节点"，不值得为一句提示
+    #: 再点开详情拉整棵树。
+    node_count: int | None = None
 
 
 class RunDetail(RunSummary):
@@ -377,6 +437,8 @@ class RunDetail(RunSummary):
     candidate: Any | None = None
     failure: dict[str, Any] | None = None
     mode: str | None = None
+    #: 半棵树的那一句原因（与 `done` 帧的 `partial_reason` 同一句）。
+    partial_reason: str | None = None
 
 
 def _summary(record: runs.RunRecord) -> RunSummary:
@@ -389,6 +451,15 @@ def _summary(record: runs.RunRecord) -> RunSummary:
         created_at=record.created_at,
         updated_at=record.updated_at,
         applied_at=record.applied_at,
+        partial=record.partial,
+        checkpointed_at=record.checkpointed_at,
+        # 只在检查点上数一遍：成品那份前端已经会按 `partial` 说话，不需要这个数。
+        # 数一遍是遍历一棵树，几十微秒；列表最多 20 条，划算。
+        node_count=(
+            shapes.count_nodes(record.candidate)
+            if record.checkpointed_at and record.candidate is not None
+            else None
+        ),
     )
 
 
@@ -396,7 +467,7 @@ def _summary(record: runs.RunRecord) -> RunSummary:
 def list_runs(
     status_filter: Literal["done", "cancelled", "failed", "running"] | None = Query(
         default=None, alias="status",
-        description="只看某一种状态。缺省 = 有结果且还没被保存过的（done + cancelled）。",
+        description="只看某一种状态。缺省 = 有结果且还没被保存过的（done + cancelled + failed）。",
     ),
     unapplied: bool = Query(
         default=True,
@@ -406,14 +477,22 @@ def list_runs(
 ) -> list[RunSummary]:
     """运行台账。默认回答的是"上次跑完、我还没存下来的是哪一次"。
 
-    `status` 缺省时把 `done` 与 `cancelled` 一起算：**被取消但已经产出结果的那次
-    同样要能被捡起来**——否则"关掉页面那 40 秒"照样白花，只是从内存白花变成写进
-    数据库白花。
+    `status` 缺省时把 `done` / `cancelled` / `failed` 一起算：
+
+      - **`cancelled` 但已经产出结果的那次同样要能被捡起来**——否则"关掉页面那
+        40 秒"照样白花，只是从内存白花变成写进数据库白花。
+      - **`failed` 里有 `run_abandoned`**：进程崩了，`sweep_abandoned()` 把那行判死
+        并留下了崩溃前那个检查点。不列它的后果是"检查点存得再好也没人读得到"——
+        用户下次进来看到的是"什么都没有"，而那棵树其实就在库里。
+
+    有没有东西可捡由 `candidate IS NOT NULL` 判（`pending()` 里的条件），不由状态判：
+    一个 `failed` 行可能什么都留，一个 `cancelled` 行可能留了整棵树。
 
     这条查询就是这张表结果列的**唯一读者**。没有它，`candidate` 写进去之后再没人看过。
     """
     statuses: tuple[str, ...] = (
-        (status_filter,) if status_filter else (runs.STATUS_DONE, runs.STATUS_CANCELLED)
+        (status_filter,) if status_filter
+        else (runs.STATUS_DONE, runs.STATUS_CANCELLED, runs.STATUS_FAILED)
     )
     records = runs.pending(limit=limit, statuses=statuses, unresolved_only=unapplied)
     return [_summary(record) for record in records]
@@ -430,6 +509,7 @@ def get_run(run_id: str) -> RunDetail:
         candidate=None if record.candidate is None else record.candidate.model_dump(mode="json"),
         failure=record.failure,
         mode=record.mode,
+        partial_reason=record.partial_reason,
     )
 
 

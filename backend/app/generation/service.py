@@ -443,6 +443,20 @@ class GenerationError(Exception):
     pass
 
 
+class ModelNotConfigured(GenerationError):
+    """模型地址/密钥/模型名没配齐。
+
+    单独一个类型不是为了更细的异常体系，而是因为这一类失败与前缀里的其它
+    `GenerationError`（上游 5xx、超时、响应不合规）**在界面上该给不同的下一步**：
+    后者"再试一次"有意义，前者重试一百次也是同一个结果——它要的是有人去填环境
+    变量。在此之前两者共用一个 `generation_failed`，失败卡片只能给一个重试按钮，
+    点下去必然再失败，用户没有任何别的出路。
+
+    继承 `GenerationError` 是必需的：`router._frames` 与工具层都按基类捕获它，
+    换成独立体系会让"没配模型"从"可读的一帧错误"退回成"未预期异常"。
+    """
+
+
 def estimate_input_tokens(text: str) -> int:
     """估算一段文本的 token 数，用于在**发请求之前**判断它装不装得进上下文。
 
@@ -787,12 +801,16 @@ def _choice_message(body: Any) -> tuple[str, bool]:
 
 
 def _config() -> tuple[str, str, str]:
-    """读模型配置。缺失或格式不对时抛 GenerationError，让上层给出可读文案。"""
+    """读模型配置。缺失或格式不对时抛 GenerationError，让上层给出可读文案。
+
+    抛的是 `ModelNotConfigured` 而不是基类：这条错误的下一步不是"重试"，
+    是"去把环境变量填上"（见那个类的 docstring）。上层按类型分开给文案。
+    """
     base = os.getenv("MINDMAP_LLM_BASE_URL", "").strip().rstrip("/")
     key = os.getenv("MINDMAP_LLM_API_KEY", "").strip()
     model = os.getenv("MINDMAP_LLM_MODEL", "").strip()
     if not base.startswith(("https://", "http://")) or not key or not model:
-        raise GenerationError("请在后端环境变量中配置模型地址、密钥和模型名称")
+        raise ModelNotConfigured("请在后端环境变量中配置模型地址、密钥和模型名称")
     return base, key, model
 
 

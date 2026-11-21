@@ -68,7 +68,7 @@ npm test
 npm run build
 ```
 
-当前基线（2026-11-16，合入上游 RAG 与知识库入口之后）：后端 1209 个测试（pytest，另有 19 个 subtest）、前端 426 个 vitest 用例（27 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
+当前基线（2026-11-21，合入 PR #6「半棵树交付 + 检查点 + 从检查点续写」之后）：后端 2383 个测试通过 / 37 skip（pytest，另有 29 个 subtest）、前端 999 个 vitest 用例（63 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
 
 本机跑后端测试时如果出现 `LegacyOfficeTest::test_xls_cell_formatting` 失败、报 `No module named 'xlrd'`，是本地依赖没装齐（`.xls` 直读要用它），`pip install xlrd` 即可，不是代码问题。
 
@@ -85,41 +85,53 @@ npm run build
 ```
 backend/
   app/
-    main.py            应用装配，注册 6 组路由（16 个路径 / 18 个端点）
+    main.py            应用装配，注册 8 组路由（30 个路径 / 34 个端点）
     contracts/         数据契约（改这里要通知另一个人）
-      mindmap.py       MindMapContent / Node / 请求响应模型
+      mindmap.py       ContentBase 与三个子类（树 / 流程图 / 鱼骨图）、Node、请求响应模型
       source.py        Source / SourceUsage / SourceRef（节点引用）
       diagnostic.py    Diagnostic / Suggestion
-      ops.py           导图操作（add / update / remove / move）
+      ops.py           导图操作（add / update / remove / move / edge）
+      edits.py         改动日志事件（含生成落画布的 `generate`）
+    importing/         外部文件 → 导图（xmind / freemind / opml / puml / markdown / json）
     ingestion/         多模态输入 → Source（文本 / 文档 / 图片 / WAV）
     generation/        模型调用与上下文预算（demo / model）+ `stream_partial.py` 增量解析器
     optimization/      结构诊断与建议（三条结构规则 + 引用核验）
-    knowledge/         知识库（只读入口 + 生成时入库）与检索桩
-    agent/             AI 代理（工具循环 / op 执行器 / SSE v2，生成与编辑的唯一入口）
-    export/            导出 puml / markdown / opml
-    mindmaps/          保存 / 读取 / 版本冲突
-  tests/               1209 个测试（另有 19 个 subtest）
+    knowledge/         切块 / 混合检索 / rerank / 知识库（只读入口 + 生成时入库）/ 外部检索
+    memory/            记忆模块（生成时注入相关记忆、会话结束总结）
+    prefs/             用户偏好（读写 + 从历史推建议）
+    agent/             AI 代理（工具循环 / op 执行器 / SSE v2 / 运行台账，生成与编辑的唯一入口）
+    export/            导出 puml / markdown / opml / json
+    mindmaps/          保存 / 读取 / 版本冲突 / 改动日志
+  tests/               2383 个测试通过 / 37 skip（另有 29 个 subtest）
 frontend/
   src/
-    App.vue            工作台（三栏：输入 / 画布 / 节点详情，含保存、打开、冲突弹层、导出、来源面板）
-    main.ts            入口（挂 Pinia 与 Vue Flow 样式）
+    App.vue            工作台（画布居中、左侧材料、右侧对话与详情，含保存、打开、冲突弹层、导出、来源面板）
+    main.ts            入口（挂 Pinia 与 Vue Flow 样式，启动时探测上次未收尾的运行）
     styles.css         Tailwind 入口
-    api/client.ts      fetch 封装 + ApiError（导图 CRUD 4 个、上传 1 个、导出 1 个、agent 流 1 个、知识库 2 个）
+    api/client.ts      fetch 封装 + ApiError（导图 CRUD 4 个、导入 1 个、改动日志 3 个、上传 1 个、导出 4 个、agent 流与台账 4 个、偏好 4 个、记忆 4 个、知识库 2 个）
     api/types.ts       契约 v2 的 TS 镜像（手写，读起来比生成类型省事）
     api/schema.d.ts    openapi-typescript 从 backend/openapi.json 生成，勿手改
     api/contract-check.ts 编译期断言：镜像与生成类型的键集合、形状必须一致
     canvas/MindMapCanvas.vue  Vue Flow 容器：平移 / 缩放 / 点选 / 键盘建树
     canvas/MindNode.vue       自定义节点：截断 + 悬停看全文 + 内联编辑
-    canvas/layout/tidy.ts     自研紧凑树布局（向右 / 向左 / 向下 / 双向）
+    canvas/layout/tidy.ts     树 / 双向布局（自研紧凑树）
+    canvas/layout/fishbone.ts 鱼骨图几何（手写 60° 主骨与斜插）
+    canvas/layout/flow.ts     流程图分层（dagre）
     mindmap/edits.ts   纯函数：改名 / 加子节点 / 加兄弟 / 删子树 / 提交前校验
     mindmap/ops.ts     纯函数：applyOps（与后端 agent/ops.py 共读同一份用例）
+    mindmap/edit-log.ts 改动日志：把用户每次改动转成事件（含生成落画布的 `generate`）
+    mindmap/shape.ts   六种节点形状的几何与文本排版
+    mindmap/run-status.ts 运行台账的状态映射
     sources/input.ts   来源收集常量与校验（格式白名单、字数与大小上限）
     audio/             浏览器录音（16kHz WAV）与 WAV 头处理
-    components/        AgentPanel / RecordButton / SourceInputs
-    stores/mindmap.ts  Pinia：内容、布局、选中、编辑、撤销重做、保存状态、agent 生成落地
+    components/        AgentPanel / RecordButton / SourceInputs / ChatDock / MessageFab / NodeToolbar / VoicePress / HistoryDrawer / PrefsPanel
+    stores/mindmap.ts  Pinia：内容、布局、选中、编辑、撤销重做、保存状态、agent 生成落地、运行台账
     stores/sources.ts  Pinia：来源列表
+    stores/chat.ts     Pinia：对话消息
+    stores/prefs.ts    Pinia：用户偏好
+    demo/presets.ts    三张预置演示导图（生产也带，点按钮才加载）
     dev/samples.ts     开发期布局示例（仅 `npm run dev` 动态加载）
-  tests/               426 个 vitest 用例（纯函数 / 布局 / store / 编辑 / 保存 / 界面 / 引用 / agent / 展开）
+  tests/               926 个 vitest 用例（纯函数 / 布局 / store / 编辑 / 保存 / 界面 / 引用 / agent / 对话 / 记忆 / 导入 / 三种图型）
 docs/
   FLOW.md              端到端流程 ← 先读这个
   API.md               每条路由实现到什么程度
@@ -138,11 +150,11 @@ START_HERE.md          原始的骨架说明
 
 ## 4 现在到底有什么
 
-**能用的**：文本生成导图（demo 或真实模型，走 agent 的分片生成 `mindmap_generate_deep`——骨架 + 按支检索 + 并发展开；整树一次成型的旧路已删除，见 `docs/ONE-PATH.md`）、多来源混合输入（文本 / 文档 / 图片 / WAV / 浏览器录音，合并后一次生成）、结构诊断（单子节点 / 深度上限 / 同级重复标签）与候选建议、节点级来源引用（三层校验）、三种导出（PUML / Markdown / OPML）、保存与版本冲突检测、agent 运行（工具循环 + 生成即落画布，`POST /api/agent/runs/stream` 是生成与编辑的**唯一**入口）。
+**能用的**：文本生成导图（demo 或真实模型，走 `mindmap_generate`——一次生成拆四段：骨架 → 每支检索 → 结构 → 说明并发写，实测见 `docs/ONE-CALL.md`；分片的 `mindmap_generate_deep` 代码与规格还在但不注册到 `create`，服务一次响应写不下 200+ 节点的情形）、三种图型（树 / 流程图 / 鱼骨图，各有独立几何）、多来源混合输入（文本 / 文档 / 图片 / WAV / 浏览器录音，合并后一次生成）、结构诊断（单子节点 / 深度上限 / 同级重复标签）与候选建议、节点级来源引用（三层校验）、四种导出（PUML / Markdown / OPML / JSON）、导入外部文件为导图（xmind / freemind / opml / puml / markdown / json）、保存与版本冲突检测、agent 运行（工具循环 + **生成即落画布，没有候选确认层**，`POST /api/agent/runs/stream` 是生成与编辑的**唯一**入口）、修改日志与统计、用户偏好、记忆模块（生成时注入相关记忆）。
 
 **是桩的**：知识检索（返回空 + `implemented:false`）、`POST /api/agent/tasks`（返回固定四阶段，不产生导图；真正的 agent 走 `/agent/runs/stream`）。
 
-**没有 501 的导出**：Markdown 与 OPML 在 2026-11-05 已实现，三种格式都从浏览器直接下载。
+**没有 501 的导出**：Markdown / OPML / JSON 均已实现，四种格式都从浏览器直接下载。
 
 这条规矩写在代码注释里，也写在 `docs/FLOW.md` 第 4 节：**不允许返回空对象假装成功**。桩接口必须带 `implemented:false`，让前端能据此禁用入口。
 
@@ -161,14 +173,18 @@ START_HERE.md          原始的骨架说明
 
 ---
 
-## 5 接口一览（16 个路径 / 18 个端点）
+## 5 接口一览（30 个路径 / 34 个端点）
 
 ```
 基础
 GET  /api/health
 
 生成（唯一入口）
-POST /api/agent/runs/stream        目标 + 来源 + 当前树 → SSE v2 事件与生成结果
+POST /api/agent/runs/stream        目标 + 来源 + 当前树 → SSE v2 事件；生成结果直接落画布
+POST /api/agent/tasks              目标 → 阶段骨架（桩，implemented:false）
+GET  /api/agent/runs               运行台账列表（可筛状态 / 未应用）
+GET  /api/agent/runs/{id}          单次运行的详情（含草稿）
+POST /api/agent/runs/{id}/applied  标记这次结果已被用户采纳
 
 输入（多来源）
 POST /api/ingestion/text           文本 → Source
@@ -183,15 +199,31 @@ POST /api/optimization/suggest     导图 → 候选建议 + 诊断
 POST /api/export/puml              导图 → PlantUML 文本
 POST /api/export/markdown          导图 → Markdown 文本
 POST /api/export/opml              导图 → OPML 文本
+POST /api/export/json              导图 → JSON
 
-保存
+保存与导入
 GET  /api/mindmaps                 列表
 POST /api/mindmaps                 新建（version 从 1 起）
 GET  /api/mindmaps/{id}            读取
 PUT  /api/mindmaps/{id}            更新（带版本号，冲突返回 409）
+POST /api/mindmaps/import          外部文件（xmind / freemind / opml / puml / markdown / json）→ 导图
+GET  /api/mindmaps/{id}/edits      改动日志
+GET  /api/mindmaps/{id}/edits/summary  改动统计（按 kind / field 分组）
+GET  /api/mindmaps/edits/health    改动日志表的健康检查
 
-代理与检索
-POST /api/agent/tasks              目标 → 阶段骨架（桩，implemented:false）
+用户偏好
+GET  /api/prefs                    已保存的偏好
+PUT  /api/prefs/{pref_key}         写一条偏好
+DELETE /api/prefs/{pref_key}       删一条偏好
+GET  /api/prefs/suggestions        从历史里推出来的偏好建议
+
+记忆
+GET  /api/memory                   记忆列表
+POST /api/memory                   手工添加一条记忆
+GET  /api/memory/search            按主题检索（带时间衰减）
+DELETE /api/memory/{item_id}       删除一条记忆
+
+检索与知识库
 POST /api/knowledge/search         检索（桩，返回空）
 GET  /api/knowledge/library        知识库列表（含被引用次数）
 GET  /api/knowledge/library/{id}   单份材料正文预览（前 4000 字）

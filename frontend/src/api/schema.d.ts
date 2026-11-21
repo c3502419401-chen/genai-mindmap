@@ -365,9 +365,16 @@ export interface paths {
          * List Runs
          * @description 运行台账。默认回答的是"上次跑完、我还没存下来的是哪一次"。
          *
-         *     `status` 缺省时把 `done` 与 `cancelled` 一起算：**被取消但已经产出结果的那次
-         *     同样要能被捡起来**——否则"关掉页面那 40 秒"照样白花，只是从内存白花变成写进
-         *     数据库白花。
+         *     `status` 缺省时把 `done` / `cancelled` / `failed` 一起算：
+         *
+         *       - **`cancelled` 但已经产出结果的那次同样要能被捡起来**——否则"关掉页面那
+         *         40 秒"照样白花，只是从内存白花变成写进数据库白花。
+         *       - **`failed` 里有 `run_abandoned`**：进程崩了，`sweep_abandoned()` 把那行判死
+         *         并留下了崩溃前那个检查点。不列它的后果是"检查点存得再好也没人读得到"——
+         *         用户下次进来看到的是"什么都没有"，而那棵树其实就在库里。
+         *
+         *     有没有东西可捡由 `candidate IS NOT NULL` 判（`pending()` 里的条件），不由状态判：
+         *     一个 `failed` 行可能什么都留，一个 `cancelled` 行可能留了整棵树。
          *
          *     这条查询就是这张表结果列的**唯一读者**。没有它，`candidate` 写进去之后再没人看过。
          */
@@ -1910,6 +1917,12 @@ export interface components {
             updated_at: string;
             /** Applied At */
             applied_at?: string | null;
+            /** Partial */
+            partial?: boolean | null;
+            /** Checkpointed At */
+            checkpointed_at?: string | null;
+            /** Node Count */
+            node_count?: number | null;
             /** Candidate */
             candidate?: unknown | null;
             /** Failure */
@@ -1918,6 +1931,8 @@ export interface components {
             } | null;
             /** Mode */
             mode?: string | null;
+            /** Partial Reason */
+            partial_reason?: string | null;
         };
         /**
          * RunSummary
@@ -1941,6 +1956,12 @@ export interface components {
             updated_at: string;
             /** Applied At */
             applied_at?: string | null;
+            /** Partial */
+            partial?: boolean | null;
+            /** Checkpointed At */
+            checkpointed_at?: string | null;
+            /** Node Count */
+            node_count?: number | null;
         };
         /**
          * SaveRequest
@@ -2847,7 +2868,7 @@ export interface operations {
     list_runs_api_agent_runs_get: {
         parameters: {
             query?: {
-                /** @description 只看某一种状态。缺省 = 有结果且还没被保存过的（done + cancelled）。 */
+                /** @description 只看某一种状态。缺省 = 有结果且还没被保存过的（done + cancelled + failed）。 */
                 status?: ("done" | "cancelled" | "failed" | "running") | null;
                 /** @description 只列有结果、且后来没被保存过的；置 false 则把这段台账原样列出来。 */
                 unapplied?: boolean;

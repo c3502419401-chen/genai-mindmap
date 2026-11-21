@@ -130,8 +130,18 @@ def _tree_for(user: str, *, roles: dict[str, str] | None = None) -> dict[str, An
     return _tree_from(_branches_in(user) or ["甲"], roles=roles)
 
 
+def _collect_into(seen: list[Any]) -> Any:
+    """检查点通道是 async 的（落库交给线程池），测试里用这个收集器接住。"""
+
+    async def collect(content: Any) -> None:
+        seen.append(content)
+
+    return collect
+
+
 def _generate_with(plan: dict, *, diagram_type: str,
-                   structure: dict | None = None) -> tuple[Any, RunContext]:
+                   structure: dict | None = None,
+                   checkpoint: Any = None) -> tuple[Any, RunContext]:
     """跑一次完整的 `_generate`（骨架 / 结构 / 说明三段都 mock），返回工具结果。"""
     systems: list[str] = []
 
@@ -148,6 +158,7 @@ def _generate_with(plan: dict, *, diagram_type: str,
         return structure if structure is not None else _tree_for(user)
 
     ctx = _ctx(diagram_type)
+    ctx.checkpoint = checkpoint
     with patch("app.agent.tools.chat_async", new=fake_chat):
         result = asyncio.run(_generate(GenerateArgs(topic=TOPIC, branches=6), ctx))
     assert result.ok, result.content
@@ -633,7 +644,7 @@ class TestNonTreeEditing:
         """`add_node` 能在骨下面加节点，产物仍然是 `FishboneContent`。"""
         ctx = _fishbone_ctx()
 
-        result = _add_node(AddNodeArgs(parent_id="h1-1", label="新原因"), ctx)
+        result = asyncio.run(_add_node(AddNodeArgs(parent_id="h1-1", label="新原因"), ctx))
 
         assert result.ok, result.content
         assert isinstance(ctx.candidate, FishboneContent)
@@ -689,3 +700,201 @@ class TestNonTreeEditing:
 
 def _edit_args(ops: list[dict]) -> EditArgs:
     return EditArgs.model_validate({"ops": ops})
+
+
+# ---------------------------------------------------------------- 检查点
+
+
+class TestCheckpoint:
+    """检查点要真的在"结构就绪、说明之前"那一刻被叫到。
+
+    它是本轮唯一一个**不在收尾**发生的落库动作，所以验的不是"函数能调"，而是
+    "在真跑一遍 `_generate` 的链路上，它被调到的时刻上那棵树是什么样"。
+    """
+
+    def test_checkpoint_sees_a_valid_tree_before_the_details_are_written(self):
+        """叫到检查点时，手里那棵是契约合法的完整树，只是 `detail` 还空着。"""
+        seen: list[Any] = []
+        _generate_with(TREE_PLAN, diagram_type=None, checkpoint=_collect_into(seen))
+
+        assert len(seen) == 1, "一轮生成只该打一个点"
+        checkpointed = seen[0]
+        # 那一刻它已经是契约类型（能过 `model_validate`），不是半截 JSON。
+        reround = MindMapContent.model_validate(checkpointed.model_dump(mode="json"))
+        assert shapes.count_nodes(reround) > 1
+        # 说明还没写：这正是"落在这里而不是收尾"的意义。
+        assert all(not node.detail for node in shapes.iter_nodes(reround))
+
+    def test_checkpoint_payload_is_the_structure_the_run_finally_delivers(self):
+        """检查点那份与最终交付的那份，**结构**必须一致（说明是之后才补的）。"""
+        seen: list[Any] = []
+        _result, ctx = _generate_with(TREE_PLAN, diagram_type=None, checkpoint=_collect_into(seen))
+
+        checkpointed, delivered = seen[0], ctx.candidate
+        assert [node.id for node in shapes.iter_nodes(checkpointed)] == [
+            node.id for node in shapes.iter_nodes(delivered)]
+        assert [node.label for node in shapes.iter_nodes(checkpointed)] == [
+            node.label for node in shapes.iter_nodes(delivered)]
+
+    def test_no_checkpoint_channel_means_no_call(self):
+        """没有通道时不发生任何额外动作（单测与直接调工具那条路）。"""
+        result, ctx = _generate_with(TREE_PLAN, diagram_type=None)
+
+        assert ctx.checkpoint is None
+        assert result.ok
+
+    def test_fishbone_checkpoint_is_a_fishbone_not_a_tree(self):
+        """要鱼骨图的那一轮，检查点存下来的也必须是鱼骨图。
+
+        收尾的折叠（`_shape_output`）原本发生在检查点之后，于是崩溃后捡回来的
+        是一棵 `MindMapContent`——用户当初明明说了要鱼骨图，捡回来的却是一张
+        思维导图，看起来像"这一轮连图型都没认对"。
+        """
+        seen: list[Any] = []
+        _result, ctx = _generate_with(FISHBONE_PLAN, diagram_type="fishbone",
+                                      checkpoint=_collect_into(seen))
+
+        assert len(seen) == 1
+        checkpointed = seen[0]
+        assert isinstance(checkpointed, FishboneContent)
+        assert isinstance(ctx.candidate, FishboneContent)
+        # 六根骨与最终交付的那份逐根同序：折叠是纯函数，折出来的形状不该与最终不同。
+        assert [bone.category for bone in checkpointed.bones] == [
+            bone.category for bone in ctx.candidate.bones]
+
+    def test_flow_checkpoint_is_a_flow_not_a_tree(self):
+        """要流程图的那一轮同理：检查点里得是阶段，不是一棵挂着 `diagram_type` 的树。"""
+        seen: list[Any] = []
+        _result, ctx = _generate_with(FLOW_PLAN, diagram_type="flowchart",
+                                      checkpoint=_collect_into(seen))
+
+        assert len(seen) == 1
+        checkpointed = seen[0]
+        assert isinstance(checkpointed, FlowContent)
+        assert isinstance(ctx.candidate, FlowContent)
+        assert [stage.root.label for stage in checkpointed.stages] == [
+            stage.root.label for stage in ctx.candidate.stages]
+
+    def test_checkpoint_stamps_cut_nodes_as_unknown(self):
+        """被裁掉子节点的那些，快照里必须是 `unknown` 而不是缺省的 `yes`。
+
+        正式打标（`_stamp_expandable`）在检查点后面，所以快照里那些节点还是 `yes`。
+        用户点开它以为还能长，点下去却报 `too_deep`——被裁的恰好是唯一能再长的地方。
+
+        上限压到 5 是为了真的触发裁剪：`GenerateArgs.branches=6` 决定骨架清单的
+        条数，光给 plan 更多分支不会让树变大。
+        """
+        seen: list[Any] = []
+        with patch("app.agent.tools.INITIAL_MAX_NODES", 5):
+            _result, ctx = _generate_with(TREE_PLAN, diagram_type=None,
+                                          checkpoint=_collect_into(seen))
+
+        assert len(seen) == 1
+        checkpointed = seen[0]
+        assert isinstance(checkpointed, MindMapContent)
+        stamped = {node.id: node.expandable for node in shapes.iter_nodes(checkpointed)}
+        assert "unknown" in stamped.values(), "被裁的节点在快照里必须标成没长完"
+        # 交付的那份与快照的标记口径一致：两边都说"没长完"，用户不会因为载入的是
+        # 检查点而看到一个不同的可展开状态。
+        delivered = {node.id: node.expandable for node in shapes.iter_nodes(ctx.candidate)}
+        assert {key for key, value in delivered.items() if value == "unknown"} == {
+            key for key, value in stamped.items() if value == "unknown"}
+
+    def test_checkpoint_does_not_disturb_the_tree_the_rest_of_the_run_uses(self):
+        """折叠只作用于副本：检查点之后 `_fill_details` / `check` 仍按一棵树工作。"""
+        seen: list[Any] = []
+        _result, ctx = _generate_with(FISHBONE_PLAN, diagram_type="fishbone",
+                                      checkpoint=_collect_into(seen))
+
+        # 交付的那份是鱼骨图，说明它与结构都来自同一棵树——若检查点那次折叠改坏了
+        # 原树，这里会缺骨或串形。
+        delivered = ctx.candidate
+        assert isinstance(delivered, FishboneContent)
+        assert len(delivered.bones) == len(FISHBONE_PLAN["branches"])
+
+
+# ---------------------------------------------------------------- 编辑侧的检查点
+
+
+class TestEditCheckpoint:
+    """edit / expand 也要打检查点。
+
+    创建那条路的检查点保的是"结构长好了、说明还没写"；编辑这条路保的是**已经改完
+    的那一批 op**——同样是一大段模型调用之前能救回来的东西。少了它，一次二十分钟的
+    编辑在写完说明前崩掉，用户重新打开看到的还是编辑前的树。
+    """
+
+    def test_edit_batch_lands_a_checkpoint(self):
+        """一批 op 落树之后立刻打点，内容就是改完的那棵树。"""
+        ctx = _fishbone_ctx()
+        seen: list[Any] = []
+        ctx.checkpoint = _collect_into(seen)
+
+        args = _edit_args([{"op": "update", "id": "h1-1", "changes": {"label": "审批人已排班"}}])
+        result = asyncio.run(_edit(args, ctx))
+
+        assert result.ok, result.content
+        assert len(seen) == 1, "一批 op 只该打一个点"
+        checkpointed = seen[0]
+        # 图型必须是用户原来那张：edit 路不经过 `_shape_output`，交出去的本来就是
+        # 最终形状（`_apply_ops_any` 保持容器类型）。
+        assert isinstance(checkpointed, FishboneContent)
+        assert shapes.find(checkpointed, "h1-1").label == "审批人已排班"
+
+    def test_single_node_tool_lands_a_checkpoint_too(self):
+        """细粒度的 `add_node` 与 `mindmap_edit` 共用 `_commit_drafts`，也要打点。"""
+        ctx = _fishbone_ctx()
+        seen: list[Any] = []
+        ctx.checkpoint = _collect_into(seen)
+
+        result = asyncio.run(_add_node(AddNodeArgs(parent_id="l1-1", label="只是打点"), ctx))
+
+        assert result.ok, result.content
+        assert len(seen) == 1
+        assert isinstance(seen[0], FishboneContent)
+        assert [child.label for child in shapes.find(seen[0], "l1-1").children] == ["只是打点"]
+
+    def test_failed_batch_does_not_land_a_checkpoint(self):
+        """op 被拒时树一个字都没动，那就没有什么可存的——不打点。"""
+        ctx = _fishbone_ctx()
+        seen: list[Any] = []
+        ctx.checkpoint = _collect_into(seen)
+
+        args = _edit_args([{"op": "update", "id": "没有这个节点", "changes": {"label": "甲"}}])
+        result = asyncio.run(_edit(args, ctx))
+
+        assert not result.ok
+        assert seen == []
+
+    def test_expand_lands_a_checkpoint(self):
+        """`node_expand` 在批次落树之后打点：新长的这一支不该等到写说明才安全。"""
+        ctx = _fishbone_ctx()
+        ctx.request = AgentRunRequest(
+            goal="展开", intent="expand", selected_ids=["h1-1"],
+            budget=RunBudget(max_model_calls=4, max_output_tokens=32768),
+        )
+        seen: list[Any] = []
+        ctx.checkpoint = _collect_into(seen)
+
+        async def fake_chat(system: str, user: str, *, max_tokens: int | None = None,
+                            on_delta: Any = None) -> dict:
+            return {"children": [{"label": "排班表缺失", "expandable": False}]}
+
+        with patch("app.agent.tools.chat_async", new=fake_chat):
+            result = asyncio.run(_expand(ExpandArgs(node_id="h1-1", count=2), ctx))
+
+        assert result.ok, result.content
+        assert len(seen) == 1
+        assert isinstance(seen[0], FishboneContent)
+        assert [child.label for child in shapes.find(seen[0], "h1-1").children] == [
+            "排班表缺失"]
+
+    def test_edit_without_a_checkpoint_channel_is_fine(self):
+        """没有通道时（单测、脚本、直接调工具）不能因为缺回调而失败。"""
+        ctx = _fishbone_ctx()
+        assert ctx.checkpoint is None
+
+        args = _edit_args([{"op": "update", "id": "h1-1", "changes": {"label": "甲"}}])
+        result = asyncio.run(_edit(args, ctx))
+
+        assert result.ok, result.content

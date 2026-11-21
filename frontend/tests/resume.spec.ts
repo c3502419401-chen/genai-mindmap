@@ -239,6 +239,53 @@ describe('上次的运行结果', () => {
     expect(store.generatedSummary).toBeNull();
     expect(wrapper.get('[role="status"]').text()).toContain('没有留下可用的内容');
   });
+
+  it('待处理提示对半棵树不写"生成完的"', async () => {
+    stubFetch({ list: [summary({ partial: true })] });
+    const wrapper = mountApp();
+
+    await useMindMapStore().probeResumableRun();
+    await flushPromises();
+
+    const text = wrapper.get(NOTICE).text();
+    expect(text).toContain('只完成了一部分');
+    expect(text).not.toContain('生成完的导图还没保存');
+  });
+
+  it('载入一份半棵树：状态行与告警都说清它不是完整交付', async () => {
+    stubFetch({
+      list: [summary({ partial: true })],
+      detail: detail({ partial: true, partial_reason: '模型调用次数已用完' }),
+    });
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+
+    await store.probeResumableRun();
+    await flushPromises();
+    await buttonByText(wrapper, '载入').trigger('click');
+    await flushPromises();
+
+    // 内容照常进画布（半棵树也是交付），但"它是半棵"这件事不能丢：
+    // 实时流那条路在 done 帧上记这条告警，载入这条路必须自己补上同一笔。
+    expect(store.content?.title).toBe('上次那张图');
+    expect(store.agentWarnings.some(item => item.kind === 'partial')).toBe(true);
+    expect(store.agentWarnings[0].message).toBe('模型调用次数已用完');
+    expect(wrapper.get('[role="status"]').text()).toContain('部分分支未完成');
+  });
+
+  it('完整跑完的那次载入之后不留半棵树告警', async () => {
+    stubFetch({ list: [summary()], detail: detail({ partial: null }) });
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+
+    await store.probeResumableRun();
+    await flushPromises();
+    await buttonByText(wrapper, '载入').trigger('click');
+    await flushPromises();
+
+    expect(store.agentWarnings.some(item => item.kind === 'partial')).toBe(false);
+    expect(wrapper.get('[role="status"]').text()).not.toContain('部分分支未完成');
+  });
 });
 
 describe('运行身份', () => {

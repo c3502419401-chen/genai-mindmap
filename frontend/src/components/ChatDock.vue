@@ -587,9 +587,23 @@ const resumableText = computed(() => {
     ? ''
     : date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
   const when = clock ? `（${clock}）` : '';
-  const what = run.status === 'cancelled'
-    ? `上次${when}那次生成被中断了，已经生成的部分还留着`
-    : `上次${when}生成完的导图还没保存`;
+  // 第三种形态：跑完了但它只交出半棵树（`partial`）。说成"生成完的"是撒谎——用户
+  // 载入之后才发现某几支是空的，那时画布已经是他的作品了。`partial === true` 才
+  // 算数：缺字段是"这条记录没记过"，不是"确定完整"。
+  //
+  // 检查点（`checkpointed_at`）单独一档、排在 `partial` 前面：它交出来的**不是**
+  // 半棵树，是完整结构 + 空的说明。说成"只完成了一部分"会让用户以为要重跑，而实际
+  // 上他载入之后直接改就是一棵能用的树——两者下一步完全不同。
+  // `node_count` 用 `!= null` 判而不是真值判：0 个节点是**合法**的（检查点落在裁剪
+  // 之后、恰好一棵空树），`run.node_count ?` 会把它悄悄吞成"没存下节点"。
+  const count = run.node_count != null ? `，已保存 ${run.node_count} 个节点` : '';
+  const what = run.checkpointed_at
+    ? `上次${when}生成在写说明之前断了，结构还在${count}`
+    : run.status === 'cancelled'
+      ? `上次${when}那次生成被中断了，已经生成的部分还留着`
+      : run.partial === true
+        ? `上次${when}生成只完成了一部分，没长完的树还留着`
+        : `上次${when}生成完的导图还没保存`;
   return run.goal ? `${what}：「${run.goal}」` : `${what}。`;
 });
 
@@ -685,11 +699,57 @@ const statusActions = computed<StatusAction[]>(() => {
   }
 });
 
-/** 「上次没接住的结果」那两个动作：捡回来，或者这次会话里不要再问。 */
-const resumableActions = computed<StatusAction[]>(() => [
-  { key: 'load', label: '载入', test: 'run-status-load', run: () => store.resumeRun() },
-  { key: 'skip', label: '不用了', test: 'run-status-skip', run: () => store.ignoreResumable() },
-]);
+/**
+ * 「上次没接住的结果」那几个动作：捡回来，或者这次会话里不要再问。
+ *
+ * 检查点上多一个「补齐说明」：那种结果的结构是完整的、缺的只是节点说明，而补说明
+ * 是一条独立的、更便宜的往返（只发写说明那几次调用，不重跑骨架与结构）。没有这个
+ * 按钮，用户唯一的补救办法是重跑一次生成——既换出一棵可能不一样的树，也多花三倍
+ * 的调用。
+ *
+ * **判据是"这行还能被重开"，不是 `checkpointed_at`**：那个时间戳只在收尾时交出
+ * 候选的那一刻被清（`runs.finish`），而补说明失败那一轮照样会交出 edit 的快照，
+ * 于是失败一次之后入口就永久消失了——用户明明还缺说明，按钮却没了，文案也退化成
+ * "生成完的导图还没保存"。能重开（cancelled / failed）才是"这次点下去真的会跑"的
+ * 判据：`runs.begin()` 对这两个状态是重开同一行，对 `done` 是幂等重放（点了也不会
+ * 补，只会把旧结果再放一遍）。何况树上没有可补的节点时，工具本身零调用返回
+ * `nothing_to_fill`，多摆一个按钮不花任何额度。
+ */
+const resumableActions = computed<StatusAction[]>(() => {
+  const actions: StatusAction[] = [
+    { key: 'load', label: '载入', test: 'run-status-load', run: () => void store.resumeRun() },
+  ];
+  const status = resumable.value?.status;
+  if (status === 'cancelled' || status === 'failed') {
+    actions.push({
+      key: 'fill',
+      label: '补齐说明',
+      test: 'run-status-fill',
+      // 先载入再补：补说明要的是"画布上是这棵树"，而后端那条路要求带 `snapshot`。
+      // 载入失败（换过图 / 服务端没了）就不该继续发补写请求——那会在另一张图上跑。
+      run: () => void fillDetailsAfterLoad(),
+    });
+  }
+  actions.push({ key: 'skip', label: '不用了', test: 'run-status-skip', run: () => store.ignoreResumable() });
+  return actions;
+});
+
+/**
+ * 「补齐说明」：载入检查点，再让模型只补 `detail`。
+ *
+ * 两步而不是一步：补说明那条路的输入是**画布上的树**（后端按 `snapshot` 走
+ * `edit`），所以要先把检查点装进画布。`resumeRun()` 返回布尔——换图、服务端没
+ * 内容这两种情况它自己已经提示过，这里不该在同一件事上再叠一句。
+ *
+ * `run_id` 必须在载入**之前**取：载入成功会清 `resumableRun`，之后再读只会拿到
+ * null，于是补说明会悄悄新开一个身份，台账上同一次生成变成两次运行。
+ */
+async function fillDetailsAfterLoad(): Promise<void> {
+  const runId = resumable.value?.run_id;
+  const loaded = await store.resumeRun();
+  if (!loaded) return;
+  await store.fillMissingDetails(runId);
+}
 
 const statusTone = computed(() => {
   switch (statusKind.value) {

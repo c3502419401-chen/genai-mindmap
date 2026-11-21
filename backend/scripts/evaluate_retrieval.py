@@ -89,8 +89,10 @@ query 的每个 bigram 都在目标区间里，于是 `R@3/5/10` 全饱和、三
 "真实提问"的分数，几套 20pp 的难度差会被一个看似合理的中间数掩掉。报告里它们是
 `suites.title` / `suites.manual` / `suites.crossdoc` 几个并列对象。
 
-`manual` 套的 `source_hash` 对着 `MANUAL_SOURCE_HASHES` 校验：材料正文一变，
-**直接报错退出**，不跳过。跳过会让"标注失效"伪装成"指标掉了 10pp"。
+`manual` / `crossdoc` 两套的 `MANUAL_SOURCE_HASHES` 校验的是**已标注章节的正文指纹**，
+不是整份文件：改到 case 标注过的章节就**直接报错退出**，不跳过（跳过会让"标注失效"
+伪装成"指标掉了 10pp"）；只追加变更记录、改没人标注的小节不报错——那种变更不携带任何
+"标注可能失效"的信息，钉死它只会训练人闭着眼睛更新指纹。
 
 `--check` 只比 `title` 套：`manual` 的绝对分更低、方差更大（28 条里一条翻面就是
 3.6pp），当 CI 门槛会天天误报。它的数字进文档、由人看趋势。
@@ -496,14 +498,85 @@ def manual_materials_present(materials: Sequence[Material]) -> bool:
     return all(ref in present for ref in manual_cases.MANUAL_SOURCE_HASHES)
 
 
+def annotated_prefixes() -> dict[str, tuple[str, ...]]:
+    """每份材料**被两套 case 标注过的**章节前缀（去重，按首次出现排序）。
+
+    `manual` 套的 `sections` 与 `crossdoc` 套的 `targets[].section` 合起来就是"人类
+    承诺复核过的范围"。指纹只钉这一块正文（见 `annotated_hashes`），所以这份表必须
+    与两套 case 同源、由代码算出来——手抄一份清单迟早与 case 表漂移。
+    """
+    collected: dict[str, list[str]] = {ref: [] for ref in manual_cases.MANUAL_SOURCE_HASHES}
+    for case in manual_cases.CASES:
+        bucket = collected.setdefault(case.material, [])
+        for prefix in case.sections:
+            if prefix not in bucket:
+                bucket.append(prefix)
+    for case in crossdoc_cases.CASES:
+        for target in case.targets:
+            bucket = collected.setdefault(target.material, [])
+            if target.section not in bucket:
+                bucket.append(target.section)
+    return {ref: tuple(prefixes) for ref, prefixes in collected.items()}
+
+
+def _annotated_spans(ref: str, material: Material, entries, prefixes: Sequence[str]) -> list[tuple[int, int]]:
+    """把一份材料上所有已标注章节解析成 `relevant` 风格的区间（已合并）。
+
+    前缀必须恰好命中一章：标题被改掉就是标注过期，报错比猜一个安全。区间口径与
+    `_manual_spans` / `_crossdoc_spans` 一致（`entry.start` 到 `entry.coverage` 末），
+    否则"指纹钉的范围"与"评测用的范围"会变成两处各自演化的定义。
+    """
+    text = material.text
+    spans: list[tuple[int, int]] = []
+    for prefix in prefixes:
+        matches = [entry for entry in entries if entry.title.startswith(prefix)]
+        if len(matches) != 1:
+            raise SystemExit(
+                f"已标注章节的前缀命中 {len(matches)} 个（要恰好 1 个）："
+                f"{ref} /「{prefix}」\n标题被改掉了就是标注过期："
+                "请复核 eval_cases_manual.py 的 sections 与 "
+                "eval_cases_crossdoc.py 的 targets。")
+        entry = matches[0]
+        spans.append((entry.start, min(entry.start + entry.coverage, len(text))))
+    return _merge(spans)
+
+
+def _annotated_hash(ref: str, material: Material, entries, prefixes: Sequence[str]) -> str:
+    """一份材料**已标注章节正文**的 `sha256`（不是整份文件，见 `annotated_hashes`）。"""
+    spans = _annotated_spans(ref, material, entries, prefixes)
+    return knowledge_library.content_hash(
+        "".join(material.text[start:end] for start, end in spans))
+
+
+def annotated_hashes(materials: Sequence[Material]) -> dict[str, str]:
+    """每份材料已标注章节正文的 `sha256`：`MANUAL_SOURCE_HASHES` 该登记的那个值。
+
+    只覆盖**被 case 标注过的章节**，所以：往文件末尾追加一行变更记录、改一个没人标注
+    的小节，指纹不变、不报错；改到已标注章节的正文，指纹变、当场报错。整份文件的
+    `sha256`（`Material.content_hash`）仍是材料身份键，两件事互不替代——身份要区分
+    "这是哪份材料"，指纹要回答"标注覆盖的正文动没动"。
+    """
+    prefixes_by_ref = annotated_prefixes()
+    out: dict[str, str] = {}
+    for material in materials:
+        prefixes = prefixes_by_ref.get(material.ref)
+        if not prefixes:
+            continue
+        entries = heading_outline([material.source], max_items=10 ** 6)
+        out[material.ref] = _annotated_hash(material.ref, material, entries, prefixes)
+    return out
+
+
 def build_manual_dataset(materials: Sequence[Material]) -> Dataset:
     """装载 `eval_cases_manual.py` 那 28 条手写 case。
 
     三道校验都在最前面做完，任何一道不过就整轮退出：
 
     1. 四份材料都在本次材料集里（`--material` 换掉材料时，手写套无从标注）；
-    2. 每份材料的 `content_hash` 与 `MANUAL_SOURCE_HASHES` 一致——**材料正文一变就
-       报错**。跳过会让"标注失效"看起来像"检索掉了 10pp"，那是两种完全不同的结论；
+    2. 每份材料**已标注章节**的正文指纹与 `MANUAL_SOURCE_HASHES` 一致——改到标注过的
+       正文就报错。跳过会让"标注失效"看起来像"检索掉了 10pp"，那是两种完全不同的结论。
+       只钉标注章节是有意的：整份文件钉死会让"末尾追加一行变更记录"也报错，那种红
+       不携带任何"标注可能失效"的信息；
     3. 每条 case 的章节前缀唯一、锚点唯一且落在章节内（`_manual_spans`）。
 
     顺带算出每条 query 对**目标区间**的词面重合（`overlap_ratio`），进报告：它是这套
@@ -517,25 +590,27 @@ def build_manual_dataset(materials: Sequence[Material]) -> Dataset:
             + "\n  ".join(missing)
             + "\n手写 case 只对这四份 md 标注，换材料请先补标注。")
 
-    drifted = [
-        (ref, expected, by_ref[ref].content_hash)
-        for ref, expected in manual_cases.MANUAL_SOURCE_HASHES.items()
-        if by_ref[ref].content_hash != expected
-    ]
+    entries_by_ref = {
+        ref: heading_outline([material.source], max_items=10 ** 6)
+        for ref, material in by_ref.items()
+    }
+    prefixes_by_ref = annotated_prefixes()
+    drifted: list[tuple[str, str, str]] = []
+    for ref, expected in manual_cases.MANUAL_SOURCE_HASHES.items():
+        actual = _annotated_hash(ref, by_ref[ref], entries_by_ref[ref], prefixes_by_ref[ref])
+        if actual != expected:
+            drifted.append((ref, expected, actual))
     if drifted:
         detail = "\n  ".join(
             f"{ref}\n    登记 {expected[:16]}…  实际 {actual[:16]}…"
             for ref, expected, actual in drifted)
         raise SystemExit(
-            "材料正文变了，manual 套的标注已失效（不跳过，直接报错）：\n  "
+            "材料里**已标注章节**的正文变了，manual 套的标注已失效（不跳过，直接报错）：\n  "
             + detail
-            + "\n请重读材料、复核 relevant 区间与问法，再把新指纹写回 "
-              "scripts/eval_cases_manual.py 的 MANUAL_SOURCE_HASHES。")
+            + "\n请重读这些章节、复核 relevant 区间与问法，再把新指纹写回 "
+              "scripts/eval_cases_manual.py 的 MANUAL_SOURCE_HASHES。"
+              "（指纹只覆盖 case 标注过的章节：改别的小节或追加变更记录不会报错。）")
 
-    entries_by_ref = {
-        ref: heading_outline([material.source], max_items=10 ** 6)
-        for ref, material in by_ref.items()
-    }
     cases: list[EvalCase] = []
     overlaps: list[float] = []
     per_ref: dict[str, list[float]] = {ref: [] for ref in manual_cases.MANUAL_SOURCE_HASHES}
@@ -658,25 +733,27 @@ def build_crossdoc_dataset(materials: Sequence[Material]) -> Dataset:
             + "\n  ".join(missing)
             + "\n跨文档 case 只对这四份 md 标注，换材料请先补标注。")
 
-    drifted = [
-        (ref, expected, by_ref[ref].content_hash)
-        for ref, expected in crossdoc_cases.CROSSDOC_SOURCE_HASHES.items()
-        if by_ref[ref].content_hash != expected
-    ]
+    entries_by_ref = {
+        ref: heading_outline([material.source], max_items=10 ** 6)
+        for ref, material in by_ref.items()
+    }
+    prefixes_by_ref = annotated_prefixes()
+    drifted: list[tuple[str, str, str]] = []
+    for ref, expected in crossdoc_cases.CROSSDOC_SOURCE_HASHES.items():
+        actual = _annotated_hash(ref, by_ref[ref], entries_by_ref[ref], prefixes_by_ref[ref])
+        if actual != expected:
+            drifted.append((ref, expected, actual))
     if drifted:
         detail = "\n  ".join(
             f"{ref}\n    登记 {expected[:16]}…  实际 {actual[:16]}…"
             for ref, expected, actual in drifted)
         raise SystemExit(
-            "材料正文变了，跨文档套的标注已失效（不跳过，直接报错）：\n  "
+            "材料里**已标注章节**的正文变了，跨文档套的标注已失效（不跳过，直接报错）：\n  "
             + detail
-            + "\n请重读材料、复核 relevant 区间与问法，再把新指纹写回 "
-              "scripts/eval_cases_manual.py 的 MANUAL_SOURCE_HASHES（两套共用那张表）。")
+            + "\n请重读这些章节、复核 relevant 区间与问法，再把新指纹写回 "
+              "scripts/eval_cases_manual.py 的 MANUAL_SOURCE_HASHES（两套共用那张表）。"
+              "（指纹只覆盖两套 case 标注过的章节：改别的小节或追加变更记录不会报错。）")
 
-    entries_by_ref = {
-        ref: heading_outline([material.source], max_items=10 ** 6)
-        for ref, material in by_ref.items()
-    }
     cases: list[EvalCase] = []
     groups: list[dict] = []
     overlaps: list[float] = []

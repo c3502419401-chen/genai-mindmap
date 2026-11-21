@@ -283,6 +283,19 @@ class ToolProvider(Protocol):
 EmitFn = Callable[[dict[str, Any]], Awaitable[None]]
 
 
+# 工具 -> 落库的检查点通道。参数是"那一刻已经长好的树"，调用方负责写进 `runs`。
+#
+# 与 `EmitFn` 一样是**异步**回调，理由却不是对称美学：落库要把整棵树序列化再写
+# SQLite，而这条调用发生在工具内部——工具本身是 async 的、跑在事件循环上。同步
+# 写库在这里等于拿整个循环去等一把写锁（`BEGIN IMMEDIATE` 撞上别的写入时最长
+# 等满 `sqlite3.connect` 的忙等上限），同一个进程里别的 SSE 流会跟着一帧都发不
+# 出来。交给线程池之后，阻塞被关在那个 worker 里。
+#
+# 用回调而不是让工具直接 import `app.agent.runs`，是为了让工具层不知道"运行台账"
+# 这件事——它只需要"我这儿有一棵可以交出去的树了"。
+CheckpointFn = Callable[[DiagramContent], Awaitable[None]]
+
+
 class ToolResult(BaseModel):
     """工具执行结果。
 
@@ -367,7 +380,19 @@ class RunContext:
     # 这一轮正在长的那棵树。**名字是历史遗留**：候选层删掉（`acfdb5b`）之后，
     # 它不再"等用户点应用"，`done` 帧一到就整树交给前端落进画布（前端标成未保存）。
     # 改名成本高、收益低，所以字段名留着，读它时按"生成中的工作树"理解。
+    #
+    # **初值不是 None**：`edit` / `expand` 两个意图必须带 `request.snapshot`
+    # （`router._validate` 强制），构造 ctx 时它就落进这个字段。所以"candidate 非空"
+    # 只说明"手上有一棵树"，不说明"这一轮产出过东西"——判"该不该把树当成模型交付"
+    # 必须看下面的 `produced`。
     candidate: DiagramContent | None = None
+    # 这一轮**真的产出过**树（`publish_tree()` 置位）。它是 `_deliver_or_fail`
+    # 唯一该信的判据。
+    #
+    # 为什么不能用 `revision > 0`：语义上 `revision` 是"批次序号"，将来若拿它做
+    # 别的比较（比如前端对账），会连带改掉"半棵树要不要交"这个用户可见的决定。
+    # 一个只管交付判据的字段，改它时只需要想清楚交付这件事。
+    produced: bool = False
     revision: int = 0
     batches: list[OpBatch] = field(default_factory=list)
     sources_by_id: dict[str, Source] = field(default_factory=dict)
@@ -406,6 +431,15 @@ class RunContext:
     # 必须与加通道之前**逐字相同**（连流式请求都不发）。判空只在
     # `tools._emit_grow` 与 `tools._GrowStream` 的入口处做一次。
     emit: EmitFn | None = None
+    # 检查点通道。`service.run()` 在整轮运行期间挂上它，工具在"树已经能读了、但还要
+    # 接着跑很久"的那一刻调用一次，由循环写进 `runs` 表。
+    #
+    # 与 `emit` 同样默认 None、同样要求判空只在调用点做一次：单测与直接调工具的代码
+    # 没有台账可写，这条路上工具的行为必须与加通道之前逐字相同（连一次库调用都没有）。
+    #
+    # 为什么是"回调"而不是工具直接调 `runs.checkpoint()`：工具层不该知道运行台账的
+    # 存在。它只知道"我这儿有一棵可以交出去的树"，落不落库、落到哪由调用层决定。
+    checkpoint: CheckpointFn | None = None
     # 本次运行累积的命中区间（`tools._rag` 每检索一次并一批进来）。它是
     # `verify_source_refs(..., evidence=...)` 的唯一输入，也是"父块模式"下唯一能
     # 区分"引用落在命中的子块里"与"引用落在父块里与查询无关的一半"的东西。
@@ -563,6 +597,19 @@ class RunContext:
             return False
         self.model_calls_used += 1
         return True
+
+    def publish_tree(self, content: "DiagramContent") -> None:
+        """把这一轮新长出的树交出去：写候选、记批次号、标"这一轮产出过"。
+
+        三件事必须一起做，所以只留这一个入口。四处产出点（`_generate` /
+        `_generate_deep` / `_expand` / `_commit_drafts`）从前各写一行
+        `ctx.candidate = ...` 一行 `ctx.revision += 1`，加产出标记时只要有一处漏写，
+        那条路上"半棵树要不要交"就退回到按 `candidate` 判——而 edit/expand 下
+        `candidate` 初值就是用户原树，漏一处就多一条假成功。
+        """
+        self.candidate = content
+        self.produced = True
+        self.revision += 1
 
 
 # ---------------------------------------------------------------- 请求
@@ -915,6 +962,19 @@ class DoneEvent(_EventBase):
     # 取不到（演示模式、按脚本回放的假 provider、老版本服务端）时是 None，帧里整条
     # 不存在，界面写"未知"——不拿请求名冒充答案。
     served_model: str | None = None
+    # 这一帧交出去的那棵树**没有生成完**：预算耗尽、工具超时、连续失败、空转都算。
+    #
+    # 从前这几条收尾路径一律发 `error` 帧，哪怕树上已经长出了大半个能用的结构——
+    # 前端收到 `error` 会清掉预览、`content` 也不动，于是用户看着它跑了三分钟，
+    # 最后什么都没拿到。现在统一成"有树就交树，没树才报错"，`partial` 就是
+    # "交了，但不是完整的一次生成"这个事实的落点。
+    #
+    # 缺省 None 而不是 False：`exclude_none=True` 会把它整条抹掉，正常收尾的帧
+    # 与加这个字段之前**逐字节相同**——老客户端、`_replay` 重放都不受影响。
+    partial: bool | None = None
+    # 为什么是半棵树（"模型调用次数已用完（已执行 6 次工具调用，树上是 41 个节点）…"）。
+    # 与 `partial` 成对出现；前端把它显示成告警文案，不要只给一个布尔值。
+    partial_reason: str | None = None
 
 
 class ErrorEvent(_EventBase):

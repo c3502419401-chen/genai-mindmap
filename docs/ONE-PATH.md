@@ -5,8 +5,8 @@ prompt）与整树一次成型的 `mindmap_generate` 一起删除，`create` 意
 生成路——`rag` 语义的分片生成（`mindmap_generate_deep`）+ 按支检索。
 
 `docs/RAG-DECISIONS.md` 里提到旧行为的文字**保持原样**：那份文档是检索评估套件的
-语料，指纹登记在 `backend/scripts/eval_cases_manual.py` 的 `MANUAL_SOURCE_HASHES` 里，
-改一个字评估集就跟着变。决策记录因此放在这里。
+语料，它被 case 标注到的那些章节的正文指纹登记在 `backend/scripts/eval_cases_manual.py`
+的 `MANUAL_SOURCE_HASHES` 里，改动那些章节评估集就跟着变。决策记录因此放在这里。
 
 ## 删了什么
 
@@ -25,9 +25,9 @@ prompt）与整树一次成型的 `mindmap_generate` 一起删除，`create` 意
 `AGENTS.md` 里对这两个东西的描述。
 
 **两份文档刻意没改**：`docs/AGENT_PLAN.md` 与 `docs/ARCHITECTURE.md` 也是检索评估套件的
-语料——它们的 `sha256(正文)` 登记在 `backend/scripts/eval_cases_manual.py` 的
+语料——它们被 case 标注到的章节正文指纹登记在 `backend/scripts/eval_cases_manual.py` 的
 `MANUAL_SOURCE_HASHES` 里（与 `docs/RAG-DECISIONS.md`、`docs/PLAN.md` 一起，共四份）。
-改一个字整套手写标注就失效，`tests/test_retrieval_eval_manual.py` 会直接报错。所以这两份
+改到那些章节整套手写标注就失效，`tests/test_retrieval_eval_manual.py` 会直接报错。所以这两份
 文档里仍然写着"`mindmap_generate` 走 `validate_generated_content`"这类旧描述——它们现在是
 **语料**，不是文档；准确描述以本文与上表为准。
 

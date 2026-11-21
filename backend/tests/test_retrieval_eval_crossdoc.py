@@ -130,22 +130,28 @@ def test_no_single_case_copies_the_material(crossdoc, dataset, module):
 
 
 def _fake_material(module, ref: str):
-    text = f"# 汇编\n\n## {Path(ref).stem}\n\n" + "正文" * 200
+    # 两章起：`heading_outline` 少于 `OUTLINE_MIN_ITEMS`(2) 个标题时返回空表。
+    text = (f"# 汇编\n\n## {Path(ref).stem}\n\n" + "正文" * 200
+            + "\n\n## 另一章\n\n另一段正文。\n")
     source = parse_text(text, kind="markdown")
     return module.Material(ref=ref, source=source,
                            content_hash=library.content_hash(source.text or ""))
 
 
 def test_hash_drift_is_fatal(module, crossdoc, monkeypatch):
-    """正文变了 → 明确报错（不跳过）：静默跳过会让"标注失效"看起来像"没有收益"。"""
+    """已标注章节的正文变了 → 明确报错（不跳过）：静默跳过会让"标注失效"看起来像"没有收益"。"""
     refs = list(crossdoc.CROSSDOC_SOURCE_HASHES)
     fakes = [_fake_material(module, ref) for ref in refs]
-    registered = {material.ref: material.content_hash for material in fakes}
+    monkeypatch.setattr(
+        module, "annotated_prefixes",
+        lambda: {ref: (Path(ref).stem,) for ref in refs})
+    registered = module.annotated_hashes(fakes)
     drifted = {**registered, refs[-1]: "0" * 64}
     monkeypatch.setattr(module.crossdoc_cases, "CROSSDOC_SOURCE_HASHES", drifted)
     with pytest.raises(SystemExit) as info:
         module.build_crossdoc_dataset(fakes)
     assert "跨文档套的标注已失效" in str(info.value)
+    assert "已标注章节" in str(info.value)
     assert refs[-1] in str(info.value)
 
 

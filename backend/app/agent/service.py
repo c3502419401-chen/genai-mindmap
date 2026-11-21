@@ -28,6 +28,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from app.agent.contracts import (
     AgentEvent,
     AgentRunRequest,
+    CheckpointFn,
     DoneEvent,
     ErrorEvent,
     HeartbeatEvent,
@@ -55,6 +56,7 @@ from app.contracts.diagnostic import Diagnostic, DiagnosticLevel
 from app.contracts.mindmap import DiagramContent
 from app.generation.service import (
     GenerationError,
+    ModelNotConfigured,
     _demo_content,
 )
 from app.memory import store as memory_store
@@ -548,21 +550,20 @@ def _no_progress_stop(
 ) -> DoneEvent | ErrorEvent:
     """连续无进展到硬阈值：收尾。
 
-    与 `_budget_stop` 同一条规矩：已经有候选就当作完成（那棵树是能用的，报成失败
-    只会让用户不知道该不该用），一份都没有才报错。
+    与 `_budget_stop` 走同一个出口（`_deliver_or_fail`）：已经有候选就当作完成
+    （那棵树是能用的，报成失败只会让用户不知道该不该用），一份都没有才报错。
 
     `model` / `served_model` / `reasoning` 也要带上：这一帧和"模型自己收尾"那一条在
     界面上是同一种成功（都落进了画布），少字段就会出现"同样是生成成功，一次看得到
     模型名与思考过程，另一次什么都没有"——而用户完全不知道差别来自哪种收尾。
     """
     message = (f"连续 {no_progress} 次工具调用没有改动导图，模型在原地打转，已停止。")
-    _log_failure(ctx, tool_calls, code="no_progress", message=message)
-    if ctx.candidate is not None:
-        return DoneEvent(seq=next(seq), content=ctx.candidate, usage=usage_total,
-                         mode="model", model=model, served_model=served_model,
-                         reasoning=_reasoning_text(reasoning))
-    return ErrorEvent(seq=next(seq), code="no_progress", message=message,
-                      limit="no_progress")
+    return _deliver_or_fail(
+        ctx, seq, usage_total,
+        code="no_progress", message=message, limit="no_progress",
+        tool_calls=tool_calls, model=model, served_model=served_model,
+        reasoning=reasoning,
+    )
 
 
 def _args_summary(call: ToolCall, width: int = 80) -> dict[str, Any]:
@@ -681,6 +682,67 @@ def _budget_message(ctx: RunContext, limit: str, tool_calls: int) -> str:
             "或者调大 max_seconds。")
 
 
+def _deliver_or_fail(
+    ctx: RunContext,
+    seq: "itertools.count[int]",
+    usage_total: dict[str, Any],
+    *,
+    code: str,
+    message: str,
+    limit: str | None = None,
+    tool_calls: int,
+    call: ToolCall | None = None,
+    model: str | None = None,
+    served_model: str | None = None,
+    reasoning: str = "",
+    log_code: str | None = None,
+) -> DoneEvent | ErrorEvent:
+    """收尾的唯一口径：**这一轮产出过树就交树，一棵都没长出来才报错。**
+
+    六条终态路径（预算用尽、空转、工具超时、连续失败、意外收尾、工具次数到顶）
+    从这里一起出：从前它们各写一份，其中两条按规矩交候选、四条无条件发 error，
+    于是同一件事——"跑到一半停了"——在界面上有两种截然不同的样子。用户看到的差别
+    不是"停的原因不同"，而是"一次拿到了半棵树、一次什么都没拿到"，而后者往往还
+    是跑了三五分钟的那次。
+
+    **判据是 `ctx.produced`，不是 `ctx.candidate is not None`。** 后者看着等价，
+    实际差得很远：`edit` / `expand` 必须带 `request.snapshot`（`router._validate`），
+    而 `RunContext(candidate=request.snapshot)` 把它直接装进了候选位。于是编辑意图下
+    "候选非空"在**第一帧之前**就成立了——那棵树是用户自己的，不是模型交付的。按
+    `candidate` 判的结果是：模型没配置、模型报错、工具全挂，一律返回
+    `done(partial=True, content=用户原树)`，前端把它当新结果落进画布、记一条 0 改动的
+    生成事件、状态行写"结果已落到画布"——用户以为模型改过了，而"去配模型"那张卡片
+    永远不会出现。
+
+    交出去的树标 `partial`：它确实不是一次完整的生成（有分支没长出来、说明可能
+    没写完），**必须让用户知道**，否则"半棵树"会被当成模型认为的完整答案。但
+    "不完整"与"失败"是两件事：前者可以改、可以保存、可以接着展开，后者只能重跑。
+
+    `message` 在两条分支上都要用：作为 `partial_reason` 显示在结果旁边，或作为
+    error 帧的 `message`。所以它必须是人能读的一句话，不能只是错误码。
+
+    `model` / `served_model` / `reasoning` 只在成功分支带（与"模型自己收尾"那一帧
+    同形）：同一份产出，不该因为停的原因不同，一次看得到模型名与思考过程、另一次
+    什么都没有。`served_model` 与 `model` 是两件事，两个都要带（见 `DoneEvent`）。
+
+    `log_code` 只在**日志**与出站 `code` 不一致时才传（现在只有工具超时这一条：
+    帧上仍是 `budget_exhausted`/`max_seconds`，而日志要写 `tool_timeout`）。把它
+    并成一个 code 会丢掉排查时唯一的区分线索——"这次是工具卡住了还是单纯没额度"
+    决定了下次该调 `max_seconds` 还是 `max_model_calls`。
+    """
+    _log_failure(ctx, tool_calls, call=call, code=log_code or code, message=message)
+    if ctx.produced and ctx.candidate is not None:
+        return DoneEvent(
+            seq=next(seq), content=ctx.candidate, usage=usage_total,
+            mode="model", model=model, served_model=served_model,
+            reasoning=_reasoning_text(reasoning),
+            partial=True, partial_reason=message,
+        )
+    return ErrorEvent(
+        seq=next(seq), code=code, message=message, limit=limit,
+    )
+
+
 def _budget_stop(
     ctx: RunContext,
     seq: "itertools.count[int]",
@@ -709,17 +771,13 @@ def _budget_stop(
     `reasoning` 取**最后一次模型响应**的思考过程——那是这一轮真正决定"可以收尾了"
     的那次思考，前面的轮次属于过程。
     """
-    message = _budget_message(ctx, limit, tool_calls)
-    _log_failure(
-        ctx, tool_calls, call=call, code="budget_exhausted", message=message,
-    )
-    if ctx.candidate is not None:
-        return DoneEvent(seq=next(seq), content=ctx.candidate, usage=usage_total,
-                         mode="model", model=model, served_model=served_model,
-                         reasoning=_reasoning_text(reasoning))
-    return ErrorEvent(
-        seq=next(seq), code="budget_exhausted",
-        message=message, limit=limit,
+    return _deliver_or_fail(
+        ctx, seq, usage_total,
+        code="budget_exhausted",
+        message=_budget_message(ctx, limit, tool_calls),
+        limit=limit,
+        tool_calls=tool_calls, call=call,
+        model=model, served_model=served_model, reasoning=reasoning,
     )
 
 
@@ -991,6 +1049,7 @@ async def run(
     provider: ToolProvider | None = None,
     tools: ToolRegistry | None = None,
     on_close: Callable[[DiagramContent | None], None] | None = None,
+    on_checkpoint: CheckpointFn | None = None,
     first_seq: int = 1,
 ) -> AsyncIterator[AgentEvent]:
     """跑一次多轮工具循环，边跑边发事件。
@@ -1015,6 +1074,15 @@ async def run(
 
     `on_close` 不传时行为与加它之前**逐字相同**（连一次库调用都没有），单测与
     直接调 `run()` 的代码不受影响。
+
+    `on_checkpoint` 是同一件事的**中途**版本：`on_close` 只在结束时有一次机会，
+    而一轮生成里有很长一段（写说明，实测 26 秒上下）是"树已经能读了但还没跑完"。
+    这段时间进程被杀 / 重启 / 合盖，`finally` 根本没跑到，那一轮连半棵树都不留。
+    工具在那一刻调一次 `ctx.checkpoint(...)`，这里把它交给调用方落库。
+
+    它**不走同步回调**：这里不是取消路径（工具正常跑到那一步才调），而落库要把整
+    棵树序列化再写 SQLite，同步做等于拿事件循环去等写锁——同进程的其它 SSE 流会
+    跟着卡住。所以它是 `async` 的，调用方（路由层）自己把阻塞的写交给线程池。
     """
     # 「这次图型是怎么定的」随请求一起进来（`diagram_intent.apply` 在开流前写好）。
     # 直接构造请求的调用方没经过那一层，两个私有属性都是 `None`——那表示"这一层
@@ -1026,6 +1094,7 @@ async def run(
         sources_by_id={source.id: source for source in request.sources},
         diagram_source=intent.source,
         diagram_stripped=intent.stripped,
+        checkpoint=on_checkpoint,
     )
     try:
         async with contextlib.aclosing(
@@ -1099,7 +1168,7 @@ async def _loop(
         # 也记到 ctx 上：草稿要按"这次运行产出的那棵树"落库，占位树同样是产出。
         # 不写这里的话，演示模式的 run 会以"没产出"收尾，回放时前端只看到
         # 一句"模型这次没有产出导图"。
-        ctx.candidate = demo
+        ctx.publish_tree(demo)
         demo_seq = itertools.count(first_seq)
         yield StageEvent(seq=next(demo_seq), stage="demo", detail="演示模式，不调用模型")
         yield SnapshotEvent(seq=next(demo_seq), content=demo)
@@ -1217,9 +1286,24 @@ async def _loop(
                 ctx, seq, usage_total, "max_seconds", tool_calls,
                 model=model_name, served_model=served_model, reasoning=last_reasoning)
             return
+        except ModelNotConfigured as exc:
+            # 单独一条：这一类失败重试没有意义，界面要给的是"去配模型"而不是
+            # "再试一次"（见 `ModelNotConfigured` 的 docstring）。
+            yield _deliver_or_fail(
+                ctx, seq, usage_total,
+                code="model_not_configured", message=str(exc),
+                tool_calls=tool_calls, model=model_name, served_model=served_model, reasoning=last_reasoning,
+            )
+            return
         except GenerationError as exc:
-            _log_failure(ctx, tool_calls, code="generation_failed", message=str(exc))
-            yield ErrorEvent(seq=next(seq), code="generation_failed", message=str(exc))
+            # 日志由 `_deliver_or_fail` 统一记（它带 `log_code`，两条分支都记一次）。
+            # 这里再写一条会把同一次失败记成两条——两条都带 `model_calls_used`，
+            # 长得像两次独立事件，按 code 数失败次数就会翻倍。
+            yield _deliver_or_fail(
+                ctx, seq, usage_total,
+                code="generation_failed", message=str(exc),
+                tool_calls=tool_calls, model=model_name, served_model=served_model, reasoning=last_reasoning,
+            )
             return
         except Exception as exc:  # noqa: BLE001 — 留下摘要后仍交给路由处理，不改变异常语义
             _log_failure(
@@ -1302,22 +1386,24 @@ async def _loop(
                 )
             else:
                 message = f"模型以 {completion.finish_reason or '未知原因'} 结束，且没有调用任何工具"
-                _log_failure(ctx, tool_calls, code="unexpected_finish", message=message)
-                yield ErrorEvent(
-                    seq=next(seq), code="unexpected_finish",
-                    message=message,
+                # 已经有树就交树（标 partial），没有才报错：`length` 截断、内容
+                # 过滤这些收尾方式，前面长出来的那棵树一样是能用的。
+                yield _deliver_or_fail(
+                    ctx, seq, usage_total,
+                    code="unexpected_finish", message=message,
+                    tool_calls=tool_calls, model=model_name, served_model=served_model, reasoning=last_reasoning,
                 )
             return
 
         for call in completion.tool_calls:
             if tool_calls >= budget.max_tool_calls:
-                _log_failure(
-                    ctx, tool_calls, call=call, code="budget_exhausted",
-                    message=_BUDGET_HINT["max_tool_calls"],
-                )
-                yield ErrorEvent(
-                    seq=next(seq), code="budget_exhausted",
-                    message=_BUDGET_HINT["max_tool_calls"], limit="max_tool_calls",
+                # 同上：这一轮还没执行的工具不做了，但已经长出来的树要交出去。
+                yield _deliver_or_fail(
+                    ctx, seq, usage_total,
+                    code="budget_exhausted", message=_BUDGET_HINT["max_tool_calls"],
+                    limit="max_tool_calls",
+                    tool_calls=tool_calls, call=call,
+                    model=model_name, served_model=served_model, reasoning=last_reasoning,
                 )
                 return
 
@@ -1348,10 +1434,6 @@ async def _loop(
                     yield event
             if outcome.timed_out:
                 timeout_message = _budget_message(ctx, "max_seconds", tool_calls)
-                _log_failure(
-                    ctx, tool_calls, call=call, code="tool_timeout",
-                    message=timeout_message,
-                )
                 # 超时也是一次「工具结束了」。少了这一帧，事件序列就是
                 # `stage → tool_start → error`，前端那行工具永远停在「执行中」——
                 # `max_repairs` 判停那条路径修过同一个问题，超时这里当时漏了。
@@ -1363,14 +1445,41 @@ async def _loop(
                     },
                     latency_ms=int((time.monotonic() - begun) * 1000),
                 )
-                yield ErrorEvent(
-                    seq=next(seq), code="budget_exhausted",
-                    message=timeout_message, limit="max_seconds",
+                # 超时前已经写进 `ctx.candidate` 的树要交出去。这一条从前是无条件
+                # 发 error 的，而 `_run_tool` 超时会 `task.cancel()`——被取消那次
+                # 工具内部的分片结果拿不回来，能救的只有"之前已经落到候选里的"。
+                yield _deliver_or_fail(
+                    ctx, seq, usage_total,
+                    code="budget_exhausted", message=timeout_message,
+                    limit="max_seconds",
+                    tool_calls=tool_calls, call=call,
+                    model=model_name, served_model=served_model, reasoning=last_reasoning,
+                    log_code="tool_timeout",
                 )
                 return
             if outcome.error is not None:
-                # 工具内部抛异常时原样上抛，交给路由那个兜底把它变成一帧可读错误；
-                # 在这里转成 ToolResult 等于替工具谎报"执行完了"。
+                # 工具内部抛的异常：**这一轮已经产出过树时走统一收尾**，否则原样上抛。
+                #
+                # 从前这里一律上抛，由路由那三条 `except` 兜成 error 帧——而路由
+                # 只看得到异常，看不到 `ctx`，于是"工具里模型挂了、但树上已经有东西"
+                # 这条路仍然把半棵树丢了。`_deliver_or_fail` 存在的全部意义就是不丢这
+                # 棵树，那么最后这条绕过它的路也得堵上，否则六条变七条、缺口仍在。
+                #
+                # 没产出时必须继续上抛：把一个"什么都没做成"的运行由这里改写成
+                # `_deliver_or_fail` 的 error 帧，等于替路由做决定（它还要落库、
+                # 发 DONE_FRAME），两条出口对同一件事各说一遍容易漂移。
+                if ctx.produced and isinstance(outcome.error, (ModelNotConfigured, GenerationError)):
+                    config_error = isinstance(outcome.error, ModelNotConfigured)
+                    yield _deliver_or_fail(
+                        ctx, seq, usage_total,
+                        code="model_not_configured" if config_error else "generation_failed",
+                        message=str(outcome.error),
+                        tool_calls=tool_calls, call=call,
+                        model=model_name, served_model=served_model, reasoning=last_reasoning,
+                    )
+                    return
+                # 这里的 `_log_failure` 只覆盖"继续上抛"的那一半：走上面分支时
+                # `_deliver_or_fail` 自己会记，记两次等于一次失败两条日志。
                 _log_failure(
                     ctx, tool_calls, call=call,
                     code="generation_failed" if isinstance(outcome.error, GenerationError) else "agent_failed",
@@ -1426,13 +1535,13 @@ async def _loop(
                             f"工具执行已失败 {failures} 次，"
                             f"最多允许重试 {budget.max_repairs} 次，继续重试没有意义，已停止。"
                         )
-                        _log_failure(
-                            ctx, tool_calls, call=call, code="too_many_failures", message=message,
-                        )
-                        yield ErrorEvent(
-                            seq=next(seq), code="too_many_failures",
-                            message=message,
+                        # 与其它五条收尾同规矩：已经长出来的树交出去，别让它白跑。
+                        yield _deliver_or_fail(
+                            ctx, seq, usage_total,
+                            code="too_many_failures", message=message,
                             limit="max_repairs",
+                            tool_calls=tool_calls, call=call,
+                            model=model_name, served_model=served_model, reasoning=last_reasoning,
                         )
                         return
 

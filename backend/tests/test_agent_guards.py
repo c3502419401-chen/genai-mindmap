@@ -65,8 +65,18 @@ def _request(intent: str = "edit", budget: RunBudget | None = None,
                            budget=budget or RunBudget(), snapshot=snapshot)
 
 
-def _ctx(request: AgentRunRequest, candidate: MindMapContent | None = None) -> RunContext:
-    return RunContext(request=request, candidate=candidate)
+def _ctx(request: AgentRunRequest, candidate: MindMapContent | None = None,
+         *, produced: bool = False) -> RunContext:
+    """造一个 run 上下文。
+
+    `produced=True` 表示「这一轮已经真的长出过树」——收尾判据看的是这个标记，
+    不是 `candidate` 有没有值：`edit`/`expand` 的候选位一开始就是用户带来的原树，
+    拿它当判据会把"一棵都没长"的失败说成"交付了半棵树"。
+    """
+    ctx = RunContext(request=request, candidate=candidate)
+    if produced:
+        ctx.publish_tree(candidate if candidate is not None else _tree())
+    return ctx
 
 
 def _completion(calls: list[ToolCall] | None = None, finish: str = "stop") -> Completion:
@@ -299,14 +309,14 @@ def _varying_calls(count: int) -> list[ToolCall]:
 def test_no_progress_warns_then_stops():
     """连续不改树 → 第 8 次记 `NO_PROGRESS`，第 16 次中止。"""
     request = _request()
-    ctx = _ctx(request, candidate=_tree())
+    ctx = _ctx(request, candidate=_tree(), produced=True)
     events = _drain_loop(
         request, ctx, ScriptedProvider(_rounds(_varying_calls(NO_PROGRESS_ABORT))),
         _echo_registry(),
     )
 
     assert "no_progress" in _stages(events)
-    # 这份样本有候选，所以中止帧是 Done（成果保留），不是 Error
+    # 这一轮真的产出过树，所以中止帧是 Done（成果保留），不是 Error
     assert events[-1].type == "done"
     assert len(_ends(events)) == NO_PROGRESS_ABORT
     assert [item.code for item in ctx.loop_diagnostics] == ["NO_PROGRESS"]
@@ -317,7 +327,7 @@ def test_no_progress_warns_then_stops():
 
 
 def test_no_progress_without_a_candidate_ends_with_an_error():
-    """一份候选都没有时，无进展中止要报错而不是假装完成。"""
+    """一棵树都没长出来时，无进展中止要报错而不是假装完成。"""
     request = _request()
     ctx = _ctx(request)
     events = _drain_loop(
@@ -433,10 +443,17 @@ def test_count_budgets_keep_their_short_message():
 def test_timed_out_tool_reports_the_same_sentence_as_the_loop(caplog):
     """工具超时与循环判停必须说同一句话，且都带进度。
 
-    两处各写一份文案的话，同一件事在日志、`tool_end` 与 `error` 帧里会长得不一样，
+    两处各写一份文案的话，同一件事在日志、`tool_end` 与收尾帧里会长得不一样，
     而排查的人只能靠它们互相对上。
+
+    这里带着候选超时，所以收尾帧是 `done`（标 `partial`）而不是 `error`——树的
+    交出口径统一之后，"跑到一半停了"不再等于"什么都没拿到"。那句解释从
+    `error.message` 移到了 `done.partial_reason`，仍然是**逐字相同的一句**。
     """
     async def slow(args, ctx):
+        # 先真的长出一棵树再卡住：收尾判据是"这一轮产出过"，光有用户带来的
+        # 快照不算交付，那样超时会被判成 error 而不是 done。
+        ctx.publish_tree(_tree())
         await asyncio.sleep(2)
         return ToolResult(ok=True, content="太慢了")
 
@@ -452,8 +469,11 @@ def test_timed_out_tool_reports_the_same_sentence_as_the_loop(caplog):
     end = _ends(events)[0]
     assert end.result_summary["code"] == "tool_timeout"
     assert "已执行 1 次工具调用" in end.result_summary["message"]
-    assert events[-1].limit == "max_seconds"
-    assert events[-1].message == end.result_summary["message"]
+    last = events[-1]
+    assert last.type == "done", "树已经在手上了，超时不该把它报成失败"
+    assert last.content is not None
+    assert last.partial is True
+    assert last.partial_reason == end.result_summary["message"]
     assert caplog.text.count("tool_timeout") >= 1
 
 
@@ -490,14 +510,14 @@ def test_create_intent_still_gets_no_rag_query():
                                          has_library=False).names()
 
 
-def test_edit_intent_keeps_all_seven_tools():
-    """`edit` 的七个写工具一个都没少——提额度不是为了删工具。"""
+def test_edit_intent_keeps_all_eight_tools():
+    """`edit` 的八个写工具一个都没少——提额度不是为了删工具。"""
     names = build_registry("edit", has_library=False).names()
     assert set(names) == {
         "add_node", "update_node", "remove_node", "move_node",
-        "add_edge", "remove_edge", "mindmap_edit",
+        "add_edge", "remove_edge", "mindmap_fill_details", "mindmap_edit",
     }
-    assert len(names) == 7
+    assert len(names) == 8
 
 
 def test_expand_intent_keeps_its_tools():

@@ -741,7 +741,7 @@
           "AI 代理"
         ],
         "summary": "List Runs",
-        "description": "运行台账。默认回答的是\"上次跑完、我还没存下来的是哪一次\"。\n\n`status` 缺省时把 `done` 与 `cancelled` 一起算：**被取消但已经产出结果的那次\n同样要能被捡起来**——否则\"关掉页面那 40 秒\"照样白花，只是从内存白花变成写进\n数据库白花。\n\n这条查询就是这张表结果列的**唯一读者**。没有它，`candidate` 写进去之后再没人看过。",
+        "description": "运行台账。默认回答的是\"上次跑完、我还没存下来的是哪一次\"。\n\n`status` 缺省时把 `done` / `cancelled` / `failed` 一起算：\n\n  - **`cancelled` 但已经产出结果的那次同样要能被捡起来**——否则\"关掉页面那\n    40 秒\"照样白花，只是从内存白花变成写进数据库白花。\n  - **`failed` 里有 `run_abandoned`**：进程崩了，`sweep_abandoned()` 把那行判死\n    并留下了崩溃前那个检查点。不列它的后果是\"检查点存得再好也没人读得到\"——\n    用户下次进来看到的是\"什么都没有\"，而那棵树其实就在库里。\n\n有没有东西可捡由 `candidate IS NOT NULL` 判（`pending()` 里的条件），不由状态判：\n一个 `failed` 行可能什么都留，一个 `cancelled` 行可能留了整棵树。\n\n这条查询就是这张表结果列的**唯一读者**。没有它，`candidate` 写进去之后再没人看过。",
         "operationId": "list_runs_api_agent_runs_get",
         "parameters": [
           {
@@ -763,10 +763,10 @@
                   "type": "null"
                 }
               ],
-              "description": "只看某一种状态。缺省 = 有结果且还没被保存过的（done + cancelled）。",
+              "description": "只看某一种状态。缺省 = 有结果且还没被保存过的（done + cancelled + failed）。",
               "title": "Status"
             },
-            "description": "只看某一种状态。缺省 = 有结果且还没被保存过的（done + cancelled）。"
+            "description": "只看某一种状态。缺省 = 有结果且还没被保存过的（done + cancelled + failed）。"
           },
           {
             "name": "unapplied",
@@ -4028,6 +4028,39 @@
             ],
             "title": "Applied At"
           },
+          "partial": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Partial"
+          },
+          "checkpointed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Checkpointed At"
+          },
+          "node_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node Count"
+          },
           "candidate": {
             "anyOf": [
               {},
@@ -4059,6 +4092,17 @@
               }
             ],
             "title": "Mode"
+          },
+          "partial_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Partial Reason"
           }
         },
         "additionalProperties": false,
@@ -4110,6 +4154,39 @@
               }
             ],
             "title": "Applied At"
+          },
+          "partial": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Partial"
+          },
+          "checkpointed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Checkpointed At"
+          },
+          "node_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node Count"
           }
         },
         "additionalProperties": false,

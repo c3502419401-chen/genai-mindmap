@@ -411,6 +411,44 @@ describe('部分完成与诊断', () => {
     expect(store.content?.root.label).toBe('候选');
     expect(store.agentWarnings).toHaveLength(1);
   });
+
+  it('done 帧标了 partial 时，告警用的是后端给的理由', async () => {
+    stubFetch(() => agentReply([
+      {
+        type: 'done',
+        seq: 2,
+        content: content('半棵树'),
+        mode: 'model',
+        partial: true,
+        partial_reason: '模型调用次数已用完（已执行 6 次工具调用）',
+      },
+    ]));
+    const store = useMindMapStore();
+
+    await store.runGeneration('做一张导图', 'create');
+
+    expect(store.content?.root.label).toBe('半棵树');
+    const partial = store.agentWarnings.find(item => item.kind === 'partial');
+    // 兜底文案只说"有分支没生成完整"，而后端知道得更具体：是把模型额度用完了。
+    // 丢掉这句话，用户就不知道该把目标写小还是该等一会儿再来。
+    expect(partial?.message).toContain('模型调用次数已用完');
+    expect(store.status).toContain('部分分支未完成');
+    // 半棵树不是失败：树已经在画布上了，只是没长完。把它记成 `agentError`
+    // 会让面板弹一张"这次没成功"的卡片，而用户眼前明明有一棵能改的树。
+    expect(store.agentError).toBe('');
+  });
+
+  it('done 帧没带 partial 时不凭空加一条「部分完成」', async () => {
+    stubFetch(() => agentReply([doneFrame(content('新图'))]));
+    const store = useMindMapStore();
+
+    await store.runGeneration('做一张导图', 'create');
+
+    // 缺字段 = 没说（正常收尾、加这两个字段之前的老帧）。当成"不完整"会让人
+    // 以为每次生成都缺分支；这也是这里用 `=== true` 而不是真值判断的原因。
+    expect(store.agentWarnings).toHaveLength(0);
+    expect(store.status).not.toContain('部分分支未完成');
+  });
 });
 
 describe('生成落地', () => {
@@ -603,6 +641,31 @@ describe('生成结果与换图', () => {
     // 会话号变了，结果属于上一张图：装上去就是把 A 写进 B
     expect(store.content).toBeNull();
     expect(store.status).toContain('换了一张图');
+  });
+
+  it('载入一份检查点时，说清它缺的是说明而不是结构', async () => {
+    const store = useMindMapStore();
+    store.newMap();
+    store.resumableRun = {
+      run_id: 'cp-1', status: 'failed', intent: 'create', goal: '崩掉那张',
+      created_at: '2024-01-01T00:00:00Z', updated_at: '2024-01-01T00:00:00Z',
+      checkpointed_at: '2024-01-01T00:01:00Z', node_count: 12,
+    };
+    stubFetch(() => jsonReply({
+      run_id: 'cp-1', status: 'failed', intent: 'create', goal: '崩掉那张',
+      created_at: '2024-01-01T00:00:00Z', updated_at: '2024-01-01T00:00:00Z',
+      checkpointed_at: '2024-01-01T00:01:00Z', node_count: 12,
+      candidate: content('崩之前长的树'), failure: null, mode: 'model',
+    }));
+
+    await store.resumeRun();
+
+    // 树装进来了（结构是完整的）。
+    expect(store.content?.root.label).toBe('崩之前长的树');
+    const warning = store.agentWarnings.find(item => item.code === 'CHECKPOINT');
+    expect(warning?.message).toContain('说明');
+    // 而且不能被记成"半棵树"：那会让状态行按"分支没长完"提示。
+    expect(store.agentWarnings.some(item => item.kind === 'partial')).toBe(false);
   });
 });
 

@@ -37,15 +37,22 @@ gr re eS SQ QL` 九个 bigram——写一个英文专名就能把重合度刷到
 
 ## 材料改了怎么办
 
-`MANUAL_SOURCE_HASHES` 是这四份材料的 `sha256(正文)`（与 `knowledge.library.
-content_hash` 同口径）。材料一改，`load_manual_dataset` **明确报错**，不静默跳过：
-静默跳过会让"标注失效"看起来像"指标掉了"。改法是重读那一章、复核区间与问法，再把
-新指纹写回本文件。
+`MANUAL_SOURCE_HASHES` 是这四份材料里**已标注章节正文**的 `sha256`（章节与片段的口径
+见 `evaluate_retrieval.annotated_hashes`：两套 case 用到的 `sections` / `targets` 覆盖
+到哪儿，就钉到哪儿）。改到标注过的正文，装载**明确报错**，不静默跳过：静默跳过会让
+"标注失效"看起来像"指标掉了"。改法是重读那一章、复核区间与问法，再把新指纹写回本文件。
 
-指纹是**整份文件**的 `sha256`，所以往 `docs/PLAN.md` 末尾追加一行变更记录也会让它变红——
-追加不改变已标注章节的正文与偏移，此时把新指纹写回、再跑一遍 `test_retrieval_eval_*` 确认
-章节前缀与锚点仍各自命中一次即可，不需要重新标注。这个误触已经发生过四次（v1.21、v1.23、v1.24 与 v1.25），
-看见 `MANUAL_SOURCE_HASHES` 报错先分辨是"标注过期"还是"只是追加了记录"。
+指纹**只覆盖已标注章节**，所以往文件末尾追加变更记录、改一个没人标注的小节都不会让它
+变红——那些变更不携带任何"标注可能失效"的信息。改到已标注章节时才需要重标。想算新值：
+
+    cd backend
+    python -c "import sys; sys.path[:0]=['scripts','.']; \
+      import evaluate_retrieval as ev; \
+      print(ev.annotated_hashes(ev.load_materials(list(ev.DEFAULT_MATERIALS), [])))"
+
+（历史：指纹口径曾是整份文件的 `sha256`，于是"只追加一行变更记录"这种零风险动作也报错，
+已误触七次——v1.21、v1.23、v1.24、v1.25、v1.26、v1.27 与 v1.27 补丁。改成章节范围之后
+这类误触不会再发生，见 v1.27 补丁之后的这次口径调整。）
 """
 from __future__ import annotations
 
@@ -88,8 +95,8 @@ class ManualCase:
     """一条手写样例。
 
     `sections` 是 `heading_outline` 给出的标题**前缀**（唯一匹配；前缀而不是全等，
-    是为了标题后半截微调时少改一个字——但材料一改 hash 就报错，所以这条便利只在
-    "标题没动、正文动了"这种本就要重标的情况下才有意义）。
+    是为了标题后半截微调时少改一个字——但已标注章节的正文一改指纹就报错，所以这条
+    便利只在"标题改了但正文没动"这种仍要人复核的情况下才用得上）。
     """
 
     query: str
@@ -102,18 +109,20 @@ class ManualCase:
 
 
 MANUAL_SOURCE_HASHES: dict[str, str] = {
-    "docs/AGENT_PLAN.md": "bd5cecdff33fb17382d1ba0ba8e5d877f1cbd05dc3d07c402398f9f4e4fdd9ec",
-    "docs/RAG-DECISIONS.md": "0a61ef1684479991fae70e9bba07d1ece3e0f0f0997feab9d5bbbda2b59bcfb8",
-    "docs/PLAN.md": "34c6cbd6ea7ad495400b97cb9594e9dcd52285ffd7cdcd2ceaa01ada4b76c3ce",
-    "docs/ARCHITECTURE.md": "d5022f5907fec818f6bf91c3876fc45ae5a1b19d86fdb3b09a42c9beb6e07de8",
+    "docs/AGENT_PLAN.md": "4587560fa7bf967d3244b3c2f21c814328ba7a66e0d5581faa270e439e09d800",
+    "docs/RAG-DECISIONS.md": "a96ec40fc249cffcb19a15ac057c2a2685b51ac8761675ed537d82e5e05e1b13",
+    "docs/PLAN.md": "b5291b5bfacb0ba36eb197e8254e514f5d1d4ac61bda70e97f98939181cd7bd3",
+    "docs/ARCHITECTURE.md": "a830171342192fec95c489e21502b94c7c19f7f2b35d883a914daa304b296279",
 }
-"""这四份材料的 `sha256(正文)`；对不上就是材料变了，整套标注要复核。
+"""这四份材料**已标注章节正文**的 `sha256`；对不上就是标注覆盖的正文变了，整套要复核。
 
-v1.26 更新（`acfdb5b` 之后那次候选层注释清理）：`AGENT_PLAN.md` 只在开头加了"这是历史
-设计稿"的方框，`ARCHITECTURE.md` 改的是 §数据与调用约定第 4 条与两处用词。**两套 case
-用到的章节与锚点一个字都没动**（`AGENT_PLAN.md` 用的是「真相、会话与编辑同步」等章，
-`ARCHITECTURE.md` 用的是「安全与部署边界」「数据与调用约定」），按文件头那条规矩——
-先分辨"标注过期"还是"只是追加"——这次属于后者，所以只把新指纹写回，不重新标注。
+口径：把该材料上两套 case 用到的章节前缀（`manual` 的 `sections` + `crossdoc` 的
+`targets[].section`）解析成区间，取这些区间正文的 `sha256`（`evaluate_retrieval.
+annotated_hashes` 就是这件事的实现，也是新值的唯一算法）。**不是整份文件**：整份钉死
+会让"末尾追加一行变更记录"也报错，那种红不携带任何"标注可能失效"的信息。
+
+历史：v1.26、v1.27 与 v1.27 补丁那三次更新都发生在"整份文件"口径下——按当时的规矩
+分辨"只是追加"再写回新指纹即可，不重标。改成章节范围之后，同样的追加不再触发报错。
 """
 
 

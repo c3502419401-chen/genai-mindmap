@@ -99,17 +99,21 @@ def _assert_untouched(ctx: RunContext, before: MindMapContent) -> None:
 # ---------------------------------------------------------------- 注册表
 
 
-def test_edit_intent_registers_all_seven_write_tools():
-    """`edit` 意图下七个写工具都给：四个节点 + 两个边 + 批量兜底。
+def test_edit_intent_registers_all_eight_write_tools():
+    """`edit` 意图下八个写工具都给：四个节点 + 两个边 + 补说明 + 批量兜底。
 
     边工具与节点工具**并列**而不是塞进 `mindmap_edit` 的 op 表：一条边改一次，
     开销只是多一次调用；而把两种东西混进同一张 op 表会让批量工具的提示词再长
     一截，模型在批量里连边的情况本来就少。
+
+    `mindmap_fill_details` 也算"写"：它改的是 `detail` 字段。不并进批量工具的
+    理由与边工具同源——批量是"精确改、按 id 逐个说"，而补说明要改哪些节点由代码
+    按长度数出来，让模型在 op 表里逐个报一遍既漏又长（见 `FillDetailsArgs`）。
     """
     names = build_registry("edit", has_library=False).names()
     assert set(names) == {
         "add_node", "update_node", "remove_node", "move_node",
-        "add_edge", "remove_edge", "mindmap_edit",
+        "add_edge", "remove_edge", "mindmap_fill_details", "mindmap_edit",
     }
 
 
