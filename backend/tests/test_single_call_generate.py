@@ -200,6 +200,30 @@ def test_skeleton_uses_the_material_outline():
     assert "K-means 与层次聚类" not in plan_user
 
 
+def test_skeleton_sees_the_material_inventory():
+    """有材料时骨架还看得见**清单**：几份、每份多长（正文仍然一行都不进）。
+
+    这条与上一条不重复：目录说"有哪几块"，清单说"有几份东西、各多长"。16 份独立
+    摘要抽不出章节，旧行为下骨架对"有 16 份"这件事一无所知，于是按主题猜出 3 支
+    （实测见 `docs/GRAPH-SCALE.md` 第 4 节）。清单是让那个数进入骨架那一次调用的
+    唯一入口，所以它必须在**整树这条路上**也被接线到（分片那条有 `test_outline.py`）。
+    """
+    seen: list[tuple[str, str]] = []
+    source = _material()
+    chars = len((source.text or "").strip())
+    result = _run(_ctx([source]), _chat(_three_branches(), seen=seen))
+
+    assert result.ok, result.content
+    plan_user = seen[0][1]
+    assert f"这次的材料（共 1 份，合计 {chars:,} 字" in plan_user
+    assert "1. 机器学习讲义.md" in plan_user
+    # 清单在主题之后、条数要求之前（顺序即权重），并且带上了"怎么用这个数"那句
+    assert (plan_user.index(TOPIC) < plan_user.index("这次的材料")
+            < plan_user.index("最多 3 条"))
+    # 只有结构：正文里那些句子一句都不在
+    assert "K-means" not in plan_user
+
+
 def test_skeleton_falls_back_to_the_topic_without_material():
     """无材料 → 没有目录可拼，骨架由模型从主题定；这条路一次生成照常跑完。"""
     seen: list[tuple[str, str]] = []
@@ -207,6 +231,8 @@ def test_skeleton_falls_back_to_the_topic_without_material():
 
     assert result.ok, result.content
     assert OUTLINE_HEADER not in seen[0][1]
+    # 没有材料时连清单都没有：骨架那一次的 user 与加清单之前逐字节相同
+    assert "这次的材料" not in seen[0][1]
     assert TOPIC in seen[0][1]
     # 没有材料时骨架的 system 里有那两句纯文本契约（别写引用、可以自由展开）
     assert "不要写 source_refs" in seen[0][0]

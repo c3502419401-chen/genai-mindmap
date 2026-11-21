@@ -2908,6 +2908,93 @@ def _render_outline(entries: Sequence[Any], sources: list[Source]) -> str:
     return "\n".join(lines)
 
 
+# 骨架那一次的**第四种**结构线索（前三种见 `_material_inputs` 的 docstring）：材料清单。
+#
+# 它只回答一个问题：**这次有几份东西、各多长**。没有它时骨架只看到主题 + （可能的）
+# 章节目录，而 16 份独立摘要是"抽不出章节"的——于是它按主题猜"机器学习该分几块"
+# （上一轮中批就是这么切出 3 支的，那 3 支要吃下 16 份材料）。`docs/GRAPH-SCALE.md`
+# 第 4 节实测：一级分支数跟着**配额量级**走（上限 80 → 5–6 支，32 → 3 支，10 → 1 支），
+# 因为模型手里没有任何"材料规模"的量可供参照。
+#
+# 为什么它比另外三条都窄（每条只有文件名与字数，正文一个字都不进）：planner 要判断
+# "该分几块"，需要的是**件数与长度**，不是内容。前三种给内容的方式在这里都是浪费
+# ——章节标题行是原文子集但要材料有标题，全塞要 5 万字以内，`_material_inputs` 的
+# 200 字只在 `MINDMAP_QUERY_EXPANSION` 打开时才走（默认关）。
+INVENTORY_HEADER = "这次的材料（共 {count} 份，合计 {chars} 字{note}）："
+
+# 没有可用结构块时补的那半句。措辞必须与 `OUTLINE_MIN_COVERAGE` 那道闸对齐：
+# 覆盖不足时目录同样不拼，"没有可用的章节标题"对"抽不出标题"与"覆盖率不够"两种
+# 都成立（写"没有章节标题"在后者上就是假话）。
+INVENTORY_NO_STRUCTURE = "，没有可用的章节标题"
+
+# 一行"文件名 + 字数"约 30 字，20 行 ≈ 600 字——与一段目录（30 行 × 20 字）同量级，
+# 这是它敢设成 20 而 `MAX_MATERIALS` 只能设 10 的原因：那边每份带 200 字正文
+# （10 × 200 = 2,000 字），这边只带结构。
+#
+# 但**上限不能藏住规模**：16 份被截到 10 份时，模型看到的规模与真实规模不符，
+# 清单就成了新的谎话。所以表头永远是**总数**，被截掉的部分另起一行明说还有几份。
+INVENTORY_MAX_LINES = 20
+
+
+def _material_inventory(sources: list[Source], *, has_structure: bool) -> str:
+    """拼给骨架的材料清单；没有材料时返回空串（那一支逐字节不变）。
+
+    `has_structure` 表示 `_plan_ask` 里已经有结构块（章节或图谱）：有就不再补
+    "没有可用的章节标题"——那句话在"有目录"和"图谱骨架"两种情形下都不成立。
+
+    字数按 `strip()` 后的长度算，与 `_intake.full_text_chars` 同一口径：清单上那个
+    "合计 X 字"必须能与 prompt 里真正塞进去的正文对得上，否则同一批材料在两个
+    地方有两个字数。
+
+    顺序按 `sources` 原序（与 `_full_text_sections` 同一条理由：材料在请求里的次序
+    是用户表达"哪份更重要"的方式，重排会让清单与界面上的清单对不上）。被截掉的
+    永远是**尾巴**，不是按长度挑——挑大的会把"还有 N 份"变成一句无法解释的话。
+    """
+    rows = [(source, (source.text or "").strip()) for source in sources]
+    if not rows:
+        return ""
+    total = sum(len(text) for _, text in rows)
+    header = INVENTORY_HEADER.format(
+        count=len(rows), chars=f"{total:,}",
+        note="" if has_structure else INVENTORY_NO_STRUCTURE,
+    )
+    lines = [header]
+    for index, (source, text) in enumerate(rows[:INVENTORY_MAX_LINES], start=1):
+        # 文件名压平换行：与 `_material_snippets` 同一个理由（材料里的换行会让
+        # 模型把清单的下一行当成新的一段指令）。只截长度，不改措辞。
+        name = " ".join((source.filename or "").split())[:80] or "（未命名）"
+        lines.append(f"  {index}. {name}（{len(text):,} 字）")
+    rest = rows[INVENTORY_MAX_LINES:]
+    if rest:
+        lines.append(
+            f"  （还有 {len(rest)} 份未列出，合计 {sum(len(t) for _, t in rest):,} 字）")
+    return "\n".join(lines)
+
+
+# 清单之后那句"怎么用这个数"。**光给清单不够**：模型看了 16 份也只是看了，它仍会按
+# "机器学习"这个主题的直觉去切——而那 16 篇在它眼里是"一篇关于机器学习的文章"。
+#
+# 措辞的三条约束（防止走向"每份一条分支"的另一个极端）：
+#
+#   1. **给的是判据，不是条数**：只说"按件数分"，不说"每份一条分支"。后者会撞上
+#      `branches` 上限（界面最多 8）与 `MIN_BRANCHES=3`，模型要么被截断要么失败；
+#   2. **必须点名"合并"**：中批这 16 篇里真有重叠——两篇讲财务报销流程优化、两篇讲
+#      用户注册登录的安全性、两篇讲机器学习进课堂；只说"分到不同分支下"会让它宁可拆细；
+#   3. **必须说"这几件也算"**：一份材料里讲了几件不同的事，同样算几件——否则
+#      小批（1 份 492 字）会被理解为"只有一件，给 1 支"，而契约要求至少 3 支。
+#
+# 实测（`docs/GRAPH-SCALE.md` 第 9 节，中批 A/B 各 3 次）：分支数**没有变多**
+# （5.67 → 5.67；请求 8 支时两臂都 6 支），变的是**分支点在哪**——从模型的通用领域
+# （金融风控/智能制造/交通）换成材料里真实存在的篇目，锚定率 16.9% → 24.2%，
+# 请求 8 支那一档从 0.0% → 24.7%。所以这条判据的作用是"让宽度跟着材料走"，
+# 不是"让图变宽"；后者由节点配额（`INITIAL_MAX_NODES`）决定。
+INVENTORY_RULES = (
+    "上面这些材料是**一堆彼此独立的篇目**，不是同一份长文的各节——一级分支按"
+    "「里面有几件互不相同的事」来分：讲不同事情的篇目分到不同分支下，"
+    "讲同一件事的几篇合进一支；一篇里讲了几个互不相同的方面，也算几件。"
+)
+
+
 def _full_text_sections(sources: list[Source]) -> list[str]:
     """把材料**整份**渲染成 prompt 里的分节：一份一节，标题带文件名、字数与 source_id。
 
@@ -3083,7 +3170,8 @@ def _slice_budget(chapters: int) -> int:
 
 
 def _plan_ask(
-    topic: str, branches: int, *, outline: str = "", diagram_type: str = "tree",
+    topic: str, branches: int, *, outline: str = "", materials: str = "",
+    diagram_type: str = "tree",
 ) -> str:
     """骨架调用的 user 消息。
 
@@ -3097,6 +3185,15 @@ def _plan_ask(
     见到"最多 8 条"时，它倾向凑满 8 条再找话说。空串表示这份材料没有可用目录，
     那一字不加（与加目录之前逐字相同）。
 
+    `materials` 是材料清单（`_material_inventory` 的产物：份数 / 每份文件名与字数），
+    位置与 `outline` 同一条理由、**紧随其后**：它也是"材料长什么样"，只是比目录更粗
+    ——目录说"有哪几块"，清单说"有几份、各多长"。空串表示这次没有材料（纯主题），
+    那一字不加（与加清单之前**逐字节相同**，有回归用例钉着）。
+
+    清单之后必须紧跟 `INVENTORY_RULES` 那一句：只给数不给判据时，模型会"看了但
+    不用"（实测措辞与依据见那个常量）。两句一起出现、一起消失——半截的清单等于
+    一个没有用处的数字。
+
     `diagram_type` 只影响末尾补的那一两句：`tree` 时**一个字符都不加**（有逐字节
     回归用例钉着），`flowchart` 补"阶段顺序 + edges 只连骨架"，`fishbone` 补
     "六个类别固定"。system 里的图型差异（`FLOW_PLAN_PROMPT` 等）与这里的分工是
@@ -3106,8 +3203,12 @@ def _plan_ask(
     parts = [f"主题：{topic}"]
     if outline:
         parts += ["", outline, ""]
+    if materials:
+        parts += ["", materials, ""]
     parts.append(f"根据内容实际包含的方面来定一级分支数量，最多 {branches} 条。")
     parts.append("材料层次多就用足、内容单薄就少给，不要为了凑数把不同的事塞进同一支。")
+    if materials:
+        parts.append(INVENTORY_RULES)
     # 这个数必须与系统提示词和代码截断同源（`GENERATED_LABEL_MAX_CHARS`）。
     # 这里曾经写死 20：`PLAN_PROMPT` 说 16、`_skeleton_titles` 按 16 截、
     # 而 user 消息说 20——模型照 user 写，写出来就被截，用户看到的是
@@ -7058,6 +7159,11 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             # 少一条就有一章没有支（那一章的覆盖率恒为 0）。
             len(slice_chapters) if slice_chapters else args.branches,
             outline=outline,
+            # 清单紧跟在 `outline` 之后进 prompt：三个条件（有材料、没材料、按章切）
+            # 共用同一个渲染器，`sources` 为空时它是空串，`_plan_ask` 一字不加。
+            # `has_structure` 看的是**已经拼进去的那个块**（章节或图谱），不是
+            # "有没有标题"——图谱骨架那一档同样不该被补"没有可用的章节标题"。
+            materials=_material_inventory(sources, has_structure=bool(outline)),
             diagram_type=diagram_type,
         )
         if slice_chapters:
@@ -8326,6 +8432,9 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             plan_system,
             _plan_ask(
                 args.topic, args.branches, outline=outline,
+                # 与整树那条逐字同一处（`AGENTS.md`：骨架被两条生成路共用，
+                # 只改一条会得到一个"两个入口对同一批材料给出不同骨架"的分叉）。
+                materials=_material_inventory(sources, has_structure=bool(outline)),
                 diagram_type=diagram_type,
             ) + hint_block)
     except GenerationError as exc:
@@ -10776,6 +10885,10 @@ def _material_inputs(sources: list[Source]) -> list[str]:
 
     它的边界很小且是刻意的——只在前 200 字、只在这个开关打开时。planner 判断"该用
     哪些词、范围有多大"本来就需要看一眼材料长什么样，只给标题它只能靠猜。
+
+    骨架那一次还有**第四条**线索：`_material_inventory` 的材料清单（份数 / 每份文件名
+    与字数）。它比上面三条都窄——**不含正文**，只有结构——所以它不属于"正文进 prompt"
+    这条路，但它是同一个问题的答案："让骨架知道这次的材料长什么样"。四条一起看才完整。
 
     所以"正文不出进程"这句话**不成立**，准确的说法是：检索片段（`rag_query` 的返回、
     按支检索的命中）、全塞时的整份正文、这里的 200 字（默认关）、以及骨架那一次的

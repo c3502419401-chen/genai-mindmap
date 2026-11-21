@@ -395,8 +395,13 @@ def test_outline_is_absent_when_material_has_no_outline():
     result, model = _run_deep(sources)
     assert result.ok, result.content
     assert OUTLINE_HEADER not in model.plan_user
-    # 与没有目录时逐字相同：主题 + 条数要求
-    assert model.plan_user.startswith("主题：管理办法\n根据内容实际包含的方面")
+    # 没有目录时进 prompt 的只有**清单**（`_material_inventory`），章节块一个字不加：
+    # 主题 → 清单 → 条数要求。这条断言在加清单之前是"主题后面直接跟条数要求"，
+    # 加清单之后中间多了一段——**这是本次改动的意图**，不是回归；"没有材料时逐字节
+    # 不变"那条不变量由 `test_plan_ask_without_outline_is_unchanged` 单独钉着。
+    assert model.plan_user.startswith(
+        "主题：管理办法\n\n这次的材料（共 1 份，合计 1,400 字，没有可用的章节标题）：")
+    assert model.plan_user.index("这次的材料") < model.plan_user.index("最多 3 条")
 
 
 def test_plan_ask_without_outline_is_unchanged():
