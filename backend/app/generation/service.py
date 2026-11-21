@@ -217,6 +217,24 @@ CONTENT_FREEDOM_CONTRACT = (
 # `SUBNODE_EXPAND_PROMPT`）——它们是"一次只写一层"的写法，与整树一次性输出不同。
 # 上一版这里的差别写成"后者不许凭空加内容"，实测把整棵树压成了材料的目录
 # （覆盖率 28.8%），这一段因此改写。
+
+
+def _initial_scale_line(node_limit: int) -> str:
+    """「这一次的规模」那三句。**唯一**一个按材料换数的句子。
+
+    为什么单独成函数：`MINDMAP_NODE_SCALE` 开启时，这个数由材料决定
+    （`budget.scaled_initial_nodes`），而 `DETAIL_PROMPT` 是一份被回归用例逐字节
+    钉着的常量。两件事只能这样共存——拼接时传默认值，字符串就与改动前相同。
+    """
+    return (
+        f"第一次生成本身请控制在 {node_limit} 个节点、"
+        f"{INITIAL_MAX_DEPTH + 1} 层（含中心主题）以内：宁可少两层，也要让每一层都写完整。"
+        "更细的内容留给用户点开某个节点后再展开。"
+    )
+
+
+_INITIAL_SCALE_LINE = _initial_scale_line(INITIAL_MAX_NODES)
+
 DETAIL_PROMPT = (
     "把用户输入变成一张思维导图。只返回一个 JSON 对象，不要代码围栏。"
     "格式为 {\"title\":\"标题\",\"root\":{\"id\":\"唯一id\","
@@ -239,9 +257,11 @@ DETAIL_PROMPT = (
     # 上面那句是**契约**上限（承载能力），这一句是**这一次**的规模。两句都要在：
     # 只说 1000 时模型会照着写一百多个节点，一次重响应既容易撞输出上限，画布上
     # 也读不完；只说 80 时它会把 80 当硬边界，复杂主题上主动砍内容。
-    f"第一次生成本身请控制在 {INITIAL_MAX_NODES} 个节点、"
-    f"{INITIAL_MAX_DEPTH + 1} 层（含中心主题）以内：宁可少两层，也要让每一层都写完整。"
-    "更细的内容留给用户点开某个节点后再展开。"
+    #
+    # 这一句单独成常量（`_INITIAL_SCALE_LINE`），因为它是**唯一**一个要按材料
+    # 换数的句子（`MINDMAP_NODE_SCALE`，见 `budget.scaled_initial_nodes`）。
+    # 默认值拼进去之后 `DETAIL_PROMPT` 与改动前逐字节相同——回归用例钉着它。
+    + _INITIAL_SCALE_LINE
     # 展开规则必须单独成段，判据只能是「还能不能再拆」。
     #
     # 早先这条规则被塞在分支数量里（「每个分支再给 2-4 个要点」），模型把它读成
@@ -251,7 +271,7 @@ DETAIL_PROMPT = (
     # 反向的坑同样要堵：写成「越深越好」模型会开始制造层级。所以这里给的是
     # **停止条件**（最小可执行单元 / 单一概念），并把层数上限明确成可读性上限、
     # 不是目标：深度由内容决定，不由数字决定。
-    f"层级上限 {MAX_TREE_DEPTH} 是可读性上限，不是要拆到的目标。"
+    + f"层级上限 {MAX_TREE_DEPTH} 是可读性上限，不是要拆到的目标。"
     "一个节点如果还能拆成更具体的子项，就继续拆；拆不动了就停："
     "要么已经是最小可执行单元（能直接照着做），要么本身就是单一概念"
     "（再拆只是把它自己换个说法重复一遍）。"
@@ -287,6 +307,20 @@ DETAIL_PROMPT = (
     "不要停在两级就收；也不要为了凑层数制造节点——拆不动的那一支到此为止是正常的。"
     + CONTENT_FREEDOM_CONTRACT
 )
+
+
+def detail_prompt(node_limit: int | None = None) -> str:
+    """这一次的 `DETAIL_PROMPT`。
+
+    默认（`None` 或等于 `INITIAL_MAX_NODES`）**返回常量本身**，逐字节不变——这是
+    回归用例与 `MINDMAP_NODE_SCALE` 关闭时的唯一路径。开关打开时只换「这一次的
+    规模」那一句，其余每一个字都不动：规模是**这一次的预算**，而树规则、深度规则、
+    拆到哪一层的判据都不该随材料量变。
+    """
+    if node_limit is None or node_limit == INITIAL_MAX_NODES:
+        return DETAIL_PROMPT
+    return DETAIL_PROMPT.replace(
+        _INITIAL_SCALE_LINE, _initial_scale_line(node_limit))
 
 # 没有材料可标出处的那条路（纯主题生成，以及材料太短被降级之后）追加的一句。
 #

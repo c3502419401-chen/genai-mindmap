@@ -358,3 +358,59 @@ def test_node_limit_is_capped_for_the_first_generation():
     assert _node_limit() > INITIAL_MAX_NODES
     assert INITIAL_MAX_NODES == 80
     assert INITIAL_MAX_DEPTH == 3
+
+
+# ---------------------------------------------------------------- 5. 规模随材料伸缩
+
+
+def test_node_scale_is_off_by_default(monkeypatch):
+    """开关不设 = 关：默认路径必须与改动前逐字节相同（80 个节点）。"""
+    monkeypatch.delenv(budget.NODE_SCALE_ENV, raising=False)
+    assert budget.node_scale_enabled() is False
+    for value in ("1", "on", "TRUE", "yes"):
+        monkeypatch.setenv(budget.NODE_SCALE_ENV, value)
+        assert budget.node_scale_enabled() is True
+    monkeypatch.setenv(budget.NODE_SCALE_ENV, "0")
+    assert budget.node_scale_enabled() is False
+
+
+def test_scaled_nodes_are_decided_by_the_largest_vote():
+    """三条判据各在某一格上失效，取最大值才在三个点位上都是合理的数。
+
+    这三个点位就是 `scripts/measure_scale.py` 那三批材料，数字必须与报告一致。
+    """
+    # 小：492 字 1 份、抽不出章节 → 字数 0.6、份数 2，都低于下限 → 10
+    assert budget.scaled_initial_nodes(material_chars=492, sources=1, chapters=0) == 10
+    # 中：5,616 字 16 份、章节 0 —— 字数说 7，份数说 32
+    assert budget.scaled_initial_nodes(material_chars=5616, sources=16, chapters=0) == 32
+    # 大：66,536 字 4 份 30 章 —— 字数说 83、章节说 150，撞上限 80
+    assert budget.scaled_initial_nodes(material_chars=66536, sources=4, chapters=30) == 80
+    # 每条判据单独拿出来也能撑起一个数（否掉"其实只有字数在起作用"）
+    assert budget.scaled_initial_nodes(material_chars=40_000, sources=0, chapters=0) == 50
+    assert budget.scaled_initial_nodes(material_chars=0, sources=16, chapters=0) == 32
+    assert budget.scaled_initial_nodes(material_chars=0, sources=0, chapters=30) == 80
+
+
+def test_scaled_nodes_never_exceed_the_readability_ceiling():
+    """上限是 `INITIAL_MAX_NODES`：材料再多也不涨（那是 `node_expand` 的事）。"""
+    for chars in (100_000, 500_000, 10_000_000):
+        assert budget.scaled_initial_nodes(
+            material_chars=chars, sources=4, chapters=30) == INITIAL_MAX_NODES
+    assert budget.scaled_initial_nodes(
+        material_chars=0, sources=0, chapters=0) == budget.MIN_INITIAL_NODES
+    assert budget.scaled_initial_nodes(
+        material_chars=100_000, sources=0, chapters=0, ceiling=32) == 32
+
+
+def test_detail_prompt_only_swaps_the_scale_line():
+    """开关打开时只换「这一次要多大」那一句；关着时**就是**原来那个常量。"""
+    from app.generation.service import DETAIL_PROMPT, detail_prompt
+
+    assert detail_prompt() is DETAIL_PROMPT
+    assert detail_prompt(INITIAL_MAX_NODES) is DETAIL_PROMPT
+    scaled = detail_prompt(32)
+    assert "32 个节点" in scaled
+    assert f"{INITIAL_MAX_NODES} 个节点" not in scaled
+    # 除了那一个数字，逐字节相同
+    assert len(scaled) == len(DETAIL_PROMPT)
+    assert scaled.replace("32 个节点", f"{INITIAL_MAX_NODES} 个节点") == DETAIL_PROMPT

@@ -95,11 +95,11 @@ from app.generation.service import (
     CONTENT_FREEDOM_CONTRACT,
     CONTEXT_TOKEN_LIMIT,
     DETAIL_NO_SOURCE_RULES,
-    DETAIL_PROMPT,
     EXTERNAL_TRUST_RULES,
     MIN_BRANCHES,
     GenerationError,
     chat_async,
+    detail_prompt,
     estimate_input_tokens,
     max_tokens_cap,
     thinking_block,
@@ -6951,6 +6951,9 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         ))
     graph_entities: list[graph_store.GraphEntity] = []
     graph_links: list[graph_store.GraphLink] = []
+    # 章节目录：只在三段式的骨架那一步算一次（`heading_outline` 是对整份材料跑正则，
+    # 大材料上不是零成本）。两段式没有"用目录定骨架"这件事，留空。规模判据要用它。
+    outline_entries: list[Any] = []
     raw_plan: Any = None
     plan: _SkeletonPlan | None = None
     skeleton_seconds = 0.0
@@ -7178,6 +7181,38 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     # 前提——两组的差异只可能来自第二段，不可能来自收尾。
     structure_seconds = 0.0
     slice_report: dict[str, Any] | None = None
+    # ---- 规模：这一次要求几个节点 ------------------------------------------------
+    #
+    # 默认恒为 `INITIAL_MAX_NODES`（80）——与改动前逐字节相同。`MINDMAP_NODE_SCALE=1`
+    # 时由材料决定（判据、系数与三点位实测见 `generation.budget.scaled_initial_nodes`）。
+    #
+    # **三处必须用同一个数**：system 里那句要求、`_clip_tree` 的上限、`data["node_limit"]`。
+    # 只改一处就会造出"提示词要 32、裁到 80、报 80"这种自相矛盾的产物，而它从数据上
+    # 看是"模型没听话"——排查方向会从一开始就错。
+    #
+    # 字数取 `max(material_chars, full_text_chars)`：后者含外部检索补进来的量，那部分
+    # 也在这一次的 prompt 里，规模该把它算进去。
+    initial_nodes = (
+        budget.scaled_initial_nodes(
+            material_chars=max(material_chars, full_text_chars),
+            sources=len(sources),
+            chapters=len(outline_entries),
+        )
+        if budget.node_scale_enabled()
+        else INITIAL_MAX_NODES
+    )
+    if initial_nodes != INITIAL_MAX_NODES:
+        # 只说这一次是多大，以及为什么：用户看到一棵 32 节点的树时，得能分辨"模型
+        # 没写完"与"这次就是这么要的"。
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.info, code="NODE_SCALE_APPLIED",
+            message=(
+                f"这次按材料规模要求 {initial_nodes} 个节点"
+                f"（材料 {max(material_chars, full_text_chars)} 字 / {len(sources)} 份 /"
+                f" {len(outline_entries)} 章；开关 `{budget.NODE_SCALE_ENV}`）；"
+                f"不设该开关时恒为 {INITIAL_MAX_NODES}"
+            ),
+        ))
     # 外部来源的可信度提示：两条路共用（第三段也用它），所以必须在 if/else **之前**
     # 定下来。判据只看 `sections` 与来源类型，与"结构那一次怎么发"无关。
     external_rules = (
@@ -7297,28 +7332,31 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             else FISHBONE_TREE_RULES if diagram_type == "fishbone"
             else SKELETON_TREE_RULES
         )
+        # 树规则那一份只改「这一次要多大」那一句（`detail_prompt`）；开关关着时它就是
+        # `DETAIL_PROMPT` 本身，逐字节不变。
+        base_system = detail_prompt(initial_nodes)
         if sections and full_text:
             # 全塞：引用规则换成"这是全文"那一套。**不能复用 `BRANCHED_EVIDENCE_RULES`**
             # ——它开头就说"已经按一级分支各做过一次检索"，与这次真的没检索相矛盾；
             # 模型会据此推断"没被检索到的内容不存在"，然后只写第一份材料覆盖的部分。
-            system = (DETAIL_PROMPT + thinking + shape_rules
+            system = (base_system + thinking + shape_rules
                       + FULL_TEXT_EVIDENCE_RULES + external_rules)
         elif sources and sections and graph_mode:
             # 两段式的证据是按概念检索的（同 `user` 那一段的理由），所以引用规约也要自己
             # 一份：`BRANCHED_EVIDENCE_RULES` 说的是"按一级分支分组"。
-            system = (DETAIL_PROMPT + thinking + shape_rules
+            system = (base_system + thinking + shape_rules
                       + GRAPH_EVIDENCE_RULES + external_rules)
         elif sources and sections:
-            system = (DETAIL_PROMPT + thinking + shape_rules
+            system = (base_system + thinking + shape_rules
                       + BRANCHED_EVIDENCE_RULES + external_rules)
 
         elif sources:
             # 有材料但这一轮一条都没命中：与旧的整树路径同一条降级——按无来源写满，
             # 引用留空。**不把 `sources` 判成 None**：模型在本次运行前几轮可能已经
             # `rag_query` 到过真片段，逐字校验照跑，留下的只可能是真依据。
-            system = DETAIL_PROMPT + thinking + shape_rules + DETAIL_NO_SOURCE_RULES
+            system = base_system + thinking + shape_rules + DETAIL_NO_SOURCE_RULES
         else:
-            system = DETAIL_PROMPT + thinking + DETAIL_NO_SOURCE_RULES
+            system = base_system + thinking + DETAIL_NO_SOURCE_RULES
             if graph_mode:
                 # 没有可检索材料时上面四条分支都不带 `shape_rules`——三段式在这条路上也
                 # 不需要它（没有分支要摆）。两段式仍然需要：那一段正是"一级分支从图谱里
@@ -7414,15 +7452,15 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     before_clip = _count_nodes(content.root)
     clipped = 0
     cut_ids: set[str] = set()
-    if before_clip > INITIAL_MAX_NODES:
+    if before_clip > initial_nodes:
         original_root = content.root
-        content, clipped = _clip_tree(content, INITIAL_MAX_NODES)
+        content, clipped = _clip_tree(content, initial_nodes)
         cut_ids = _shortened_ids(original_root, content.root)
         diagnostics.append(Diagnostic(
             level=DiagnosticLevel.warn, code="TREE_CLIPPED_TO_INITIAL",
             message=(
-                f"模型返回了 {before_clip} 个节点，超过初次生成的 {INITIAL_MAX_NODES} 个上限，"
-                f"已保留前 {INITIAL_MAX_NODES} 个（尾部 {clipped} 个未保留）；"
+                f"模型返回了 {before_clip} 个节点，超过初次生成的 {initial_nodes} 个上限，"
+                f"已保留前 {initial_nodes} 个（尾部 {clipped} 个未保留）；"
                 "想要更大的树，请生成后用 node_expand 逐支展开"
             ),
         ))
@@ -7785,8 +7823,8 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         )
     if clipped:
         summary += (
-            f"节点数超过初次生成的 {INITIAL_MAX_NODES} 个上限，已保留前 "
-            f"{INITIAL_MAX_NODES} 个；想要更大的树，用 node_expand 逐支展开。"
+            f"节点数超过初次生成的 {initial_nodes} 个上限，已保留前 "
+            f"{initial_nodes} 个；想要更大的树，用 node_expand 逐支展开。"
         )
     if detail_report["requested"] and detail_report["filled"] < detail_report["requested"]:
         # 只在**没补全**的时候说一句：补全是常态（结构那一轮按提示词留空、第三段
@@ -7811,8 +7849,9 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         # 树里），所以报**落树后的**实际条数——这是同一个问题的答案，只是来源不同。
         "planned_branches": len(plan.flat) if plan is not None else len(content.root.children),
         # 初次规模的两个上限：报出来才能解释"为什么这棵树只有这么深/这么大"。
-        # 两者都是既有常量，这次改动没有动它们。
-        "node_limit": INITIAL_MAX_NODES,
+        # 节点上限是**这一次**的值（`MINDMAP_NODE_SCALE` 关着时恒为 80）；深度上限
+        # 仍是常量——材料量只改规模，不改层数（层数由可读性定）。
+        "node_limit": initial_nodes,
         "depth_limit": INITIAL_MAX_DEPTH,
         # 两个来源：输出被截断（`SalvagedOutput`）、节点被裁剪。都是"少了一块"
         # 而不是失败，而 `ok=true` 与"完整成功"长得一模一样。

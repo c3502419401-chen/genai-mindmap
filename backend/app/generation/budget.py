@@ -33,6 +33,7 @@
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Sequence
 
 from app.contracts.mindmap import GENERATED_LABEL_MAX_CHARS
@@ -96,6 +97,89 @@ REASONING_MARGIN_RATIO = 0.35
 # 而是"这一批根本不该发"——调用方看到 0 应当停手（`_generate_deep` 的
 # `DEEP_MIN_BREADTH` 是同一个意思的另一个入口）。
 MIN_NODES_PER_CALL = 1
+
+# ---------------------------------------------------------------- 规模随材料伸缩
+#
+# `INITIAL_MAX_NODES = 80` 是**与材料无关**的常数，而实测它是模型的填额目标：
+#
+#     材料 492 字（1 份）   → 80 节点 / 9.3–10.5 千字说明   压缩比 0.05:1
+#     材料 5,616 字（16 份）→ 80 节点 / 10.3–11.0 千字说明  压缩比 0.51–0.54:1
+#     材料 66,536 字（4 份）→ 80 节点 / 12.2 千字说明       压缩比 5.45:1
+#
+# 材料量翻 135 倍，说明总量只涨 30%——图不是材料的函数，是那个 80 的函数。数字见
+# `scripts/measure_scale.py` 与 `data/scale-baseline.json`。
+#
+# 这里的三个系数是**三个候选判据**，各自在哪一批上是唯一合理的那个：
+#
+#   - 字数（`CHARS_PER_NODE`）：永远可用。66,536/800 = 83 撞上限，与现状吻合；
+#     但它在"多份短材料"上系统性低估——5,616 字是 16 篇独立摘要，不是一篇
+#     5,616 字的文章，按字数它只是 7 个节点。
+#   - 份数（`SOURCES_PER_NODE`）：补的正是上面那一格。16 份 → 32；而 4 份长文档
+#     只给 8，那 4 份里有 30 章、66,536 字，"每份 2 个节点"是荒谬的。
+#   - 章节（`CHAPTERS_PER_NODE`）：最接近"材料里有多少个要点"，实测 4 份长文档
+#     抽出 30 条（覆盖 91%），30 × 5 = 150 撞上限；但纯摘要上它**完全失效**：
+#     小批 1 份 492 字、中批 16 份 5,616 字，`heading_outline` 都是 0 条。
+#
+# 所以判据不是"选一个"，是**取三者的最大值**：每个判据都在某一格上失效，而失效
+# 的方向永远是低估，取 max 只会在最该大的那一格上大。下限 `MIN_INITIAL_NODES`
+# 是结构算术（3 支 × 每支 2 个要点 + 根，见下面那个常量的注释）；上限仍是
+# `INITIAL_MAX_NODES`——那是可读性上限，不该随材料量涨（5 万字材料想要更多细节时，
+# `node_expand` 是既有的那条路）。
+NODE_SCALE_ENV = "MINDMAP_NODE_SCALE"
+
+#: 多少材料字数摊一个节点。800 的依据是现状：66,536/800 = 83，与"首次 80 节点"
+#: 这个已经跑了几百次的值吻合——它保证**大材料的行为不变**，改的只是小材料。
+CHARS_PER_NODE = 800
+
+#: 每份材料至少摊几个节点。2 = 一份材料至少要在图上占两处（标题 + 一处结论），
+#: 低于它时"材料被总结了"这件事在图上看不出来。
+SOURCES_PER_NODE = 2
+
+#: 每个章节至少摊几个节点。5 = 一章至少「标题 + 两三个要点 + 一个收束」。
+CHAPTERS_PER_NODE = 5
+
+#: 下限：**结构算术**，不是口味。`MIN_BRANCHES=3`（契约）× 每支至少 2 个要点
+#: （`_SKELETON_BODY`）+ 根 = 7，再留一格给"根下直接挂的收束"，取 10。
+#:
+#: **但它不是宽度的杠杆，实测说得很清楚**：492 字材料 / 同一主题，把上限设成
+#: 8 / 10 / 13 时，六次采样**全部只长出 1 条一级分支**（`{'1':1,'2':1,'3':5,'4':3}`
+#: 这种一条链的形状）；同一批材料在上限 32 时给 3 支、上限 80 时给 5–6 支。
+#: 也就是说宽度跟着**配额的量级**走，不跟着下限走——想让小材料也铺成 3 支，
+#: 得改提示词里"拆深"与"铺宽"的权重（`DETAIL_PROMPT` 的展开规则占了那一份的
+#: 大半），而不是把这个数调大。这一条必须留在这里：调大下限只会让说明更膨胀
+#: （实测压缩比 8→0.44:1、10→0.33:1、13→0.26:1），一级分支一条都不多。
+MIN_INITIAL_NODES = 10
+
+
+def node_scale_enabled() -> bool:
+    """`MINDMAP_NODE_SCALE=1` 才按材料伸缩；不设 = 关（保持 80，与改动前逐字节相同）。
+
+    默认关的理由与其它 A/B 开关一致：这个数改的是**每一次生成的规模**，翻它之前
+    得先有一组数字（`data/scale-baseline.json` 是现状那一组）。开关而不是直接改
+    默认值，是为了让"要不要翻"成为一个可以单独回滚的决定。
+    """
+    return os.getenv(NODE_SCALE_ENV, "").strip().lower() in ("1", "on", "true", "yes")
+
+
+def scaled_initial_nodes(
+    *,
+    material_chars: int,
+    sources: int,
+    chapters: int,
+    ceiling: int = INITIAL_MAX_NODES,
+) -> int:
+    """这次生成该要求几个节点：三条判据取最大值，夹在 `[MIN_INITIAL_NODES, ceiling]`。
+
+    三个入参都可以是 0（没有材料 / 抽不出章节），此时对应那一项不参与比较。
+    返回的是**要求量**，不是上限承诺——模型仍可以少写，`_clip_tree` 仍按这个数裁。
+    """
+    votes = [
+        max(0, material_chars) / CHARS_PER_NODE,
+        max(0, sources) * SOURCES_PER_NODE,
+        max(0, chapters) * CHAPTERS_PER_NODE,
+    ]
+    target = max(votes) if votes else 0.0
+    return max(MIN_INITIAL_NODES, min(max(1, ceiling), int(round(target))))
 
 
 def _tokens(chars: int) -> int:
@@ -245,18 +329,25 @@ def calls_for_levels(sizes: Sequence[int]) -> int:
 
 
 __all__ = [
+    "CHAPTERS_PER_NODE",
+    "CHARS_PER_NODE",
     "ENVELOPE_TOKENS",
+    "MIN_INITIAL_NODES",
     "MIN_NODES_PER_CALL",
+    "NODE_SCALE_ENV",
     "NODE_STRUCTURE_TOKENS",
     "PROMPT_DETAIL_MAX_CHARS",
     "REASONING_MARGIN_RATIO",
     "REFS_PER_NODE",
+    "SOURCES_PER_NODE",
     "available_output_tokens",
     "batch_output_tokens",
     "calls_for_levels",
     "level_sizes",
     "max_nodes_for_tokens",
+    "node_scale_enabled",
     "nodes_per_call",
     "per_node_tokens",
     "plan_batches",
+    "scaled_initial_nodes",
 ]
