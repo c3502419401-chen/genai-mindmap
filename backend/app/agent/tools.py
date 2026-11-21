@@ -5438,9 +5438,14 @@ def _relations_from(
 #     / 海绵+升级理念 / 海绵城市设施措施 / 自然排水雨洪管理系统」，**忠实度 66.7%，
 #     其中 4 条只能来自那两份摘要**。这一档的真实作用域就是这个形状。
 #
-# 所以默认值是**关**：收益只在"这批检索材料一份能用的目录都没有"时出现，而"维基命中
-# 一条"在真实检索里很常见（一命中就把覆盖率撑到 0.7）。翻默认值之前，要先有办法把那
-# 种形状认出来（或者把入图挪到"用户本来就在等"的那一刻，比如上传解析时预抽）。
+# 所以成本只在"这一档**有可能**接管"时才付——第五道闸（`_outline_entries` 非空就不入）
+# 就是这件事，见 `_ingest_external_graph` 的注释。于是这个开关打开之后的行为是：
+#
+#     目录可用（真实检索里最常见）→ 零成本、零变化（一次本地抽标题，不发网络）
+#     目录不可用（全摘要，或维基那条没命中）→ +17.5 秒，一级分支从"模板词"变成材料原词
+#
+# 默认值仍取**关**：第二行那种形状在真实检索里是小概率，而它的收益目前只有一次 A/B
+# （每组 1 次采样）。要翻默认值，先把 `measure_graph_ingest.py --repeat 3` 跑够样本。
 GRAPH_INGEST_ENV = "MINDMAP_GRAPH_INGEST"
 
 # 与 `MINDMAP_GRAPH_EXTRACTION`（`graph_extract.ENABLED_ENV`）的关系：**两个开关都要
@@ -5497,14 +5502,20 @@ async def _ingest_external_graph(
 ) -> dict[str, Any] | None:
     """把这次检索回来的材料抽进图；不做时返回 `None`。
 
-    四道闸与 `_graph_outline` 同构（代价从低到高），因为它们问的是同一个部署问题：
+    五道闸按代价从低到高排，前四道与 `_graph_outline` 同构（它们问的是同一个部署
+    问题），第五道是**这一档独有的、也是最重要的**：
 
       0. `graph_ingest_enabled()` 为假（默认）→ None，一次查询都不发；
       1. 没有材料 → None；
       2. `configured()` 为假（没配密码）→ None，**不发起任何连接**；
       3. `available()` 为假（刚连失败、冷却中）→ None，同样不连——库不在时把
          3 份材料各付一遍 15 秒连接超时，等于让用户为一次注定失败的建图等一分钟。
-         这一条比 `_graph_outline` 更要紧：那边只付一次，这边是 N 份并行。
+         这一条比 `_graph_outline` 更要紧：那边只付一次，这边是 N 份并行；
+      4. **这批材料还有能用的章节目录**（`_outline_entries` 非空）→ None。判据与
+         `_generate` 里那道 `if not outline_entries` 是同一个函数：**目录可用时第三档
+         根本不会被问到**，入图的产物一次都不会被读。实测（`measure_graph_ingest.py`
+         的形状 1）就是这一种：全批 7 条目录 / 覆盖率 0.718，两组一级分支**逐字相同**，
+         而这一边白付了 17.5 秒。这是五道闸里唯一"拦掉的是注定零收益"的那一道。
 
     返回值是**这一趟的账**（不是抽取结果）：`materials` / `skipped` / `chunks` /
     `entities` / `edges` / `failed` / `aborted` / `seconds`。它进诊断与日志——
@@ -5517,6 +5528,11 @@ async def _ingest_external_graph(
     if not graph_ingest_enabled() or not sources:
         return None
     if not graph_store.configured() or not graph_store.available():
+        return None
+    if _outline_entries(list(sources)):
+        # 目录可用 = 第三档不接管 = 入图的产物无人消费。记一行是刻意的：用户打开了
+        # 开关却没看到任何成本与任何变化，日志里必须有话说。
+        logger.info("检索材料入图跳过：这批材料有可用章节目录，第三档不会接管")
         return None
 
     pending = _graph_ingest_pending(sources)
