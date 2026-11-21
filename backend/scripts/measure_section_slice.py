@@ -1,29 +1,35 @@
-"""A/B：第二段给「整份材料」还是给「每支自己那一章的原文」。
+"""A/B：第二段（结构）与第三段（说明）各自给什么证据。
 
-    python scripts/measure_section_slice.py                        # 两臂各跑一次
+    python scripts/measure_section_slice.py                        # 两组各跑一次
     python scripts/measure_section_slice.py --repeat 2             # 采样
+    python scripts/measure_section_slice.py --arms slice,detail    # 只跑第三段这组 A/B
     python scripts/measure_section_slice.py --material FILE --save out.json
 
-两个 arm 是同一份代码、同一个骨架形态，**唯一**的差别是第二段（结构）怎么发：
+三组 arm 是同一份代码、同一个骨架形态，差别只有**开关**：
 
-  - `full`（`MINDMAP_SECTION_SLICE` 不设）：结构与说明各拿**整份正文**，一次写完
-    （这就是现状——`FULL_TEXT_MATERIAL_CHARS = 50_000`，14k 字的材料整份进 prompt）；
+  - `full`（两个开关都不设）：结构与说明各拿**整份正文**，一次写完
+    （这就是改动之前的现状——`FULL_TEXT_MATERIAL_CHARS = 50_000`，14k 字的材料整份进 prompt）；
   - `slice`（`MINDMAP_SECTION_SLICE=1`）：骨架定好之后**每章一次调用**，每次只给它
-    自己那一章的原文，组装成整棵树；第三段（只写 detail）与上面**逐字节相同**。
+    自己那一章的原文，组装成整棵树。第三段拿的还是整份正文；
+  - `detail`（`MINDMAP_SECTION_SLICE=1` + `MINDMAP_DETAIL_RETRIEVAL=1`）：结构同上，
+    **第三段的证据换成"每个节点在它自己那一章内检索到的块"**。`slice` 与 `detail`
+    一起跑，就把第三段的变量单独隔出来了（第二段两组完全一样）。
 
-测量口径（六个数，前两个是核心）：
+测量口径（前两个是核心）：
 
   1. **每章覆盖率**：这一章的字有多少被**活下来的引用**覆盖（按章内区间并集算）。
      与"全材料覆盖率"不同——那个数被长章拉平，看不出"某一章整章没被写"；
-  2. **跨支重复**：`_cross_branch_duplicates` 的**节点数**，并把重复的 label 与它
-     出现在哪几支打出来（分片那版是 6 处，判据同源）；
-  3. `detail` 平均 / 最短：第三段没改，但要确认它没被前面的 N 次调用影响；
-  4. 节点数与**有没有撞 `INITIAL_MAX_NODES` 被裁**（`cut_nodes` / `partial`）；
-  5. 耗时：三段各自 + 总墙钟；
-  6. token：按 `estimate_input_tokens` 估（输入 = Σ system+user，输出 = Σ 响应原文）。
+  2. **引用落点**：引用条数、**不同的**区间数、落在多少个不同段落 / 多少章上
+     ——"条数涨了"不等于"覆盖了更多地方"，两个数必须一起看；
+  3. 跨支重复：`_cross_branch_duplicates` 的**节点数**，并打出重复的 label 与它
+     出现在哪几支（分片那版是 6 处，判据同源）；
+  4. `detail` 平均 / 最短 / **章内贴合度**（说明的词组有多少落在它自己那一章里）：
+     第三段的证据一变，这三个数最先动；
+  5. 节点数与**有没有撞 `INITIAL_MAX_NODES` 被裁**（`cut_nodes` / `partial`）；
+  6. 耗时：三段各自 + 总墙钟；token 按 `estimate_input_tokens` 估。
 
-**骨架形态在两臂里是一样的**：`SKELETON_GROUP_THRESHOLD` 抬到不可能达到（两臂都
-不请求两级）。这不是为了美化现状，而是为了让"差异只可能来自第二段"——两级骨架是
+**骨架形态在各组里是一样的**：`SKELETON_GROUP_THRESHOLD` 抬到不可能达到（谁都不请求
+两级）。这不是为了美化现状，而是为了让"差异只可能来自被切换的那一段"——两级骨架是
 第三个变量，混进来之后"覆盖率为什么变"就说不清了（`measure_two_tier.py` 用同一种
 手法造 arm）。这一条必须写进报告。
 
@@ -36,6 +42,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -52,7 +59,14 @@ CREDENTIALS = (
 
 DEFAULT_MATERIAL = Path(__file__).resolve().parents[2] / "docs" / "RAG-DECISIONS.md"
 DEFAULT_TOPIC = "检索增强生成的技术决策"
-ARMS = ("full", "slice")
+
+# 每个 arm 只要设这几个环境变量，别的都一样。
+ARM_ENV: dict[str, dict[str, str]] = {
+    "full": {},
+    "slice": {"MINDMAP_SECTION_SLICE": "1"},
+    "detail": {"MINDMAP_SECTION_SLICE": "1", "MINDMAP_DETAIL_RETRIEVAL": "1"},
+}
+DEFAULT_ARMS = ("full", "slice")
 
 
 def _user_env(name: str) -> str:
@@ -151,6 +165,72 @@ def _duplicate_rows(root, duplicates) -> list[dict]:
     return rows
 
 
+def _paragraphs(text: str) -> list[tuple[int, int]]:
+    """原文的段落区间（空行分隔）。"引用落在多少段上"的分母就是它的长度。"""
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    for match in re.finditer(r"\n\s*\n", text):
+        spans.append((cursor, match.start()))
+        cursor = match.end()
+    spans.append((cursor, len(text)))
+    return [(low, high) for low, high in spans if text[low:high].strip()]
+
+
+def _ref_places(root, text: str) -> dict:
+    """引用落在**多少个不同的地方**：条数、不同区间数、不同段落数。
+
+    为什么单看条数会骗人：38 条挤在 3 段里与 38 条散在 30 段里是同一件事的两种说法，
+    而覆盖率只认**并集**——前者的"条数翻倍"可能一分覆盖率都不加。三个数一起看才
+    说得清"这条路买到的是更多依据，还是更啰嗦的引用"。
+    """
+    refs = [(ref.start, ref.end) for node in _walk(root) for ref in node.source_refs
+            if ref.start is not None and ref.end is not None and ref.end > ref.start]
+    spans = sorted(set(refs))
+    paragraphs = _paragraphs(text)
+    return {
+        "refs": sum(len(node.source_refs) for node in _walk(root)),
+        "spans": len(spans),
+        "paragraphs": sum(1 for low, high in paragraphs
+                          if any(start < high and end > low for start, end in spans)),
+        "total_paragraphs": len(paragraphs),
+    }
+
+
+def _detail_affinity(root, text: str, chapters, *, gram: int = 2) -> float | None:
+    """说明有多"贴着自己那一章"：节点说明的字符二元组里落在本章的比例（均值）。
+
+    这是第三段**能**动的质量指标。引用条数由第二段决定（`_slice_refs` 在章内定位
+    模型抄的 quote），第三段一个字都不写引用——所以要判"按节点章内检索"有没有用，
+    只能看说明本身是否更贴它自己那一章：同一个节点，证据给的是整份材料时它会写到
+    别的章的话题上，给的是本章的块时它就只能写这一章。
+    """
+    if not chapters:
+        return None
+    all_grams = {text[index:index + gram] for index in range(len(text) - gram + 1)}
+    by_index = {f"s{chapter.index}": chapter for chapter in chapters}
+    scores: list[float] = []
+    for child in root.children:
+        chapter = by_index.get(child.id)
+        if chapter is None:
+            continue
+        own = text[chapter.start:chapter.end]
+        own_grams = {own[index:index + gram] for index in range(len(own) - gram + 1)}
+        rest = all_grams - own_grams
+        stack = [child]
+        while stack:
+            node = stack.pop()
+            stack.extend(node.children)
+            detail = (node.detail or "").strip()
+            if len(detail) < 20:
+                continue
+            grams = {detail[index:index + gram]
+                     for index in range(len(detail) - gram + 1)}
+            inside, outside = len(grams & own_grams), len(grams & rest)
+            if inside + outside:
+                scores.append(inside / (inside + outside))
+    return round(sum(scores) / len(scores), 3) if scores else None
+
+
 def _classify(system: str) -> str:
     from app.agent.tools import (
         DETAIL_ONLY_PROMPT, PLAN_PROMPT, SECTION_SLICE_PROMPT,
@@ -199,12 +279,11 @@ async def _run_arm(*, arm: str, text: str, topic: str, branches: int):
     call = ToolCall(call_id="measure", name="mindmap_generate",
                     arguments={"topic": topic, "branches": branches})
 
-    if arm == "slice":
-        os.environ["MINDMAP_SECTION_SLICE"] = "1"
-    else:
-        os.environ.pop("MINDMAP_SECTION_SLICE", None)
+    for name in ("MINDMAP_SECTION_SLICE", "MINDMAP_DETAIL_RETRIEVAL"):
+        os.environ.pop(name, None)
+    os.environ.update(ARM_ENV[arm])
     threshold = tools_module.SKELETON_GROUP_THRESHOLD
-    tools_module.SKELETON_GROUP_THRESHOLD = 10**6      # 两臂都不分组
+    tools_module.SKELETON_GROUP_THRESHOLD = 10**6      # 各组都不分组
     tools_module.chat_async = counting_chat
     started = time.perf_counter()
     try:
@@ -247,10 +326,13 @@ async def _run_arm(*, arm: str, text: str, topic: str, branches: int):
         "detail_min": min(details, default=0),
         "detail_filled": (data.get("detail") or {}).get("filled"),
         "detail_requested": (data.get("detail") or {}).get("requested"),
+        "detail_affinity": _detail_affinity(root, text, chapters),
+        "detail_evidence": (data.get("detail") or {}).get("evidence"),
         "duplicates": len(duplicates),
         "duplicate_rows": _duplicate_rows(root, duplicates),
         "refs": (data.get("source_refs") or {}).get("kept"),
         "refs_declared": (data.get("source_refs") or {}).get("declared"),
+        "refs_places": _ref_places(root, text),
         "seconds": round(elapsed, 1),
         "stage_seconds": data.get("calls"),
         "calls": dict(calls),
@@ -261,8 +343,7 @@ async def _run_arm(*, arm: str, text: str, topic: str, branches: int):
     }, content
 
 
-def _table(rounds: list[dict[str, dict]]) -> str:
-    arms = list(ARMS)
+def _table(rounds: list[dict[str, dict]], arms: list[str]) -> str:
     head = "| 指标 | " + " | ".join(
         f"{arm}#{index}" for index in range(1, len(rounds) + 1) for arm in arms) + " |"
     sep = "|---|" + "---|" * (len(rounds) * len(arms))
@@ -289,11 +370,25 @@ def _table(rounds: list[dict[str, dict]]) -> str:
         ("跨支重复（节点）", cell("duplicates")),
         ("detail 平均", cell("detail_avg")),
         ("detail 最短", cell("detail_min")),
+        ("**detail 章内贴合度**", cell("detail_affinity",
+                                     lambda v: "—" if v is None else f"{v:.1%}")),
         ("写回说明/需要", cell(
             "detail_filled",
             lambda v: v if v is not None else "—",
             pick=lambda item: f"{item['detail_filled']}/{item['detail_requested']}")),
         ("引用条数（保留）", cell("refs")),
+        ("★ 引用落点：不同区间 / 段 / 章", cell(
+            "refs_places",
+            pick=lambda item: (f"{item['refs_places']['spans']}"
+                               f" / {item['refs_places']['paragraphs']}"
+                               f"（共 {item['refs_places']['total_paragraphs']} 段）"
+                               f" / {item['chapters_hit']}"))),
+        ("第三段证据（块 / 字 / 命中节点）", cell(
+            "detail_evidence",
+            pick=lambda item: ("—" if not item.get("detail_evidence") else
+                               f"{item['detail_evidence']['blocks']}"
+                               f" / {item['detail_evidence']['chars']:,}"
+                               f" / {item['detail_evidence']['nodes_with_evidence']}"))),
         ("模型调用", cell("calls_total", pick=lambda item: "+".join(
             str(item["calls"][key]) for key in ("skeleton", "structure", "slice", "detail")))),
         ("输入 token（估）", cell("tokens", pick=lambda item: f"{item['tokens']['in']:,}")),
@@ -304,8 +399,7 @@ def _table(rounds: list[dict[str, dict]]) -> str:
         f"| {label} |{values}" for label, values in rows)
 
 
-def _coverage_table(rounds: list[dict[str, dict]]) -> str:
-    arms = list(ARMS)
+def _coverage_table(rounds: list[dict[str, dict]], arms: list[str]) -> str:
     head = "| 章 | 字数 | " + " | ".join(
         f"{arm}#{index}" for index in range(1, len(rounds) + 1) for arm in arms) + " |"
     sep = "|---" * (2 + len(rounds) * len(arms)) + "|"
@@ -331,8 +425,17 @@ async def _main(argv: list[str]) -> int:
     parser.add_argument("--topic", default=DEFAULT_TOPIC)
     parser.add_argument("--branches", type=int, default=12)
     parser.add_argument("--repeat", type=int, default=1)
+    parser.add_argument("--arms", default=",".join(DEFAULT_ARMS),
+                        help="逗号分隔，可选 " + " / ".join(ARM_ENV))
     parser.add_argument("--save", default="")
     args = parser.parse_args(argv)
+
+    arms = [item.strip() for item in args.arms.split(",") if item.strip()]
+    unknown = [item for item in arms if item not in ARM_ENV]
+    if unknown or not arms:
+        print(f"未知的 arm：{unknown or args.arms}（可选 {list(ARM_ENV)}）",
+              file=sys.stderr)
+        return 2
 
     _fill_credentials()
     os.environ["MINDMAP_EXTERNAL_KNOWLEDGE"] = "0"
@@ -344,7 +447,7 @@ async def _main(argv: list[str]) -> int:
     rounds: list[dict[str, dict]] = []
     for round_index in range(1, max(1, args.repeat) + 1):
         reports: dict[str, dict] = {}
-        for arm in ARMS:
+        for arm in arms:
             report, _content = await _run_arm(
                 arm=arm, text=text, topic=args.topic, branches=args.branches)
             reports[arm] = report
@@ -354,18 +457,21 @@ async def _main(argv: list[str]) -> int:
                 print(f"[{round_index}] {arm}: 覆盖率 "
                       f"{report['coverage_avg']:.1%}｜{report['nodes']} 节点"
                       f"（被裁 {report['cut_nodes']}）｜重复 {report['duplicates']}"
-                      f"｜detail {report['detail_avg']}｜{report['seconds']}s"
+                      f"｜引用 {report['refs_places']['refs']}"
+                      f" / 不同区间 {report['refs_places']['spans']}"
+                      f"｜detail {report['detail_avg']}（贴合 "
+                      f"{report['detail_affinity']}）｜{report['seconds']}s"
                       f"｜调用 {calls}", file=sys.stderr)
             else:
                 print(f"[{round_index}] {arm}: 失败 {report['content']}", file=sys.stderr)
         rounds.append(reports)
 
-    print(_table(rounds))
+    print(_table(rounds, arms))
     print()
-    print(_coverage_table(rounds))
+    print(_coverage_table(rounds, arms))
     print()
     for index, report in enumerate(rounds, start=1):
-        for arm in ARMS:
+        for arm in arms:
             item = report.get(arm) or {}
             if not item.get("ok"):
                 continue
@@ -374,6 +480,11 @@ async def _main(argv: list[str]) -> int:
                 print("（无）")
             for row in item["duplicate_rows"]:
                 print(f"- 「{row['label']}」出现在 {'、'.join(row['branches'])}")
+            print(f"\n### {arm}#{index} 引用落点："
+                  f"{json.dumps(item['refs_places'], ensure_ascii=False)}")
+            if item.get("detail_evidence"):
+                print(f"\n### {arm}#{index} 第三段证据："
+                      f"{json.dumps(item['detail_evidence'], ensure_ascii=False)}")
             print(f"\n### {arm}#{index} 诊断：{', '.join(item['diagnostics'])}")
             if item.get("section_slice"):
                 print(f"\n### {arm}#{index} 按章切账：{json.dumps(item['section_slice'], ensure_ascii=False)}")
@@ -389,3 +500,4 @@ if __name__ == "__main__":
         sys.stdout.reconfigure(encoding="utf-8")
         sys.stderr.reconfigure(encoding="utf-8")
     raise SystemExit(asyncio.run(_main(sys.argv[1:])))
+

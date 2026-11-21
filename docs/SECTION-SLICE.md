@@ -11,6 +11,10 @@
 ③ 说明：_fill_details 两半并发      ③ 同左，一个字都没改
 ```
 
+> ③ 那一栏有第二条路了：`MINDMAP_DETAIL_RETRIEVAL=1` 让第三段按节点在**它自己那一章内**
+> 检索证据，见 `docs/DETAIL-RETRIEVAL.md`。它只在这一条路（按章切）成立时才有意义，
+> 且默认关——**本节的全部数字都是它关着时量的**。
+
 第三段、裁剪、套色、跨支重复检测、`check()` 全部复用同一条出口：组装的 `raw` 与
 "一次写完"那条路形状相同（`{"title","root"}`）。所以两组之间**只可能**有第二段的差别。
 
@@ -208,7 +212,8 @@ full#2   引用 80 条｜引文均长 59.5 字｜实测 31.8%   天花板 34%
   整份 `model_dump()`，`tests/test_section_slice.py::test_switch_off_keeps_the_old_shape`
   是更快的那一道；
 - **第三段一行没改**：`tests/test_section_slice.py::test_switch_on_keeps_the_third_stage_system_byte_identical`
-  比的是两臂所有 `DETAIL_ONLY_PROMPT` 开头的 system，集合相等；
+  比的是两臂所有 `DETAIL_ONLY_PROMPT` 开头的 system，集合相等。`MINDMAP_DETAIL_RETRIEVAL`
+  打开时第三段的证据会换（见 `docs/DETAIL-RETRIEVAL.md`），但那是**另一个开关**，默认关；
 - **图渲染没动**：这条路产出的仍是一棵 `MindMapContent`，出口照旧 `_shape_output`；
 - **限额没动**：`INITIAL_MAX_NODES = 80` / `INITIAL_MAX_DEPTH = 3` 仍是全树的上限，
   平分只是把 80 分给 N 支。
