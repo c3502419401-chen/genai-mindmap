@@ -246,6 +246,25 @@ def test_open_breaker_blocks_the_ingest(monkeypatch):
     assert calls["count"] == 0 and not seen
 
 
+def test_chaptered_material_is_not_ingested(monkeypatch):
+    """**第五道闸**：这批材料有能用的章节目录 → 不入图，连一条查询都不发。
+
+    判据与 `_generate` 里那道 `if not outline_entries` 是同一个函数：目录可用时第三档
+    根本不会被问到，入图的产物一次都不会被读。实测（`measure_graph_ingest.py` 的形状
+    1，维基 1 份撑到覆盖率 0.718）：两份一级分支逐字相同，而这一边白付了 17.5 秒。
+    这是五道闸里唯一"拦掉的是注定零收益"的那一道。
+    """
+    calls = _fake_graph(monkeypatch, default=0)
+    seen = _fake_ingest(monkeypatch)
+    monkeypatch.setenv(GRAPH_INGEST_ENV, "1")
+    chaptered = _material(
+        "# 施工准备\n\n" + ABSTRACT_ONE + "\n\n# 管网布局\n\n" + ABSTRACT_TWO,
+        source_id="src-chaptered", filename="wikipedia: 城市雨污分流改造")
+
+    assert asyncio.run(_ingest_external_graph([chaptered])) is None
+    assert calls["count"] == 0 and not seen
+
+
 # ---------------------------------------------------------------- 3. 幂等：第三把锁
 
 
