@@ -121,7 +121,16 @@ SWITCHES = ("MINDMAP_HYBRID_SEARCH", "MINDMAP_QUERY_EXPANSION", "MINDMAP_PARENT_
             # 每条命中要多一次 embedding，见 `profile.SWITCH_ENV`），而这里的用例
             # 全部走 `no_real_http`——清空会让"默认开"那一侧的用例真的去 embed。
             # 需要它的用例自己 `setenv(..., "1")` 并替换 `embed_texts`。
-            "MINDMAP_PROFILE_RERANK")
+            "MINDMAP_PROFILE_RERANK",
+            # 第三档骨架（`tools.GRAPH_OUTLINE_ENV`）。它线上默认**开**——补的是
+            # "材料抽不出章节标题"那个缺口。这里置 0 而不是清空，理由与
+            # `MINDMAP_EXTERNAL_KNOWLEDGE` 完全相同：清空 = 默认开 = 每条"无标题
+            # 材料"的生成用例都会去问一次图存储，而宿主机上很可能正跑着一个 Neo4j
+            # （`NEO4J` 那组只清连接参数，挡不住用例自己 `setenv` 进去之后的那批）。
+            # 需要它的用例自己 `setenv(..., "1")`；"默认开"由
+            # `tests/test_graph_outline.py` 的一条专门用例（`delenv` + 直接问
+            # `graph_outline_enabled()`）钉着。
+            "MINDMAP_GRAPH_OUTLINE")
 
 # 图存储的连接参数。清空而不是设默认值：URI/USER/DATABASE 有代码默认，PASSWORD
 # 没有——"没配"必须是可见的未配置状态，否则宿主机上跑着的 Neo4j 会被单测连上。
