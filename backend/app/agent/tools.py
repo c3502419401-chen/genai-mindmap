@@ -5138,11 +5138,19 @@ def _graph_block(
 # 为什么这两件事必须分别成段而不是塞进 `DETAIL_PROMPT`：那一份有三个调用点
 # （纯主题生成、全塞、按支检索），塞进去会让另两条路也收到"按图谱分支"的要求，
 # 而它们根本没有图。
+
+# "一级分支从图谱里怎么挑"这一条**两处要用**：两段式（`GRAPH_TREE_RULES`，一次写完
+# 整棵树）与第三档骨架（`GRAPH_PLAN_RULES`，只定一级分支）。抽成常量而不是各写一遍：
+# 同一个图谱在两条路上给出不同的挑法时，A/B 就分辨不出"图谱好不好"与"规则松紧"。
+_GRAPH_BRANCH_SOURCE = (
+    "- 一级分支从「最重要的概念」里挑，优先挑**连接数高**且彼此不重复的；"
+    "概念之间是整体与部分的关系时，合成一条分支（用整体当分支名），不要拆成两条；\n"
+)
+
 GRAPH_TREE_RULES = (
     "\n这次**不用章节标题定骨架**，一级分支从 user 消息里那张图谱来：\n"
     "- 根节点是主题本身；\n"
-    "- 一级分支从「最重要的概念」里挑，优先挑**连接数高**且彼此不重复的；"
-    "概念之间是整体与部分的关系时，合成一条分支（用整体当分支名），不要拆成两条；\n"
+    + _GRAPH_BRANCH_SOURCE +
     "- 每个一级分支下面写它的具体要点；要点可以是图上与它相连的概念，"
     "也可以是材料里支持这个分支的细节；\n"
     "- 图谱只是**选材依据**，不是要照抄的清单：图上没有但材料里有的内容照样写，"
@@ -5345,6 +5353,154 @@ def _relations_from(
     return kept, drops
 
 
+# ------------------------------------------- 第三档：没有章节标题时用图谱定骨架
+#
+# ## 缺口在哪
+#
+# 骨架的第一档是**材料自带的章节**（`_skeleton_outline` → `heading_outline`，覆盖率
+# ≥ `OUTLINE_MIN_COVERAGE` 才拼）。抽不出标题时覆盖率是 0，过不了闸，`entries` 为空，
+# `_render_outline` 返回空串——于是 `PLAN_PROMPT` 里那句「材料自带章节时优先采用它们
+# 作为一级分支；**目录为空或不完整时再自行归纳**」生效。
+#
+# 问题是"自行归纳"手上什么都没有：**骨架那一次调用的输入只有主题**（正文要到第三步
+# "结构"才进 prompt，见 `_intake` 的 `full_text` 与 `_retrieve_branches`）。所以它给
+# 的是**模板词**：8 次采样（`docs/GRAPH-OUTLINE.md` 第 5 节）里，没有这一档时一级分支
+# 的**逐字忠实度是 0/24**——24 条分支没有一条能在本次材料的原文里找到；有这一档时
+# 6/23。那 24 条是「基础理论 / 医疗健康 / 金融风控 / 智能制造 / 交通出行 / 挑战与趋势」
+# 这类说法：它们对"机器学习在各领域的应用"这个主题永远成立，对**这几份材料**一条都
+# 不成立。
+#
+# ## 为什么图谱补得上
+#
+# 抽取层在**短材料**上抽得反而不差（`data/graph-ingest-report.json` 那批外部检索正文
+# 里，349 字的摘要 17 个实体 / 16 条边、111 字的 9 个 / 8 条，边∶实体 ≈ 1∶1；而
+# 2 万字的大文档是 45–53 字一个实体，反而稀）。摘要那种文本通篇是"A 是 B 的一种"
+# "A 用了 B"，抽出来正好是一张概念图——而"这份材料讲了哪几件事"正是骨架要问的。
+#
+# ## 三条闸，缺一条就会误触发
+#
+# 1. **只在第一档不可用时进**（调用方判 `not _outline_entries(sources)`）。有章节的
+#    材料一个字符都不变——那条路钉着逐字节用例（`tests/test_single_call_generate.py`、
+#    `tests/test_outline.py`）。
+# 2. **图里必须有这批材料自己的带边实体**，数量 ≥ `GRAPH_OUTLINE_MIN_ENTITIES`。
+#    判据只看 scope，**不看** `subgraph` 的返回条数：那个函数在 scope 落空时会回退
+#    全图（"好过两段式直接降级"），拿它当判据等于"库里只要有图，每批材料都算有图"。
+# 3. **图不可用就当没有这一档**（没配密码 / 连不上 / 熔断中）：退回"模型自行归纳"，
+#    与加这一档之前逐字节相同。
+#
+# ## 与两段式（`MINDMAP_GRAPH_SKELETON`）的关系
+#
+# 两段式是**整棵树都不看章节标题**：一级分支直接从图谱挑，骨架那一次调用被省掉。
+# 这一档只在"章节不可用"时接管**骨架这一次调用**——后面三步（检索 / 结构 / 说明）
+# 一个字不动，`titles` 仍由模型给（带 color / icon），所以三级分组、按支检索、
+# `_fill_details` 全部照旧。两段式那个开关管的不是这件事，所以这一档有**自己的**
+# 开关（见 `GRAPH_OUTLINE_ENV`）。
+
+GRAPH_OUTLINE_MIN_ENTITIES = 8
+"""这批材料在图里至少要有的**带边实体**数，低于它就不用图谱定骨架。
+
+实测（`data/graph-outline-probe.json`，那 15 份既无章节标题、又有正文的外部材料，
+每份自己的带边实体数）：
+
+    3  4  4  4  5  6  8  8  9  10  10  10  16  17  18      中位数 8 / 最小 3 / 最大 18
+
+取 **8（= 中位数）**，取的不是最小值：实体数不是分支数的上界，里面还夹着 `其他`
+类型的名字（`service.py`、`w1`）与按规则要合并的整体-部分对（`_GRAPH_BRANCH_SOURCE`），
+而一级分支至少要 `MIN_BRANCHES` = 3 条、请求一般要 5–6 条。按"每条分支至少有一个
+能与别的概念相连的概念"算，8 是还能给出 3 条以上互不重叠分支的下限；3–5 个实体的
+材料（那 15 份里有 5 份）最多凑出两条，与"让模型自己归纳"的差别落在噪声里。
+
+注意判据作用于**本次这一批材料的并集**（`scope` 传的是全部 source_id），不是单份：
+一次请求给三份 4 个实体的短摘要时，并集通常已经够 8 条——跨材料共享的实体在图上
+本来就是同一个节点。
+"""
+
+GRAPH_OUTLINE_HEADER = "这份材料没有章节标题，但它在图谱里有这些概念（请按它们划分一级分支）："
+"""第三档拼进骨架提示词的表头。与 `OUTLINE_HEADER` 平行、措辞必须区分开：
+说成"材料自带的章节"时模型会去原文里找章，而原文里没有。"""
+
+# 第三档的开关。**默认开**：它是补一个缺口（目录不可用那条路上模型手上没有任何
+# 结构信息），不是加一个新能力，所以默认就该生效。留着它只为两件事——A/B 要能跑
+# "没有这一档"的那一组（`scripts/measure_graph_outline.py`），以及出问题时能一键
+# 退回改动之前（`MINDMAP_GRAPH_OUTLINE=0`）。
+#
+# 与 `MINDMAP_GRAPH_SKELETON` / `MINDMAP_GRAPH_SEARCH` 的写法一致（正列举假值，
+# 默认值写在这一处）：不设变量时取默认，显式写 `0/off/false/no` 才关。
+#
+# 默认开的代价只有"配了图密码的部署"要付：`_graph_outline` 先看 `configured()`
+# （只看密码，不连库），没配图的机器这条闸一次连接都不会发。
+GRAPH_OUTLINE_ENV = "MINDMAP_GRAPH_OUTLINE"
+_GRAPH_OUTLINE_FALSY = {"0", "off", "false", "no"}
+
+
+def graph_outline_enabled() -> bool:
+    """第三档是否启用（默认 `True`）。"""
+    return os.getenv(GRAPH_OUTLINE_ENV, "1").strip().lower() not in _GRAPH_OUTLINE_FALSY
+
+
+GRAPH_PLAN_RULES = (
+    "\n这次**没有可用的章节标题**，一级分支从 user 消息里那张图谱来：\n"
+    + _GRAPH_BRANCH_SOURCE +
+    "- 图谱只是**选材依据**，不是要照抄的清单：图上没有但材料里有的内容，"
+    "归进最接近的那条分支；\n"
+    # 这一条打在"模板词"上：模型在拿不到结构时最省力的做法是套一组放到任何材料上
+    # 都成立的说法（「概述 / 现状 / 挑战 / 展望」）。要求它用图上那些**原词**，等于
+    # 要求分支名能在材料里找到依据——这也是 A/B 里"骨架忠实度"那个指标的判据。
+    "- 分支名优先用材料里的**原词**（上面这张图谱里的概念名就是材料里的词）；"
+    "要把两个概念合成一条时，用它们在材料里的说法拼，不要换成「概述 / 现状 / 挑战 / "
+    "应用前景」这类放到任何材料上都成立的空词；`service.py`、`w1` 这种抽取层的名字"
+    "不必照抄，但也不要改写成材料里没有的说法；\n"
+    "- 这一步**只定一级分支**：不写子要点、不写 relations。\n"
+)
+"""第三档的 system 尾巴。与 `GRAPH_TREE_RULES` 共用"分支从哪来"那一条
+（`_GRAPH_BRANCH_SOURCE`），差别只在收尾：那一份要模型一次写完整棵树 + relations，
+这一份只要几条分支名。给错规则时模型会照两段式输出 children，而 `_skeleton_plan`
+只认 `branches`——那一次生成会以「分支太少」失败。"""
+
+
+def _graph_outline(
+    sources: Sequence[Source],
+) -> tuple[str, int]:
+    """第三档的骨架线索：这批材料的图谱块（已带表头）；不可用时返回 `("", 0)`。
+
+    第二个返回值是**为什么没触发/触发了多少**的那笔账：实体数。它不是调试信息，
+    是诊断与测量共同要读的唯一数字（"这一档到底走没走"必须能从 `data` 里看出来，
+    否则用户只会说"图谱好像没生效"）。
+
+    四道闸按代价从低到高排，一个字节都不白花钱：
+
+      0. `graph_outline_enabled()` 为假（`MINDMAP_GRAPH_OUTLINE=0`）→ 空。A/B 的
+         那一组与"退回改动之前"都靠它；
+      1. 没有材料 → 空。没材料时模型本来就该按主题写（`DETAIL_NO_SOURCE_RULES`）；
+      2. `configured()` 为假（没配密码）→ 空，**不发起任何连接**。"这台机器不用图"
+         是部署选择，不该为它每条请求付一次连接超时；
+      3. `available()` 为假（刚连失败过、还在熔断冷却里）→ 空，同样不连；
+      4. 这批材料的带边实体数 < `GRAPH_OUTLINE_MIN_ENTITIES` → 空。
+
+    四道都过了才 `subgraph`（两条 Cypher + 一次类型回查，这是这条路上真正的花费）。
+
+    `scope` 必须传且必须与判据用的是同一份：图是跨材料共享的，不限定范围时"上一次
+    那批报销材料"的实体会混进这一次的主题。第 4 道闸已经证明 scope 有货，所以
+    `subgraph` 不会走到它自己的"回退全图"分支——**判据先行**在这里不是风格，
+    它是"取回的实体一定属于本批材料"的唯一保证。
+    """
+    if not graph_outline_enabled() or not sources:
+        return "", 0
+    if not graph_store.configured() or not graph_store.available():
+        return "", 0
+    scope = [source.id for source in sources]
+    count = graph_store.scoped_entity_count(scope)
+    if count < GRAPH_OUTLINE_MIN_ENTITIES:
+        return "", count
+    entities, links = graph_store.subgraph(
+        entities=GRAPH_ENTITY_LIMIT, links=GRAPH_LINK_LIMIT, scope=scope)
+    if len(entities) < GRAPH_OUTLINE_MIN_ENTITIES:
+        # 计数够了、取回来不够：只可能是两次查询之间图被改了（建图中途）。按不够处理，
+        # 并把取回的真实条数报上去——静默降级时的那个数字是唯一能查的证据。
+        return "", len(entities)
+    return GRAPH_OUTLINE_HEADER + "\n" + _graph_block(entities, links), len(entities)
+
+
 async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     """整树生成：**骨架一次、每支检索一次、结构一次、只写说明一到两次**。
 
@@ -5519,6 +5675,27 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         ctx.extra_model_calls += 1
         outline_entries = _outline_entries(sources)
         outline = _render_outline(outline_entries, sources)
+        # 第三档：目录不可用（`entries` 为空，含"抽不出标题"与"覆盖率不足"两种）时，
+        # 用图谱定骨架，而不是让模型凭前 200 字自行归纳。判据 / 阈值 / 代价见
+        # `_graph_outline` 那一段的注释——这里只消费它的两个出口。
+        #
+        # 为什么不在 `_outline_entries` 里就把图谱拼进去：那是个纯函数（只读原文、
+        # 不碰网络、被 `_measure` 与两级骨架的判据共用），塞一次 Neo4j 往返会让它
+        # 从"读文本"变成"读文本 + 读库"。
+        graph_outline, graph_outline_entities = "", 0
+        if not outline_entries:
+            graph_outline, graph_outline_entities = _graph_outline(sources)
+            if graph_outline:
+                outline = graph_outline
+                # 记一条 info：用户看到的分支名与他自己材料里的词对得上时，得有一条
+                # 记录说明那是"图谱定的"而不是模型瞎猜对了。降级方向不记——没图是
+                # 部署常态，沉默退回"自行归纳"（与加这一档之前逐字节相同）。
+                diagnostics.append(Diagnostic(
+                    level=DiagnosticLevel.info, code="GRAPH_OUTLINE_USED",
+                    message=(
+                        f"材料抽不出章节标题（{material_chars} 字），改用图谱里的 "
+                        f"{graph_outline_entities} 个概念定骨架。"),
+                ))
         base_plan = (
             PLAN_PROMPT if diagram_type == "tree"
             else FLOW_PLAN_PROMPT if diagram_type == "flowchart"
@@ -5544,6 +5721,12 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             diagram_type == "tree" and sections_expected > SKELETON_GROUP_THRESHOLD)
         plan_system = base_plan + (
             _group_plan_rules(sections_expected) if grouped_request else "")
+        # 第三档的规则尾巴接在 base_plan 之后、分组规则之后：它说的是"一级分支从
+        # 哪来"，与 `PLAN_PROMPT` 里那句「目录为空或不完整时再自行归纳」直接对冲，
+        # 越靠后越压得住那句（模型对紧挨着输出位置的规则更敏感）。
+        # 有章节标题时**一个字都不加**，那条路逐字节不变。
+        if graph_outline:
+            plan_system += GRAPH_PLAN_RULES
         # 没有可检索材料时补那两句纯文本契约（与 `_generate_deep` 的骨架段同一条
         # 判定）：它们不含输出格式，不会与 `PLAN_PROMPT` 的"只返回 branches"打架。
         if not sources:
@@ -6651,6 +6834,21 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         return _fail("budget_exhausted", "本次运行的模型调用额度已用完，连骨架都出不了，无法分片生成。")
     ctx.extra_model_calls += 1
     outline = _skeleton_outline(sources) if slicing else ""
+    # 第三档（`_graph_outline`）在这里**必须同步接**：分片与整树共用骨架那一次调用
+    # 的输入，只接一条会得到一个"两个入口对同一批材料给出不同骨架来源"的分叉，
+    # 而那种分叉只在把分片重新注册到 `create` 的那天才暴露（见 `AGENTS.md` 关于
+    # 两条生成路的那条要求）。判据与整树那条完全一样：目录不可用时才问图谱。
+    graph_outline = ""
+    if slicing and not outline:
+        graph_outline, graph_outline_entities = _graph_outline(sources)
+        if graph_outline:
+            outline = graph_outline
+            diagnostics.append(Diagnostic(
+                level=DiagnosticLevel.info, code="GRAPH_OUTLINE_USED",
+                message=(
+                    f"材料抽不出章节标题（{material_chars} 字），改用图谱里的 "
+                    f"{graph_outline_entities} 个概念定骨架。"),
+            ))
     # ---- 图型的唯一判定点 -------------------------------------------------------
     # **请求给了就用请求的，没给才用工具参数。** 这一行是"用户说了画流程图"能被
     # 兑现的全部原因：模型看不见界面，`diagram_type` 这种"可以填也可以不填"的工具
@@ -6693,6 +6891,10 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     )
     plan_system = base_plan if slicing else (
         base_plan + "\n" + CONTENT_FREEDOM_CONTRACT + DETAIL_NO_SOURCE_RULES)
+    # 与整树那条同一句、同一位置（理由见 `_generate` 里那段注释）：它要在
+    # `PLAN_PROMPT` 的「目录为空时自行归纳」之后，才压得住那一句。
+    if graph_outline:
+        plan_system += GRAPH_PLAN_RULES
     try:
         raw_plan = await ask_model(
             plan_system,

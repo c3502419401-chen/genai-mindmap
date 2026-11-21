@@ -1337,6 +1337,57 @@ CYPHER_SUBGRAPH_TYPES = (
     "RETURN name, head(collect(DISTINCT e.type)) AS type"
 )
 
+# 这批材料在图里**有多少个带连接的实体**。只回答一个问题："这一批值不值得拿图谱
+# 当结构线索"，不取名字、不取类型、不取边。
+#
+# **为什么不复用 `subgraph` 再数它返回了几条**：那个函数在 `scope` 一条都对不上时
+# 会**回退全图**（见它的 docstring，"好过两段式直接降级成三段式"）。拿它当判据等于
+# "库里只要有任何一张图，每一批材料就都算有图"——而"这批材料没入过图"恰恰是本函数
+# 要区分的那件事。判据必须只看 scope。
+#
+# 口径与 `CYPHER_TOP_ENTITIES` 一个字不差（`MATCH (a)-[r:REL]-()` 无向匹配会为每条边
+# 产生两个方向的行，所以 `DISTINCT a.name` 就是两端并集；孤立实体度 0、没有边就不
+# 出现）。两处口径分叉时，"判定说有图、取子图却是空"会变成一条无声的降级。
+CYPHER_COUNT_SCOPED_ENTITIES = (
+    f"MATCH (a:{ENTITY_LABEL})-[r:{EDGE_TYPE}]-()\n"
+    "WHERE $source_ids IS NULL OR r.source_id IN $source_ids\n"
+    "WITH DISTINCT a.name AS name\n"
+    "RETURN count(name) AS n"
+)
+
+
+def scoped_entity_count(scope: Sequence[str] | None = None) -> int:
+    """这批材料在图里有多少个**带连接**的实体；读不到图返回 0。
+
+    它是 `subgraph` 的**判据前驱**：`subgraph` 只能回答"图里有什么"，回答不了
+    "这批材料在图里有没有东西"——它在 scope 为空时回退全图。要用图谱定骨架就得先
+    知道这一问，否则每一批没入过图的材料都会拿到别的材料的概念清单。
+
+    三条与 `subgraph` 对齐的约定：
+
+      - `scope` 为空时数**全图**（与 `subgraph(scope=None)` 同义：不限定材料就
+        不限定范围）；
+      - 只数**带连接**的实体。孤立实体在这条路上没有用：骨架要的是"哪些概念彼此
+        相连"，一个不跟任何东西相连的名字撑不起一级分支；
+      - 读不到库（没配密码 / 连不上 / 超时）返回 0、记一条 warning，**不抛**。
+        "判定说有图"与"取子图拿到东西"必须是同一批数据决定的，而"库坏了"在这条
+        判定上与"没入过图"同一个结果：这一次不用图谱定骨架。区别只在日志里。
+
+    调用方还应当先看 `configured()` / `available()`：没配图是部署选择，不该为它
+    每条请求付一次连接超时（熔断计数在 `_session` 里，本函数只负责折成 0）。
+    """
+    names_scope = list(scope) if scope else None
+    try:
+        with _transaction(read_only=True) as transaction:
+            record = transaction.run(
+                CYPHER_COUNT_SCOPED_ENTITIES, {"source_ids": names_scope}).single()
+    except (GraphStoreError, OSError) as exc:
+        # `GraphStoreError` 是 `OSError` 的子类，两个都写是为了与 `subgraph` 一致：
+        # 那里也把两种都接住（库坏了 / 磁盘读不到），因为它们的后果相同。
+        logger.warning("图谱实体计数不可用：%s", type(exc).__name__)
+        return 0
+    return int(record["n"]) if record is not None else 0
+
 
 def subgraph(
     *, entities: int = 60, links: int = 120, scope: Sequence[str] | None = None,
