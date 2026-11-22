@@ -6973,7 +6973,7 @@ def _graph_outline(
 # 前三档（章节 / 清单 / 图谱）都是**整批材料一个结论**：`_outline_entries` 把全部
 # 材料拼成一份目录再裁剪，`_graph_outline_attempt` 也只看"这批材料在图里有没有实体"。
 # 于是一批材料里只要有**一部分**能抽出章节，另一部分的去处就没有人问。实测（库里
-# 那 29 份材料，`data/_probe_mixed.py` 与 `scripts/measure_mixed_skeleton.py`）：
+# 那 29 份材料，`scripts/measure_mixed_skeleton.py --probe`）：
 #
 #     只有 markdown（4 份 / 66,536 字）        30 条章节，覆盖 0.91
 #     只有 paper（20 份 / 6,658 字）            0 条（没有标题）
@@ -7025,9 +7025,9 @@ GRAPH_SUPPLEMENT_MAX_ITEMS = 8
 
 数与 `GRAPH_OUTLINE_MIN_ENTITIES`（8）刻意相同，但含义不同：那一头是"够不够定义整副
 骨架"，这一头是"补一个缺口的预算"。上限必须有——实测这 20 份无章节材料在图里有
-**169 个带边实体**、`subgraph` 按度数取回 60 个（`data/_probe_mixed.json`），整段塞进
-提示词是 2,489 字，会把 30 条章节压成背景，也让模型在 60 个名字里挑分支。8 条与
-"每条分支至少有一个能与别的概念相连的概念 + 请求一般 5–8 支"同一量级。
+**169 个带边实体**、`subgraph` 按度数取回 60 个（`scripts/measure_mixed_skeleton.py
+--probe`），整段塞进提示词是 2,489 字，会把 30 条章节压成背景，也让模型在 60 个名字里
+挑分支。8 条与"每条分支至少有一个能与别的概念相连的概念 + 请求一般 5–8 支"同一量级。
 """
 
 GRAPH_SUPPLEMENT_HEADER = "这几份材料没有章节标题，但它们在图谱里有这些概念（每一份都要有分支指向）："
@@ -7138,7 +7138,7 @@ def _merge_chapter_entries(pairs: Sequence[tuple[Source, list[Any]]]) -> list[An
     为什么不直接用 `heading_outline`：它按 coverage 挑前 30 条，**挑的粒度是整批**
     ——一份 6 章的材料在同批的大文档面前可能一条都留不下，那与"无章节被丢掉"是同一个
     缺陷的另一种形状（实测纯 markdown 批没有触发：41 条裁到 30 条时四份各剩 8/4/11/7，
-    `data/_probe_mixed.py` 的读数）。所以这里的顺序是：
+    `scripts/measure_mixed_skeleton.py --probe` 的读数）。所以这里的顺序是：
 
       1. **先占位**：每份材料 coverage 最大的那一章无条件入选；
       2. **去重**：跨材料的同名章节只留先出现的那一条（模型最后只会画一条分支，

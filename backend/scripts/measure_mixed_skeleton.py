@@ -77,6 +77,23 @@ def _fixtures(rows: list, loaded: list) -> dict[str, list]:
     }
 
 
+def _kept_per_source(sources: list, kept: list) -> dict[str, int]:
+    """整批裁剪之后，**每份材料**各留下几条标题。
+
+    `_merge_chapter_entries` 的"每份至少留一条"就是冲着这一列来的：旧路径按 coverage
+    挑前 30 条，粒度是整批，小材料可以被整批挤光（这个脚本在纯 markdown 批上量到
+    `8/4/11/7`——四份都在，所以那条缺陷在纯章节批上**没有触发**，混批才是它的形状）。
+    """
+    from app.knowledge.service import heading_outline
+
+    titles = {entry.title for entry in kept}
+    return {
+        (source.filename or source.id)[:24]: len(
+            [entry for entry in heading_outline([source]) if entry.title in titles])
+        for source in sources
+    }
+
+
 def probe(rows: list, loaded: list) -> dict:
     """§二：五组材料的现状、分组结果、图谱补充条数与合并后的总数。"""
     from app.agent import tools as tools_module
@@ -98,6 +115,13 @@ def probe(rows: list, loaded: list) -> dict:
             "entries": len(entries), "coverage": round(share, 4),
             "usable": len(usable),
         })
+        if len(sources) > 1 and entries:
+            kept = _kept_per_source(sources, usable)
+            if all(count > 0 for count in kept.values()):
+                # 只对"全都有目录"的批有意思：混批里无章节那几份恒为 0（那不是缺陷，
+                # 是它们本来就没有标题），打出来只是噪声。
+                print(f"{'':<30} 裁完之后每份各剩：{kept}", flush=True)
+                report["fixtures"][-1]["kept_per_source"] = kept
 
     print("\n=== 分组（每份单独判：目录非空且覆盖 ≥ 60%）===", flush=True)
     for name, sources in fixtures.items():
