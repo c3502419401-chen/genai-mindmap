@@ -518,11 +518,35 @@ def attach_refs(
     return attached
 
 
-def summarize(report: VerifyReport, sources: Sequence[Source]) -> dict[str, Any]:
+def _source_names(sources: Sequence[Source], limit: int = 3) -> str:
+    """这批正文来自哪几个站，拼成 `"example.org、ccf.org.cn"`。
+
+    取 `Source.metadata.tags` 的第二项（站点名，`_external_source` 把它塞在那里），
+    没有就退回 `filename` 的前缀（`"deepseek: 碳中和"` → `deepseek`），再取不到就说
+    "外部"。只用于给人看的那句话：一句"依据来自这几篇"里，站名比标题更能说明
+    "这是百科/学校教务页/论文库"——而"4 篇正文不对题"正是这一步最主要的失败面。
+    """
+    names: list[str] = []
+    for source in sources:
+        tags = list(source.metadata.tags or [])
+        name = (tags[1] if len(tags) > 1 else "") or (
+            (tags[0] if tags else (source.filename or "").split(":", 1)[0]).strip())
+        if name and name not in names:
+            names.append(name)
+        if len(names) >= limit:
+            break
+    return "、".join(names)
+
+
+def summarize(report: VerifyReport, sources: Sequence[Source]) -> str:
     """核对这一步给人看的那一句话。
 
     三句话术各自对应一个要去做的动作，不能合并：`contradicted` 要人去看那两条，
-    `unverified` 多半是"这个题太小众"，`supported` 是常态。一条都没有时说明为什么。
+    `unverified` 多半是"这个题太小众"，`supported` 是常态。一条都没有时说明为什么
+    ——"没做"与"做了但一条都没判出来"必须分得开，前者重试有用、后者重试没用。
+
+    `sources` 只用来报站名（`_source_names`）：用户看到"4 篇正文"时，唯一能判断
+    "这几篇够不够权威"的信息就是它们来自哪里。
     """
     states = report.states
     if report.skipped == "no_articles":
@@ -531,7 +555,9 @@ def summarize(report: VerifyReport, sources: Sequence[Source]) -> dict[str, Any]
         return "核对没有做：这棵树没有可判的节点"
     if not report.judged:
         return "核对没有做：模型没有给出任何一条可用的判定"
-    parts = [f"已用一次联网搜索核对 {report.judged} 个节点（{report.articles} 篇正文）"]
+    where = _source_names(sources)
+    parts = [f"已用一次联网搜索核对 {report.judged} 个节点"
+             f"（{report.articles} 篇正文{'' if not where else '，来自 ' + where}）"]
     if states[SUPPORTED]:
         parts.append(f"{states[SUPPORTED]} 个在正文里找得到支持"
                      + (f"（其中 {report.attached} 个已挂上逐字引用）"
