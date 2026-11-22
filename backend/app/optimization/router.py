@@ -33,6 +33,12 @@ class CheckResponse(BaseModel):
 
 class CheckRequest(SaveRequest):
     sources: list[Source] | None = Field(default=None, max_length=50)
+    # 当前这张图在库里的 id。**只被跨图参照用**：历史库要从参照物里排除"这张图
+    # 自己"，否则同一张图保存两次之后，每个节点都能在"历史"里找到一模一样的一条，
+    # 建议会变成一堆"另一张图写了 140 字"（那张图就是它上一版）。
+    #
+    # 可缺省：新建未保存的图没有 id，前端也就没有东西可传；那时天然不会命中自己。
+    map_id: str | None = Field(default=None, max_length=64)
 
     @model_validator(mode="after")
     def unique_sources(self) -> "CheckRequest":
@@ -51,5 +57,5 @@ def check_map(body: CheckRequest):
 def suggest_for_map(body: CheckRequest):
     """给出候选修改列表。用户确认后才能应用（当前无自动应用接口）。"""
     content = _tree_content(body.content)
-    return SuggestResponse(suggestions=suggest(content),
+    return SuggestResponse(suggestions=suggest(content, map_id=body.map_id),
                            diagnostics=check(content, body.sources))

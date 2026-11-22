@@ -14,3 +14,7 @@ xlrd>=2,<3
 # 图存储（app/knowledge/graph_store.py）。5.x 与 6.x 的异常树不一样（6.0 起
 # ServiceUnavailable 不再属于 Neo4jError），代码两边都兼容，见 _session 的 docstring
 neo4j>=5.14,<7
+# 跨图参照的矩阵乘（app/optimization/cross_map.py）。docling 会把它带进来，那是传递依赖：
+# 那条链换掉时这里静默变成 ImportError，而失败只表现为「这一类建议不出现」。
+# 显式写一行。
+numpy>=1.26

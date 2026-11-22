@@ -818,6 +818,8 @@ export interface components {
             truncated: number;
             /** Sources */
             sources?: components["schemas"]["Source"][] | null;
+            /** Map Id */
+            map_id?: string | null;
         };
         /** CheckResponse */
         CheckResponse: {
@@ -2197,7 +2199,7 @@ export interface components {
          *     节点级的两件事，混进 `fill` 会让按钮文案说不清要点哪里。
          * @enum {string}
          */
-        SuggestionKind: "dedupe" | "merge" | "link" | "fill" | "drop" | "expand" | "add_detail";
+        SuggestionKind: "dedupe" | "merge" | "link" | "fill" | "drop" | "expand" | "add_detail" | "cross_map";
         /** Theme */
         Theme: {
             /**

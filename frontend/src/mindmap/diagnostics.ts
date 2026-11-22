@@ -100,6 +100,7 @@ export const SUGGESTION_KIND_LABELS: Record<string, string> = {
   drop: '剔除无依据',
   expand: '再展开一层',
   add_detail: '补说明',
+  cross_map: '同类图参照',
 };
 
 /**
@@ -115,6 +116,7 @@ export const SUGGESTION_KIND_LABELS: Record<string, string> = {
 export const MANUAL_KINDS: Record<string, string> = {
   expand: '这一类要按需展开：选中那个节点，点工具条上的「展开」',
   add_detail: '这一类要走 AI 生成：选中节点后用「改这个节点」让它补说明',
+  cross_map: '依据来自你库里别的图：点开那张图，看它是怎么展开这一节的',
 };
 
 export function suggestionKindLabel(kind: string): string {

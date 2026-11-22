@@ -476,12 +476,19 @@ def check(content: MindMapContent, sources: list[Source] | None = None) -> list[
     return diagnostics
 
 
-def suggest(content: MindMapContent, *, use_model: bool | None = None) -> list[Suggestion]:
+def suggest(
+    content: MindMapContent, *, use_model: bool | None = None,
+    use_cross_map: bool | None = None, map_id: str | None = None,
+) -> list[Suggestion]:
     """把诊断结果转成用户可确认的候选修改。
 
     `use_model`：`None` 走环境变量（`MINDMAP_OPTIMIZATION_LLM`，缺省关），
     `True` / `False` 显式开关（调用方与测试用）。关掉之后这一层**一次调用都不
     发生**，也不需要网络。
+
+    `use_cross_map` / `map_id`：第四层判据（跨图参照，见
+    `optimization/cross_map.py`）。同样是 `None` 走环境变量、缺省关；
+    `map_id` 只用来把"这张图自己"从历史库里排除。
 
     建议不自动应用——见模块 docstring 的两条路。
     """
@@ -502,6 +509,14 @@ def suggest(content: MindMapContent, *, use_model: bool | None = None) -> list[S
 
     if _should_use_model(content, use_model):
         suggestions.extend(_model_suggestions(content, rule_pairs))
+
+    # 延迟导入：关闭时 `cross_map` 与它依赖的 numpy / 数据库都不进 import 图
+    # （与模型层"关闭即零开销"同一条规矩）。
+    from app.optimization import cross_map
+
+    enabled = (use_cross_map if use_cross_map is not None else cross_map.enabled())
+    if enabled:
+        suggestions.extend(cross_map.suggestions(content, map_id=map_id, enabled=True))
     return suggestions
 
 

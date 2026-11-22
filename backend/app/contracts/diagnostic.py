@@ -43,6 +43,13 @@ class SuggestionKind(str, Enum):
     drop = "drop"              # 剔除无依据节点
     expand = "expand"          # 把这一支再展开一层
     add_detail = "add_detail"  # 给节点补说明
+    # 依据来自**别的图**：同类图里这个节点被展开了 / 写得更详细。
+    #
+    # 与 `expand` / `add_detail` 分开而不是合并：动作指引可能一样，但用户在界面
+    # 上要能分辨"这是从别的图学来的"——它依赖历史图库，图库空的时候这一类整类
+    # 不出现，而 `expand`（同级里别的分支更深）与图库无关。混成一个值，用户点开
+    # 一条建议时无法判断"这条需不需要联网"。
+    cross_map = "cross_map"    # 参照历史图库里的同类节点
 
 
 class Suggestion(BaseModel):
