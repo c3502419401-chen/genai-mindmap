@@ -2981,7 +2981,23 @@ def _render_outline(entries: Sequence[Any], sources: list[Source]) -> str:
 # "该分几块"，需要的是**件数与长度**，不是内容。前三种给内容的方式在这里都是浪费
 # ——章节标题行是原文子集但要材料有标题，全塞要 5 万字以内，`_material_inputs` 的
 # 200 字只在 `MINDMAP_QUERY_EXPANSION` 打开时才走（默认关）。
-INVENTORY_HEADER = "这次的材料（共 {count} 份，合计 {chars} 字{note}）："
+INVENTORY_HEADER = "这次的材料（合计 {chars} 字{note}）："
+"""**表头不报份数**——这是 `c5465fd9` 之后修的一个实测缺陷（`docs/GRAPH-SCALE.md` 第 11 节）。
+
+原来写的是「这次的材料（共 2 份，合计 424 字…）」。那批 16 份的 A/B 里它是有用的
+（模型因此把一级分支从模板词换成了真实篇目），但在**薄批**上它是灾难：两份
+openalex 摘要（210 + 214 字）时，模型把表头那个「2」当成"这次有几个方面"，
+直接给 2 条一级分支 —— 而 `MIN_BRANCHES = 3`，那次生成当场判废。实测（同进程
+交替，每臂 3 次，`scripts/probe_plan_inventory.py`）：
+
+    清单开（旧表头）  3 支 / 判废 / 判废
+    清单关            6 支 / 6 支 / 6 支
+
+材料明明撑得住 6 支（清单关时三次都给了 6），所以根因不是"内容单薄"，是那个数字。
+模型需要知道的只是"有哪些东西、各多长"，份数是编目事实、对"分几支"没有信息量；
+规模已经由**行数与每行字数**表达，截断时另有「还有 N 份未列出」一行兜底
+（`INVENTORY_MAX_LINES` 那段注释：上限不许藏住规模）。删掉它不丢信息，只丢一个锚。
+"""
 
 # 没有可用结构块时补的那半句。措辞必须与 `OUTLINE_MIN_COVERAGE` 那道闸对齐：
 # 覆盖不足时目录同样不拼，"没有可用的章节标题"对"抽不出标题"与"覆盖率不够"两种
@@ -3049,7 +3065,7 @@ def _material_inventory(sources: list[Source], *, has_structure: bool) -> str:
         return ""
     total = sum(len(text) for _, text in rows)
     header = INVENTORY_HEADER.format(
-        count=len(rows), chars=f"{total:,}",
+        chars=f"{total:,}",
         note="" if has_structure else INVENTORY_NO_STRUCTURE,
     )
     lines = [header]
@@ -3086,6 +3102,13 @@ INVENTORY_RULES = (
     "上面这些材料是**一堆彼此独立的篇目**，不是同一份长文的各节——一级分支按"
     "「里面有几件互不相同的事」来分：讲不同事情的篇目分到不同分支下，"
     "讲同一件事的几篇合进一支；一篇里讲了几个互不相同的方面，也算几件。"
+    # 最后这一句是 `docs/GRAPH-SCALE.md` 第 11 节那个缺陷的第二道闸。表头已经不报
+    # 份数（`INVENTORY_HEADER`），但清单里仍是**一行一份**：行数照样是一个可数的锚。
+    # 把「份数 ≠ 分支数」写成一句独立的话，是因为原来那句"一篇里讲了几个方面，
+    # 也算几件"埋在一个长句的末尾、还用了"也"字（读起来像补充说明）。实测两种
+    # openalex 摘要时模型给的正是"2 份 → 2 支"，而它这 424 字里真有五六件事。
+    "**材料的份数不是分支数**：行数只说编目，不说该切几块——两篇摘要里也可能讲着"
+    "五六件互不相同的事，不要按行数把分支数对齐。"
 )
 
 

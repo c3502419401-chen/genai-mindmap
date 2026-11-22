@@ -215,7 +215,10 @@ def test_skeleton_sees_the_material_inventory():
 
     assert result.ok, result.content
     plan_user = seen[0][1]
-    assert f"这次的材料（共 1 份，合计 {chars:,} 字" in plan_user
+    # 表头只报字数、不报份数（`docs/GRAPH-SCALE.md` 第 11 节：那个数字在薄批上会被
+    # 读成"该切几条分支"，两份摘要 → 两条分支 → `MIN_BRANCHES` 判废）。
+    assert f"这次的材料（合计 {chars:,} 字" in plan_user
+    assert "份，" not in plan_user.split("这次的材料", 1)[1].split("\n", 1)[0]
     assert "1. 机器学习讲义.md" in plan_user
     # 清单在主题之后、条数要求之前（顺序即权重），并且带上了"怎么用这个数"那句
     assert (plan_user.index(TOPIC) < plan_user.index("这次的材料")

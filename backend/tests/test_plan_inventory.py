@@ -49,7 +49,7 @@ def test_inventory_lists_name_and_length_but_no_body():
     block = _material_inventory(sources, has_structure=False)
 
     assert block.splitlines()[0] == INVENTORY_HEADER.format(
-        count=2, chars=f"{len(sources[0].text) + len(sources[1].text):,}",
+        chars=f"{len(sources[0].text) + len(sources[1].text):,}",
         note=INVENTORY_NO_STRUCTURE)
     assert "  1. openalex: 心血管.pdf（240 字）" in block
     assert "  2. crossref: 电力负荷.pdf（91 字）" in block
@@ -71,17 +71,34 @@ def test_truncation_still_reports_the_true_scale():
 
     这是 `INVENTORY_MAX_LINES` 与 `MAX_MATERIALS` 不能共用的全部理由：那个 10 是
     "每份 200 字正文"的预算，这里的每行只带结构，上限可以宽，而**总数永远不许截**。
+
+    报总数的位置换过一次（`docs/GRAPH-SCALE.md` 第 11 节）：原来是表头「共 N 份」，
+    现在是末尾那句「还有 N 份未列出」＋清单里实际列出的行数。换的原因是表头那个
+    数字在**薄批**上会被读成"该切几条分支"（两份摘要 → 两条分支 → 判废），
+    而截断这一侧的算术没变：行数 + 还有几份 = 总数。
     """
     total = INVENTORY_MAX_LINES + 6
     sources = [_source(f"m{index}.md", "字" * 100) for index in range(total)]
     block = _material_inventory(sources, has_structure=True)
     lines = block.splitlines()
 
-    assert lines[0] == INVENTORY_HEADER.format(
-        count=total, chars=f"{total * 100:,}", note="")
+    assert lines[0] == INVENTORY_HEADER.format(chars=f"{total * 100:,}", note="")
     assert len(lines) == 1 + INVENTORY_MAX_LINES + 1
     assert lines[1] == "  1. m0.md（100 字）"
     assert lines[-1] == "  （还有 6 份未列出，合计 600 字）"
+
+
+def test_header_reports_scale_but_never_the_count():
+    """表头**不许再出现份数**：那个数字在薄批上会被读成维度数（第 11 节实测）。
+
+    钉住的不是措辞而是判据：表头里只有字数。份数仍可从"列了几行 + 还有几份"里
+    算出来，所以删掉它不丢规模——这条用例正是防止有人"顺手补回来"。
+    """
+    sources = [_source(f"m{index}.md", "字" * 100) for index in range(2)]
+    header = _material_inventory(sources, has_structure=False).splitlines()[0]
+
+    assert header == "这次的材料（合计 200 字，没有可用的章节标题）："
+    assert "份" not in header.split("，")[0]
 
 
 def test_structure_note_only_when_there_is_no_structure_block():

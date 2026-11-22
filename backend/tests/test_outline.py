@@ -399,8 +399,10 @@ def test_outline_is_absent_when_material_has_no_outline():
     # 主题 → 清单 → 条数要求。这条断言在加清单之前是"主题后面直接跟条数要求"，
     # 加清单之后中间多了一段——**这是本次改动的意图**，不是回归；"没有材料时逐字节
     # 不变"那条不变量由 `test_plan_ask_without_outline_is_unchanged` 单独钉着。
+    # 表头不含份数：那个数字在薄批上会被读成"该切几条分支"（`docs/GRAPH-SCALE.md`
+    # 第 11 节），所以逐字节钉住的这一行只剩字数。
     assert model.plan_user.startswith(
-        "主题：管理办法\n\n这次的材料（共 1 份，合计 1,400 字，没有可用的章节标题）：")
+        "主题：管理办法\n\n这次的材料（合计 1,400 字，没有可用的章节标题）：")
     assert model.plan_user.index("这次的材料") < model.plan_user.index("最多 3 条")
 
 
