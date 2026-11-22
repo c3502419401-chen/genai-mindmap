@@ -7823,6 +7823,19 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     # 见 `_search_branch`），而全文进 prompt 之后，材料里每一段都在模型的上下文里，
     # 覆盖率不再取决于它的 query 写得好不好。代价是输入 token（见
     # `FULL_TEXT_MATERIAL_CHARS` 的成本口径），所以闸门按实测的注意力拐点定。
+    #
+    # ★ **全塞 = 不要检索，正文就是依据。** 下面那道 `if` 不是"条件没满足"而是
+    # **刻意跳过**：全塞时一次 `search_parent` / `search_multi` 都不发，`sections`
+    # 换成 `_full_text_sections(sources)`（每份材料一整节）。这也是这一步唯一的收益
+    # 来源——省下的那些检索调用与向量往返正好可以付给生成之后那一次核对
+    # （`_verify_after_generate`）：**同一笔钱从"召回材料"换成"核对这棵树"**。
+    #
+    # 一条边界（实测见 `scripts/measure_fulltext_retrieval.py`，文档
+    # `docs/GENERATION-VERIFY.md` 第 3 节）：第三段那条按节点章内检索
+    # （`MINDMAP_DETAIL_RETRIEVAL`）另有一道前置条件 `chapters`——它是按章切出来的，
+    # 而按章切要求"恰好一份材料且能抽出目录"。所以**多份材料全塞时三条检索路径全是
+    # 0 次**；但一份带标题的小 markdown 会让全塞与按章切同时成立，那时第三段仍然会
+    # 检索（那是另一条路的开关，不归这里管）。
     evidences: list[_BranchEvidence | None] = []
     retrieval_queries: list[str] = []
     expansions: dict[str, list[str]] = {}
