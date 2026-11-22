@@ -130,7 +130,11 @@ SWITCHES = ("MINDMAP_HYBRID_SEARCH", "MINDMAP_QUERY_EXPANSION", "MINDMAP_PARENT_
             # 需要它的用例自己 `setenv(..., "1")`；"默认开"由
             # `tests/test_graph_outline.py` 的一条专门用例（`delenv` + 直接问
             # `graph_outline_enabled()`）钉着。
-            "MINDMAP_GRAPH_OUTLINE")
+            "MINDMAP_GRAPH_OUTLINE",
+            # 每段说明的字数伸缩（`budget.DETAIL_SCALE_ENV`）。置 0 = 80–150 的现状
+            # 区间：宿主机上留着 `MINDMAP_DETAIL_SCALE=1` 时，每条生成用例的第三段
+            # 提示词都会悄悄换一个区间，而断言里那些"80–150 字"逐字比的就是它。
+            "MINDMAP_DETAIL_SCALE")
 
 # 图存储的连接参数。清空而不是设默认值：URI/USER/DATABASE 有代码默认，PASSWORD
 # 没有——"没配"必须是可见的未配置状态，否则宿主机上跑着的 Neo4j 会被单测连上。

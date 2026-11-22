@@ -35,6 +35,8 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Any
 
 from app.contracts.mindmap import GENERATED_LABEL_MAX_CHARS
 
@@ -250,6 +252,142 @@ def initial_nodes(
     return ceiling
 
 
+# ---------------------------------------------------------------- 每节点说明字数随材料伸缩
+#
+# 上一轮只把**节点数**接上了材料（`MINDMAP_NODE_SCALE`），每段说明的长度仍是常量，
+# 于是同一批材料上两条路都还是配额驱动：
+#
+#     48 节点 × 130 字（现状实测均长）= 6,240 字 · 材料 5,616 字 → κ 0.90（还是膨胀）
+#
+# `INITIAL_MAX_NODES` 与 `DETAIL_MIN_CHARS/MAX_CHARS` 各占膨胀的一半，只动一个等于
+# 只关掉半扇门。这里的算术与 `scaled_initial_nodes` 同源但方向相反：那边问"材料有多少、
+# 该摊出几个节点"，这边问"这一次的节点有多少材料撑着、每段说明该写多长"。
+#
+#     support 支撑   = 材料字数 / 这一次要写的节点数
+#     mean    目标均长 = support / κ目标        （κ = 材料字数 / Σdetail，与监控同一个方向）
+#     hi      上限   = mean / 0.867            ← 实测：现状 [80,150] 的均长是 130
+#     lo      下限   = 0.533 × hi              ← 实测：80/150
+#
+# 两条比例不是拍的，是**从现状反解出来的**：把 mean=130 代进这两条式子，得到
+# [80, 150]——也就是"不打开关时这条公式的产物就是现状"，开关只是把 mean 换成材料给的量。
+#
+# 下限为什么不能再低：`DETAIL_ONLY_PROMPT` 要求"至少 3 句完整的话"，而实测一句完整
+# 中文说明约 25 字（130 字 / 5 句），3 句 = 75 字。所以 80 这个数**本来就是 3 句的
+# 四舍五入**，能降的空间只有 5 个字——它不是配额，是质量线。字数伸缩于是有一道与
+# 材料无关的地板（`DETAIL_SENTENCE_FLOOR`）：材料撑不住时，该减的是节点数
+# （`MINDMAP_NODE_SCALE`），不是把一段完整说明压成一句半。
+DETAIL_SCALE_ENV = "MINDMAP_DETAIL_SCALE"
+
+#: 目标压缩比 κ = 材料字数 / Σdetail。1.0 = 说明总量与材料等量（既不膨胀也不压缩）。
+#: 取 1.0 而不是 1.2：κ 是本仓库一直在量的那个数（`measure_quad` 的 `compression`），
+#: 目标直接写成同一个量的 1.0，A/B 出来的 κ 与它就是同一个数，不需要再换算。
+DETAIL_SCALE_KAPPA = 1.0
+
+#: 现状区间 [80,150] 上实测的均长是 130，于是均长/上限 = 0.867、下限/上限 = 0.533。
+#: 只有**一个**标定点这件事要记住：130 来自 42 次采样的均值（`docs/ONE-CALL.md`
+#: 与 `data/scale-quad-medium.json` 的 113–130）。换模型或换语言要重标。
+DETAIL_MEAN_TO_HI = 0.867
+DETAIL_LO_TO_HI = 0.533
+
+#: 一句完整中文说明的实测均长。3 句 = 75 字，就是 `DETAIL_MIN_CHARS = 80` 的出处。
+DETAIL_SENTENCE_CHARS = 25
+DETAIL_MIN_SENTENCES = 3
+DETAIL_SENTENCE_FLOOR = DETAIL_SENTENCE_CHARS * DETAIL_MIN_SENTENCES
+
+
+@dataclass(frozen=True)
+class DetailSpan:
+    """这一次"每段说明写多长"的区间与它的来处。
+
+    为什么不直接返回 `(min, max)`：这个区间的两个数都是算出来的，而"为什么这一次是
+    75–135"必须能从 `data` 里读出来——否则事后看到一棵说明偏短的树，分辨不出是模型
+    没听话还是这次就要它短。`support` 与 `kappa` 就是那两个因。
+    """
+
+    min_chars: int
+    max_chars: int
+    #: 这个区间折出来的**目标均长**（不是材料支撑本身）：[75,135] → 117、[80,150] → 130。
+    #: 与 `support` 分开两个字段，是因为"材料每节点摊到 832 字"与"这次让模型写 130 字"
+    #: 恰恰是这条伸缩最重要的两个读数——大材料上它们差 6 倍，而 κ 5.45 就来自这个差。
+    mean_chars: int
+    support: float
+    kappa: float
+    sentences: int = DETAIL_MIN_SENTENCES
+    #: 开关是否真的接管了这一次。False 时 `min/max` 就是 `DETAIL_MIN_CHARS/MAX_CHARS`，
+    #: 提示词与出账与加这个开关之前逐字节相同。
+    scaled: bool = False
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "min": self.min_chars, "max": self.max_chars,
+            "mean": self.mean_chars, "support": round(self.support, 1),
+            "kappa": self.kappa, "sentences": self.sentences,
+        }
+
+
+def default_detail_span(*, floor_chars: int, ceiling_chars: int) -> DetailSpan:
+    """现状区间：`[DETAIL_MIN_CHARS, DETAIL_MAX_CHARS]`，均长按同一个 0.867 折出来。"""
+    return DetailSpan(
+        min_chars=floor_chars, max_chars=ceiling_chars,
+        mean_chars=int(round(ceiling_chars * DETAIL_MEAN_TO_HI)),
+        support=0.0, kappa=DETAIL_SCALE_KAPPA)
+
+
+def detail_scale_enabled() -> bool:
+    """`MINDMAP_DETAIL_SCALE=1` 才按材料伸缩；不设 = 关（保持 80–150，逐字节相同）。
+
+    与 `MINDMAP_NODE_SCALE` 同一个理由：改的是每一次生成的规模，翻它之前得先有一组
+    数字（`data/detail-scale-ab.json` 是现状那一组），而且"要不要翻"要能单独回滚。
+    """
+    return os.getenv(DETAIL_SCALE_ENV, "").strip().lower() in ("1", "on", "true", "yes")
+
+
+def scaled_detail_span(
+    *,
+    material_chars: int,
+    nodes: int,
+    floor_chars: int,
+    ceiling_chars: int,
+    kappa: float = DETAIL_SCALE_KAPPA,
+) -> DetailSpan:
+    """这次每段说明写多长：材料支撑 ÷ 目标 κ，夹在「3 句的地板」与可读性上限之间。
+
+    `nodes` 是**这一次真的要写说明的节点数**（不是配额）：树被裁到 30 个节点时，
+    每段能分到的材料是 30 份而不是配额那份数。
+
+    返回的是**目标区间**而不是硬约束：模型仍可以写短（`_needs_detail` 兜底补写），
+    也可以写长（契约上限 2000 兜底）。
+    """
+    support = max(0.0, material_chars) / max(1, nodes)
+    # 地板压在 mean 上而不是压在 lo 上：压 lo 会得到 [75,75] 那种退化的区间
+    # （lo == hi 时"写 A–B 字"既没有余地也读不出意图）。
+    mean = max(DETAIL_SENTENCE_FLOOR, support / max(kappa, 0.01))
+    hi = min(ceiling_chars, int(round(mean / DETAIL_MEAN_TO_HI)))
+    lo = max(DETAIL_SENTENCE_FLOOR, min(hi, int(round(DETAIL_LO_TO_HI * hi))))
+    return DetailSpan(
+        min_chars=lo, max_chars=hi,
+        # 报的是**这个区间**折出来的均长，不是 `mean`：上限一旦夹到 150，`mean` 就
+        # 变成了"材料想给的量"（大批 832），而模型这一次只会写到 150 附近。
+        mean_chars=int(round(hi * DETAIL_MEAN_TO_HI)),
+        support=support, kappa=kappa, scaled=True)
+
+
+def detail_span(
+    *, material_chars: int, nodes: int, floor_chars: int, ceiling_chars: int,
+) -> DetailSpan:
+    """本次的说明区间。开关关着、或没有材料/没有节点时，返回**现状那个区间**。
+
+    "没有材料"不是"材料是 0 字所以每段写 0 字"：没有材料时模型写的是自己的知识，
+    长度要求与加这个开关之前一样，因此退回常量。这条分支也是默认路径唯一的入口——
+    它连着 `default_detail_span`，而那个函数返回的就是 `DETAIL_MIN_CHARS/MAX_CHARS`。
+    """
+    if not detail_scale_enabled() or material_chars <= 0 or nodes <= 0:
+        return default_detail_span(floor_chars=floor_chars, ceiling_chars=ceiling_chars)
+    return scaled_detail_span(
+        material_chars=material_chars, nodes=nodes,
+        floor_chars=floor_chars, ceiling_chars=ceiling_chars)
+
+
 def _tokens(chars: int) -> int:
     """按汉字密度折算 token 数（输出侧几乎全是中文）。"""
     return math.ceil(max(0, chars) * _CJK_TOKENS_PER_CHAR)
@@ -399,6 +537,14 @@ def calls_for_levels(sizes: Sequence[int]) -> int:
 __all__ = [
     "CHAPTERS_PER_NODE",
     "CHARS_PER_NODE",
+    "DETAIL_LO_TO_HI",
+    "DETAIL_MEAN_TO_HI",
+    "DETAIL_MIN_SENTENCES",
+    "DETAIL_SCALE_ENV",
+    "DETAIL_SCALE_KAPPA",
+    "DETAIL_SENTENCE_CHARS",
+    "DETAIL_SENTENCE_FLOOR",
+    "DetailSpan",
     "ENVELOPE_TOKENS",
     "MIN_INITIAL_NODES",
     "MIN_NODES_PER_CALL",
@@ -412,6 +558,9 @@ __all__ = [
     "available_output_tokens",
     "batch_output_tokens",
     "calls_for_levels",
+    "default_detail_span",
+    "detail_scale_enabled",
+    "detail_span",
     "initial_nodes",
     "level_sizes",
     "max_nodes_for_tokens",
@@ -420,5 +569,6 @@ __all__ = [
     "nodes_per_call",
     "per_node_tokens",
     "plan_batches",
+    "scaled_detail_span",
     "scaled_initial_nodes",
 ]

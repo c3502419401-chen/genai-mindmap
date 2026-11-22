@@ -3796,30 +3796,52 @@ DETAIL_SPLIT_MIN = 12
 # （21–46 字）。这是提示词位置问题，不是措辞问题——同一批采样里平均长度 104–138，
 # 说明它读懂了要求，只是对"简单的节点"自行通融。所以把最要紧的两条挪到末尾（模型
 # 对 system 末尾与 user 末尾更敏感），并在 user 末尾再加一句自查。
-DETAIL_ONLY_PROMPT = (
-    "这一次只写思维导图节点的「说明」，不写结构。"
-    "节点已经定好了：id、label、它在一级分支下的位置都在 user 消息里，"
-    "一个都不许增删改名，也不许改动父子关系。\n"
-    "只返回一个 JSON 对象，不要代码围栏：键是节点 id（原样照抄），值是说明正文，"
-    '例如 {"d1a":"…","d1b":"…"}。'
-    "每一个 id 都必须出现，一个都不能漏。\n"
-    "不要写「简要说明」「详见教材」「同上」「可参考」这类占位话；"
-    "也不要把 label 换个说法重复一遍——画布上已经有 label 了，"
-    "detail 是点开之后才能看到的正文。\n"
-    "**这一轮不要写 source_refs**：引用已经在结构那一轮按证据定好了，"
-    "这里再写会与那些引用对不上。\n"
-    # 下面是**最后**一段，两条都是拿真实采样改出来的：
-    #   - 偏短的都是**并列型 label**（「常见变体」「循环与序列网络」「K-means 与层次
-    #     聚类」）：模型只把名字列一遍就收（21–46 字，低于 60 的下限）。所以点名要求
-    #     逐个说清，并给出"至少 3 句"这个比字数更难自我通融的下限；
-    #   - 不压上限会写出 165/170 字（超过 150 的目标），多出来的字既读不完，也拖慢
-    #     这一次调用（说明那一次是总耗时的大头）。
-    f"\n每一段说明写 {DETAIL_MIN_CHARS}–{DETAIL_MAX_CHARS} 字、**至少 3 句完整的话**"
-    "（不是 3 个短语），少于 3 句就是没写完。"
-    "如果这个节点的标题是一串并列的东西（几个算法、几种变体、几类方法、几个阶段），"
-    "要逐个说清它们各自做什么、差别在哪，不要只把名字列一遍就收。"
-    f"超过 {DETAIL_MAX_CHARS} 字就挑最关键的两三点，长文留给节点下面的子节点。\n"
-)
+#
+# **只有两个数字是可变的**（`min_chars` / `max_chars`，由 `budget.detail_span` 给）：
+# 句子数不跟着伸缩。"至少 3 句"是拿 21–46 字的一句半量出来的质量线，句子数一降就
+# 退回那个形态；材料撑不住 3 句时该减的是节点数（`MINDMAP_NODE_SCALE`），见
+# `generation.budget.DETAIL_SENTENCE_FLOOR` 的理由。
+def _detail_only_prompt(min_chars: int, max_chars: int) -> str:
+    """第三段的 system，长度区间参数化。`(80, 150)` 下与加伸缩之前逐字节相同。"""
+    sentences = budget.DETAIL_MIN_SENTENCES
+    return (
+        "这一次只写思维导图节点的「说明」，不写结构。"
+        "节点已经定好了：id、label、它在一级分支下的位置都在 user 消息里，"
+        "一个都不许增删改名，也不许改动父子关系。\n"
+        "只返回一个 JSON 对象，不要代码围栏：键是节点 id（原样照抄），值是说明正文，"
+        '例如 {"d1a":"…","d1b":"…"}。'
+        "每一个 id 都必须出现，一个都不能漏。\n"
+        "不要写「简要说明」「详见教材」「同上」「可参考」这类占位话；"
+        "也不要把 label 换个说法重复一遍——画布上已经有 label 了，"
+        "detail 是点开之后才能看到的正文。\n"
+        "**这一轮不要写 source_refs**：引用已经在结构那一轮按证据定好了，"
+        "这里再写会与那些引用对不上。\n"
+        # 下面是**最后**一段，两条都是拿真实采样改出来的：
+        #   - 偏短的都是**并列型 label**（「常见变体」「循环与序列网络」「K-means 与层次
+        #     聚类」）：模型只把名字列一遍就收（21–46 字，低于 60 的下限）。所以点名要求
+        #     逐个说清，并给出"至少 3 句"这个比字数更难自我通融的下限；
+        #   - 不压上限会写出 165/170 字（超过 150 的目标），多出来的字既读不完，也拖慢
+        #     这一次调用（说明那一次是总耗时的大头）。
+        f"\n每一段说明写 {min_chars}–{max_chars} 字、**至少 {sentences} 句完整的话**"
+        f"（不是 {sentences} 个短语），少于 {sentences} 句就是没写完。"
+        "如果这个节点的标题是一串并列的东西（几个算法、几种变体、几类方法、几个阶段），"
+        "要逐个说清它们各自做什么、差别在哪，不要只把名字列一遍就收。"
+        f"超过 {max_chars} 字就挑最关键的两三点，长文留给节点下面的子节点。\n"
+    )
+
+
+#: 现状区间的那一份（`MINDMAP_DETAIL_SCALE` 关着、或没有材料时用它，逐字节不变）。
+DETAIL_ONLY_PROMPT = _detail_only_prompt(DETAIL_MIN_CHARS, DETAIL_MAX_CHARS)
+
+
+def _default_detail_span() -> budget.DetailSpan:
+    """没有伸缩时的区间：就是 `DETAIL_MIN_CHARS`–`DETAIL_MAX_CHARS` 与 3 句。
+
+    单独成函数而不是在两处各写一遍 `span or budget.default_detail_span(...)`：
+    这两个调用点（system 与自查句）必须给同一个区间，写两遍就会在某次改动里漂开。
+    """
+    return budget.default_detail_span(
+        floor_chars=DETAIL_MIN_CHARS, ceiling_chars=DETAIL_MAX_CHARS)
 
 # 有证据时拼在 `DETAIL_ONLY_PROMPT` 之后。与 `BRANCHED_EVIDENCE_RULES` 的区别是
 # 它只要"读"，不要"抄"：引用是上一轮的事，这一轮读原文是为了让**说明**与那些引用
@@ -4287,6 +4309,7 @@ def _detail_ask(
     topic: str, targets: Sequence[tuple[Node, tuple[str, ...]]],
     sections: Sequence[str], *, full_text: bool = False,
     instruction: str | None = None, evidence: str = "",
+    span: budget.DetailSpan | None = None,
 ) -> str:
     """第三段的 user 消息：主题 + 节点清单（id / label / 位置）+ 可选的原文。
 
@@ -4307,7 +4330,11 @@ def _detail_ask(
     与 `sections` 互斥（调用了这条路就不再拼整支/整份）。空串表示这条路没走，此时
     本函数的输出与加这个参数之前**逐字节相同**——`tests/test_detail_round.py` 与
     `test_fill_details_tool.py` 里的回归断言比的就是那些 case。
+
+    `span` 是这次的长度区间（`budget.detail_span`）。`None` = 没开伸缩，末尾那句自查
+    用 `DETAIL_MIN_CHARS`/`DETAIL_MAX_CHARS`，与加这个参数之前逐字节相同。
     """
+    span = span or _default_detail_span()
     lines = [
         f"{index}. id={node.id}｜{node.label}｜位置：{' / '.join(path) or '中心主题'}"
         for index, (node, path) in enumerate(targets, start=1)
@@ -4341,7 +4368,8 @@ def _detail_ask(
     # 而实测"每段至少 3 句"这一条只有写在最后才会被逐条执行（见 `DETAIL_ONLY_PROMPT`
     # 的注释——前两轮有 1–3 个节点只写了一句）。
     user += (f"\n\n写完后自查一遍：上面 {len(targets)} 个 id 是不是都写了？"
-             f"每一段是不是都有 3 句以上、{DETAIL_MIN_CHARS}–{DETAIL_MAX_CHARS} 字？"
+             f"每一段是不是都有 {span.sentences} 句以上、{span.min_chars}–"
+             f"{span.max_chars} 字？"
              "不够的补写，然后再返回。")
     return user
 
@@ -4461,6 +4489,7 @@ async def _fill_details_half(
     full_text: bool = False,
     instruction: str | None = None,
     evidence: _DetailEvidence | None = None,
+    span: budget.DetailSpan | None = None,
 ) -> _DetailHalf:
     """发这一次「只写说明」的请求并解析。**预算是调用方的事**（见 `_fill_details`）。
 
@@ -4480,8 +4509,11 @@ async def _fill_details_half(
     """
     half = _DetailHalf(requested=len(targets),
                        target_ids=[node.id for node, _ in targets])
+    span = span or _default_detail_span()
     section = _detail_evidence_section(targets, evidence) if evidence is not None else ""
-    system = DETAIL_ONLY_PROMPT
+    # 区间参数化只换两个数字：`span` 是默认区间时 `_detail_only_prompt` 的输出与
+    # `DETAIL_ONLY_PROMPT` 逐字节相同（同一个构造函数，同一组数）。
+    system = _detail_only_prompt(span.min_chars, span.max_chars)
     if section:
         system += DETAIL_ONLY_RETRIEVED_RULES + external_rules
     elif sections and full_text:
@@ -4497,7 +4529,7 @@ async def _fill_details_half(
         raw = await _chat(
             ctx, system,
             _detail_ask(topic, targets, sections, full_text=full_text,
-                        instruction=instruction, evidence=section),
+                        instruction=instruction, evidence=section, span=span),
             max_tokens=_max_tokens(ctx))
 
     except GenerationError as exc:
@@ -4601,6 +4633,7 @@ async def _fill_details(
     instruction: str | None = None,
     chapters: Sequence[_Chapter] = (),
     source: Source | None = None,
+    material_chars: int = 0,
 ) -> tuple[MindMapContent, dict[str, Any]]:
     """第三段：给缺说明的节点补 detail。**只读结构、只写 detail**。
 
@@ -4634,6 +4667,11 @@ async def _fill_details(
     多份材料、没开按章切）走的仍是原来那条"整支/整份"证据——**prompt 与 data 逐
     字节相同**。给了章但一次命中都没有时同样退回原来那条（见下面的 `fallback`），
     因为"检索没成"不该把本来能用的证据一起丢掉。
+
+    `material_chars` 是这次材料的**总字数**（含外部检索补进来的量），只在
+    `MINDMAP_DETAIL_SCALE` 开着时用来算"每段说明该写多长"。分母是**真的会写说明的
+    节点数**（`targets`）而不是配额：树被裁到 30 个节点时，每段分到的是 30 份材料。
+    不传（0）时按"没有材料"处理，退回 `DETAIL_MIN_CHARS/MAX_CHARS` 那一份常量区间。
     """
     targets = _detail_targets(content.root, skip=skip_ids)
     report: dict[str, Any] = {
@@ -4644,6 +4682,29 @@ async def _fill_details(
         # 结构那一轮自己就写够了说明（或被裁到只剩几个节点）：不花这次调用。
         report["skipped"] = "nothing_to_fill"
         return content, report
+
+    # ---- 长度：这一段写多长由材料撑不撑得住决定 --------------------------------
+    #
+    # 与节点配额是**同一件事的两半**：`MINDMAP_NODE_SCALE` 决定"摊几个节点"，这里决定
+    # "每个节点写多长"。只开前一个时，48 个节点 × 130 字仍是 6,240 字——对 5,616 字
+    # 的材料还是膨胀（κ 0.90）。`span.scaled` 为假时两个数与常量逐字节相同：system、
+    # 自查句、`data["detail"]` 的键集都不变（`test_detail_round` 钉着）。
+    span = budget.detail_span(
+        material_chars=material_chars, nodes=len(targets),
+        floor_chars=DETAIL_MIN_CHARS, ceiling_chars=DETAIL_MAX_CHARS)
+    if span.scaled:
+        # 只在真接管时多一个键：默认路径的 `data["detail"]` 键集必须与改动前相同。
+        report["chars"] = span.as_dict()
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.info, code="DETAIL_SCALE_APPLIED",
+            message=(
+                f"这次按材料规模要求每段说明写 {span.min_chars}–{span.max_chars} 字"
+                f"（材料 {material_chars} 字 / {len(targets)} 个待写节点 = 每节点"
+                f" {span.support:.1f} 字支撑，目标压缩比 {span.kappa:g}；"
+                f"开关 `{budget.DETAIL_SCALE_ENV}`）；不设该开关时恒为 "
+                f"{DETAIL_MIN_CHARS}–{DETAIL_MAX_CHARS} 字"
+            ),
+        ))
 
     # ---- 证据：每个节点在它自己那一章里检索（开关 + 两种输入都齐了才走）---------
     #
@@ -4698,7 +4759,7 @@ async def _fill_details(
     results = await asyncio.gather(*(
         _fill_details_half(half, ctx=ctx, topic=topic, sections=sections,
                            external_rules=external_rules, full_text=full_text,
-                           instruction=instruction, evidence=evidence)
+                           instruction=instruction, evidence=evidence, span=span)
         for half in pending
     ), return_exceptions=True)
     settled = _settle_halves(results, pending)
@@ -7734,7 +7795,10 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         external_rules=external_rules, diagnostics=diagnostics,
         skip_ids=group_ids, full_text=full_text,
         chapters=tuple(slice_chapters or ()),
-        source=sources[0] if slice_chapters else None)
+        source=sources[0] if slice_chapters else None,
+        # 每段说明写多长（`MINDMAP_DETAIL_SCALE`）：口径与节点配额同一行代码，
+        # `max(...)` 的理由也一样——外部检索补进来的那份也在这一次的 prompt 里。
+        material_chars=max(material_chars, full_text_chars))
 
     # `expandable` 三态：被裁掉子节点的那些是**没长完**（`unknown`），不是"到底了"
     # ——这个区别在这里最实，用户下一步就是点开某个节点继续展开，而把被裁的那几个
@@ -10849,7 +10913,10 @@ async def _fill_details_tool(args: FillDetailsArgs, ctx: RunContext) -> ToolResu
     filled, report = await _fill_details(
         current, ctx=ctx, topic=topic, sections=sections,
         external_rules=external_rules, diagnostics=diagnostics,
-        instruction=args.instruction)
+        instruction=args.instruction,
+        # 续写这条路的材料是**按引用找回来的那些来源**（`_expand_sources`），
+        # 口径同样是它们的正文字数。找不到来源时是 0 → 退回常量区间。
+        material_chars=sum(len(source.text or "") for source in sources))
     requested = int(report.get("requested") or 0)
     applied = int(report.get("filled") or 0)
     skipped = report.get("skipped")
