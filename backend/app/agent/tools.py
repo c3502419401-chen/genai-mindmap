@@ -6583,14 +6583,19 @@ async def _ingest_external_graph(
         stats["seconds"],
     )
     if stats["failed"] and not stats["entities"]:
-        # **一份都没成功**（开关开着、材料在、库不可写）：先报这一句，别再说"抽进了
-        # 图谱"——`chunks` 非 0 只说明"材料被切开了"，不说明"进去了"。原来这里会走
-        # 下面的 `chunks` 分支，对着一份都没写进去的结果说"抽进了图谱（2 块 / 0 实体）"，
-        # 而它恰恰是最该被当成故障的形状（Neo4j 停机时就是这样）。
+        # **一份都没成功**（开关开着、材料在、一块都没写进去）：先报这一句，别再说
+        # "抽进了图谱"——`chunks` 非 0 只说明"材料被切开了"，不说明"进去了"。
+        #
+        # 两种来路，必须都说出来：抽取层一次调用都没发（`extract_graph` 返回 None：
+        # 开关关着 / LLM 凭据缺失 / 调用失败）与写库失败（Neo4j 连不上）。判据是
+        # **耗时**：0.0 秒说明请求根本没发出去，3 秒说明发了、是写不进去。只指一个
+        # 方向的指向会把用户带到错的地方——实测两种都在本轮出现过。
         logger.warning(
-            "检索材料入图：%d 份全部失败（已切 %d 块、实体 0）——先确认 Neo4j 在跑"
-            "（check-neo4j.ps1），不是抽取开关的问题",
-            stats["failed"], stats["chunks"])
+            "检索材料入图：%d 份全部失败（已切 %d 块、实体 0、耗时 %.1f 秒）——"
+            "耗时约 0 说明抽取层一次调用都没发（看 %s 与 LLM 凭据），"
+            "耗时大于 0 说明请求发了、写不进去（看 check-neo4j.ps1）",
+            stats["failed"], stats["chunks"], float(stats["seconds"]),
+            graph_extract.ENABLED_ENV)
     elif stats["chunks"] and not stats["entities"]:
         # 抽取开关（`graph_extract.ENABLED_ENV`）关着时就是这个形状：块切了、一次
         # 调用都没发、实体为 0。说清楚，否则"入图开着却什么都没进图"只能靠翻代码解释。
@@ -6616,9 +6621,11 @@ def _graph_ingest_diagnostic(stats: dict[str, Any]) -> Diagnostic:
         return Diagnostic(
             level=DiagnosticLevel.warn, code="GRAPH_INGEST_FAILED",
             message=(
-                f"这次 {stats['failed']} 份检索材料一份都没能写进图谱（抽取或写库失败）"
-                "——这一次的图谱骨架也就没有材料可读。日志里有每份的异常类名；"
-                "先确认 Neo4j 在跑（`check-neo4j.ps1`）。"),
+                f"这次 {stats['failed']} 份检索材料一份都没能写进图谱（{stats['chunks']} "
+                f"块切开、实体 0、耗时 {float(stats.get('seconds') or 0):.1f} 秒）——"
+                "这一次的图谱骨架也就没有材料可读。耗时约 0 说明抽取层一次调用都没发"
+                f"（`{graph_extract.ENABLED_ENV}` 或 LLM 凭据）；耗时大于 0 说明请求发了、"
+                "是写不进去（`check-neo4j.ps1`，日志里有每份的异常类名）。"),
         )
     if stats.get("chunks"):
         materials = int(stats.get("materials") or 0) - int(stats.get("skipped") or 0)
