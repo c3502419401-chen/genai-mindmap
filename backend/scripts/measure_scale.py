@@ -187,6 +187,9 @@ def _text_budget(content) -> dict:
     return {
         "detail_total": sum(details),
         "detail_avg": round(sum(filled) / len(filled), 1) if filled else 0.0,
+        # 最短的那一段是"配额有没有被填满"之外的另一半：均长 100 而最短 21 说明模型
+        # 对个别节点通融了，而那种形态恰是第三段当初要消灭的（见 `DETAIL_FILL_FLOOR`）。
+        "detail_min": min(filled) if filled else 0,
         "detail_empty": len(details) - len(filled),
         "label_total": sum(labels),
     }
@@ -218,13 +221,16 @@ def _arm(arm: str):
 
 async def _run_once(
     *, topic: str, branches: int, sources: list, scale: bool, arm: str = "b",
-    cap: int | None = None,
+    cap: int | None = None, detail_scale: bool | None = None,
 ) -> dict:
     """跑一次整树生成。开关全部显式设置——四格之间只许配额与清单两件事变。
 
     `scale=True` 打开 `MINDMAP_NODE_SCALE`（节点数按材料伸缩）；默认关 = 现状。
     `cap=N` 打开 `MINDMAP_NODE_CAP`（人为配额，优先于伸缩）；不设 = 现状。
     `arm` 见 `_arm`：`a` = 骨架只看主题，`b` = 骨架看到材料清单。
+    `detail_scale` 三态：`True` 打开 `MINDMAP_DETAIL_SCALE`（每段说明按材料伸缩）、
+    `False` 显式关、`None`（默认）不碰这个变量——`None` 与 `False` 在"效果"上一样，
+    在**证据**上不一样：`None` 说明这条线根本没被这段代码碰过（历史脚本的默认路径）。
     """
     from app.agent import tools as tools_module
     from app.agent.contracts import AgentRunRequest, RunBudget, RunContext, ToolCall
@@ -234,7 +240,10 @@ async def _run_once(
     os.environ.pop("MINDMAP_GRAPH_SKELETON", None)
     for name, value in ((tools_module.budget.NODE_SCALE_ENV, "1" if scale else None),
                         (tools_module.budget.NODE_CAP_ENV,
-                         str(cap) if cap is not None else None)):
+                         str(cap) if cap is not None else None),
+                        (tools_module.budget.DETAIL_SCALE_ENV,
+                         None if detail_scale is None else
+                         ("1" if detail_scale else "0"))):
         if value is None:
             os.environ.pop(name, None)
         else:
@@ -269,6 +278,9 @@ async def _run_once(
         "model_calls": getattr(ctx, "model_calls_used", None),
         "inventory_chars": inventory_chars,
         "node_cap": tools_module.budget.node_cap(),
+        # 这一次第三段要求的区间（`_fill_details` 出的账；没开伸缩时是 None）：
+        # 表里那一列比 κ 更能说明"差在哪一步"——区间对了而 κ 没动，是模型没听话。
+        "detail_span": (result.data or {}).get("detail", {}).get("chars"),
     }
 
 
