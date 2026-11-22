@@ -134,7 +134,11 @@ SWITCHES = ("MINDMAP_HYBRID_SEARCH", "MINDMAP_QUERY_EXPANSION", "MINDMAP_PARENT_
             # 每段说明的字数伸缩（`budget.DETAIL_SCALE_ENV`）。置 0 = 80–150 的现状
             # 区间：宿主机上留着 `MINDMAP_DETAIL_SCALE=1` 时，每条生成用例的第三段
             # 提示词都会悄悄换一个区间，而断言里那些"80–150 字"逐字比的就是它。
-            "MINDMAP_DETAIL_SCALE")
+            "MINDMAP_DETAIL_SCALE",
+            # 节点预算的旧口径（`budget.NODE_POOL_ENV`：总量池 + 前序裁剪）。置 0 =
+            # 按支摊（默认）。清空与置 0 效果相同，但置 0 更明确：宿主机上留着
+            # `MINDMAP_NODE_POOL=1` 时，`test_branch_budget` 里那两条对照会一起变绿。
+            "MINDMAP_NODE_POOL")
 
 # 图存储的连接参数。清空而不是设默认值：URI/USER/DATABASE 有代码默认，PASSWORD
 # 没有——"没配"必须是可见的未配置状态，否则宿主机上跑着的 Neo4j 会被单测连上。
