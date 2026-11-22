@@ -127,6 +127,7 @@ from app.knowledge.service import (
     search_parent,
 )
 from app.optimization import nli
+from app.optimization import verify as verify_step
 from app.optimization.service import check
 from app.prefs import profile as profile_rank
 from app.prefs import service as prefs
@@ -7275,6 +7276,199 @@ async def _slice_structure(
     return raw, report
 
 
+# ---------------------------------------------------------------- 生成之后的核对
+#
+# 这一步补的是整条路上唯一一次"回头看"：**在此之前没有任何一步问过'这棵树是不是
+# 真的'**。骨架凭主题猜、结构凭主题写、说明凭主题写，而 `DETAIL_NO_SOURCE_RULES`
+# 又明令不许写年份、人名、论文标题与数字统计——于是产物是一大棵既没有具体内容、
+# 也无法核对的树。材料那条路有逐字校验，但它管的是"引文出处在不在原文里"，不是
+# "这个节点说的对不对"；纯主题那条路连前者都没有。
+#
+# 形态与代价（判据见 `app/optimization/verify.py` 与 `docs/GENERATION-VERIFY.md`）：
+# `标题 + 一级分支`拼一个 query、**搜一次**、拿到 3–5 篇正文、让模型逐节点判三态。
+# 逐节点各搜一次是它的 40 倍成本（40 节点 × 0.9 秒 vs 0.9 秒），所以在"这个便宜版本
+# 够不够用"这件事有数字之前不先做贵的那个。
+#
+# 三种状态的处置**只有一种是对的**：
+#
+#     supported     留下，挂引用（quote 是搜到正文里的原始切片，过 `verify_source_refs`）
+#     contradicted  留下但标出来，让用户看
+#     unverified    保留，标 unverified
+#
+# "未证实"是个状态，不是待删项：删是不可逆的，而"小众但正确"与"模型编的"在"搜不到"
+# 这个结果上长得一模一样。
+VERIFY_STAGE_DETAIL = "正在用一次联网搜索核对这棵树…"
+
+# `ContentBase.source_usage` 的 `max_length`。与契约同值：多写一条就是 422，而报错
+# 指向的是"来源太多"，与真正的原因（这一步并了几篇进来）隔了三层。
+_SOURCE_USAGE_MAX = 50
+
+# 核对探针一次能带几个节点。与 `Node.children` 的上限同值（契约的
+# `MAX_NODE_CHILDREN`）：探针是"所有挂了引用的节点"的一次性副本，一棵 80 节点的树
+# 轻松超过 50 条，不分批就是一次 `ValidationError`（实测 58 条就崩）。
+_PROBE_CHILDREN = 50
+
+
+async def _verify_after_generate(
+    content: MindMapContent, *, ctx: RunContext, sources: Sequence[Source],
+    diagnostics: list[Diagnostic],
+) -> dict[str, Any] | None:
+    """跑一次核对，把三态放进 `data["verify"]`。**开关关着时一次都不进来。**
+
+    五条边界，每条都对应一种"这一步把生成搞坏了"的失败：
+
+      1. **额度**：判定是一次模型调用，`reserve_model_call()` 拿不到就整段跳过并记
+         一条诊断——核对是生成之后多出来的一步，它没有资格把已经成型的树拖成失败；
+      2. **搜索失败 = 空报告**，不是失败（`verify.search_articles` 自己吞异常）；
+      3. **引用只在 95% 逐字命中时才挂**（`attach_refs` 用 `locate_quote` 拿原文
+         切片）：挂一条对不上原文的引用，比不挂更糟——`verify_source_refs` 会把它
+         剔掉，而"剔掉"在用户那里与"这里没有依据"长得一样；
+      4. **不碰已经有引用的节点**：那是材料那一步的产物，两件事的可信度不同；
+      5. **不改 `Node` 契约**：三态进 `data`（`Node` 是 `extra="forbid"`，加字段要
+         重导 `openapi.json` 与 `schema.d.ts`）。
+
+    `sources` 是本次运行**可校验的来源**（`_verify_sources(ctx)` 的同一份）：新抓回来
+    的那几篇会先入库、再并进 `ctx`，否则刚挂上的引用在收尾校验里会因为"来源不存在"
+    被静默剔掉——检索成功、引用写出、最后消失，是这条链上最隐蔽的一种失败。
+    """
+    from app.optimization import verify as verify_step
+    from app.knowledge import library as knowledge_library
+
+    if not ctx.reserve_model_call():
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.info, code="VERIFY_SKIPPED_NO_BUDGET",
+            message=("模型调用额度已用完，这次没有做「生成之后用一次搜索核对」；"
+                     "树本身不受影响"),
+        ))
+        return None
+    await _emit_stage(ctx, EXTERNAL_SEARCH_STAGE, VERIFY_STAGE_DETAIL)
+
+    # 一次检索：query 由 `verify.build_query` 拼（标题 + 一级分支，去重截断）。
+    query = verify_step.build_query(content)
+    search_started = time.perf_counter()
+    try:
+        hits = await asyncio.to_thread(verify_step.search_articles, query)
+    except Exception as exc:  # noqa: BLE001 — 见 docstring 第 2 条
+        logger.warning("核对检索失败（%r）：%s: %s",
+                       query[:40], type(exc).__name__, str(exc)[:160])
+        hits = []
+    # 检索在这一层发出去，所以耗时也在这一层量：`verify_tree` 收下现成的正文时不自己
+    # 计时（它只知道"没搜"），"这一步让用户多等了几秒"就成了 0——而这条链上唯一的
+    # 成本问题就是那几秒。
+    search_seconds = time.perf_counter() - search_started
+    await _emit_stage(ctx, EXTERNAL_SEARCH_STAGE, f"核对检索拿到 {len(hits)} 篇正文",
+                      count=len(hits))
+
+    built: list[Source] = []
+    for hit in hits:
+        try:
+            source = _external_source(hit)
+            source = source.model_copy(update={"id": knowledge_library.ingest(source)})
+        except Exception as exc:  # noqa: BLE001 — 单条入库失败不废整次核对
+            logger.warning("核对来源入库失败（%s / %s）：%s: %s",
+                           hit.source_name, hit.title[:40],
+                           type(exc).__name__, str(exc)[:160])
+            continue
+        built.append(source)
+    if built:
+        ctx.record_library_sources(built)
+        _note_verify_sources(content, built)
+
+    async def chat(system: str, user: str, **kwargs: Any) -> Any:
+        # 走 `_chat` 而不是 `chat_async`：`deep_thinking` 从那一个出口取
+        # （`tests/test_model_exit_single_path.py` 钉着这条，别在这里直连）。
+        return await _chat(ctx, system, user, **kwargs)
+
+    report = await verify_step.verify_tree(
+        content, articles=hits, chat=chat, max_tokens=_max_tokens(ctx))
+    report.search_seconds = search_seconds
+    report.attached = verify_step.attach_refs(content, report, built)
+    if report.attached:
+        _drop_unverifiable_refs(content, report, built, diagnostics)
+    diagnostics.append(Diagnostic(
+        level=(DiagnosticLevel.warn if report.count(verify_step.CONTRADICTED)
+               else DiagnosticLevel.info),
+        code="GENERATION_VERIFIED",
+        message=verify_step.summarize(report, built),
+    ))
+    return report.as_dict()
+
+
+def _note_verify_sources(content: MindMapContent, sources: Sequence[Source]) -> None:
+    """把核对抓回来的那几篇并进 `content.source_usage`。
+
+    **必须做，不是可选的整理**：`MindMapContent` 的契约校验要求每条 `source_refs` 的
+    `source_id` 都在 `source_usage` 里——不并进去，下一步挂引用会直接抛
+    `ValidationError`，而那句报错指向"节点引用的来源不在 source_usage 中"，看起来
+    像生成那边写歪了。
+
+    顺带它也解决界面上那件事：保存的图**不带** `Source`，重新打开时只有这份摘要——
+    引用要能点回原文，靠的就是这里的 `url`。
+    """
+    known = {item.source_id for item in content.source_usage}
+    allowance = _SOURCE_USAGE_MAX - len(content.source_usage)
+    for source in sources:
+        if allowance <= 0:
+            break
+        text = (source.text or "").strip()
+        if source.id in known or not text:
+            continue
+        content.source_usage.append(SourceUsage(
+            source_id=source.id, kind=source.kind, filename=source.filename,
+            char_count=len(text), url=source.metadata.url))
+        allowance -= 1
+
+
+def _drop_unverifiable_refs(
+    content: MindMapContent, report: Any, sources: Sequence[Source],
+    diagnostics: list[Diagnostic],
+) -> None:
+    """核对挂上的引用逐条过一遍 `verify_source_refs`，不合格的摘掉。
+
+    判据用的是**现成的那一份实现**，不另写一套：`quote` 已经取自原文切片，正常情况下
+    一条都不会被摘——但"正常情况下"不是理由，`SOURCE_QUOTE_AMBIGUOUS`（同一句话在
+    正文里出现多次）与它将来可能加的规则都会在这里生效，而重写一份校验只会多一处
+    迟早分叉的真相。
+
+    只在**一棵探针树**上跑：直接对整棵树跑会给每个没有引用的节点各记一条
+    `UNSOURCED_NODE`（几十上百条），把真正要看的诊断淹掉。探针树带着同一份
+    `source_usage`——契约要求引用指向已登记的来源，少带一条就是一次
+    `ValidationError`。
+    """
+    from app.contracts.mindmap import Node as _Node
+
+    # **只碰这一步亲手挂上的引用**（`report.attached_nodes`）。把树上原有的引用一起
+    # 塞进来会做两件不该做的事：重新判定一遍生成那一步已经校验过的引用，以及——
+    # 更糟——用 `built`（这次抓回来的那几篇）当来源表，原有的引用会因此在探针里
+    # 校验失败、被当成"引文对不上"删掉。实测就是这么崩的（58 条引用一次建探针）。
+    mine = set(report.attached_nodes)
+    attached = [node for node in _walk_tree(content.root)
+                if node.id in mine and node.source_refs]
+    if not attached:
+        return
+    registered = {source.id for source in sources}
+    usage = [item.model_copy() for item in content.source_usage
+             if item.source_id in registered]
+    kept: set[str] = set()
+    # 探针分批发：`Node.children` 有上限（契约的 `MAX_NODE_CHILDREN`），一棵 80 节点的
+    # 树挂上四五十条引用时一次塞进去会直接 `ValidationError`——而那句报错说的是
+    # "children 太多"，与本意（校验引用）隔了两层。实测：58 条引用一次建探针就崩。
+    for start in range(0, len(attached), _PROBE_CHILDREN):
+        batch = attached[start:start + _PROBE_CHILDREN]
+        probe = MindMapContent(
+            title=content.title, source_usage=usage,
+            root=_Node(id="verify-probe", label="核对探针", children=[
+                _Node(id=node.id, label=node.label, source_refs=list(node.source_refs))
+                for node in batch]),
+        )
+        verify_source_refs(probe, list(sources), remove_invalid=True)
+        kept |= {child.id for child in probe.root.children if child.source_refs}
+    dropped = [node for node in attached if node.id not in kept]
+    for node in dropped:
+        node.source_refs = []
+    report.dropped = len(dropped)
+
+
 async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     """整树生成：**骨架一次、每支检索一次、结构一次、只写说明一到两次**。
 
@@ -8221,6 +8415,21 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     # 这是"三条生成路径各产出自己的结构"落地的地方，也是整条流水线上唯一认识
     # `FishboneContent` / `FlowContent` 的一行。上面全部步骤都在树上跑（理由见
     # `_shape_output`），换形状只发生在交出产物之前这一刻。
+    #
+    # **核对这一步排在折形状之前**：它要往节点上挂引用，而折形状会把树拷进
+    # `bones[i].root` / `stages[i].root`——挂完之后再折，引用跟着一起过去；反过来
+    # 就要在两套结构上各挂一遍。
+    #
+    # `refs_before_verify` 只在开核对时量：下面那两条诊断（`EVIDENCE_UNUSED` /
+    # `MATERIAL_UNUSED`）问的是"生成那一步给的证据有没有被用上"，核对补的引用不算
+    # 数——让它算进去，一次"模型一条都没抄"就会被核对挂上的几条洗成"用上了"。
+    # 开关关着时它是 None，那两条诊断读到的仍是 `kept_refs`，与加这段之前逐字节相同。
+    refs_before_verify: int | None = None
+    verify_data: dict[str, Any] | None = None
+    if verify_step.verify_enabled() and isinstance(content, MindMapContent):
+        refs_before_verify = shapes.count_refs(content)
+        verify_data = await _verify_after_generate(
+            content, ctx=ctx, sources=verify_sources, diagnostics=diagnostics)
     content = _shape_output(
         content, diagram_type=diagram_type, raw_plan=raw_plan,
         diagnostics=diagnostics)
@@ -8228,6 +8437,9 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     ctx.publish_tree(content)
     count = shapes.count_nodes(content)
     kept_refs = shapes.count_refs(content)
+    # 引用条数**两处口径各一个名字**：生成那一笔用 `generated_refs`（核对之前量的），
+    # 交付时树上有几条用 `kept_refs`。开关关着时两者恒等。
+    generated_refs = kept_refs if refs_before_verify is None else refs_before_verify
 
     # 证据拼进了 prompt、树上却一条引用都没留下：`rag` 形态下唯一没有信号的失败面
     # ——"把证据给了模型"与"模型用了证据"在产出上长得不一样，而失败的样子却与
@@ -8238,7 +8450,7 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         for branch in evidences if branch is not None
         for entry in branch.payload
     })
-    evidence_unused = bool(evidence_total) and not kept_refs
+    evidence_unused = bool(evidence_total) and not generated_refs
     if evidence_unused:
         diagnostics.append(Diagnostic(
             level=DiagnosticLevel.warn, code="EVIDENCE_UNUSED",
@@ -8254,7 +8466,7 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     # prompt 里"是既成事实，零引用只能是模型没抄（提示词/模型问题），没有"检索
     # 没召回"这一档可能；混进 `EVIDENCE_UNUSED` 会让"分支标题写歪了"与"全文给了
     # 也不抄"在遥测里再也分不开，而用户能做的动作完全不同。
-    material_unused = bool(full_text) and bool(sections) and not kept_refs
+    material_unused = bool(full_text) and bool(sections) and not generated_refs
     if material_unused:
         diagnostics.append(Diagnostic(
             level=DiagnosticLevel.warn, code="MATERIAL_UNUSED",
@@ -8490,6 +8702,15 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         },
         "diagnostics": [item.model_dump() for item in diagnostics],
     }
+    if verify_data is not None:
+        # 只有真的开了核对才有这个键（开关关着时 `data` 的键集与加这段之前逐字节
+        # 相同——回归用例比的是键集，不只是值）。
+        #
+        # 三态**只能进这里**：`Node` 是 `extra="forbid"`，给它加字段就要重导
+        # `openapi.json` 与 `schema.d.ts`；`data` 是 `dict[str, Any]`，形状自由，
+        # 而"哪个节点是 supported / unverified / contradicted"本来就是一次运行的
+        # 读数，不是这棵树的一部分。前端要按状态过滤时读的就是这份表。
+        data["verify"] = verify_data
     if plan is not None and plan.grouped:
         # 只有真的分成两级时才有这个键：扁平时 `data` 的键集与这次改动之前逐字节
         # 相同（`test_edges.py` 的 `TestTreeIsByteIdentical` 比的就是键与值）。
