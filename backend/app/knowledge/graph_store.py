@@ -575,6 +575,21 @@ def _note_success() -> None:
     _FAILURES = 0
 
 
+def cooldown_remaining() -> float:
+    """还要等多少秒才值得再发一条图查询；`0.0` = 现在就可以试。
+
+    `available()` 的拆解版（那个布尔就是 `cooldown_remaining() <= 0`）。单独暴露它
+    是因为**诊断要说清"等着"还是"去起服务"**：两个动作的分界正是这个数——0 秒说明
+    这一次还没失败过、连不上是真的连不上（该去起 Neo4j）；30 秒说明刚刚失败过、系统
+    自己在退避（该等，重启后端没有用）。只报"不可用"时这两种情形在界面上长得一样。
+    """
+    if _FAILURES <= 0:
+        return 0.0
+    backoff = min(FAILURE_COOLDOWN_SECONDS * 2 ** (_FAILURES - 1),
+                  FAILURE_COOLDOWN_MAX_SECONDS)
+    return max(0.0, backoff - (time.monotonic() - _FAILED_AT))
+
+
 def available() -> bool:
     """现在值不值得发一条图查询。**不连库**，纯读熔断状态。
 
@@ -582,11 +597,17 @@ def available() -> bool:
     调用方（`graph_search.search_graph`）在发第一条 Cypher 之前查它：返回 `False`
     就直接当作"图里没有东西"，不付连接超时。
     """
-    if _FAILURES <= 0:
-        return True
-    backoff = min(FAILURE_COOLDOWN_SECONDS * 2 ** (_FAILURES - 1),
-                  FAILURE_COOLDOWN_MAX_SECONDS)
-    return time.monotonic() - _FAILED_AT >= backoff
+    return cooldown_remaining() <= 0.0
+
+
+def endpoint() -> tuple[str, str]:
+    """`(uri, database)`——**不含密码**。诊断与日志要能说"连的是哪儿"。
+
+    报一句 `bolt://127.0.0.1:7687` 比报一句"连不上"多出来的信息，正好是用户
+    判断"我起的那个服务是不是它"所需的那一半（另一个是端口）。
+    """
+    uri, _user, _password, database = _config()
+    return uri, database
 
 
 _DRIVER: Driver | None = None

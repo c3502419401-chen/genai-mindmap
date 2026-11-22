@@ -158,6 +158,11 @@ def clean_env(monkeypatch, tmp_path):
     for name in SWITCHES:
         monkeypatch.setenv(name, "0")
     monkeypatch.setenv("MINDMAP_DB_PATH", str(tmp_path / "mindmaps.db"))
+    # 图谱降级的"这个原因已经报过"账本是**模块级**状态（`tools._GRAPH_NOTICES`）：
+    # 不清的话，第一个用例把四种原因报完，后面每个用例拿到的诊断都是空的——而那些
+    # 用例正是要验"这一次报了什么"。
+    from app.agent.tools import reset_graph_notices
+    reset_graph_notices()
     yield
 
 

@@ -5512,6 +5512,11 @@ class _Intake:
     `ingested` 是"这一步顺手把检索材料抽进图"的那笔账（见 `_ingest_external_graph`），
     None 表示没做（开关关着 / 没有外部材料 / 图不可用）。它**只用来上报**：不改
     `sources`、不改任何既有分支——这一步的产物在图里，不在这个 dataclass 里。
+
+    `graph_ingest_skip` 是"没做"的**原因**（`GRAPH_SKIP_*`，`None` 时为空元组）。
+    它与 `ingested` 互斥、不能合并：`ingested is None` 有四种来路，而"没做"这件事
+    对用户有四句不同的话要说（没配 / 连不上 / 冷却 / 有目录）。原来这四种全部沉默，
+    用户只能看到"图里没有这批材料"这个结果，看不到任何决定。
     """
 
     sources: list[Source]
@@ -5522,6 +5527,7 @@ class _Intake:
     full_text: bool = False
     full_text_chars: int = 0
     ingested: dict[str, Any] | None = None
+    graph_ingest_skip: tuple[str, ...] = ()
 
 
 async def _intake(topic: str, ctx: RunContext) -> _Intake:
@@ -5575,12 +5581,26 @@ async def _intake(topic: str, ctx: RunContext) -> _Intake:
         sources = external.sources
     # 只入"这次要用的"：`external` 为 None 说明这次没走检索（有材料或开关关着），
     # 那批材料与图这一档无关，一个字节都不该花在它上面。
-    ingested = (await _ingest_external_graph(sources)
+    ingest_skip: list[str] = []
+    ingested = (await _ingest_external_graph(sources, skip_sink=ingest_skip)
                 if external is not None else None)
     full_text_chars = sum(len((source.text or "").strip()) for source in sources)
     full_text = bool(sources) and 0 < full_text_chars <= FULL_TEXT_MATERIAL_CHARS
-    return _Intake(sources, short_material, material_chars, hint_block, external,
-                   full_text, full_text_chars, ingested)
+    out = _Intake(sources, short_material, material_chars, hint_block, external,
+                  full_text, full_text_chars, ingested, tuple(ingest_skip))
+    # "这一次到底吃了几份材料"是好几条分支的判据（骨架条数、全塞、按章切），而它
+    # 在日志里从来没有过一行：出问题时只能靠"界面上看到几份"与 SSE 里 external_search
+    # 的 count 去推——那两处一个是请求给的、一个是检索报的，都不是**这一步的产物**。
+    # 级别取 warning 不是手滑：本仓库的 app logger 没有配置 handler，root 默认
+    # WARNING，info 一律看不见（`检索材料入图` 那些 info 行在 backend.log 里一条都没有）。
+    logger.warning(
+        "材料入口：%d 份 / %d 字（外部检索 %s，入图 %s）｜%s",
+        len(out.sources), full_text_chars,
+        "未走" if external is None else f"补 {len(external.sources)} 份",
+        "未做" if ingested is None else "已做",
+        "、".join((source.filename or source.id)[:28] for source in out.sources) or "（无）",
+    )
+    return out
 
 
 
@@ -6442,7 +6462,7 @@ def _graph_ingest_pending(sources: Sequence[Source]) -> list[Source]:
 
 
 async def _ingest_external_graph(
-    sources: Sequence[Source],
+    sources: Sequence[Source], *, skip_sink: list[str] | None = None,
 ) -> dict[str, Any] | None:
     """把这次检索回来的材料抽进图；不做时返回 `None`。
 
@@ -6468,15 +6488,24 @@ async def _ingest_external_graph(
 
     **失败一律降级**：任何一份抛错（写库失败、切块异常）只记 warning 并从统计里
     剔除，生成照常继续。这一整步是"让骨架更好"的加分项，它失败不该让用户拿不到图。
+
+    `skip_sink` 是**给用户看的那句话的出口**：跳过时把原因（`GRAPH_SKIP_*`）追加进去，
+    由调用点转成诊断。出参而不是返回值，是因为 `None` 的语义已经被"没做"占住了
+    （开关关 / 没材料 / 图不可用 / 有目录，四种都返回 None，而它们对用户是四件事）。
     """
     if not graph_ingest_enabled() or not sources:
         return None
-    if not graph_store.configured() or not graph_store.available():
+    if not graph_store.configured():
+        _note_graph_skip(skip_sink, GRAPH_SKIP_UNCONFIGURED)
+        return None
+    if not graph_store.available():
+        _note_graph_skip(skip_sink, GRAPH_SKIP_COOLING)
         return None
     if _outline_entries(list(sources)):
         # 目录可用 = 第三档不接管 = 入图的产物无人消费。记一行是刻意的：用户打开了
         # 开关却没看到任何成本与任何变化，日志里必须有话说。
-        logger.info("检索材料入图跳过：这批材料有可用章节目录，第三档不会接管")
+        logger.warning("检索材料入图跳过：这批材料有可用章节目录，第三档不会接管")
+        _note_graph_skip(skip_sink, GRAPH_SKIP_HAS_OUTLINE)
         return None
 
     pending = _graph_ingest_pending(sources)
@@ -6509,9 +6538,17 @@ async def _ingest_external_graph(
     outcomes = await asyncio.gather(*(_one(source) for source in pending))
     for outcome in outcomes:
         if isinstance(outcome, Exception):
+            # 抛出来的那份**必须**计进 `failed`：原来这里直接 `continue`，于是
+            # "Neo4j 停机、每份都抛 `GraphStoreError`"这种形状在统计里长得与
+            # "没有材料可入图"一模一样（chunks=0 / entities=0 / failed=0）——
+            # 而它恰恰是最该被看见的那一种。
+            stats["failed"] += 1
             continue
-        for key in ("chunks", "entities", "edges", "failed"):
+        for key in ("chunks", "entities", "edges"):
             stats[key] += int(outcome.get(key) or 0)
+        # 抽取层自己也报失败（块没写进去 / 被熔断中止），两份数分开加不重不漏：
+        # 此地只加它返回的那一份，抛出异常的份已经在上面的分支里计过了。
+        stats["failed"] += int(outcome.get("failed") or 0)
         stats["aborted"] = stats["aborted"] or bool(outcome.get("aborted"))
     stats["seconds"] = round(time.perf_counter() - started, 2)
 
@@ -6522,7 +6559,16 @@ async def _ingest_external_graph(
         stats["edges"], stats["failed"], "（中止）" if stats["aborted"] else "",
         stats["seconds"],
     )
-    if stats["chunks"] and not stats["entities"]:
+    if stats["failed"] and not stats["entities"]:
+        # **一份都没成功**（开关开着、材料在、库不可写）：先报这一句，别再说"抽进了
+        # 图谱"——`chunks` 非 0 只说明"材料被切开了"，不说明"进去了"。原来这里会走
+        # 下面的 `chunks` 分支，对着一份都没写进去的结果说"抽进了图谱（2 块 / 0 实体）"，
+        # 而它恰恰是最该被当成故障的形状（Neo4j 停机时就是这样）。
+        logger.warning(
+            "检索材料入图：%d 份全部失败（已切 %d 块、实体 0）——先确认 Neo4j 在跑"
+            "（check-neo4j.ps1），不是抽取开关的问题",
+            stats["failed"], stats["chunks"])
+    elif stats["chunks"] and not stats["entities"]:
         # 抽取开关（`graph_extract.ENABLED_ENV`）关着时就是这个形状：块切了、一次
         # 调用都没发、实体为 0。说清楚，否则"入图开着却什么都没进图"只能靠翻代码解释。
         logger.warning(
@@ -6539,9 +6585,25 @@ def _graph_ingest_diagnostic(stats: dict[str, Any]) -> Diagnostic:
     "全都已在图里"也必须是一句独立的结论——它和"什么都没抽到"在界面上长得一样，
     而前者是零成本命中、后者是配置错了。
     """
+    if stats.get("failed") and not stats.get("entities"):
+        # **一份都没成功**（开关开着、材料在、库不可写）：这一支必须排在 `chunks` 前面。
+        # `chunks` 有数只说明"材料被切开了"，不说明"进去了"——按原来的顺序，Neo4j
+        # 停机那一次会得到一句"这次把 2 份检索材料抽进了图谱（2 块 / 0 实体 / 0 边）"，
+        # 而它恰恰是最该被当成故障的形状。实测这句话就是本轮反例里出现的那一条。
+        return Diagnostic(
+            level=DiagnosticLevel.warn, code="GRAPH_INGEST_FAILED",
+            message=(
+                f"这次 {stats['failed']} 份检索材料一份都没能写进图谱（抽取或写库失败）"
+                "——这一次的图谱骨架也就没有材料可读。日志里有每份的异常类名；"
+                "先确认 Neo4j 在跑（`check-neo4j.ps1`）。"),
+        )
     if stats.get("chunks"):
         materials = int(stats.get("materials") or 0) - int(stats.get("skipped") or 0)
         notes = "（中止）" if stats.get("aborted") else ""
+        failed = int(stats.get("failed") or 0)
+        if failed:
+            # 部分失败也要说出来：上面那一支管"全失败"，这一支管"进了一部分"。
+            notes += f"（其中 {failed} 份失败）"
         return Diagnostic(
             level=DiagnosticLevel.info, code="GRAPH_INGEST_DONE",
             message=(
@@ -6666,6 +6728,156 @@ GRAPH_PLAN_RULES = (
 只认 `branches`——那一次生成会以「分支太少」失败。"""
 
 
+# ------------------------------------ 「图谱这一档为什么没跑」：四种原因，四句话
+#
+# 降级本身是对的（不为一条请求付一次连接超时），**不说**是错的：用户在界面上拿到的
+# 那张图与"图谱骨架真的定了骨架"那张长得一模一样，唯一能分辨的东西就是诊断。这四道
+# 闸原来一律 `return "", 0`，SSE 里一条 diagnostic 都没有，日志里只有 warning——
+# 于是"图谱这条路在跑吗"只能靠翻代码回答。这一节就是补那四句话。
+#
+# 四种原因必须**分开报**，因为它们要的处置完全不同：
+#
+#     没配密码  → 改配置（配上 `MINDMAP_NEO4J_PASSWORD` 并重启后端）
+#     连不上    → 起服务（本机是 `run-neo4j.bat`，它不会自启）
+#     熔断冷却  → 等着（指数退避 30s → 300s；重启后端反而把计数清零、下次更慢）
+#     实体不足  → 什么都不用做（材料太少，是正常结果）
+#
+# 合成一句"图谱不可用"等于让用户去猜该做哪一件——那与不说没有区别。
+GRAPH_SKIP_DISABLED = "disabled"
+GRAPH_SKIP_UNCONFIGURED = "unconfigured"
+GRAPH_SKIP_UNREACHABLE = "unreachable"
+GRAPH_SKIP_COOLING = "cooling"
+GRAPH_SKIP_TOO_FEW = "too_few_entities"
+GRAPH_SKIP_HAS_OUTLINE = "has_outline"
+
+_GRAPH_NOTICES: set[str] = set()
+"""这个进程里已经报过的 `(code: reason)`。
+
+为什么去抖：冷却从 30 秒起，这 30 秒里用户可能连点五次生成——五次都报"Neo4j 连不上"
+比一句不报更烦，还会把这条提示挤成"又一条可以无视的东西"。**日志里不去抖**（每次
+一条 warning）——诊断给正在看图的人，日志给排障的人，两份读者的容忍度不一样。
+"""
+
+
+def reset_graph_notices() -> None:
+    """清空"已经报过"的账。测试用例之间必须隔离，否则第二个用例永远看不到诊断。"""
+    _GRAPH_NOTICES.clear()
+
+
+def _graph_notice_once(code: str, reason: str) -> bool:
+    """`(code, reason)` 这个组合在本进程里第一次出现时返回 `True`。"""
+    key = f"{code}:{reason}"
+    if key in _GRAPH_NOTICES:
+        return False
+    _GRAPH_NOTICES.add(key)
+    return True
+
+
+def _note_graph_skip(sink: list[str] | None, reason: str) -> None:
+    """把跳过原因写进出参（`_ingest_external_graph` 的 `skip_sink`）。"""
+    if sink is not None:
+        sink.append(reason)
+
+
+def _graph_outline_skip_diagnostic(reason: str, entities: int) -> Diagnostic | None:
+    """第三档跳过时给人看的那一行；`None` = 这次不该报（开关是用户自己关的）。"""
+    if not reason or reason == GRAPH_SKIP_DISABLED:
+        return None
+    uri, _database = graph_store.endpoint()
+    cooldown = graph_store.cooldown_remaining()
+    if reason == GRAPH_SKIP_UNCONFIGURED:
+        level, message = DiagnosticLevel.info, (
+            f"图谱这一档没生效：这台机器没有配 {graph_store.PASSWORD_ENV}，"
+            "图谱骨架与材料入图整条都不走——这次的一级分支是模型按主题自己归纳的。"
+            "要用图谱就配上密码并重启后端。")
+    elif reason == GRAPH_SKIP_UNREACHABLE:
+        level, message = DiagnosticLevel.warn, (
+            f"图谱这一档没生效：连不上 Neo4j（{uri}），刚失败一次，接下来约 "
+            f"{max(1, round(cooldown))} 秒内不会再试——这次的一级分支是模型自己"
+            "归纳的。把这台机器上的 Neo4j 起起来（`run-neo4j.bat`）就恢复。")
+    elif reason == GRAPH_SKIP_COOLING:
+        level, message = DiagnosticLevel.warn, (
+            f"图谱这一档暂时跳过：Neo4j（{uri}）还在熔断冷却里，约 "
+            f"{max(1, round(cooldown))} 秒后才会再试——这次的一级分支是模型自己"
+            "归纳的。冷却会自己结束，不用重启后端；要立刻恢复就把 Neo4j 起起来"
+            "（`run-neo4j.bat`）。")
+    else:
+        level, message = DiagnosticLevel.info, (
+            f"图谱这一档没触发：这批材料在图里只有 {entities} 个带连接的实体"
+            f"（少于 {GRAPH_OUTLINE_MIN_ENTITIES}），按材料太少处理，这次的一级分支"
+            "是模型自己归纳的。这不是故障——材料本身没问题，是抽出来的概念还彼此"
+            "连不起来。")
+    if not _graph_notice_once("GRAPH_OUTLINE_UNAVAILABLE", reason):
+        # 诊断只报第一次；日志**每次**留一条（那才查得出"这次也降级了"），但重复的
+        # 那几次走 info：warning 每次一条时，冷却 30 秒里连点几次就把日志刷成噪声。
+        logger.info("图谱骨架跳过（%s，已报过，不再进诊断）：%s", reason, message)
+        return None
+    logger.warning("图谱骨架跳过（%s，首次即报）：%s", reason, message)
+    return Diagnostic(level=level, code="GRAPH_OUTLINE_UNAVAILABLE", message=message)
+
+
+def _graph_ingest_skip_diagnostic(reason: str) -> Diagnostic | None:
+    """入图跳过时给人看的那一行；`None` = 这次不该报（开关关 / 没材料）。"""
+    if not reason or reason == GRAPH_SKIP_DISABLED:
+        return None
+    if reason == GRAPH_SKIP_HAS_OUTLINE:
+        level, code = DiagnosticLevel.info, "GRAPH_INGEST_SKIPPED"
+        message = ("检索材料没有入图：这批材料自带可用的章节目录，骨架走章节那条路，"
+                   "入图的产物这一次不会被读到——省下的正是抽取那一笔钱。")
+    elif reason == GRAPH_SKIP_UNCONFIGURED:
+        level, code = DiagnosticLevel.info, "GRAPH_INGEST_UNAVAILABLE"
+        message = (f"检索材料没有入图：这台机器没有配 {graph_store.PASSWORD_ENV}，"
+                   f"{GRAPH_INGEST_ENV} 开着也不会做——图谱那一整条路都不走。")
+    else:
+        uri, _database = graph_store.endpoint()
+        level, code = DiagnosticLevel.warn, "GRAPH_INGEST_UNAVAILABLE"
+        message = (f"检索材料没有入图：Neo4j（{uri}）"
+                   + ("连不上，刚失败一次" if reason == GRAPH_SKIP_UNREACHABLE
+                      else "还在熔断冷却里")
+                   + f"，约 {max(1, round(graph_store.cooldown_remaining()))} 秒内不会再试"
+                   "——这次的材料没进图，图谱骨架也就没有东西可读。")
+    if not _graph_notice_once(code, reason):
+        logger.info("检索材料入图跳过（%s，已报过，不再进诊断）：%s", reason, message)
+        return None
+    logger.warning("检索材料入图跳过（%s，首次即报）：%s", reason, message)
+    return Diagnostic(level=level, code=code, message=message)
+
+
+def _graph_outline_attempt(
+    sources: Sequence[Source],
+) -> tuple[str, int, str]:
+    """第三档的骨架线索 + **为什么没触发**：`(块, 实体数, 跳过原因)`。
+
+    三个返回值的分工：块进提示词，实体数进 `GRAPH_OUTLINE_USED` 那句诊断，
+    跳过原因进 `_graph_outline_skip_diagnostic`。把原因带出来而不是在调用点重判一遍，
+    是因为"闸在哪"只该有一处（重判迟早与这里分叉）。
+
+    四道闸与 `_graph_outline` 的 docstring 一一对应，一个字节都不白花钱。
+    """
+    if not graph_outline_enabled() or not sources:
+        return "", 0, GRAPH_SKIP_DISABLED
+    if not graph_store.configured():
+        return "", 0, GRAPH_SKIP_UNCONFIGURED
+    if not graph_store.available():
+        return "", 0, GRAPH_SKIP_COOLING
+    scope = [source.id for source in sources]
+    count = graph_store.scoped_entity_count(scope)
+    if graph_store.cooldown_remaining() > 0:
+        # 这一条查询把熔断点亮了 = 连不上。**必须与"图里没有这批材料"分开**：
+        # `scoped_entity_count` 把两种情形都折成 0（读接口的降级契约），而它们的
+        # 处置一个是"起服务"、一个是"材料太少"。熔断状态是唯一能分开它们的信号。
+        return "", 0, GRAPH_SKIP_UNREACHABLE
+    if count < GRAPH_OUTLINE_MIN_ENTITIES:
+        return "", count, GRAPH_SKIP_TOO_FEW
+    entities, links = graph_store.subgraph(
+        entities=GRAPH_ENTITY_LIMIT, links=GRAPH_LINK_LIMIT, scope=scope)
+    if len(entities) < GRAPH_OUTLINE_MIN_ENTITIES:
+        # 计数够了、取回来不够：只可能是两次查询之间图被改了（建图中途）。按不够处理，
+        # 并把取回的真实条数报上去——静默降级时的那个数字是唯一能查的证据。
+        return "", len(entities), GRAPH_SKIP_TOO_FEW
+    return GRAPH_OUTLINE_HEADER + "\n" + _graph_block(entities, links), len(entities), ""
+
+
 def _graph_outline(
     sources: Sequence[Source],
 ) -> tuple[str, int]:
@@ -6687,26 +6899,18 @@ def _graph_outline(
 
     四道都过了才 `subgraph`（两条 Cypher + 一次类型回查，这是这条路上真正的花费）。
 
+    **这一层只回答"有没有"，不回答"为什么没有"**：原因由
+    `_graph_outline_attempt` 带出来（生成侧两个入口都读它）。这个两元组签名留着是
+    因为测试与测量脚本按它断言（`test_graph_outline.py` 全文件），改签名会让一批
+    只看"结果对不对"的用例被迫重写——而它们要验的东西与"为什么"无关。
+
     `scope` 必须传且必须与判据用的是同一份：图是跨材料共享的，不限定范围时"上一次
     那批报销材料"的实体会混进这一次的主题。第 4 道闸已经证明 scope 有货，所以
     `subgraph` 不会走到它自己的"回退全图"分支——**判据先行**在这里不是风格，
     它是"取回的实体一定属于本批材料"的唯一保证。
     """
-    if not graph_outline_enabled() or not sources:
-        return "", 0
-    if not graph_store.configured() or not graph_store.available():
-        return "", 0
-    scope = [source.id for source in sources]
-    count = graph_store.scoped_entity_count(scope)
-    if count < GRAPH_OUTLINE_MIN_ENTITIES:
-        return "", count
-    entities, links = graph_store.subgraph(
-        entities=GRAPH_ENTITY_LIMIT, links=GRAPH_LINK_LIMIT, scope=scope)
-    if len(entities) < GRAPH_OUTLINE_MIN_ENTITIES:
-        # 计数够了、取回来不够：只可能是两次查询之间图被改了（建图中途）。按不够处理，
-        # 并把取回的真实条数报上去——静默降级时的那个数字是唯一能查的证据。
-        return "", len(entities)
-    return GRAPH_OUTLINE_HEADER + "\n" + _graph_block(entities, links), len(entities)
+    block, count, _reason = _graph_outline_attempt(sources)
+    return block, count
 
 
 def _count_dict_nodes(nodes: list[dict[str, Any]]) -> int:
@@ -7153,6 +7357,12 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     # 入图那一步的账（开关关着时恒为 None，什么都不加——键集与加它之前逐字节相同）。
     if intake.ingested is not None:
         diagnostics.append(_graph_ingest_diagnostic(intake.ingested))
+    for reason in intake.graph_ingest_skip:
+        # "没做"也要有一句话：这一档是**花钱买来的加分项**，用户打开了开关却什么都没
+        # 发生时，唯一能分辨"配置没生效"与"材料太少"的东西就是这一条。
+        skip = _graph_ingest_skip_diagnostic(reason)
+        if skip is not None:
+            diagnostics.append(skip)
     thinking = thinking_block(ctx.request.thinking_model)
     # 图型：请求层权威（理由与 `_generate_deep` 同一段注释——模型看不见界面，
     # `diagram_type` 只要默认值存在它就会走默认值）。
@@ -7256,18 +7466,24 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         # 从"读文本"变成"读文本 + 读库"。
         graph_outline, graph_outline_entities = "", 0
         if not outline_entries:
-            graph_outline, graph_outline_entities = _graph_outline(sources)
+            graph_outline, graph_outline_entities, graph_skip = (
+                _graph_outline_attempt(sources))
             if graph_outline:
                 outline = graph_outline
                 # 记一条 info：用户看到的分支名与他自己材料里的词对得上时，得有一条
-                # 记录说明那是"图谱定的"而不是模型瞎猜对了。降级方向不记——没图是
-                # 部署常态，沉默退回"自行归纳"（与加这一档之前逐字节相同）。
+                # 记录说明那是"图谱定的"而不是模型瞎猜对了。
                 diagnostics.append(Diagnostic(
                     level=DiagnosticLevel.info, code="GRAPH_OUTLINE_USED",
                     message=(
                         f"材料抽不出章节标题（{material_chars} 字），改用图谱里的 "
                         f"{graph_outline_entities} 个概念定骨架。"),
                 ))
+            else:
+                # 降级方向也要说：判据说"没图是部署常态"是**沉默的理由**，但不是
+                # "用户不该知道开关没生效"的理由。四种原因各一句（`GRAPH_SKIP_*`）。
+                skip = _graph_outline_skip_diagnostic(graph_skip, graph_outline_entities)
+                if skip is not None:
+                    diagnostics.append(skip)
         base_plan = (
             PLAN_PROMPT if diagram_type == "tree"
             else FLOW_PLAN_PROMPT if diagram_type == "flowchart"
@@ -8537,6 +8753,10 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     # 入图那一步的账。与 `_generate` 同一份判断（开关关着时恒为 None）。
     if intake.ingested is not None:
         diagnostics.append(_graph_ingest_diagnostic(intake.ingested))
+    for reason in intake.graph_ingest_skip:
+        skip = _graph_ingest_skip_diagnostic(reason)
+        if skip is not None:
+            diagnostics.append(skip)
     # 思维模型两条路都要拼：骨架决定怎么分块，展开决定每块怎么拆。
     thinking = thinking_block(ctx.request.thinking_model)
 
@@ -8599,7 +8819,8 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     # 两条生成路的那条要求）。判据与整树那条完全一样：目录不可用时才问图谱。
     graph_outline = ""
     if slicing and not outline:
-        graph_outline, graph_outline_entities = _graph_outline(sources)
+        graph_outline, graph_outline_entities, graph_skip = (
+            _graph_outline_attempt(sources))
         if graph_outline:
             outline = graph_outline
             diagnostics.append(Diagnostic(
@@ -8608,6 +8829,12 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
                     f"材料抽不出章节标题（{material_chars} 字），改用图谱里的 "
                     f"{graph_outline_entities} 个概念定骨架。"),
             ))
+        else:
+            # 与整树那条逐字同一个出口（`AGENTS.md`：两条生成路对同一批材料必须给出
+            # 同一个骨架来源，否则只会在重新注册分片的那天才暴露）。
+            skip = _graph_outline_skip_diagnostic(graph_skip, graph_outline_entities)
+            if skip is not None:
+                diagnostics.append(skip)
     # ---- 图型的唯一判定点 -------------------------------------------------------
     # **请求给了就用请求的，没给才用工具参数。** 这一行是"用户说了画流程图"能被
     # 兑现的全部原因：模型看不见界面，`diagram_type` 这种"可以填也可以不填"的工具
