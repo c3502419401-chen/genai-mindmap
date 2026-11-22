@@ -1010,14 +1010,39 @@ def heading_outline(
     上限、去重都在这一层收口：`max_items` 条以内、按原文顺序、标题互不重复，
     `coverage` 之和就是这份目录"管住了多少字"（见 `outline_coverage`）。
     多份材料时先各自出目录再一起裁剪：一份材料的结构不因另一份材料存在而变形。
+
+    **但"一起裁剪"是整批二选一**：`_trim_outline` 按 coverage 挑前 `max_items` 条，
+    一批材料里只要有一份（或几份）抽不出目录，它们在这份列表里一条都不占——调用方
+    看到的是"这批材料有目录"或"这批材料没有目录"，看不到"这几份有、那几份没有"。
+    要那个区分时用 `heading_outline_by_source`（逐份给，不裁剪），它就是为此拆出来的：
+    调用的还是同一个 `_outline_entries`，只是把"合并后裁剪"换成"各自交出去"。
     """
-    entries: list[OutlineEntry] = []
+    groups = heading_outline_by_source(sources, max_title_chars=max_title_chars)
+    entries = [entry for group in groups for entry in group]
+    return _trim_outline(entries, max_items)
+
+
+def heading_outline_by_source(
+    sources: list[Source], *, max_title_chars: int = OUTLINE_MAX_TITLE_CHARS,
+) -> list[list[OutlineEntry]]:
+    """**每份材料各自**的目录：`[第 1 份的条目, 第 2 份的条目, ...]`，与 `sources` 同序。
+
+    与 `heading_outline` 的唯一区别是**不做跨材料的裁剪**：那一层把多份目录拼起来再
+    按 coverage 挑 top-N，于是一份材料的目录可能被另一份的大章整批挤掉（混合材料里
+    无章节那几份本身就没有条目，有章节的也会在小材料上被挤）。这里只回答"这一份
+    自己有没有可用目录"，取舍交给调用方——它才知道"每份至少要有一条"这种约束。
+
+    空正文给空列表（没有结构可言，`status` 只给界面看）；判据（`OUTLINE_MIN_ITEMS`
+    起算、去重）与 `heading_outline` 逐字同源，两处不可能给出不同答案。
+    """
+    groups: list[list[OutlineEntry]] = []
     for source in sources:
         text = source.text or ""
-        if not text.strip():
-            continue                      # 空正文没有结构可言（`status` 只给界面看）
-        entries.extend(_outline_entries(text, max_title_chars=max_title_chars))
-    return _trim_outline(entries, max_items)
+        groups.append(
+            _outline_entries(text, max_title_chars=max_title_chars)
+            if text.strip() else []
+        )
+    return groups
 
 
 def outline_coverage(

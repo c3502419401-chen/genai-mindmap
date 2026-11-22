@@ -117,10 +117,12 @@ from app.knowledge.service import (
     EXTERNAL_SOURCE_KINDS,
     LEAF_MAX_CHARS,
     OUTLINE_MAX_ITEMS,
+    OUTLINE_MIN_TITLE_CHARS,
     EvidenceHit,
     SourceFilter,
     filter_sources,
     heading_outline,
+    heading_outline_by_source,
     outline_coverage,
     search_exact_blocks,
     search_multi,
@@ -6810,35 +6812,55 @@ def _note_graph_skip(sink: list[str] | None, reason: str) -> None:
         sink.append(reason)
 
 
-def _graph_outline_skip_diagnostic(reason: str, entities: int) -> Diagnostic | None:
-    """第三档跳过时给人看的那一行；`None` = 这次不该报（开关是用户自己关的）。"""
+def _graph_outline_skip_diagnostic(
+    reason: str, entities: int, *, mixed: int = 0,
+) -> Diagnostic | None:
+    """第三档跳过时给人看的那一行；`None` = 这次不该报（开关是用户自己关的）。
+
+    `mixed` 是"这批里有多少份没有章节的材料"（>0 = 混合材料，走的是补充档）。它只改
+    **后果那一句**：整批没章节时后果是"一级分支全由模型归纳"，混合批的后果是
+    "有章节的那几份照旧、这几份没有分支指向它们"——同一句"模型自己归纳的"在混合批上
+    是假话（骨架明明来自章节）。
+    """
     if not reason or reason == GRAPH_SKIP_DISABLED:
         return None
     uri, _database = graph_store.endpoint()
     cooldown = graph_store.cooldown_remaining()
+    consequence = (
+        f"这次只有自带章节的那几份定了骨架，{mixed} 份没有章节的材料没有分支指向它们。"
+        if mixed else "这次的一级分支是模型按主题自己归纳的。"
+    )
     if reason == GRAPH_SKIP_UNCONFIGURED:
-        level, message = DiagnosticLevel.info, (
-            f"图谱这一档没生效：这台机器没有配 {graph_store.PASSWORD_ENV}，"
-            "图谱骨架与材料入图整条都不走——这次的一级分支是模型按主题自己归纳的。"
-            "要用图谱就配上密码并重启后端。")
+        level = DiagnosticLevel.info
+        head = (f"图谱这一档没生效：这台机器没有配 {graph_store.PASSWORD_ENV}，"
+                "图谱骨架与材料入图整条都不走——")
+        hint = "要用图谱就配上密码并重启后端。"
     elif reason == GRAPH_SKIP_UNREACHABLE:
-        level, message = DiagnosticLevel.warn, (
-            f"图谱这一档没生效：连不上 Neo4j（{uri}），刚失败一次，接下来约 "
-            f"{max(1, round(cooldown))} 秒内不会再试——这次的一级分支是模型自己"
-            "归纳的。把这台机器上的 Neo4j 起起来（`run-neo4j.bat`）就恢复。")
+        level = DiagnosticLevel.warn
+        head = (f"图谱这一档没生效：连不上 Neo4j（{uri}），刚失败一次，接下来约 "
+                f"{max(1, round(cooldown))} 秒内不会再试——")
+        hint = "把这台机器上的 Neo4j 起起来（`run-neo4j.bat`）就恢复。"
     elif reason == GRAPH_SKIP_COOLING:
-        level, message = DiagnosticLevel.warn, (
-            f"图谱这一档暂时跳过：Neo4j（{uri}）还在熔断冷却里，约 "
-            f"{max(1, round(cooldown))} 秒后才会再试——这次的一级分支是模型自己"
-            "归纳的。冷却会自己结束，不用重启后端；要立刻恢复就把 Neo4j 起起来"
-            "（`run-neo4j.bat`）。")
+        level = DiagnosticLevel.warn
+        head = (f"图谱这一档暂时跳过：Neo4j（{uri}）还在熔断冷却里，约 "
+                f"{max(1, round(cooldown))} 秒后才会再试——")
+        hint = ("冷却会自己结束，不用重启后端；要立刻恢复就把 Neo4j 起起来"
+                "（`run-neo4j.bat`）。")
+    elif mixed:
+        level = DiagnosticLevel.info
+        head = (f"图谱这一档没补上：那 {mixed} 份没有章节的材料在图里只有 {entities} 个"
+                "带连接的实体，取不出能指到它们的概念——")
+        hint = ("这不是故障——材料本身没问题，是抽出来的概念还彼此连不起来；把这几份"
+                "重新入图（`scripts/ingest_graph_corpus.py`）能补上。")
     else:
-        level, message = DiagnosticLevel.info, (
-            f"图谱这一档没触发：这批材料在图里只有 {entities} 个带连接的实体"
-            f"（少于 {GRAPH_OUTLINE_MIN_ENTITIES}），按材料太少处理，这次的一级分支"
-            "是模型自己归纳的。这不是故障——材料本身没问题，是抽出来的概念还彼此"
-            "连不起来。")
-    if not _graph_notice_once("GRAPH_OUTLINE_UNAVAILABLE", reason):
+        level = DiagnosticLevel.info
+        head = (f"图谱这一档没触发：这批材料在图里只有 {entities} 个带连接的实体"
+                f"（少于 {GRAPH_OUTLINE_MIN_ENTITIES}），按材料太少处理，")
+        hint = "这不是故障——材料本身没问题，是抽出来的概念还彼此连不起来。"
+    message = head + consequence + hint
+    # 混合批与整批的账分开报：前者要说明"哪几份没位置"，后者才是"骨架从哪来"。
+    key = f"{reason}:mixed" if mixed else reason
+    if not _graph_notice_once("GRAPH_OUTLINE_UNAVAILABLE", key):
         # 诊断只报第一次；日志**每次**留一条（那才查得出"这次也降级了"），但重复的
         # 那几次走 info：warning 每次一条时，冷却 30 秒里连点几次就把日志刷成噪声。
         logger.info("图谱骨架跳过（%s，已报过，不再进诊断）：%s", reason, message)
@@ -6942,6 +6964,436 @@ def _graph_outline(
     """
     block, count, _reason = _graph_outline_attempt(sources)
     return block, count
+
+
+# ------------------------------- 混合材料：有章节的走章节、没章节的走图谱，合成一套骨架
+#
+# ## 缺陷是什么
+#
+# 前三档（章节 / 清单 / 图谱）都是**整批材料一个结论**：`_outline_entries` 把全部
+# 材料拼成一份目录再裁剪，`_graph_outline_attempt` 也只看"这批材料在图里有没有实体"。
+# 于是一批材料里只要有**一部分**能抽出章节，另一部分的去处就没有人问。实测（库里
+# 那 29 份材料，`data/_probe_mixed.py` 与 `scripts/measure_mixed_skeleton.py`）：
+#
+#     只有 markdown（4 份 / 66,536 字）        30 条章节，覆盖 0.91
+#     只有 paper（20 份 / 6,658 字）            0 条（没有标题）
+#     markdown + paper 混（24 份 / 73,194 字）  30 条章节，覆盖 0.83 ← paper 那 20 份
+#                                              一条都没有，骨架里没有它们的位置
+#
+# 同一条缺陷更早的一次观测：维基 1 份（9 条）+ 论文摘要 2 份（0 条）→ 9 条全来自
+# 维基，论文那 2,393 字（占 24%）只在按支检索时被零星捞上来。**判据是"标题总共管住了
+# 多少字"，不是"哪些材料有结构、哪些没有"。**
+#
+# ## 改法：分组，各自出骨架，再合并
+#
+# `_mixed_outline` 逐份判（判据与 `_outline_entries` 同源：目录非空且覆盖 ≥
+# `OUTLINE_MIN_COVERAGE`），把这一批分成两组：
+#
+#     有章节   → 章节目录（`_merge_chapter_entries`，**每份至少留一条**）
+#     没章节   → 图谱里的概念（`_graph_supplement_attempt`，scope **只给这一组**）
+#     没章节且图里也没有 → 一段规则（`_mixed_plain_rules`），让模型按主题归位
+#
+# 两组都非空才走这条路；只有一组时走的是原来的那一档，一个字节都不变
+# （`MINDMAP_MIXED_SKELETON=0` 是 A/B 与回滚用的开关）。
+#
+# ## 合并规则（顺序 / 总量 / 去重）——三条都对着实测定的
+#
+# ① **顺序：章节在前，图谱在后。** 章节是**作者自己划的结构**，本来就该是一级分支的
+#    首选（`PLAN_PROMPT` 那句"材料自带章节时优先采用它们"就是这个意思）；图谱那一段
+#    是"这几份没有结构，别忘了它们"，放在章节之后、条数要求之前，作用是把遗漏说出来
+#    而不是与章节争夺一级。按材料原始顺序穿插的写法被否掉了：那样章节的"约占 X%"要
+#    与抽出来的概念混编，模型分不清哪些是原文结构、哪些是抽取层的产物——两者的可信度
+#    不同，混在一起就没法各自打折。
+#
+# ② **总量：两边各有硬上限，合并后不新造第三个数。** 章节 ≤ `OUTLINE_MAX_ITEMS`
+#    （30，既有）+ 图谱 ≤ `GRAPH_SUPPLEMENT_MAX_ITEMS`（8）。合并后最多 38 条"方面"，
+#    与"30 章 + 20 份摘要"仍是同一量级：它只影响 `sections_expected`（两级骨架的
+#    判据），而那一头在 30 章时早就 > `SKELETON_GROUP_THRESHOLD`（10），**形状不变**。
+#    真正会改变形状的是"少章节 + 多摘要"那种批（4 章 + 8 概念 = 12 > 10）：那确实
+#    多了几块，该分组——而不是把概念藏起来、装作只有 4 块。
+#
+# ③ **去重：同一个说法只留一条，留下的是章节那一条。** 比折叠后的键（`_concept_key`：
+#    去空白与标点、折小写），判等与互相包含（`碳中和` ⊂ `碳中和碳达峰`）都算重复。
+#    留章节是因为它带 `start` / `coverage`——能回到原文的那一条，比抽出来的名字更可信。
+#    图谱内部也去重：互相包含的只留更短（更概括）的，且**贪心按"还能覆盖几份材料"
+#    选**——同一件事的几种说法不该各占一条分支（见 `_pick_supplement`）。
+MIXED_SKELETON_ENV = "MINDMAP_MIXED_SKELETON"
+"""混合材料分组的开关。默认**开**：它补的是"一部分材料被静默丢掉"，不是新能力。"""
+
+GRAPH_SUPPLEMENT_MAX_ITEMS = 8
+"""图谱补充档最多给几条概念。
+
+数与 `GRAPH_OUTLINE_MIN_ENTITIES`（8）刻意相同，但含义不同：那一头是"够不够定义整副
+骨架"，这一头是"补一个缺口的预算"。上限必须有——实测这 20 份无章节材料在图里有
+**169 个带边实体**、`subgraph` 按度数取回 60 个（`data/_probe_mixed.json`），整段塞进
+提示词是 2,489 字，会把 30 条章节压成背景，也让模型在 60 个名字里挑分支。8 条与
+"每条分支至少有一个能与别的概念相连的概念 + 请求一般 5–8 支"同一量级。
+"""
+
+GRAPH_SUPPLEMENT_HEADER = "这几份材料没有章节标题，但它们在图谱里有这些概念（每一份都要有分支指向）："
+"""补充档的表头。与 `OUTLINE_HEADER` / `GRAPH_OUTLINE_HEADER` 都不同、且必须不同：
+说成"材料自带的章节"时模型会去原文里找章（那几份没有），说成整批"没有章节标题"时
+与上一段自相矛盾。`每一份都要有分支指向`是整个改动的判据，写在表头而不是只写在
+`_mixed_plan_rules` 里：它是这一段的**用途**，读这一段时一定要看到。"""
+
+def _mixed_plan_rules(items: int) -> str:
+    """混合材料的 system 尾巴。三条与 `GRAPH_PLAN_RULES` 同构（都从"分支从哪来"出发），
+    差别是这里**同时**有两类材料：`PLAN_PROMPT` 那句"目录为空或不完整时再自行归纳"
+    在混合批上是错的（目录不为空，只是只覆盖了一部分材料），所以它必须被覆盖掉。
+
+    **第二类的条数写成"至少 N 条"而不是"每一条概念都要有分支"**：后者在实测里是
+    **不可能满足**的指令——8 个概念、请求 4–6 条分支，模型怎么排都缺，于是它整段
+    无视（`data/ab-mixed-small.json`：B 组三次里有一次一个概念都没用上，分支名回到
+    "城市与生态建设 / 低碳与可持续发展"这类通用词）。N 取
+    `min(3, 概念条数)`：一次请求 5–8 条分支，让出 3 条给"没有章节的那几份"是可行的，
+    而且它正好等于 `MIN_BRANCHES`——低于它那张图本来就不成立。
+    """
+    floor = min(3, max(1, items))
+    return (
+        "\n这次的材料**分成两类**，上面那两份清单就是它们：第一份是**自带章节**的材料"
+        "（作者自己划的结构），第二份是**没有章节**的那几份在**图谱**里的概念。\n"
+        "- 第一类的章节优先做一级分支，顺序照原文；条数不够时先合并互不重叠的小章，"
+        "不要整章丢掉；\n"
+        f"- 第二类要有**至少 {floor} 条**一级分支落在那些概念上：讲同一件事的几份材料"
+        "合成一支，分支名就用材料里的原词；不要因为第一类占了条数就把第二类整批丢掉；\n"
+        "- 两边都出现同一个说法时只留一条分支，不要列两条；\n"
+        "- 这一步**只定一级分支**：不写子要点、不写 relations。\n"
+    )
+
+
+def mixed_skeleton_enabled() -> bool:
+    """混合材料分组是否启用（默认 `True`，与 `MINDMAP_GRAPH_OUTLINE` 同一套写法）。"""
+    return os.getenv(MIXED_SKELETON_ENV, "1").strip().lower() not in _GRAPH_OUTLINE_FALSY
+
+
+def _mixed_plain_rules(count: int) -> str:
+    """有章节 + 无章节、但图谱里没有那几份概念时补的那段规则。
+
+    "留给模型归纳"不是什么都不说：那几份在图里连一个概念都没有时，骨架手上唯一的
+    材料信息是清单里的文件名（`_material_inventory`），模型不会自己想到"没标题的
+    那几份也要有位置"——它看到目录就认为材料讲的就是目录上那些事。这句话补的正是
+    那一步，成本是一行字。
+    """
+    return (
+        f"\n这次的材料**分成两类**：上面那份清单是自带章节的那几份；另有 {count} 份"
+        "**没有章节标题**，图谱里也还没有它们的概念。\n"
+        "- 章节优先做一级分支；\n"
+        "- 没有章节的那几份按它们讲的事归进最接近的分支，讲的事与已有章节都不同的，"
+        "单独给一条分支——**不要因为它们没有标题就不给它们位置**；\n"
+        "- 这一步只定一级分支：不写子要点、不写 relations。\n"
+    )
+
+
+_CONCEPT_STRIP_RE = re.compile(r"[\s，。、；：！？·「」『』（）()【】《》〈〉\"'“”‘’—\-_/]+")
+
+
+def _concept_key(title: str) -> str:
+    """概念名的比较键：去空白与标点、折小写。
+
+    与 `_skeleton_key`（只折空白）分开：那一处比的是**分支标题**（同一支写了两次），
+    这里比的是"章节标题"与"抽取出来的概念名"——`碳中和（概念）`、`碳中和`、`碳中和 `
+    是同一个东西，而它们来自两个完全不同的提取器。
+    """
+    return _CONCEPT_STRIP_RE.sub("", title or "").lower()
+
+
+@dataclass(frozen=True)
+class _OutlineSplit:
+    """一批材料按"有没有可用章节"分成的两组，以及有章节那几份的章节目录。"""
+
+    titled: tuple[Source, ...]
+    plain: tuple[Source, ...]
+    chapters: tuple[Any, ...]
+
+    @property
+    def mixed(self) -> bool:
+        return bool(self.titled) and bool(self.plain)
+
+
+@dataclass(frozen=True)
+class _Supplement:
+    """图谱补充档的结果：块、给了几条、覆盖了几份、以及"为什么没有"。"""
+
+    block: str
+    items: int
+    covered: int
+    plain: int
+    entities: int
+    skip: str
+
+
+@dataclass(frozen=True)
+class _MixedOutline:
+    """混合材料这一次的骨架输入：章节 + 图谱补充 + 两组的份数。"""
+
+    chapters: list[Any]
+    supplement: _Supplement
+    titled: int
+    plain: int
+
+
+def _merge_chapter_entries(pairs: Sequence[tuple[Source, list[Any]]]) -> list[Any]:
+    """几份材料的章节目录 → 一份**每份都至少有一条**的合并目录（≤ `OUTLINE_MAX_ITEMS`）。
+
+    为什么不直接用 `heading_outline`：它按 coverage 挑前 30 条，**挑的粒度是整批**
+    ——一份 6 章的材料在同批的大文档面前可能一条都留不下，那与"无章节被丢掉"是同一个
+    缺陷的另一种形状（实测纯 markdown 批没有触发：41 条裁到 30 条时四份各剩 8/4/11/7，
+    `data/_probe_mixed.py` 的读数）。所以这里的顺序是：
+
+      1. **先占位**：每份材料 coverage 最大的那一章无条件入选；
+      2. **去重**：跨材料的同名章节只留先出现的那一条（模型最后只会画一条分支，
+         留两条等于白占目录额度）；
+      3. **补满**：剩下的槽按 coverage 降序给（同 coverage 按材料顺序、再按原文顺序）；
+      4. **交出去按材料顺序**：一级分支的先后要读得通，"1. 引言 2. 相关工作"一旦乱序
+         就成了密码表（与 `_trim_outline` 的取舍方向一致）。
+
+    覆盖数字（`coverage`）在合并后**只在同一份材料内部可比**，所以这里不重算、
+    不改写——`_render_outline` 的百分比分母是整批字数，与原来同一口径。
+    """
+    if not pairs:
+        return []
+    slots = OUTLINE_MAX_ITEMS
+    # ① 每份的第一条（它自己最大的那一章）；`-entry.start` 让同 coverage 时取靠前的。
+    guaranteed: list[tuple[int, Any]] = []
+    for index, (_source, entries) in enumerate(pairs):
+        if not entries:
+            continue
+        best = max(entries, key=lambda entry: (entry.coverage, -entry.start))
+        guaranteed.append((index, best))
+    # ② 跨材料去重（同键只留先出现的那份）。
+    seen: set[str] = set()
+    picked: list[tuple[int, Any]] = []
+    for index, entry in guaranteed:
+        key = _concept_key(entry.title)
+        if key in seen:
+            continue
+        seen.add(key)
+        picked.append((index, entry))
+    if len(picked) > slots:
+        # 有章节的材料份数本身就超过上限时才发生（30 份以上）。按 coverage 留大的，
+        # 这时"每份至少一条"与"不超过 OUTLINE_MAX_ITEMS"无法同时成立，取后者。
+        picked = sorted(picked, key=lambda item: (-item[1].coverage, item[0]))[:slots]
+    # ③ 补满：剩下的条目按 coverage 降序。
+    taken = {(index, id(entry)) for index, entry in picked}
+    pool = [
+        (index, entry)
+        for index, (_source, entries) in enumerate(pairs)
+        for entry in entries
+        if (index, id(entry)) not in taken and _concept_key(entry.title) not in seen
+    ]
+    pool.sort(key=lambda item: (-item[1].coverage, item[0], item[1].start))
+    for item in pool:
+        if len(picked) >= slots:
+            break
+        key = _concept_key(item[1].title)
+        if key in seen:
+            continue
+        seen.add(key)
+        picked.append(item)
+    # ④ 交出去按材料顺序、再按原文顺序。
+    picked.sort(key=lambda item: (item[0], item[1].start))
+    return [entry for _index, entry in picked]
+
+
+def _outline_split(sources: Sequence[Source]) -> _OutlineSplit:
+    """逐份判"有没有可用章节"，顺带把有章节那几份的目录合出来。
+
+    判据与 `_outline_entries` **逐字同源**：`heading_outline` 非空 + 覆盖率 ≥
+    `OUTLINE_MIN_COVERAGE`。区别只在粒度——那边判的是整批（分母是全部材料的字数，
+    一份 200 字的摘要就能把整批的覆盖率拉下来），这里判的是**每一份**。
+    """
+    materialized = list(sources)
+    groups = heading_outline_by_source(materialized)
+    pairs: list[tuple[Source, list[Any]]] = []
+    plain: list[Source] = []
+    for source, entries in zip(materialized, groups):
+        if entries and outline_coverage([source], entries) >= OUTLINE_MIN_COVERAGE:
+            pairs.append((source, entries))
+        else:
+            plain.append(source)
+    return _OutlineSplit(
+        titled=tuple(source for source, _entries in pairs),
+        plain=tuple(plain),
+        chapters=tuple(_merge_chapter_entries(pairs)),
+    )
+
+
+def _supplement_candidates(
+    entities: Sequence[graph_store.GraphEntity], plain: Sequence[Source],
+) -> list[tuple[graph_store.GraphEntity, tuple[str, ...]]]:
+    """子图实体 → `(实体, 它逐字出现在哪几份材料里)`。
+
+    **忠实度过滤在这里**：一个概念若在那几份材料的原文里找不到，它就不能当分支名
+    ——`scripts/measure_graph_outline.py` 那一轮已经把这条量过：图谱里混着 `service.py`、
+    `w1` 这类抽取层的名字，以及`全国`、`中国`这类放之四海的词。判据是**折叠后的
+    子串**（`_concept_key`），不是分词：中文没有空格可切，而概念名恰好是短名词。
+
+    单字概念直接丢（`OUTLINE_MIN_TITLE_CHARS` 同一条理由：一个字的"概念"是残片）。
+    """
+    texts = [(source.id, _concept_key(source.text or "")) for source in plain]
+    rows: list[tuple[graph_store.GraphEntity, tuple[str, ...]]] = []
+    for entity in entities:
+        key = _concept_key(entity.name)
+        if len(key) < OUTLINE_MIN_TITLE_CHARS:
+            continue
+        hits = tuple(source_id for source_id, text in texts if key and key in text)
+        if not hits:
+            continue
+        rows.append((entity, hits))
+    return rows
+
+
+def _pick_supplement(
+    rows: Sequence[tuple[graph_store.GraphEntity, tuple[str, ...]]],
+    scope: Sequence[str], limit: int,
+) -> tuple[list[tuple[graph_store.GraphEntity, tuple[str, ...]]], set[str]]:
+    """挑哪几条概念进骨架：**贪心按"还能覆盖几份材料"**，返回 `(选中, 没覆盖到的)`。
+
+    为什么不是"按度数取前 N"（`subgraph` 已经按度数排好了）：那 60 个实体的度数分布
+    与"材料覆盖"不是一回事——`机器学习` 度数最高，但它出现在 8 份里，选它一次就
+    把这 8 份一起覆盖；而度数第 9 的 `海绵城市建设试点` 只出现在 1 份里，按度数取 8
+    条时它落选，那 1 份材料就没有分支指向它了。**这个改动的判据是材料覆盖，不是概念
+    热度**，所以排序键也得是它。
+
+    三条并列时的取舍（都为了可复现，不是随机）：
+      - 新增覆盖一样多 → 取度数高的（它在材料里被反复连接，撑得起一级分支）；
+      - 度数也一样 → 取更短的（`碳中和` 优于 `碳中和碳达峰路径`，更概括）；
+      - 还一样 → 按名字字典序。
+
+    两条停止条件：
+      - 覆盖满了（没有未覆盖的材料）→ 停。同一件事的几种说法不该各占一条分支，
+        这正是"每份材料一条分支"与"每件不同的事一条分支"的分界（§4 的自评）；
+      - 剩下的候选都只覆盖已覆盖的材料 → 停（同上）。
+
+    互相包含的候选（`碳中和` / `碳中和与碳达峰`）只留一条：先选中的那条赢，后面的
+    直接跳过——它们是同一个概念的两种长度，画出来是两条几乎同名的分支。
+    """
+    uncovered = set(scope)
+    remaining = list(rows)
+    picked: list[tuple[graph_store.GraphEntity, tuple[str, ...]]] = []
+    keys: list[str] = []
+    while remaining and len(picked) < limit:
+        ranked = sorted(remaining, key=lambda row: (
+            -len(set(row[1]) & uncovered), -row[0].degree, len(row[0].name), row[0].name))
+        entity, hits = ranked[0]
+        remaining.remove(ranked[0])
+        key = _concept_key(entity.name)
+        if any(key in other or other in key for other in keys):
+            continue
+        if picked and not (set(hits) & uncovered):
+            # 已经有分支覆盖了它那几份：再选一条只是同义重复。
+            continue
+        picked.append((entity, hits))
+        keys.append(key)
+        uncovered -= set(hits)
+        if not uncovered:
+            break
+    return picked, uncovered
+
+
+def _graph_supplement_attempt(
+    plain: Sequence[Source], *, chapter_titles: Sequence[str] = (),
+) -> _Supplement:
+    """无章节那几份的**补充骨架**：图谱概念块 + 它覆盖了几份 + 没覆盖到的几份。
+
+    四道闸与 `_graph_outline_attempt` 同构（开关 / 没配密码 / 熔断 / 图里没这批材料），
+    差别只有三处，都是"补充档"这个定位决定的：
+
+      - **scope 只给无章节的那几份**：图是跨材料共享的，把有章节那几份的实体也拉进来，
+        补出来的分支会与章节重复，而那正是 `_pick_supplement` 的第 ③ 条要去重的东西
+        ——在源头收窄比事后去重便宜，也不会挤掉真正的补充名额；
+      - **不要求 `GRAPH_OUTLINE_MIN_ENTITIES`（8）**：那个阈值是"图里的概念够不够撑起
+        **整副**骨架"（3 条以上互不重叠的分支）。补充档只需要"这几份里有概念可指"，
+        一条概念也比零条好；质量由两道筛子守——逐字出现（`_supplement_candidates`）
+        与覆盖优先（`_pick_supplement`），而不由数量守；
+      - **`chapter_titles` 里的说法一律不进**：同一个概念两栏各列一遍，模型会画两条
+        几乎同名的分支（章节那一条带 `start`/`coverage`、能回到原文，比抽出来的名字
+        可信，所以留章节那一条）。
+    """
+    total = len(plain)
+    if not plain:
+        return _Supplement("", 0, 0, 0, 0, GRAPH_SKIP_DISABLED)
+    if not graph_outline_enabled():
+        return _Supplement("", 0, 0, total, 0, GRAPH_SKIP_DISABLED)
+    if not graph_store.configured():
+        return _Supplement("", 0, 0, total, 0, GRAPH_SKIP_UNCONFIGURED)
+    if not graph_store.available():
+        return _Supplement("", 0, 0, total, 0, GRAPH_SKIP_COOLING)
+    scope = [source.id for source in plain]
+    count = graph_store.scoped_entity_count(scope)
+    if graph_store.cooldown_remaining() > 0:
+        return _Supplement("", 0, 0, total, 0, GRAPH_SKIP_UNREACHABLE)
+    if count <= 0:
+        return _Supplement("", 0, 0, total, 0, GRAPH_SKIP_TOO_FEW)
+    # `links=1`：补充档只用概念名，边不进提示词（那一段是章节的补充，不是一张图）。
+    entities, _links = graph_store.subgraph(
+        entities=GRAPH_ENTITY_LIMIT, links=1, scope=scope)
+    rows = _supplement_candidates(entities, plain)
+    if chapter_titles:
+        blocked = [_concept_key(title) for title in chapter_titles]
+        blocked = [key for key in blocked if key]
+        rows = [
+            row for row in rows
+            if not any(
+                _concept_key(row[0].name) in key or key in _concept_key(row[0].name)
+                for key in blocked)
+        ]
+    picked, uncovered = _pick_supplement(rows, scope, GRAPH_SUPPLEMENT_MAX_ITEMS)
+    if not picked:
+        return _Supplement("", 0, 0, total, len(entities), GRAPH_SKIP_TOO_FEW)
+    lines = [GRAPH_SUPPLEMENT_HEADER]
+    for index, (entity, _hits) in enumerate(picked, start=1):
+        kind = f"（{entity.type}）" if entity.type else ""
+        lines.append(f"{index}. {entity.name}{kind}")
+    return _Supplement(
+        block="\n".join(lines), items=len(picked),
+        covered=total - len(uncovered), plain=total, entities=len(entities), skip="",
+    )
+
+
+def _mixed_outline(sources: Sequence[Source]) -> _MixedOutline | None:
+    """混合材料的骨架输入；**不该走这条路时返回 `None`**（调用方退回原来那一档）。
+
+    返回 `None` 的三种情形，每一条都对应"这条路不该插手"：
+      - 开关关着（`MINDMAP_MIXED_SKELETON=0`，A/B 与回滚）；
+      - 没有材料；
+      - 只有一组（全都有章节，或全都没有）。全都没有那一组由第三档
+        （`_graph_outline_attempt`）负责，且它看的是**整批** scope——那是对的，
+        整批都没章节时不存在"谁的骨架被谁挤掉"。
+    """
+    if not mixed_skeleton_enabled() or not sources:
+        return None
+    split = _outline_split(sources)
+    if not split.mixed:
+        return None
+    return _MixedOutline(
+        chapters=list(split.chapters),
+        supplement=_graph_supplement_attempt(
+            split.plain,
+            chapter_titles=[entry.title for entry in split.chapters]),
+        titled=len(split.titled),
+        plain=len(split.plain),
+    )
+
+
+def _mixed_diagnostic(mixed: _MixedOutline) -> Diagnostic | None:
+    """混合骨架这一次的账：用了图谱 / 为什么没用（一句话，各一种处置）。
+
+    没章节的那几份在图里**没有**概念时同样要报——那不是故障（材料还没入图），但
+    "这几份这次没有分支指向它们"必须能从 diagnostics 里看出来，否则这个改动就变成
+    了另一种静默（与 `GRAPH_SKIP_*` 那一族的理由逐字相同）。
+    """
+    supplement = mixed.supplement
+    if supplement.block:
+        return Diagnostic(
+            level=DiagnosticLevel.info, code="GRAPH_OUTLINE_USED",
+            message=(
+                f"材料分两类：{mixed.titled} 份自带章节、{mixed.plain} 份没有。"
+                f"后面这几份在图谱里取了 {supplement.items} 个概念进骨架，"
+                f"覆盖其中 {supplement.covered}/{supplement.plain} 份的原文用词。"),
+        )
+    return _graph_outline_skip_diagnostic(
+        supplement.skip, supplement.entities, mixed=mixed.plain)
 
 
 def _count_dict_nodes(nodes: list[dict[str, Any]]) -> int:
@@ -7679,8 +8131,16 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             return _fail(
                 "budget_exhausted", "本次运行的模型调用额度已用完，出不了骨架，无法生成导图。")
         ctx.extra_model_calls += 1
-        outline_entries = _outline_entries(sources)
+        # 混合材料：有章节的那几份出章节骨架，没有的那几份**另起一组**（图谱概念）。
+        # 只有"两组都有"时才走这条路（`_mixed_outline` 自己判），纯章节 / 纯摘要那两
+        # 种批走的是下面原来那一档，一个字节都不变。
+        mixed = _mixed_outline(sources)
+        outline_entries = (
+            list(mixed.chapters) if mixed is not None else _outline_entries(sources))
         outline = _render_outline(outline_entries, sources)
+        if mixed is not None and mixed.supplement.block:
+            # 章节在前、图谱在后（顺序的理由见那一大段注释里的①）。
+            outline = outline + "\n\n" + mixed.supplement.block
         # 第三档：目录不可用（`entries` 为空，含"抽不出标题"与"覆盖率不足"两种）时，
         # 用图谱定骨架，而不是让模型凭前 200 字自行归纳。判据 / 阈值 / 代价见
         # `_graph_outline` 那一段的注释——这里只消费它的两个出口。
@@ -7689,7 +8149,12 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         # 不碰网络、被 `_measure` 与两级骨架的判据共用），塞一次 Neo4j 往返会让它
         # 从"读文本"变成"读文本 + 读库"。
         graph_outline, graph_outline_entities = "", 0
-        if not outline_entries:
+        if mixed is not None:
+            # 混合批的账（用了几个概念、覆盖几份；或者为什么没补上）在这里报一次。
+            diagnostic = _mixed_diagnostic(mixed)
+            if diagnostic is not None:
+                diagnostics.append(diagnostic)
+        elif not outline_entries:
             graph_outline, graph_outline_entities, graph_skip = (
                 _graph_outline_attempt(sources))
             if graph_outline:
@@ -7728,7 +8193,13 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         #
         # 只有 `tree` 分组：流程图的一级是**阶段**（分组会打断顺序），鱼骨图的一级是
         # 固定的六类（换一套分类就不再是鱼骨图）。
-        sections_expected = max(args.branches, len(outline_entries), len(slice_chapters))
+        #
+        # 混合批要把图谱那几条也算进"这次有几个方面"：它们是真的会变成分支的东西，
+        # 少算就少要一级（`grouped_request` 判在 10 上），多算只是提前分组——两个方向
+        # 的兜底见上面那段（`_skeleton_plan` 会压平 / 保持扁平）。
+        supplement_items = mixed.supplement.items if mixed is not None else 0
+        sections_expected = max(
+            args.branches, len(outline_entries) + supplement_items, len(slice_chapters))
         # 按章切**不请求分组**：这条路的一级分支就是章，本来是一维序列；而分组会多
         # 吃一层深度（`INITIAL_MAX_DEPTH=3`：root → 组 → 章 → 章内要点，章里只剩
         # 一层），把"这一章有 ### 子节"这件事挤没。
@@ -7740,9 +8211,16 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         # 第三档的规则尾巴接在 base_plan 之后、分组规则之后：它说的是"一级分支从
         # 哪来"，与 `PLAN_PROMPT` 里那句「目录为空或不完整时再自行归纳」直接对冲，
         # 越靠后越压得住那句（模型对紧挨着输出位置的规则更敏感）。
-        # 有章节标题时**一个字都不加**，那条路逐字节不变。
+        # 有章节标题时**一个字都不加**，那条路径逐字节不变。
         if graph_outline:
             plan_system += GRAPH_PLAN_RULES
+        elif mixed is not None:
+            # 混合批：两类材料各一句话（用了图谱 / 图谱里没有）。位置与
+            # `GRAPH_PLAN_RULES` 相同——它也要压在「目录为空时自行归纳」之后。
+            plan_system += (
+                _mixed_plan_rules(mixed.supplement.items)
+                if mixed.supplement.block
+                else _mixed_plain_rules(mixed.plain))
         # 没有可检索材料时补那两句纯文本契约（与 `_generate_deep` 的骨架段同一条
         # 判定）：它们不含输出格式，不会与 `PLAN_PROMPT` 的"只返回 branches"打架。
         if not sources:
@@ -9076,13 +9554,26 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     if not ctx.reserve_model_call():
         return _fail("budget_exhausted", "本次运行的模型调用额度已用完，连骨架都出不了，无法分片生成。")
     ctx.extra_model_calls += 1
-    outline = _skeleton_outline(sources) if slicing else ""
+    # 混合材料与整树那条**共用同一个调用**（`_mixed_outline`）：两条路对同一批材料
+    # 必须给出同一个骨架来源，否则只会在把分片重新注册回 `create` 的那天才暴露
+    # （`AGENTS.md` 关于两条生成路的那条要求）。`slicing` 为假时整段跳过，一个字符
+    # 都不算——这条路上没有可检索正文时骨架本来就不看材料。
+    mixed = _mixed_outline(sources) if slicing else None
+    outline = (
+        _render_outline(mixed.chapters, sources) if mixed is not None
+        else (_skeleton_outline(sources) if slicing else ""))
+    if mixed is not None and mixed.supplement.block:
+        outline = outline + "\n\n" + mixed.supplement.block
     # 第三档（`_graph_outline`）在这里**必须同步接**：分片与整树共用骨架那一次调用
     # 的输入，只接一条会得到一个"两个入口对同一批材料给出不同骨架来源"的分叉，
     # 而那种分叉只在把分片重新注册到 `create` 的那天才暴露（见 `AGENTS.md` 关于
     # 两条生成路的那条要求）。判据与整树那条完全一样：目录不可用时才问图谱。
     graph_outline = ""
-    if slicing and not outline:
+    if mixed is not None:
+        diagnostic = _mixed_diagnostic(mixed)
+        if diagnostic is not None:
+            diagnostics.append(diagnostic)
+    elif slicing and not outline:
         graph_outline, graph_outline_entities, graph_skip = (
             _graph_outline_attempt(sources))
         if graph_outline:
@@ -9145,6 +9636,12 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     # `PLAN_PROMPT` 的「目录为空时自行归纳」之后，才压得住那一句。
     if graph_outline:
         plan_system += GRAPH_PLAN_RULES
+    elif mixed is not None:
+        # 与整树那条逐字同一处（`AGENTS.md`：骨架被两条生成路共用）。
+        plan_system += (
+            _mixed_plan_rules(mixed.supplement.items)
+            if mixed.supplement.block
+            else _mixed_plain_rules(mixed.plain))
     try:
         raw_plan = await ask_model(
             plan_system,
