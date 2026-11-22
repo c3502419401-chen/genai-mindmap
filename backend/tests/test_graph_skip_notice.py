@@ -39,6 +39,7 @@ from app.agent.tools import (
     GRAPH_SKIP_UNCONFIGURED,
     GRAPH_SKIP_UNREACHABLE,
     _graph_ingest_skip_diagnostic,
+    _graph_ingest_diagnostic,
     _graph_outline_attempt,
     _graph_outline_skip_diagnostic,
     _ingest_external_graph,
@@ -257,6 +258,34 @@ def test_ingest_without_sink_still_returns_none(monkeypatch):
     _fake(monkeypatch, configured=False)
 
     assert asyncio.run(_ingest_external_graph([_material()])) is None
+
+
+def test_ingest_all_failed_is_a_failure_not_a_done(monkeypatch):
+    """一份都没写进去 ≠ 没有材料可入图。
+
+    `chunks` 有数只说明"材料被切开了"。按原来的顺序，Neo4j 停机那一次会得到一句
+    "这次把 2 份检索材料抽进了图谱（2 块 / 0 实体 / 0 边）"——那是本轮反例里真实出现
+    过的一句话。判据必须站在 `chunks` 前面。
+    """
+    stats = {"materials": 2, "skipped": 0, "chunks": 2, "entities": 0, "edges": 0,
+             "failed": 2, "aborted": False, "seconds": 7.0}
+    diagnostic = _graph_ingest_diagnostic(stats)
+
+    assert diagnostic.code == "GRAPH_INGEST_FAILED"
+    assert diagnostic.level.value == "warn"
+    assert "一份都没能写进图谱" in diagnostic.message
+    assert "抽进了图谱" not in diagnostic.message
+
+
+def test_ingest_partial_failure_keeps_the_done_line_but_says_so(monkeypatch):
+    """进了一部分：仍是 DONE，但消息里必须带"其中 N 份失败"。"""
+    stats = {"materials": 3, "skipped": 0, "chunks": 5, "entities": 18, "edges": 15,
+             "failed": 1, "aborted": False, "seconds": 4.9}
+    diagnostic = _graph_ingest_diagnostic(stats)
+
+    assert diagnostic.code == "GRAPH_INGEST_DONE"
+    assert "18 实体" in diagnostic.message
+    assert "其中 1 份失败" in diagnostic.message
 
 
 def test_ingest_diagnostic_is_silent_when_switch_is_off(monkeypatch):
