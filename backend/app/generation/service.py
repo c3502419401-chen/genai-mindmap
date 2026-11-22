@@ -219,13 +219,40 @@ CONTENT_FREEDOM_CONTRACT = (
 # （覆盖率 28.8%），这一段因此改写。
 
 
-def _initial_scale_line(node_limit: int) -> str:
+def _initial_scale_line(
+    node_limit: int, *, per_branch: int | None = None, branches: int | None = None,
+) -> str:
     """「这一次的规模」那三句。**唯一**一个按材料换数的句子。
 
     为什么单独成函数：`MINDMAP_NODE_SCALE` 开启时，这个数由材料决定
     （`budget.scaled_initial_nodes`），而 `DETAIL_PROMPT` 是一份被回归用例逐字节
     钉着的常量。两件事只能这样共存——拼接时传默认值，字符串就与改动前相同。
+
+    两种口径，差的是**预算的作用域**：
+
+    - 默认（`per_branch` 为 None）：预算是一个**总量池**，"控制在 N 个节点以内"。
+      这句话在小配额上会把一级分支数一起压掉——模型要么自己砍分支（6 支 × 3 个
+      装不进 10），要么照骨架写完被 `_clip_tree` 的前序裁剪砍成一支（实测
+      `docs/GRAPH-SCALE.md` 第 7 节：39 个节点 3 支 → 裁到 10 个只剩 1 支）。
+    - `per_branch` 给定时：预算**按支摊**，"每条一级分支 M 个节点"，并把"一条都
+      不能少"单独说死。分支数是用户显式选的加骨架定下的，不该被内部预算压掉；
+      材料量该影响的是每支多深，不是几支。
+
+    第二句里"该缩的是每一支的深度，不是支数"是这次改动的全部要点：原句"宁可少两层，
+    也要让每一层都写完整"把深度与完整度对立起来，而它没说清**牺牲的是谁的结构**——
+    模型把它读成整棵树的许可，于是先砍分支。作用域收窄到"每一支内部"之后，同一个
+    取舍就不再伤害分支数。
     """
+    if per_branch is not None and branches:
+        return (
+            f"第一次生成本身请按每条一级分支 {per_branch} 个节点来铺："
+            f"这次 {branches} 条一级分支，一条都不能少——"
+            "不要为了控制总量合并、跳过或写浅某一支。"
+            f"{INITIAL_MAX_DEPTH + 1} 层（含中心主题）以内。"
+            "该缩的是每一支的深度，不是支数：每一支内部宁可少两层，"
+            "也要让写出来的每一层都写完整。"
+            "更细的内容留给用户点开某个节点后再展开。"
+        )
     return (
         f"第一次生成本身请控制在 {node_limit} 个节点、"
         f"{INITIAL_MAX_DEPTH + 1} 层（含中心主题）以内：宁可少两层，也要让每一层都写完整。"
@@ -309,18 +336,26 @@ DETAIL_PROMPT = (
 )
 
 
-def detail_prompt(node_limit: int | None = None) -> str:
+def detail_prompt(
+    node_limit: int | None = None, *,
+    per_branch: int | None = None, branches: int | None = None,
+) -> str:
     """这一次的 `DETAIL_PROMPT`。
 
     默认（`None` 或等于 `INITIAL_MAX_NODES`）**返回常量本身**，逐字节不变——这是
     回归用例与 `MINDMAP_NODE_SCALE` 关闭时的唯一路径。开关打开时只换「这一次的
     规模」那一句，其余每一个字都不动：规模是**这一次的预算**，而树规则、深度规则、
     拆到哪一层的判据都不该随材料量变。
+
+    `per_branch` / `branches` 一起给定时预算按支摊（见 `_initial_scale_line`）：
+    说"每条一级分支 M 个节点、这次 K 条"，而不是"总共 N 个节点"。只给 `node_limit`
+    时仍是总量池那一句——旧口径留在原地，测量脚本的对照臂还用它。
     """
     if node_limit is None or node_limit == INITIAL_MAX_NODES:
         return DETAIL_PROMPT
     return DETAIL_PROMPT.replace(
-        _INITIAL_SCALE_LINE, _initial_scale_line(node_limit))
+        _INITIAL_SCALE_LINE,
+        _initial_scale_line(node_limit, per_branch=per_branch, branches=branches))
 
 # 没有材料可标出处的那条路（纯主题生成，以及材料太短被降级之后）追加的一句。
 #

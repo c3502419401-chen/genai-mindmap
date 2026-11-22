@@ -252,6 +252,92 @@ def initial_nodes(
     return ceiling
 
 
+# ---------------------------------------------------------------- 每支预算（预算不该压掉分支数）
+#
+# `initial_nodes` 算出来的是**一个总量池**，而它同时去了三处：提示词里那句"控制在 N
+# 个节点以内"、`_clip_tree` 的上限、`data["node_limit"]`。总量池 + **前序裁剪**这两件
+# 事叠在一起，会把一级分支数一起压掉——实测（`docs/GRAPH-SCALE.md` 第 7 节）：
+#
+#     同一份材料（openalex 两篇摘要 424 字）、同一个骨架（3 条一级分支）
+#     initial_nodes=80 → 3 支 / 64 节点 / 裁掉 0
+#     initial_nodes=10 → **1 支** / 10 节点 / 裁掉 29
+#
+# 那次裁剪**之前**树上明明有 39 个节点、3 条分支，模型完全照骨架写了。是 `_clip_tree`
+# 按前序保留前 10 个，而第 1 支的子树一口气吃掉 9 个名额，第 2、3 支一个都没剩下。
+# 所以这里要修的不是"上限大小"，是"名额怎么分"。
+#
+# 分支数是**用户显式选的**（界面下拉）加骨架定下的，不该被内部预算压掉；材料量该影响
+# 的是"每支多深/多厚"，不是"几支"。于是总量池折成**每支预算**：
+#
+#     M     = clamp(round(N / 支数), 3, 20)   ← 提示词里说的那个数
+#     total = max(N, 支数 × M)                ← 裁剪上限（仍夹在 INITIAL_MAX_NODES 内）
+#     share = (total - 1) / 支数               ← 裁剪时每条一级分支的名额
+#
+# `total` 取 `max(N, 支数 × M)` 而不是 `支数 × M`：M 有下限 3，薄材料上 `支数 × M`
+# 会小于 N（424 字 3 支 → 9 < 10），而输出预算不该因为分支变多就缩——N 是"这次装得下
+# 多少"，它不归支数管。反过来 M 撞上限时（N=80、6 支 → 13），总量也仍以 N 为底。
+#
+# 两个夹角的依据都是结构算术，不是口味：
+#   - 下限 3 = 「分支自己 + 两个要点」。`_SKELETON_BODY` 要的是每支至少 2 个要点，而
+#     一条分支只剩 1 个节点时，它在画布上就是个孤立标签：点开什么都没有，比"这一支被
+#     砍掉"更难解释（被砍掉至少看起来是"没展开"）。
+#   - 上限 20 = "这一支在吃别人的预算"那条线。`INITIAL_MAX_NODES / MIN_BRANCHES` 是 26，
+#     一支占到 20 已经不是分摊而是独吞。
+BRANCH_MIN_NODES = 3
+BRANCH_MAX_NODES = 20
+
+#: 实验开关：恢复"总量池 + 前序裁剪"的旧口径（默认不设 = 新的按支摊）。
+#:
+#: 为什么留一个这样的旋钮：这个改动同时动了提示词与裁剪两处，而"哪一处在起作用"只能
+#: 靠同一份代码上的两组数回答。`MINDMAP_NODE_SCALE` 关着时它完全不参与（默认路径连
+#: 这个函数都不会调用），所以它不会成为第二个语义入口。
+NODE_POOL_ENV = "MINDMAP_NODE_POOL"
+
+
+def node_pool_mode() -> bool:
+    """`MINDMAP_NODE_POOL=1` → 退回旧口径（总量池、整句进提示词、前序裁剪）。"""
+    return os.getenv(NODE_POOL_ENV, "").strip().lower() in ("1", "on", "true", "yes")
+
+
+def nodes_per_branch(*, initial_nodes: int, branches: int) -> int:
+    """这一次**每条一级分支**能写几个节点（含分支自己）。
+
+    `branches` 是画布上的一级节点数（两级时是分组数，不是分组下面那二十节）。
+    """
+    count = max(1, branches)
+    return max(
+        BRANCH_MIN_NODES,
+        min(BRANCH_MAX_NODES, int(round(max(1, initial_nodes) / count))),
+    )
+
+
+def branch_budget(
+    *, initial_nodes: int, branches: int, ceiling: int = INITIAL_MAX_NODES,
+) -> tuple[int, int]:
+    """把总量池折成 `(每支预算, 总量上限)`。
+
+    两个数都要回给调用方：提示词说"每条分支 M 个"，裁剪按"总量 total、每支 share"，
+    而 `data["node_limit"]` 报的是 total——三处仍用同一个口径，只是这个口径现在**随
+    支数走**（8 支的图比 2 支的图能装下更多节点，这正是它该有的行为）。
+
+    `total` 取 `max(N, 1 + 支数 × M)`：`1` 是中心主题。少了这个 1，"每支 3 个 × 6 支"
+    折出来的总量是 18，而裁剪要的是 1 + 18 = 19——`branch_share` 于是算出 2，
+    与提示词里说的 3 对不上，模型被要求写 3 个却只能留 2 个。
+    """
+    per_branch = nodes_per_branch(initial_nodes=initial_nodes, branches=branches)
+    total = max(max(1, initial_nodes), 1 + max(1, branches) * per_branch)
+    return per_branch, min(max(1, ceiling), total)
+
+
+def branch_share(*, total: int, branches: int) -> int:
+    """裁剪时每条一级分支能留下的节点数（含分支自己）。
+
+    除的是**支数**而不是"总节点数"：`total - 1` 是先扣掉中心主题，剩下的名额按支均分。
+    整除的余数留在根上（`_clip_tree` 不裁根），所以总量不会超 `total`。
+    """
+    return max(1, (max(1, total) - 1) // max(1, branches))
+
+
 # ---------------------------------------------------------------- 每节点说明字数随材料伸缩
 #
 # 上一轮只把**节点数**接上了材料（`MINDMAP_NODE_SCALE`），每段说明的长度仍是常量，
@@ -535,6 +621,8 @@ def calls_for_levels(sizes: Sequence[int]) -> int:
 
 
 __all__ = [
+    "BRANCH_MAX_NODES",
+    "BRANCH_MIN_NODES",
     "CHAPTERS_PER_NODE",
     "CHARS_PER_NODE",
     "DETAIL_LO_TO_HI",
@@ -549,6 +637,7 @@ __all__ = [
     "MIN_INITIAL_NODES",
     "MIN_NODES_PER_CALL",
     "NODE_CAP_ENV",
+    "NODE_POOL_ENV",
     "NODE_SCALE_ENV",
     "NODE_STRUCTURE_TOKENS",
     "PROMPT_DETAIL_MAX_CHARS",
@@ -557,6 +646,8 @@ __all__ = [
     "SOURCES_PER_NODE",
     "available_output_tokens",
     "batch_output_tokens",
+    "branch_budget",
+    "branch_share",
     "calls_for_levels",
     "default_detail_span",
     "detail_scale_enabled",
@@ -565,7 +656,9 @@ __all__ = [
     "level_sizes",
     "max_nodes_for_tokens",
     "node_cap",
+    "node_pool_mode",
     "node_scale_enabled",
+    "nodes_per_branch",
     "nodes_per_call",
     "per_node_tokens",
     "plan_batches",

@@ -1027,13 +1027,46 @@ def _count_nodes(root) -> int:
     return 1 + sum(_count_nodes(child) for child in root.children)
 
 
-def _clip_tree(content: MindMapContent, limit: int) -> tuple[MindMapContent, int]:
+def _take_nodes(node: Node, budget: int) -> tuple[Node | None, int]:
+    """保留 `node` 及其子树的前 `budget` 个节点（前序），返回 `(节点, 实际保留数)`。
+
+    `_clip_by_branch` 的支内裁剪器。与 `_clip_tree` 的递归是同一套前序，只是**名额
+    由调用方给**——一支一个额度，用完就停，不去借邻支的。
+    """
+    if budget <= 0:
+        return None, 0
+    kept: list[Node] = []
+    used = 1
+    for child in node.children:
+        if used >= budget:
+            break
+        sub, taken = _take_nodes(child, budget - used)
+        if sub is not None:
+            kept.append(sub)
+            used += taken
+    return node.model_copy(update={"children": kept}), used
+
+
+def _clip_tree(
+    content: MindMapContent, limit: int, *, per_branch: int | None = None,
+) -> tuple[MindMapContent, int]:
     """前序保留前 `limit` 个节点，返回 `(裁剪后的内容, 丢掉的节点数)`。
 
     **前序**是刻意的：父节点一定排在它自己的子节点前面，所以裁出来的仍是一棵合法
     的树（不会出现"有子无父"）。代价是"一层的末尾被切掉"——第 80 个节点之后的分支
     整支消失，而不是每个分支均匀地少一点。均匀裁剪反而更难解释：用户会看到每个分支
     都缺一两个，说不出"哪里不完整"。
+
+    但**纯前序在配额很小时不是"切掉末尾"，是"后几条分支整条消失"**：名额先被第 1 支
+    的深子树吃光，第 2 支起一个节点都不剩。实测（`docs/GRAPH-SCALE.md` 第 7 节）一份
+    424 字材料、骨架 3 支、`limit=10`：模型写了 39 个节点、3 支齐全，裁完只剩 1 支
+    ——用户显式选了 6 条分支，拿到 1 条。所以 `per_branch` 给定时改成**按支配额**：
+
+        root 占一个，剩下的名额按支均分，每支最多 `per_branch` 个（含分支自己），
+        支内仍按前序。
+
+    这样名额不够时缩的是**每一支的深度**，不是分支数。`per_branch=None` 保持原样
+    （默认 80 那个路径上几乎不触发裁剪，改了等于白改还多一份回归风险）。
 
     裁剪之后要重新走一遍契约校验（`model_validate`）：`relations` 可能指向被裁掉的
     节点，`source_usage` 也不会自己变。**先裁再校验**，校验失败仍然如实报错——一次
@@ -1043,18 +1076,30 @@ def _clip_tree(content: MindMapContent, limit: int) -> tuple[MindMapContent, int
     if total <= limit:
         return content, 0
 
-    remaining = [max(0, limit)]
+    if per_branch is None:
+        remaining = [max(0, limit)]
 
-    def walk(node: Node) -> Node:
-        remaining[0] -= 1
-        kept: list[Node] = []
-        for child in node.children:
-            if remaining[0] <= 0:
+        def walk(node: Node) -> Node:
+            remaining[0] -= 1
+            kept: list[Node] = []
+            for child in node.children:
+                if remaining[0] <= 0:
+                    break
+                kept.append(walk(child))
+            return node.model_copy(update={"children": kept})
+
+        root = walk(content.root)
+    else:
+        remaining = max(0, limit - 1)
+        kept_branches: list[Node] = []
+        for child in content.root.children:
+            if remaining <= 0:
                 break
-            kept.append(walk(child))
-        return node.model_copy(update={"children": kept})
-
-    root = walk(content.root)
+            kept_child, used = _take_nodes(child, min(per_branch, remaining))
+            if kept_child is not None:
+                kept_branches.append(kept_child)
+            remaining -= used
+        root = content.root.model_copy(update={"children": kept_branches})
     kept_ids = _node_ids(root)
     relations = [item for item in content.relations
                  if item.source in kept_ids and item.target in kept_ids]
@@ -1089,6 +1134,22 @@ def _shortened_ids(original: Node, trimmed: Node) -> set[str]:
 def _count_refs(root) -> int:
     """整棵树的引用条数。逐字校验前后各数一次，差值就是被剔除的条数。"""
     return len(root.source_refs) + sum(_count_refs(child) for child in root.children)
+
+
+def _budget_branches(
+    plan: "_SkeletonPlan | None", titles: Sequence[str], requested: int,
+) -> int:
+    """按支摊时"支"指几个：**画布上的一级节点数**。
+
+    两级时是分组（分组才是画布上的一级，那二十节在它下面）；扁平时是骨架给的那几条；
+    两段式没有骨架产物（`plan is None`，一级分支由模型从图谱里挑），只能按请求条数
+    估——它估错的代价只是每支预算偏大或偏小，不会改结构。
+    """
+    if plan is None:
+        return max(1, requested)
+    if plan.grouped:
+        return max(1, len(plan.groups))
+    return max(1, len(titles))
 
 
 def _pick_sources(ctx: RunContext, source_ids: list[str]) -> list:
@@ -7401,6 +7462,31 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         # `budget.initial_nodes` 的默认参数会绕过那次 patch（两个模块各有一个 80）。
         ceiling=INITIAL_MAX_NODES,
     )
+
+    # ---- 按支摊：预算不该压掉一级分支数 ------------------------------------------
+    #
+    # 上面那个数是**总量池**，而它同时去了三处（提示词那句 / `_clip_tree` 的上限 /
+    # `data["node_limit"]`）。总量池叠上 `_clip_tree` 的**前序**裁剪会压掉一级分支数：
+    # 名额先被第 1 支的深子树吃光，第 2 支起一个节点都不剩。实测（`docs/GRAPH-SCALE.md`
+    # 第 7 节）——424 字材料、骨架 3 支、`initial_nodes=10`：模型写了 39 个节点、3 支
+    # 齐全，裁完只剩 1 支。用户显式选了 6 条分支，拿到 1 条。
+    #
+    # 所以配额照样按材料算（那是"这次装得下多少"），但**名额怎么分**改成按支：
+    # 提示词说"每条一级分支 M 个"、裁剪按"每支 share 个"、`data` 报折回来的总量。
+    # 三处仍用同一个口径（`initial_nodes` 被改写成折回来的总量），只是这个口径现在
+    # 随支数走——8 支的图比 2 支的图能装下更多节点，这正是它该有的行为。
+    #
+    # 默认路径（`initial_nodes == INITIAL_MAX_NODES`）整段不执行：80 那个量级上前序
+    # 裁剪几乎不触发（三批实测 `cut_nodes=0`），改了等于白改还多一份回归风险。
+    # `MINDMAP_NODE_POOL=1` 也整段不执行：它是"旧口径"的实验臂，用来回答"哪一处改动
+    # 在起作用"——这个改动同时动了提示词与裁剪，没有它就只能对着 git 历史跑。
+    branch_target = 0
+    per_branch: int | None = None
+    if initial_nodes != INITIAL_MAX_NODES and not budget.node_pool_mode():
+        branch_target = _budget_branches(plan, titles, args.branches)
+        per_branch, initial_nodes = budget.branch_budget(
+            initial_nodes=initial_nodes, branches=branch_target,
+            ceiling=INITIAL_MAX_NODES)
     if initial_nodes != INITIAL_MAX_NODES:
         # 只说这一次是多大，以及为什么：用户看到一棵 32 节点的树时，得能分辨"模型
         # 没写完"与"这次就是这么要的"。
@@ -7408,13 +7494,19 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         # 两条来源分开报：`NODE_CAP_APPLIED` 是**人为设定的配额**（实验旋钮），
         # `NODE_SCALE_APPLIED` 是**按材料算出来的**。混成一个 code 会让报告里的
         # "这次为什么是 32" 说不清——四格实验里两格走同一句话就没法归因。
+        #
+        # **按支摊**时再多报一句"共几支、每支几个"：那个总量是 `支数 × 每支` 折出来的，
+        # 只报总数会让"为什么 10 变成 18"看起来像算错了。
+        by_branch = (
+            f"、共 {branch_target} 条一级分支每支 {per_branch} 个"
+            if per_branch is not None else "")
         cap = budget.node_cap()
         if cap is not None:
             diagnostics.append(Diagnostic(
                 level=DiagnosticLevel.info, code="NODE_CAP_APPLIED",
                 message=(
                     f"这次按 `{budget.NODE_CAP_ENV}={cap}` 手动设定的配额要求 "
-                    f"{initial_nodes} 个节点（优先于 `{budget.NODE_SCALE_ENV}`；"
+                    f"{initial_nodes} 个节点{by_branch}（优先于 `{budget.NODE_SCALE_ENV}`；"
                     f"不设该开关时按材料规模或恒为 {INITIAL_MAX_NODES}）"
                 ),
             ))
@@ -7422,7 +7514,7 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             diagnostics.append(Diagnostic(
                 level=DiagnosticLevel.info, code="NODE_SCALE_APPLIED",
                 message=(
-                    f"这次按材料规模要求 {initial_nodes} 个节点"
+                    f"这次按材料规模要求 {initial_nodes} 个节点{by_branch}"
                     f"（材料 {max(material_chars, full_text_chars)} 字 / {len(sources)} 份 /"
                     f" {len(outline_entries)} 章；开关 `{budget.NODE_SCALE_ENV}`）；"
                     f"不设该开关时恒为 {INITIAL_MAX_NODES}"
@@ -7548,8 +7640,10 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             else SKELETON_TREE_RULES
         )
         # 树规则那一份只改「这一次要多大」那一句（`detail_prompt`）；开关关着时它就是
-        # `DETAIL_PROMPT` 本身，逐字节不变。
-        base_system = detail_prompt(initial_nodes)
+        # `DETAIL_PROMPT` 本身，逐字节不变。`per_branch` 给定时那句按支摊（"每条一级
+        # 分支 M 个、这次 K 条"），与下面裁剪用的名额是同一个口径。
+        base_system = detail_prompt(
+            initial_nodes, per_branch=per_branch, branches=branch_target)
         if sections and full_text:
             # 全塞：引用规则换成"这是全文"那一套。**不能复用 `BRANCHED_EVIDENCE_RULES`**
             # ——它开头就说"已经按一级分支各做过一次检索"，与这次真的没检索相矛盾；
@@ -7669,15 +7763,36 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     cut_ids: set[str] = set()
     if before_clip > initial_nodes:
         original_root = content.root
-        content, clipped = _clip_tree(content, initial_nodes)
+        # 按支摊时名额按支均分（`per_branch` 给 `_clip_tree`），否则仍是前序砍尾巴。
+        # 这两条路的差别不是"裁得松不松"，而是"名额不够时缩谁"：前序缩的是后面的整条
+        # 分支，按支缩的是每一支的深度——见 `_clip_tree` 的 docstring。
+        content, clipped = _clip_tree(
+            content, initial_nodes,
+            per_branch=(
+                budget.branch_share(total=initial_nodes, branches=branch_target)
+                if per_branch is not None else None))
         cut_ids = _shortened_ids(original_root, content.root)
-        diagnostics.append(Diagnostic(
-            level=DiagnosticLevel.warn, code="TREE_CLIPPED_TO_INITIAL",
-            message=(
+        if per_branch is None:
+            # 默认路径：与加按支摊之前逐字节相同（80 那个量级上几乎不触发，但用例钉着）。
+            message = (
                 f"模型返回了 {before_clip} 个节点，超过初次生成的 {initial_nodes} 个上限，"
                 f"已保留前 {initial_nodes} 个（尾部 {clipped} 个未保留）；"
                 "想要更大的树，请生成后用 node_expand 逐支展开"
-            ),
+            )
+        else:
+            # 按支摊：报的是"名额怎么分的"，因为这时**总节点数不再是保留量的上限**——
+            # 分完名额外加根可能少一个（整除的余数不补），只说"保留前 N 个"会与事实对不上。
+            message = (
+                f"模型返回了 {before_clip} 个节点，超过初次生成的 {initial_nodes} 个上限，"
+                f"已保留 {_count_nodes(content.root)} 个（{clipped} 个未保留）："
+                f"名额按 {branch_target} 条一级分支均分、每支最多 "
+                f"{budget.branch_share(total=initial_nodes, branches=branch_target)} 个，"
+                f"落树 {len(content.root.children)} 支；"
+                "想要更大的树，请生成后用 node_expand 逐支展开"
+            )
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="TREE_CLIPPED_TO_INITIAL",
+            message=message,
         ))
 
     # 骨架的产物（颜色 / 图标 / flowgraph 的边）套上去。放在裁剪之后：端点表必须
