@@ -4,6 +4,7 @@ import { VueFlow, useVueFlow } from '@vue-flow/core';
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 
 import { useMindMapStore } from '../stores/mindmap';
+import { boxesOfNodes, chooseViewMode, visibleIds } from './clarity';
 import { NODE_SIZE } from './layout/tidy';
 import {
   MAX_ZOOM,
@@ -162,6 +163,21 @@ onMounted(() => window.addEventListener('keydown', onKeydown));
 const viewMode = ref<ViewMode>('fit-width');
 
 /**
+ * 下一次适配时要不要**重新选档**（`fit-all` 还是 `fit-width`）。
+ *
+ * 语义只有一句：**用户手动选过档位，就按用户的；没选过，就按可读性自动调**。
+ * 所以：
+ *   - 换图（`mode` / `mapId` / `generatedSummary` 变）→ 清掉"用户选过"的标记，重判；
+ *   - 内容变了（`content` 换引用）→ 没手动选过就重判（图长大了该切到可读档，
+ *     这是自动档该做的事），手动选过就不动（那是他明确表达过的偏好）；
+ *   - 用户手动平移/缩放（`viewAdjusted`）→ 连适配都不做，见 `scheduleFit` 第一行。
+ */
+let autoModePending = true;
+
+/** 用户自己点过档位按钮。换图时复位。 */
+let userPickedMode = false;
+
+/**
  * 切到「全图」之前那一屏。切回来要回到原位——那可能是用户手动平移、缩放到某一支之后
  * 的位置，回到"重新适配"等于把他刚调好的视角扔掉一次。
  */
@@ -169,6 +185,20 @@ let savedViewport: { x: number; y: number; zoom: number } | null = null;
 
 /** 这一屏装不下整张图（只给了根附近的一块）：界面据此说一句"拖动可平移"。 */
 const clipped = ref(false);
+
+/**
+ * 这一屏**看不见**的节点数。
+ *
+ * 它是"看不全"那句提示的第二半：只说"只显示了一部分"，用户不知道还剩多少；说
+ * "还有 32 个节点在视野外"，他就能判断是"拖一下"还是"切全图"。判据在
+ * `clarity.visibleIds`（矩形相交，露出一点就算看得见——见那个函数的注释）。
+ */
+const offscreen = ref(0);
+
+/** `store.nodes` → 外接框。位置是左上角，尺寸取节点自己的 `data.size`（菱形更大）。 */
+function canvasBoxes() {
+  return boxesOfNodes(store.nodes);
+}
 
 /**
  * 「装不下」这句话怎么说：看**真实的视口**，而不是某一次适配算出来的结论。
@@ -179,13 +209,17 @@ const clipped = ref(false);
  */
 function updateClippedHint(): void {
   const view = dimensions.value;
+  const boxes = canvasBoxes();
   const bounds = contentBounds(store.nodes);
   if (!view?.width || !view?.height || !bounds) {
     clipped.value = false;
+    offscreen.value = 0;
     return;
   }
-  const seen = coverage(bounds, view, getViewport());
+  const plan = getViewport();
+  const seen = coverage(bounds, view, plan);
   clipped.value = seen.width < 0.999 || seen.height < 0.999;
+  offscreen.value = boxes.length - visibleIds(boxes, view, plan).length;
 }
 
 /**
@@ -230,6 +264,8 @@ function applyView(mode: ViewMode, animate = false): void {
 
 function setView(next: ViewMode): void {
   if (next === viewMode.value) return;
+  // 用户表态了：此后内容变化不再自动改档（换图时才复位）。
+  userPickedMode = true;
   if (next === 'fit-all') {
     savedViewport = getViewport();
     viewMode.value = 'fit-all';
@@ -262,18 +298,47 @@ watch(() => store.content, () => {
 });
 
 let fitTimer: ReturnType<typeof setTimeout> | undefined;
+
+/** 图换了：下一次适配先按 `chooseViewMode` 定档，再摆视图。 */
+function requestAutoMode(): void {
+  autoModePending = true;
+  scheduleFit();
+}
+
 function scheduleFit() {
   if (store.viewAdjusted) return;
   clearTimeout(fitTimer);
   // 增量节点到达很密，节流一下，避免每帧都重新适配。
-  fitTimer = setTimeout(() => applyView(viewMode.value, true), 150);
+  fitTimer = setTimeout(() => {
+    if (autoModePending) {
+      autoModePending = false;
+      const choice = chooseViewMode({ boxes: canvasBoxes(), viewport: dimensions.value });
+      if (choice.mode !== viewMode.value) {
+        viewMode.value = choice.mode;
+        // 自动换档之后，"切回原位"存的那一屏属于另一档，作废。
+        savedViewport = null;
+      }
+    }
+    applyView(viewMode.value, true);
+  }, 150);
 }
 
 watch(() => store.nodeCount, scheduleFit);
 watch(() => store.direction, scheduleFit);
 // 画布尺寸第一次量出来（以及窗口缩放）时补一次：`fit-view-on-init` 已经关掉，
 // 首屏的视图完全由这里给——不补这一枪，默认档位在"进来就有一张图"时不会生效。
-watch(() => [dimensions.value.width, dimensions.value.height] as const, scheduleFit);
+watch(() => [dimensions.value.width, dimensions.value.height] as const, requestAutoMode);
+
+// 换了一张图：档位重新由可读性决定（用户上一次的选择属于上一张图）。
+watch([() => store.mode, () => store.mapId, () => store.generatedSummary], () => {
+  userPickedMode = false;
+  requestAutoMode();
+});
+
+// 内容换了：用户没手动选过档位时跟着可读性走。
+watch(() => store.content, () => {
+  if (!userPickedMode) requestAutoMode();
+});
 
 // 从引用列表跳过来时把目标挪到视野中心。位置就是布局算出的绝对坐标，
 // 中心点 = 左上角 + 半个节点；不需要访问 Vue Flow 内部的节点实例。
@@ -444,12 +509,13 @@ onBeforeUnmount(() => {
           @click="setView('fit-all')"
         >全图</button>
       </div>
-      <!-- 装不下时说一句去哪儿看：这一档的代价必须写出来，而不是让用户猜。 -->
+      <!-- 装不下时说一句去哪儿看、还剩多少。这一档的代价必须写出来，而不是让用户猜：
+           "只显示了一部分"告诉他发生了什么，"还有 N 个节点在视野外"告诉他代价有多大。 -->
       <p
         v-if="clipped && viewMode === 'fit-width'"
         data-test="view-clipped"
         class="pointer-events-none rounded bg-white/80 px-1.5 py-0.5 text-[10px] text-slate-500 shadow-sm"
-      >只显示了一部分 · 拖动可平移</p>
+      >只显示了一部分 · 拖动可平移<template v-if="offscreen > 0">（还有 {{ offscreen }} 个节点在视野外）</template></p>
     </div>
   </div>
 </template>
