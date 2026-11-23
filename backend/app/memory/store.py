@@ -48,6 +48,13 @@ logger = logging.getLogger(__name__)
 
 ITEM_TABLE = "memory_items"
 SESSION_TABLE = "memory_sessions"
+#: 观测（`observations.py`）与命题（`propositions.py`）的三张表。**DDL 留在这里**：
+#: 这个模块是记忆 schema 的唯一所有者，四张表的建表语句读一处就够。另外两个模块
+#: 只从常量拿表名，所以 `store` 不反向 import 它们——既没有环，也不需要把 DDL 拆成
+#: 第三个"只放 schema"的文件。
+OBSERVATION_TABLE = "memory_observations"
+PROPOSITION_TABLE = "memory_propositions"
+EDGE_TABLE = "memory_proposition_observations"
 
 # ---------------------------------------------------------------- 值域与上限
 
@@ -60,6 +67,23 @@ SESSION_TABLE = "memory_sessions"
 #:   - `pattern`    做事习惯：先要鱼骨图再补细节、喜欢先给结论
 MemoryKind = Literal["preference", "fact", "pattern"]
 KINDS: tuple[str, ...] = get_args(MemoryKind)
+
+#: 命题（proposition）的档位。**刻意不放进 `KINDS`**，三条理由：
+#:
+#:   1. `KINDS` 是"关于这个人的判断属于哪一档"，是给人看的分类；命题是**有出处的
+#:      判断**，它与三档不是平行关系——一条命题内部分类成 preference/fact/pattern
+#:      都成立。把它塞进 `KINDS` 会让"这条是偏好还是命题"变成一个必须二选一的问题。
+#:   2. `POST /memory` 用 `KINDS` 做校验（`router.add_memory`）：命题**不能**手工写，
+#:      它必须带 `observation_ids`。放进 `KINDS` 就等于开了一个"手工写命题但没有任何
+#:      观测支撑"的口子，那正是这套设计要禁止的形态。
+#:   3. `summarize._parse_items` 对不认识的档位兜底成 `preference`。命题若在
+#:      `KINDS` 里，会话总结的模型偶尔会在它自己的输出里写 `kind="proposition"`，
+#:      于是产出一条没有边的"命题"——没有出处，检索时与真命题混在一起。
+PROPOSITION_KIND = "proposition"
+
+#: `add()` 接受的档位：三档 + 命题。分开定义是因为**内部写入方**（命题管线）需要
+#: 写命题，而**外部写入方**（HTTP 手工添加）不该能写——校验用哪个由调用方决定。
+WRITABLE_KINDS: tuple[str, ...] = (*KINDS, PROPOSITION_KIND)
 
 #: 这条记忆是怎么来的。`summary` = 会话结束时的模型提炼；`user_explicit` = 用户
 #: 手工加的。与 `user_prefs.source` 同一套措辞（`user_explicit`），但**不共用
@@ -166,9 +190,69 @@ _CREATE_SESSIONS = f"""CREATE TABLE IF NOT EXISTS {SESSION_TABLE} (
     summarized_at TEXT NOT NULL
 )"""
 
+#: 观测：动作级事实，一条一个 `at`。**建表理由与粒度依据在 `observations.py` 的
+#: 模块 docstring 里**，这里只放语句。
+#:
+#: `source_key` 的 UNIQUE 索引不是优化，是正确性：抽取是幂等的（每次 run 开始都
+#: 抽一次），没有它整张表会随运行次数翻倍，而每条观测看起来都合法。
+_CREATE_OBSERVATIONS = f"""CREATE TABLE IF NOT EXISTS {OBSERVATION_TABLE} (
+    id          TEXT PRIMARY KEY,
+    kind        TEXT NOT NULL,
+    source_key  TEXT NOT NULL,
+    map_id      TEXT,
+    run_id      TEXT,
+    at          TEXT NOT NULL,
+    summary     TEXT NOT NULL,
+    payload     TEXT NOT NULL,
+    refs        TEXT NOT NULL,
+    stat        INTEGER NOT NULL DEFAULT 1,
+    consumed_at TEXT,
+    captured_at TEXT NOT NULL
+)"""
+
+#: 命题：**1:1 关联到 `memory_items` 的一条**。正文与向量留在 `memory_items`（复用
+#: 它的 UNIQUE `text_hash` 去重与 `vector` 列），这张表只放命题特有的四件事：依据、
+#: 置信度、持久性、修订状态。
+#:
+#: 为什么不把 confidence/decay 加成 `memory_items` 的列：那会让"这一列对
+#: preference/fact/pattern 意味着什么"变成一个没有答案的问题（它们没有置信度），
+#: 于是每个读它的地方都要先判 kind。分开一张表，`JOIN` 一下就知道"这是命题"。
+_CREATE_PROPOSITIONS = f"""CREATE TABLE IF NOT EXISTS {PROPOSITION_TABLE} (
+    item_id       TEXT PRIMARY KEY,
+    reasoning     TEXT NOT NULL DEFAULT '',
+    confidence    INTEGER NOT NULL,
+    decay         INTEGER NOT NULL,
+    status        TEXT NOT NULL,
+    superseded_by TEXT,
+    revision      TEXT NOT NULL,
+    revisions     INTEGER NOT NULL DEFAULT 0,
+    source_run_id TEXT,
+    session_id    TEXT,
+    created_at    TEXT NOT NULL,
+    revised_at    TEXT NOT NULL
+)"""
+
+#: 命题 ↔ 观测的二部图**边**。这就是论文结构里 `observation_ids` 的落地形态。
+#:
+#: 为什么是边表而不是 `memory_items` 上的一个 JSON 列：修订（consolidation）要
+#: **合并两条命题的支撑集**，那是一次集合运算；JSON 列上做它要先把所有行读进内存、
+#: 拆串、并集、写回——而且没有任何约束挡住重复 id。边表上主键就是那个约束，
+#: "这两条边合并"是 `INSERT OR IGNORE` 一句话。
+#:
+#: 不加外键：与 `edit_events` 同一条理由（加外键只会在删除时多一个级联分支）。代价
+#: 是删掉一条 `memory_items` 会留下孤儿边——读的地方一律从 `memory_items` JOIN
+#: 进来，所以孤儿边不会被读到，但它会让 `COUNT(*)` 偏大，这一点写在
+#: `propositions.edge_count()` 的 docstring 里。
+_CREATE_EDGES = f"""CREATE TABLE IF NOT EXISTS {EDGE_TABLE} (
+    item_id        TEXT NOT NULL,
+    observation_id TEXT NOT NULL,
+    added_at       TEXT NOT NULL,
+    PRIMARY KEY (item_id, observation_id)
+)"""
+
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    """建两张表。由 `repository.connect()` 在同一个连接上调用，幂等。
+    """建五张表。由 `repository.connect()` 在同一个连接上调用，幂等。
 
     **`text_hash` 上是一条 UNIQUE 索引**，不是普通索引：去重是这个设计的硬要求
     （同一条偏好在两次会话里被总结出来，不该变成两条），而"先查再插"在并发下会
@@ -178,6 +262,10 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     之所以不是 `(text_hash, kind)` 联合唯一：同一条文本只该存在一次，与它的档位
     无关。允许两档并存等于允许"同一句话既是偏好又是事实"，检索时两条一起进
     top_k，白占两个名额。
+
+    后三张表（观测 / 命题 / 边）与 `memory_items` **在同一时刻、同一个连接上**建，
+    理由与 `runs` / `edit_events` 那几处完全相同：读它们的路径都在热路径上（每次
+    run 开始抽一次观测），多一个"发现表不存在 → 建表"的分支没有好处。
     """
     conn.execute(_CREATE_ITEMS)
     conn.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{ITEM_TABLE}_hash "
@@ -185,6 +273,27 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{ITEM_TABLE}_created "
                  f"ON {ITEM_TABLE}(created_at)")
     conn.execute(_CREATE_SESSIONS)
+
+    conn.execute(_CREATE_OBSERVATIONS)
+    conn.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{OBSERVATION_TABLE}_key "
+                 f"ON {OBSERVATION_TABLE}(source_key)")
+    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{OBSERVATION_TABLE}_at "
+                 f"ON {OBSERVATION_TABLE}(at)")
+    # 时间路（"最近 N 条"）与"还没被归纳用过"两条查询各要一个索引。合成一个
+    # `(consumed_at, at)`：前者是 `WHERE consumed_at IS NULL ORDER BY at`，
+    # 后者是 `ORDER BY at DESC`，这个索引对两条都能用上，省一个。
+    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{OBSERVATION_TABLE}_open "
+                 f"ON {OBSERVATION_TABLE}(consumed_at, at)")
+
+    conn.execute(_CREATE_PROPOSITIONS)
+    # 语义路只查 `status='active'` 的命题，`(status, item_id)` 让它走索引而不是
+    # 全表扫——命题会长到几百上千条，而这条查询在每次检索里都要跑一遍。
+    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{PROPOSITION_TABLE}_status "
+                 f"ON {PROPOSITION_TABLE}(status, item_id)")
+
+    conn.execute(_CREATE_EDGES)
+    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{EDGE_TABLE}_observation "
+                 f"ON {EDGE_TABLE}(observation_id)")
 
 
 # ---------------------------------------------------------------- 时间
@@ -402,7 +511,7 @@ def add(
     它存在的。审计事实被模型推断覆盖，是一种不可逆的信息丢失。
     """
     cleaned = _check_text(text)
-    if kind not in KINDS:
+    if kind not in WRITABLE_KINDS:
         raise ValueError(f"未知的记忆档位：{kind!r}")
     if source not in SOURCES:
         raise ValueError(f"未知的记忆来源：{source!r}")
@@ -657,6 +766,7 @@ def prompt_for(request: object) -> str:
 
 
 __all__ = [
+    "EDGE_TABLE",
     "HALF_LIFE_DAYS",
     "ITEM_TABLE",
     "KINDS",
@@ -664,11 +774,15 @@ __all__ = [
     "MAX_SCAN",
     "MEMORY_HEADER",
     "MIN_COSINE",
+    "OBSERVATION_TABLE",
+    "PROPOSITION_KIND",
+    "PROPOSITION_TABLE",
     "SESSION_TABLE",
     "SOURCES",
     "SOURCE_SUMMARY",
     "SOURCE_USER_EXPLICIT",
     "TOP_K",
+    "WRITABLE_KINDS",
     "Added",
     "Hit",
     "Item",
