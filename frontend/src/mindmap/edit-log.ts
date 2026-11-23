@@ -120,6 +120,25 @@ export interface EditEvent {
   before?: string;
   after?: string;
   /**
+   * 改动之后，这个节点在树上的**父节点 id**（`null` = 它是某棵子树的根）。
+   *
+   * 只有 `kind === 'add'` 现在填它，而这正是它存在的全部理由：**"用户新加的节点
+   * 挂在哪"原本在表里是一条都没有的可判事实**。改动前的统计里 565 条事件是
+   * update 559 / style 4 / remove 2，`add` 一条都没有——不是用户从没加过节点，
+   * 而是加节点这件事从来没被记成一行。（`move` 的父变化已经写在 `before` /
+   * `after` 的父节点标题里，那是给人读的摘要；要不要也给它一个 id 事实，等有
+   * 真的 `add` 样本之后再谈，现在加了也没有读者。）
+   *
+   * **它是 `null` 与"这个字段没值"是两件事**：`undefined` 表示这类事件不记父节点
+   * （update / style / remove / edge / title / generate），`null` 表示它就是根。
+   * 混成一个值，读的人就分不清"根"和"没记"。
+   *
+   * 口径与 `indexForest` 一致：鱼骨的六根骨、流程的各阶段都是**自己的根**
+   * （`parentId: null`），哪怕它在画布上挂在主骨上——那层挂载关系不在 `Node` 的
+   * 父子关系里（与后端 `agent/shapes.py::find_parent` 同一条判断）。
+   */
+  parentId?: string | null;
+  /**
    * 涉及的层数，**根是 1**（与契约"最多 8 层"同一口径）。
    *
    * `remove` 填删除前所在层，`add` / `move` / `update` / `style` 填改动后的层。
@@ -316,7 +335,13 @@ export function diffEdits(
   for (const [id, entry] of newIndex.entries) {
     const old = oldIndex.entries.get(id);
     if (!old) {
-      emit({ kind: 'add', nodeId: id, after: clip(entry.node.label.trim()), depth: entry.depth });
+      // `parentId` 是这条事件唯一能回答"新节点挂在谁下面"的字段。`after` 只是
+      // 标签摘要（截到 40 字），拿它去猜父节点等于让统计变成一件需要解释算法的
+      // 事，而它现在只需要读一行。
+      emit({
+        kind: 'add', nodeId: id, after: clip(entry.node.label.trim()),
+        depth: entry.depth, parentId: entry.parentId,
+      });
       continue;
     }
 

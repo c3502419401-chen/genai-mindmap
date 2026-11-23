@@ -45,12 +45,43 @@ describe('diffEdits：改了什么', () => {
     }]);
   });
 
-  it('加一个节点是一条 add', () => {
+  it('加一个节点是一条 add，带父节点 id', () => {
     const after = content(node('root', '主题', [node('a', '甲', [node('b', '乙'), node('c', '丙')])]));
 
     expect(diffEdits(tree(), after, { actor: 'user', at: AT })).toEqual([{
       actor: 'user', at: AT, kind: 'add', nodeId: 'c', after: '丙', depth: 3,
+      parentId: 'a',
     }]);
+  });
+
+  it('一加就加在最外层的 add，父节点是中心主题', () => {
+    const after = content(node('root', '主题', [node('a', '甲', [node('b', '乙')]), node('d', '丁')]));
+
+    const [event] = diffEdits(tree(), after, { actor: 'user', at: AT });
+    expect(event).toMatchObject({ kind: 'add', nodeId: 'd', depth: 2, parentId: 'root' });
+  });
+
+  it('父节点 id 记的是 id，不是标题：同名兄弟也不会串', () => {
+    // 标题会重名（"风险"在两支下各有一个），用标题当父节点标识就会把两条不同的
+    // 挂载关系读成同一条。`parentId` 存在的理由就是这个。
+    const before = content(node('root', '主题', [node('x', '风险'), node('y', '风险')]));
+    const root = node('root', '主题', [
+      node('x', '风险'),
+      node('y', '风险', [node('c', '新加')]),
+    ]);
+
+    const [event] = diffEdits(before, content(root), { actor: 'user', at: AT });
+    expect(event).toMatchObject({ kind: 'add', nodeId: 'c', parentId: 'y' });
+  });
+
+  it('非 add 的事件不带 parentId（`undefined` 与 `null` 是两件事）', () => {
+    const events = diffEdits(
+      tree(),
+      content(node('root', '主题', [node('a', '新标题', [node('b', '乙')])])),
+      { actor: 'user', at: AT },
+    );
+
+    expect(events[0]).not.toHaveProperty('parentId');
   });
 
   it('删一整支：只有一条 remove，带着整支的节点数', () => {
