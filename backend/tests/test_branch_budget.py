@@ -250,11 +250,14 @@ def _payload(branches: int, per_branch: int) -> dict:
 
 
 def test_thin_material_keeps_every_branch(monkeypatch):
-    """**这个 bug 的回归用例**：424 字材料 → 预算 10，但 6 条分支必须全都落树。
+    """**这个 bug 的回归用例**：薄材料上 6 条一级分支必须全都落树。
 
     模型替身写的是 6 支 × 10 个节点（61 个）。旧口径下 `_clip_tree(content, 10)` 按
-    前序只能留下一支——用户选 6 条拿到 1 条。按支摊之后总量抬到 19、每支 3 个，
-    六支齐全。
+    前序只能留下一支——用户选 6 条拿到 1 条。
+
+    现在这条路上**没有任何配额**可压：`node_limit` 是可读性上限 80（不是"这次要几个"），
+    61 < 80 所以连折叠都不触发，六支原样落树。真超了 80 也是折叠（
+    `test_over_the_readability_limit_is_folded_not_clipped` 钉那条），不是裁。
     """
     monkeypatch.setenv(budget.NODE_SCALE_ENV, "1")
     monkeypatch.delenv(budget.NODE_POOL_ENV, raising=False)
@@ -265,36 +268,43 @@ def test_thin_material_keeps_every_branch(monkeypatch):
 
     assert result.ok, result.content
     assert len(_branch_labels(ctx.candidate)) == 6
-    # 三处同一个数：提示词说的是每支 3 个、裁剪按 19、上报 19
-    assert result.data["node_limit"] == 19
-    assert "每条一级分支 3 个节点" in seen[1][0]
+    # 配额不再进提示词：`MINDMAP_NODE_SCALE` 开着也一样（那条路只影响
+    # `budget.initial_nodes`，而生成路径已经不再读它——见 `tools._generate` 里
+    # 「规模：不再由代码给一个数」那一段）
+    assert result.data["node_limit"] == INITIAL_MAX_NODES
+    assert "控制在" not in seen[1][0]
+    assert "每条一级分支" not in seen[1][0]
     assert ctx.candidate.root.children[0].children  # 每支都还有内容，不是光杆标签
     codes = [item["code"] for item in result.data["diagnostics"]]
-    assert "TREE_CLIPPED_TO_INITIAL" in codes
+    assert "TREE_CLIPPED_TO_INITIAL" not in codes
+    assert "TREE_FOLDED_TO_READABILITY" not in codes
 
 
-def test_thin_material_with_the_old_pool_still_collapses_to_one_branch(monkeypatch):
-    """同一个模型响应、旧口径（`MINDMAP_NODE_POOL=1`）→ 只剩一支。
+def test_the_old_preorder_clip_still_collapses_to_one_branch():
+    """为什么**不能**回到前序裁剪：同一个 61 节点的树、`limit=10`，只剩一支。
 
-    这条把对照钉死：上一条的分支数是**这次改动**带来的，不是模型替身写得少的缘故。
+    这条以前是"对照臂"（`MINDMAP_NODE_POOL=1` 走旧口径）。旧口径已经从生成路径上
+    撤掉了，所以对照直接打在 `_clip_tree` 上——它仍在，但只剩一个入口：四档折叠都
+    折不动之后的兜底（`tools._fold_tree`）。把这条留在测试里，是为了让"为什么不该
+    用它"这件事永远有一条可执行的证据，而不是一段注释。
     """
-    monkeypatch.setenv(budget.NODE_SCALE_ENV, "1")
-    monkeypatch.setenv(budget.NODE_POOL_ENV, "1")
-    ctx = _ctx([_material()])
+    content = _content(branches=6, per_branch=10)      # 1 + 6×10 = 61
+    trimmed, dropped = _clip_tree(content, 10)
 
-    result = _run(_chat(_payload(6, 10)), ctx)
-
-    assert result.ok, result.content
-    assert result.data["node_limit"] == 10
-    assert len(_branch_labels(ctx.candidate)) == 1
+    assert len(trimmed.root.children) == 1             # 后 5 支整条消失
+    assert dropped == 51
 
 
 @pytest.mark.parametrize("scale", [False, True])
-def test_default_path_reports_the_unchanged_ceiling(monkeypatch, scale):
-    """开关关着时 `node_limit` 恒为 80、提示词仍是总量池那一句（逐字节回归）。
+def test_default_path_reports_the_readability_ceiling(monkeypatch, scale):
+    """`node_limit` 恒为 80（= 可读性上限），**与 `MINDMAP_NODE_SCALE` 无关**。
 
-    开着但材料算出来 10、骨架只给 3 支时：`1 + 3 × 3 = 10`，与 N 相等——按支摊在
-    3 支上不该放大总量，只换说法。
+    这条以前钉"开关关着时恒为 80、开着时按材料算成 10，提示词跟着换那句"。那个数
+    已经从生成路径上撤掉了（`tools._generate`：「规模：不再由代码给一个数」），所以
+    现在无论是哪一档开关，提示词里都不出现节点数——两档必须给出**同一份** system。
+
+    钉它的理由：这条是"配额真的没了"的守卫。哪天 `MINDMAP_NODE_SCALE` 又被接回
+    生成路径，这里立刻红。
     """
     if scale:
         monkeypatch.setenv(budget.NODE_SCALE_ENV, "1")
@@ -304,12 +314,12 @@ def test_default_path_reports_the_unchanged_ceiling(monkeypatch, scale):
     result = _run(_chat(_payload(3, 2), seen, branches=3), ctx, branches=3)
 
     assert result.ok, result.content
-    if scale:
-        assert result.data["node_limit"] == 10
-        assert "每条一级分支 3 个节点" in seen[1][0]
-    else:
-        assert result.data["node_limit"] == INITIAL_MAX_NODES
-        assert "控制在 80 个节点" in seen[1][0]
+    assert result.data["node_limit"] == INITIAL_MAX_NODES
+    system = seen[1][0]
+    assert "控制在" not in system
+    assert "每条一级分支" not in system
+    # 那一句换成了判据（`tools.SCALE_BY_MATERIAL_RULE`）
+    assert "由内容决定" in system
 
 
 def test_materials_are_the_thin_batch():

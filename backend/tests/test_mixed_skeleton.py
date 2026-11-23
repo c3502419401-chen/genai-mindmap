@@ -38,6 +38,7 @@ from app.agent.tools import (
     GRAPH_OUTLINE_ENV,
     GRAPH_SUPPLEMENT_HEADER,
     MIXED_SKELETON_ENV,
+    NO_BRANCH_CAP_RULE,
     OUTLINE_HEADER,
     OUTLINE_MAX_ITEMS,
     OUTLINE_MIN_COVERAGE,
@@ -449,8 +450,10 @@ def test_the_prompt_puts_chapters_before_the_graph(monkeypatch):
     system, user = _plan(seen)
     assert OUTLINE_HEADER in user and GRAPH_SUPPLEMENT_HEADER in user
     assert user.index(OUTLINE_HEADER) < user.index(GRAPH_SUPPLEMENT_HEADER)
-    # 两份清单都在条数要求之前（顺序即权重）
-    assert user.index(GRAPH_SUPPLEMENT_HEADER) < user.index("最多 3 条")
+    # 两份清单都在**收尾判据**之前（顺序即权重）。这一条原先锚在"最多 3 条"上：
+    # 条数不再由代码给（`tools.NO_BRANCH_CAP_RULE`），那句已经不写进 user，改锚它
+    # 现在的位置——钉的仍是"两份清单都在收尾那一段之前"。
+    assert user.index(GRAPH_SUPPLEMENT_HEADER) < user.index(NO_BRANCH_CAP_RULE)
     assert _mixed_plan_rules(1) in system
 
 

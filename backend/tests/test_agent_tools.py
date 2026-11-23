@@ -32,6 +32,7 @@ from app.agent.tools import (
     EXTERNAL_DISABLED_NOTE,
     EXTERNAL_KNOWLEDGE_ENV,
     MAX_OUTPUT_TOKENS_CAP,
+    NO_BRANCH_CAP_RULE,
     PLAN_PROMPT,
     SUBNODE_EXPAND_PROMPT,
     build_registry,
@@ -277,7 +278,12 @@ class GenerateDeepToolTest(unittest.TestCase):
         self.assertEqual(mocked.await_count, 1)  # 骨架不合格就停手
 
     def test_skeleton_off_by_two_still_builds(self):
-        """骨架条数超出 ±1 的宽容范围也用实际返回：为条数整张重来等于再花一轮。"""
+        """模型给的条数与任何期望不符也用实际返回：为条数整张重来等于再花一轮。
+
+        "期望"这一头已经不存在了（条数不再由代码给，见 `tools.NO_BRANCH_CAP_RULE`），
+        所以这条用例钉的是另一半、也是更要紧的那一半：**不设限之后没有"条数不对"这条
+        告警**。它一旦回来，说明有人又把某个数当成了期望。
+        """
         ctx = _ctx(max_model_calls=10)
 
         async def fake(system, user, *, max_tokens=None):
@@ -293,7 +299,7 @@ class GenerateDeepToolTest(unittest.TestCase):
         self.assertTrue(result.ok, result.content)
         self.assertEqual(len(ctx.candidate.root.children), 7)
         codes = [item["code"] for item in result.data["diagnostics"]]
-        self.assertIn("SKELETON_SIZE_OFF", codes)
+        self.assertNotIn("SKELETON_SIZE_OFF", codes)
 
     def test_one_branch_failure_keeps_the_others(self):
         """某一支抛异常只该让那一支空着，其他分支照常建树。"""
@@ -564,11 +570,17 @@ class GenerateDeepToolTest(unittest.TestCase):
         self.assertEqual(len(duplicated), 1)
         self.assertIn("乙", duplicated[0]["message"])
 
-    def test_plan_request_states_the_requested_branch_count(self):
-        """骨架请求的 user 里要有期望分支数：3 支与 8 支的输入必须不同。
+    def test_the_tool_branch_argument_never_reaches_the_prompt(self):
+        """工具参数里的 `branches` **不进提示词**：3 支与 8 支的骨架输入必须逐字相同。
 
-        只写在 system 里的话，两次请求模型看到的东西一字不差，`branches`
-        这个用户选项等于没生效。
+        这条用例以前钉的是反面（"user 里要有期望分支数，3 支与 8 支的输入必须不同"）。
+        改的是产品口径，不是回归口径：那个数的唯一来源是模型**在读到材料之前**自己填的
+        工具参数（字段默认 5），而"条数由材料定"（`tools.NO_BRANCH_CAP_RULE`）。把它写进
+        user 等于让一个预感变成上限——实测退化成"root → 5 条竖链 × 3 节点，一个分叉都
+        没有"。
+
+        所以现在要钉的是**相反的不变量**：它一旦漏回提示词，这条用例就红。单条长度那
+        两条断言原样保留（它们与 `GENERATED_LABEL_MAX_CHARS` 同源，与条数无关）。
         """
         plan_users: dict[int, str] = {}
         for branches in (3, 8):
@@ -590,10 +602,10 @@ class GenerateDeepToolTest(unittest.TestCase):
             self.assertEqual(len(captured), 1)
             plan_users[branches] = captured[0]
 
-        self.assertIn("3", plan_users[3])
-        self.assertIn("8", plan_users[8])
-        self.assertNotEqual(plan_users[3], plan_users[8])
+        self.assertEqual(plan_users[3], plan_users[8])
         for text in plan_users.values():
+            self.assertNotIn("最多", text)
+            self.assertIn(NO_BRANCH_CAP_RULE, text)
             # 长度口径与系统提示词、代码截断同源（16，见 `GENERATED_LABEL_MAX_CHARS`）。
             # 这里曾经钉的是 20，而 `PLAN_PROMPT` 说 16、`_skeleton_titles` 按 16 截
             # ——三处两个数，模型照 user 写、写出来就被截。

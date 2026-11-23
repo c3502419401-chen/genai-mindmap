@@ -20,6 +20,7 @@ from app.agent.tools import (
     INVENTORY_MAX_LINES,
     INVENTORY_NO_STRUCTURE,
     INVENTORY_RULES,
+    NO_BRANCH_CAP_RULE,
     OUTLINE_HEADER,
     PLAN_INVENTORY_ENV,
     _material_inventory,
@@ -108,35 +109,40 @@ def test_structure_note_only_when_there_is_no_structure_block():
     assert INVENTORY_NO_STRUCTURE not in _material_inventory(sources, has_structure=True)
 
 
-def test_inventory_sits_between_topic_and_count_with_its_rule():
-    """位置与 `outline` 同一条理由（顺序即权重），且判据那句必须紧随其后。"""
+def test_inventory_sits_between_topic_and_the_rule_with_its_rule():
+    """位置与 `outline` 同一条理由（顺序即权重），且判据那句必须紧随其后。
+
+    "条数要求"那一端换成了收尾判据（`NO_BRANCH_CAP_RULE`）：条数不再由代码给，那句话
+    已经不进提示词。`INVENTORY_RULES` 要挨着的东西也随之前移一位——它补的是"怎么数
+    方面"，而"怎么数"现在紧跟的就是那句判据。
+    """
     inventory = _material_inventory([_source("a.md", "字" * 30)], has_structure=False)
-    ask = _plan_ask("机器学习", 6, materials=inventory)
+    ask = _plan_ask("机器学习", materials=inventory)
 
     assert ask.index("主题：机器学习") < ask.index("这次的材料")
-    assert ask.index("这次的材料") < ask.index("最多 6 条")
-    # 判据在条数要求**之后**、长度要求之前：它是"怎么数条数"的补丁，得挨着那一句。
-    assert ask.index("最多 6 条") < ask.index(INVENTORY_RULES) < ask.index("每条不超过")
+    assert ask.index("这次的材料") < ask.index(NO_BRANCH_CAP_RULE)
+    # 清单判据在收尾判据**之后**、长度要求之前：得挨着那句。
+    assert (ask.index(NO_BRANCH_CAP_RULE) < ask.index(INVENTORY_RULES)
+            < ask.index("每条不超过"))
 
 
 def test_outline_stays_above_inventory():
-    """两者同时存在时：主题 → 章节（细）→ 清单（粗）→ 条数要求。"""
+    """两者同时存在时：主题 → 章节（细）→ 清单（粗）→ 收尾判据。"""
     outline = OUTLINE_HEADER + "\n1. 预算审批（约占 40%）"
     inventory = _material_inventory([_source("a.md", "字" * 30)], has_structure=True)
-    ask = _plan_ask("管理办法", 3, outline=outline, materials=inventory)
+    ask = _plan_ask("管理办法", outline=outline, materials=inventory)
 
     assert (ask.index("主题：管理办法") < ask.index(OUTLINE_HEADER)
-            < ask.index("这次的材料") < ask.index("最多 3 条"))
+            < ask.index("这次的材料") < ask.index(NO_BRANCH_CAP_RULE))
 
 
 def test_without_material_the_ask_is_byte_identical():
     """没有材料时一个字都不加：body 与加清单之前逐字节相同。"""
-    assert _plan_ask("管理办法", 3, materials="") == _plan_ask("管理办法", 3)
-    assert INVENTORY_RULES not in _plan_ask("管理办法", 3)
-    assert _plan_ask("管理办法", 3) == (
+    assert _plan_ask("管理办法", materials="") == _plan_ask("管理办法")
+    assert INVENTORY_RULES not in _plan_ask("管理办法")
+    assert _plan_ask("管理办法") == (
         "主题：管理办法\n"
-        "根据内容实际包含的方面来定一级分支数量，最多 3 条。\n"
-        "材料层次多就用足、内容单薄就少给，不要为了凑数把不同的事塞进同一支。\n"
+        f"{NO_BRANCH_CAP_RULE}\n"
         "每条不超过 16 字，互不重叠，按逻辑顺序排列。"
     )
 
@@ -171,7 +177,7 @@ def test_inventory_switch_off_renders_nothing(monkeypatch):
     assert plan_inventory_enabled() is False
     assert _material_inventory(sources, has_structure=False) == ""
     assert _material_inventory(sources, has_structure=True) == ""
-    assert _plan_ask("机器学习", 6, materials="") == _plan_ask("机器学习", 6)
+    assert _plan_ask("机器学习", materials="") == _plan_ask("机器学习")
     for value in ("off", "FALSE", "no"):
         monkeypatch.setenv(PLAN_INVENTORY_ENV, value)
         assert _material_inventory(sources, has_structure=False) == "", value

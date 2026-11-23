@@ -29,6 +29,7 @@ from app.agent.tools import (
     DETAIL_SPLIT_MIN,
     INITIAL_MAX_DEPTH,
     INITIAL_MAX_NODES,
+    NO_BRANCH_CAP_RULE,
     OUTLINE_HEADER,
     PLAN_PROMPT,
     build_registry,
@@ -220,9 +221,11 @@ def test_skeleton_sees_the_material_inventory():
     assert f"这次的材料（合计 {chars:,} 字" in plan_user
     assert "份，" not in plan_user.split("这次的材料", 1)[1].split("\n", 1)[0]
     assert "1. 机器学习讲义.md" in plan_user
-    # 清单在主题之后、条数要求之前（顺序即权重），并且带上了"怎么用这个数"那句
+    # 清单在主题之后、收尾判据之前（顺序即权重），并且带上了"怎么用这个数"那句。
+    # 收尾那一端原先锚在"最多 3 条"上：条数不再由代码给（`tools.NO_BRANCH_CAP_RULE`），
+    # 那句已经不进提示词，所以改锚判据——位置不变，钉的还是"清单在前、收尾在后"。
     assert (plan_user.index(TOPIC) < plan_user.index("这次的材料")
-            < plan_user.index("最多 3 条"))
+            < plan_user.index(NO_BRANCH_CAP_RULE))
     # 只有结构：正文里那些句子一句都不在
     assert "K-means" not in plan_user
 
@@ -444,11 +447,19 @@ def test_initial_limits_are_unchanged():
     assert result.data["partial"] is False
 
 
-def test_over_the_node_limit_is_clipped_and_marked_partial():
-    """超过 80 个节点 → 裁到 80、记一条 `TREE_CLIPPED_TO_INITIAL`、标 `partial`。
+def test_over_the_readability_limit_is_folded_not_clipped():
+    """超过 80 → **折叠**，不是裁：一级分支一条不少，被并的那些标题留在聚合节点里。
 
-    裁剪而不是判失败：这次调用已经花掉了，前 80 个节点是一棵合法的、父在子前的
-    树；判失败就什么都没有，而下一轮大概率还是给这么多。
+    这条用例以前钉的是"裁到 80、记 `TREE_CLIPPED_TO_INITIAL`、标 `partial`"。裁那条路
+    现在只剩"四档折叠都折不动"之后的兜底（`tools._fold_tree`），正常形态是：
+
+        20 条一级分支 × 每支 6 个要点 = 141 个节点
+        → 根下超过 8 个的那 12 支并成一个「其他 12 项」
+        → 58 个节点、`cut_nodes=0`、落树 9 个一级节点（8 支 + 1 个聚合）
+
+    为什么这条比原先那条重要：裁丢掉的是后 12 支**整条**（用户看到 8 支的一张图，不知道
+    少了什么），折叠之后根下第 9 个节点明说"这里原本还有 12 项"，而且它带着那 12 支的
+    标题——这是"丢层级"与"丢内容"的差别。
     """
     wide = _tree([
         _branch(index, f"分支{index}", [
@@ -456,13 +467,27 @@ def test_over_the_node_limit_is_clipped_and_marked_partial():
         ])
         for index in range(20)
     ])  # 1 + 20 + 120 = 141 个节点
-    result = _run(_ctx(), _chat(wide))
+    ctx = _ctx()
+    result = _run(ctx, _chat(wide))
 
     assert result.ok, result.content
-    assert result.data["node_count"] == INITIAL_MAX_NODES
-    assert result.data["cut_nodes"] > 0
+    assert result.data["node_count"] < INITIAL_MAX_NODES
+    assert result.data["cut_nodes"] == 0           # 一个节点都没被裁
+    assert result.data["folded_rollups"] == 1
     assert result.data["partial"] is True
-    assert "TREE_CLIPPED_TO_INITIAL" in _codes(result)
+    assert "TREE_FOLDED_TO_READABILITY" in _codes(result)
+    assert "TREE_CLIPPED_TO_INITIAL" not in _codes(result)
+
+    top = ctx.candidate.root.children
+    assert len(top) == 9                            # 8 支 + 1 个聚合，比裁到 8 支多活一条
+    assert top[0].label == "分支0" and len(top[0].children) == 6   # 前面几支原样
+    rollup = top[-1]
+    assert rollup.label == "其他 12 项"
+    # 被并的 12 支的标题一个不落地在 detail 里（读图的人据此知道少了什么）
+    for index in range(8, 20):
+        assert f"分支{index}" in rollup.detail
+    # 不是"到底了"：这一支还能从这里长回来（`NODE_EXPANDABLE` 的三态）
+    assert rollup.expandable == "unknown"
 
 
 @pytest.mark.parametrize("branches", [3, 6])

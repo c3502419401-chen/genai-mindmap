@@ -489,16 +489,26 @@ def test_evidence_unused_still_reported_on_the_two_tier_path():
     assert result.data["source_refs"]["declared"] == 0
 
 
-def test_partial_and_clipping_still_work_on_the_two_tier_path():
-    """两级这条路上 `partial` 语义不变：超过 80 个节点 → 裁到 80 并标 `partial`。"""
+def test_partial_and_folding_still_work_on_the_two_tier_path():
+    """两级这条路上 `partial` 语义不变：超过可读性上限 → **折叠**并标 `partial`。
+
+    这条以前钉"裁到 80"。裁剪现在只剩四档折叠都折不动之后的兜底（`tools._fold_tree`），
+    而两级树的每一个父节点扇出都很宽（根 5 组、每组 4 支、每支 6 个要点），正是折叠
+    最省节点的那种形状——146 个节点被折进可读性上限以内，一个都不用裁。
+
+    钉它要守住的两件事：一级、二级这两层**照样成立**（`_apply_groups` 的结果没有被后来
+    的折叠抹平），以及 `partial` 仍然如实上报。
+    """
     big = _grouped_tree(points=6)      # 1 + 5 + 20 + 120 = 146 个节点
     result = _run(_ctx(), _chat(skeleton=_grouped_response(), tree=big))
 
     assert result.ok, result.content
-    assert result.data["node_count"] == INITIAL_MAX_NODES
-    assert result.data["cut_nodes"] > 0
+    assert result.data["node_count"] <= INITIAL_MAX_NODES
+    assert result.data["cut_nodes"] == 0            # 一个都没裁
+    assert result.data["folded_rollups"] >= 1
     assert result.data["partial"] is True
-    assert "TREE_CLIPPED_TO_INITIAL" in _codes(result)
+    assert "TREE_FOLDED_TO_READABILITY" in _codes(result)
+    assert "TREE_CLIPPED_TO_INITIAL" not in _codes(result)
 
 
 def test_node_grow_frames_cover_the_three_levels():

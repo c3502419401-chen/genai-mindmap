@@ -457,17 +457,27 @@ class TestTreeIsByteIdentical:
         # 树上确实没有多出一"半"东西：edges 是空列表。
         assert new_tree["edges"] == []
 
-    def test_plan_prompt_and_ask_are_unchanged(self):
-        """骨架提示词与 user 消息在 tree 时一字不差。"""
+    def test_plan_prompt_is_unchanged_and_the_ask_only_changed_at_the_tail(self):
+        """骨架 system 一字不差；user 只**收尾那一句**变了（配额 → 判据）。
+
+        这条以前比的是"整条 user 与基线逐字节相等"。本次改动把"最多 N 条"那两句撤掉了
+        （`tools.NO_BRANCH_CAP_RULE` 上面记着原因：那个 N 的唯一来源是模型读到材料之前
+        自己填的工具参数），基线那份 `_plan_ask` 连签名都不同了，所以"整条相等"这条
+        口径本身失效。
+
+        留下的是仍然成立、也仍然值得守的三件事：system 逐字节不变；`tree` 这个默认
+        图型一个字都不加；**收尾之前那段（主题 + 目录块）与基线逐字节相同**——本次改的
+        只是收尾，前面一个字都不该动。
+        """
         baseline = _load_baseline_tools()
         from app.agent import tools as new_tools
 
         assert new_tools.PLAN_PROMPT == baseline.PLAN_PROMPT
-        assert new_tools._plan_ask("主题", 6) == baseline._plan_ask("主题", 6)
-        assert new_tools._plan_ask("主题", 6, outline="目录") == \
-               baseline._plan_ask("主题", 6, outline="目录")
-        assert new_tools._plan_ask("主题", 6, diagram_type="tree") == \
-               baseline._plan_ask("主题", 6)
+        assert new_tools._plan_ask("主题") == new_tools._plan_ask(
+            "主题", diagram_type="tree")
+        prefix = baseline._plan_ask("主题", 6, outline="目录").split("根据内容实际包含")[0]
+        assert prefix.strip()          # 基线那一份确实有前缀可比
+        assert new_tools._plan_ask("主题", outline="目录").startswith(prefix)
 
 
 # ---------------------------------------------------------------- 细粒度工具

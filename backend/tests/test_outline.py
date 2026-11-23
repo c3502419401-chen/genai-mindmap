@@ -24,6 +24,7 @@ import pytest
 
 from app.agent.contracts import AgentRunRequest, RunBudget, RunContext, ToolCall
 from app.agent.tools import (
+    NO_BRANCH_CAP_RULE,
     OUTLINE_HEADER,
     OUTLINE_MIN_COVERAGE,
     PLAN_PROMPT,
@@ -403,30 +404,39 @@ def test_outline_is_absent_when_material_has_no_outline():
     # 第 11 节），所以逐字节钉住的这一行只剩字数。
     assert model.plan_user.startswith(
         "主题：管理办法\n\n这次的材料（合计 1,400 字，没有可用的章节标题）：")
-    assert model.plan_user.index("这次的材料") < model.plan_user.index("最多 3 条")
+    # 清单在**收尾要求**之前。这一条原先锚在"最多 3 条"上——不设限之后那句已经不进
+    # 提示词了（`tools.NO_BRANCH_CAP_RULE`），收尾那一段只剩判据，所以改锚判据。
+    # 钉的仍然是同一件事：清单在前、收尾在后（顺序即权重）。
+    assert model.plan_user.index("这次的材料") < model.plan_user.index(NO_BRANCH_CAP_RULE)
 
 
 def test_plan_ask_without_outline_is_unchanged():
-    """没有目录时 user 消息的形状不变（回归口径）。
+    """没有目录、也没有材料时 user 消息的形状（回归口径）。
 
     「20 字」在 2026-11 这次改动里改成了 16：`PLAN_PROMPT` 一直说的是 16、
     `_skeleton_titles` 也按 16 截，只有这一句 user 说 20——模型照 user 写，
     写出来就被截，一级分支标题从中间断掉。三处现在都读
     `GENERATED_LABEL_MAX_CHARS`。
+
+    收尾那一句从"最多 3 条 + 用足别凑"两句变成**一句判据**（`NO_BRANCH_CAP_RULE`）：
+    条数不再由代码定（`tools._plan_ask` 的 docstring）。这条用例的价值不变——它是
+    纯主题那一路上唯一一份"逐字节"的 user 快照。
     """
-    assert _plan_ask("管理办法", 3) == (
+    assert _plan_ask("管理办法") == (
         "主题：管理办法\n"
-        "根据内容实际包含的方面来定一级分支数量，最多 3 条。\n"
-        "材料层次多就用足、内容单薄就少给，不要为了凑数把不同的事塞进同一支。\n"
+        f"{NO_BRANCH_CAP_RULE}\n"
         "每条不超过 16 字，互不重叠，按逻辑顺序排列。"
     )
 
 
-def test_plan_ask_puts_outline_between_topic_and_count():
-    """目录在主题之后、条数要求之前：先看结构，再数条数。"""
-    ask = _plan_ask("管理办法", 3, outline=OUTLINE_HEADER + "\n1. 预算审批（约占 40%）")
+def test_plan_ask_puts_outline_between_topic_and_the_rule():
+    """目录在主题之后、收尾判据之前：先看结构，再定条数。
+
+    名字里的 `count` 换成了 `the_rule`：那一段现在是一句判据，不是一个数。
+    """
+    ask = _plan_ask("管理办法", outline=OUTLINE_HEADER + "\n1. 预算审批（约占 40%）")
     assert ask.index("主题：管理办法") < ask.index(OUTLINE_HEADER)
-    assert ask.index(OUTLINE_HEADER) < ask.index("最多 3 条")
+    assert ask.index(OUTLINE_HEADER) < ask.index(NO_BRANCH_CAP_RULE)
 
 
 def test_skeleton_outline_reports_whole_material_shares():
