@@ -96,6 +96,12 @@ hit 形状、第二套引用格式、第二套校验。所以这个模块只做�
     主题 → 2-4 个方向 → 每方向并行打源（各 2 条）→ URL 去重
          → 按**方向**各自过词面门 → 方向内按源交替 → 跨方向轮转 → 取 limit 条
 
+**这条路默认关**（`DIRECTIONS_ENV`），所以它保留着改动之前的取样实现（`_interleave`
+/ `_interleave_directions`），而单方向那条路已经换成打分排序（见下面"取数策略"
+一节）。两条路的选择器不同是**刻意的**：方向路径的每个方向只有 5 次请求预算、每个
+方向回来的候选只有 1-2 条，在那种规模上"排序"与"轮转"没有区别；而它的实测结论
+（负收益）也不因为换了选择器而改变。
+
 三条约束是这个形状存在的前提，改动它们等于取消这个功能：
 
   - **门按方向施加而不是按主题**（`_relevant_hits(direction, hits)`）。合并后的池子
@@ -130,9 +136,29 @@ hit 形状、第二套引用格式、第二套校验。所以这个模块只做�
 投票权，而"这条资料值不值得 21470 字"这件事我们没有证据支持（复现：`scripts/
 measure_external_deepseek.py --truncation`）。截断前的长度照旧进 `raw_chars`。
 
-**只占 1 个名额**（`_blend_deepseek`）。`_interleave` 按源的收集顺序轮流取，第六个
-桶排在最后——不特殊处理的话，前三轮永远轮不到它，等于白搜。所以单方向路径给
-Search 一个独立席位（`limit - 1` 给五源、1 给 Search），理由与取舍写在那函数里。
+**不再独占名额**（原先 `_blend_deepseek` 给它 1 席）。那条规则与"每源保底"是同一个
+病：用源的配额代替相关性判据。它今天还害了一次——五源全挂时它抓回的是教育平台课程页
+（正文前 300 字里"机器学习"出现 5 次，全在课程名与页头导航），而"给 Search 1 席"
+保证了这条会进材料。现在六个源在同一个分数上排队，Search 的 `rerank_score` 只做同档
+内的微调（系数 0.25），不再能靠"有分数"顶掉五源。
+
+## 取数策略：打分 → 排序 → 去重 → 多样性（`limit` 的默认值由此而定）
+
+    六源候选（不去重、不截断）
+      → score_hit（标题分档 0.5 + 前 300 字次数 0.3 + 全文次数 0.2，再乘 rerank 系数）
+      → 降序 → 内容去重（Jaccard ≥0.60 只留一条）→ MMR（与已选内容相似就扣分）
+      → 取前 limit 条
+
+**没有按源的配额**，既没有保底也没有封顶。理由全是读数（7 个主题、256 条候选、
+人工判定，脚本 `scripts/measure_external_rank.py`）：词面门 + 每源交替在 `limit=3`
+上给 14 相关 / 6 噪声，打分排序给 17 / 2；`limit=8` 上是 20 / 20 对 42 / 10。而
+"每源封顶"（每源最多 `ceil(limit/2)`）在同一份池子上是**负收益**：`limit=8` 的相关
+从 42 掉到 36、噪声从 10 涨到 14——openalex/crossref 恰是某些主题唯一的相关来源。
+
+`DEFAULT_LIMIT` 因此从 3 提到 8：判据分得开时，提高 limit 拿到的是更多相关材料
+（0.3 条相关/主题 → 6 条/主题），而"3 个名额"本身就在扔东西（`城市雨污分流改造`
+一题 8 条候选全相关，3 个名额只能给 3 条）。完整读数与复现命令见
+`docs/EXTERNAL-SELECTION.md`。
 
 ## 代理
 
@@ -200,20 +226,31 @@ DEFAULT_PROXY = "http://127.0.0.1:7897"
 # 那种时刻的重试没有意义（同一个节点、同一个目标），所以要的是快速放弃。
 REQUEST_TIMEOUT = 10.0
 
+# 一次检索最多拿几条（跨源合计）。默认 3 与 _generate 的 GENERATE_RETRIEVAL_TOP_K=5
+# 不冲突：外部来源本身是"一份材料"，进库之后由检索筛，条数多了反而把清单撑满。
+# （这条理由在下一个提交里被推翻：清单已经是"文件名 + 字数"，撑不满。）
+DEFAULT_LIMIT = 3
+
 # 整次外部检索的总预算。两个数字一起构成"最坏情况下用户等多久"：
 #   - `DEADLINE_SECONDS`：整次调用的墙钟上限，20 秒后任何新请求都不再发；
-#   - `REQUEST_LIMIT`：请求次数上限。**13**，构成是
-#       五源 9：维基 1（精确标题）+ 1（条目检索）+ 3（逐条抓 `limit` 条）
-#              + arXiv 1 / OpenAlex 1 / Crossref 1 / 快懂百科 1 = 9
-#       DeepSeek Search 1（一次往返换回最多 `count` 条，正文由它自己抓好）
-#       DeepSeek Fetch 最多 3（`content` 为空时按 `url` 补抓，条数 = `count`）
-#     Search 关着时上界仍是 9——那一支一次都不会走到（`_source_available`），
-#     所以"默认关 = 与 `3c40ba6` 逐字节相同"这条承诺不受这个数字影响。
-#     Search 打开时的 4 次额外请求与五源**并行**发，墙钟上界仍是 `DEADLINE_SECONDS`。
+#   - `_request_limit(limit)`：请求次数上限，**随 `limit` 线性涨的两项**：
+#       五源固定 5 次（维基精确标题 1 + 条目检索 1 + arXiv / OpenAlex / Crossref /
+#       快懂百科各 1）+ 维基逐条抓 `limit` 次 + DeepSeek Search 1 次 + DeepSeek 补抓
+#       至多 `limit` 次，再留 1 次余量 = 7 + 2 × limit。
+#     `DEFAULT_LIMIT=3` 时它等于 13，与改动之前那个常量逐字相同——**默认 limit 下的
+#     请求预算没有变**，变的只是"limit 提上去时预算跟着涨"这件事（以前 `limit` 提到
+#     8，维基的逐条抓取会被 13 次预算掐掉一半，而那是"某个源悄悄变薄"的静默故障）。
 # 没有次数上限时，源返回一个"下一条标题"的畸形响应就能把链路拖进无界循环；给多了
 # 则是"为几条候选把预算烧光"。
 DEADLINE_SECONDS = 20.0
-REQUEST_LIMIT = 13
+# 默认 limit 下的请求预算。**它现在是一个计算结果**，不是一个独立常量：把它写成
+# 常量而让 `limit` 浮动，就是"改一个数忘了改另一个"的那类故障。
+REQUEST_LIMIT = 7 + 2 * DEFAULT_LIMIT
+
+
+def _request_limit(limit: int) -> int:
+    """一次单方向检索的请求次数上界（构成见 `REQUEST_LIMIT` 上面那段）。"""
+    return 7 + 2 * max(int(limit), 0)
 
 # 多方向检索的请求预算。15 = 3 个方向 × 5 次（每方向的次数构成见 `DIRECTION_SOURCES`
 # 与 `_wikipedia` 的 `exact_first` / `fetch_limit`）。**墙钟不放宽**：`DEADLINE_SECONDS`
@@ -294,9 +331,7 @@ _TRUTHY = {"1", "true", "yes", "on", "y", "t"}
 # 再长的部分进不了 prompt（父块 450–700 字，一次检索最多给 5 条），留着只是占库。
 TEXT_MAX_CHARS = 8000
 
-# 一次检索最多拿几条（跨源合计）。默认 3 与 `_generate` 的 `GENERATE_RETRIEVAL_TOP_K=5`
-# 不冲突：外部来源本身是"一份材料"，进库之后由检索筛，条数多了反而把清单撑满。
-DEFAULT_LIMIT = 3
+
 
 # 查询词的长度上限。用户可能整段贴进来；维基的 `titles=` 是一次精确查找、arXiv 的
 # `all:` 是一条检索式，两者在 50 字以上都只会返回噪声或空。
@@ -354,11 +389,20 @@ DEEPSEEK_TIMEOUT = 8.0
 # 改那个数会同时改变五个源的既有行为。
 DEEPSEEK_TEXT_MAX_CHARS = 4000
 
-# 每个源向服务端要几条候选。给 5 而不是 `limit`：`_interleave` 从 5 个桶里轮取，
-# 只给 3 条的话，中文源一旦排在后面就一条都进不了结果（见 `_interleave` 的
-# `prefer_language`）——而"5 个源、3 个名额"本来就是一道数学题，候选多一点才有
-# 得挑。
+# 每个源向服务端要几条候选。**取 `max(5, limit)`**（见 `_candidate_window`）：
+# `limit=8` 时向源端要 5 条，等于让 OpenAlex / Crossref 只能贡献 5 条候选，而它们
+# 恰好是某些主题（`城市雨污分流改造`、`碳中和`）唯一的相关来源——上限设在源端，
+# 排序再准也拿不到池子里没有的东西。
 SOURCE_CANDIDATES = 5
+
+
+def _candidate_window(limit: int) -> int:
+    """这次向每个源要几条候选：`max(SOURCE_CANDIDATES, limit)`。
+
+    为什么不让它恒等于 `limit`：`limit=1/2` 那种调用（测量脚本、单条溯源）仍然该拿到
+    5 条候选池——排序需要挑，1 条候选时"按相关度排"是句空话。
+    """
+    return max(SOURCE_CANDIDATES, max(int(limit), 0))
 
 # 维基要求可识别的 User-Agent 并带联系方式，否则 403：
 # 实测纯 `Mozilla/5.0 ...` 得到 "Please respect our robot policy"，
@@ -1012,7 +1056,7 @@ def _openalex(
     try:
         with _client() as client:
             payload = _request(client, OPENALEX_API, params={
-                "search": query, "per-page": str(SOURCE_CANDIDATES),
+                "search": query, "per-page": str(_candidate_window(limit)),
             }, timeout=timeout).json()
         return _parse_openalex(payload, limit)
     except Exception as exc:  # noqa: BLE001 — 外部源失败只降级，理由见模块 docstring
@@ -1086,7 +1130,7 @@ def _crossref(
     try:
         with _client() as client:
             payload = _request(client, CROSSREF_API, params={
-                "query": query, "rows": str(SOURCE_CANDIDATES),
+                "query": query, "rows": str(_candidate_window(limit)),
                 "mailto": POLITE_MAILTO,
             }, timeout=timeout).json()
         return _parse_crossref(payload, limit)
@@ -1513,10 +1557,9 @@ def _deepseek_search(
     POST 就返回 `content`（实测 0.47–1.13 秒、3 条、正文 1.5k–21k 字）。所以它只花
     1 次预算。
 
-    `count` 传 `limit` 而不是 `SOURCE_CANDIDATES=5`：我们最终只留 1 条（
-    `_blend_deepseek`），要 3 条是为了给 `_relevant_hits` 一点挑选余地（第 1 条被
-    门挡掉时还有替补）。要 5 条只会让响应体更大、延迟更高，换来的是两条我们不会用
-    的候选。
+    `count` 传 `limit` 而不是 `SOURCE_CANDIDATES`：这个源的每一条都是**要正文**的
+    （`need_content=True`），响应体随 `count` 线性涨。要 `limit` 条是因为最终可能全部
+    入选（打分之后不再有"只剩 1 席"这回事），再多要只会让响应体更大、延迟更高。
 
     失败处理与五源同一套：`budget.note_failure()` + 返回已拿到的部分。**key 缺失也
     走这一条**——它是配置错误，不是"这个源没有结果"，而 `_worth_caching` 靠这个计数
@@ -1564,6 +1607,12 @@ def _interleave(
 ) -> list[ExternalHit]:
     """按 `source_name` 交替取。
 
+    **只服务多方向检索**：单方向那条路已换成 `_select_hits`（按相关度排 + 内容去重 +
+    MMR）。方向路径保留它是因为那里的规模完全不同——每个方向只有 `DIRECTION_HIT_LIMIT`
+    =2 个名额、候选 1-2 条，排序与轮转在那儿没有区别，而"方向内保源多样"能保证
+    一个方向的 3 条不全是同一份百科。改它之前先看 `docs/EXTERNAL-SELECTION.md`：
+    "每源保底"在单方向路径上被证伪的那套读数，与这里不是同一个场景。
+
     不交替的后果是一边倒：维基一次能给 3 条、arXiv 常给 0–3 条，直接拼接会让维基
     占满全部名额，用户拿到的"资料"其实是同一个百科条目的三个邻接条目。交替之后，
     只要两个源都有结果，就至少各占一条。
@@ -1610,42 +1659,246 @@ def _query_language(query: str) -> str | None:
     return "zh" if _CJK_RE.search(query or "") else None
 
 
-def _blend_deepseek(
-    relevant: Sequence[ExternalHit], limit: int, query: str,
-) -> list[ExternalHit]:
-    """五源交替取 `limit - 1` 条，DeepSeek 的命中单独占**最后 1 席**。
+# ---------------------------------------------------------------- 取数策略：打分 → 排序 → 去重 → 多样性
+#
+# 这一段取代了"每源轮流取 + 给 DeepSeek 留 1 席"。**为什么换成排序**：那两条规则
+# 的本质是"在没有相关性判据的情况下，用源的配额代替判据"。而判据现在是有的——
+# 不需要语义模型，光是"词面证据出现在哪里、出现几次"就把噪声率从 43% 压到 18%
+# （7 主题 / 256 条候选 / 人工判定的读数见 `docs/EXTERNAL-SELECTION.md`）。
+#
+#   title  0.5  —— 标题的得分分四档（逐字 / 整串 / 词块 / token），不是二值。分档
+#                  的理由是一个具体反例：「机器学习」是维基词条，「机器学习理论与实践」
+#                  是图书商品页，二值口径下两者一样高（标题都含这个词块），而前者是
+#                  这条 query 的答案、后者是一张商品页。分档之后前者 1.0、后者 0.9，
+#                  排序把它们分开了（`--variant-grid` 的"分档"那几行）。
+#   lead   0.3  —— 正文前 `RELEVANCE_CHARS` 字里的**次数**（封顶 3）。封顶是因为
+#                  "出现"与"出现一次"都只是有无，而导航/页头里的重复不算证据：
+#                  教育平台课程页在开场 5 次，全在课程名与页头。
+#   freq   0.2  —— 全文次数（封顶 12），弱信号，只用它拉开"提了一下"与"通篇在讲"。
+#
+# 权重之和 = 1，所以 `evidence` 落在 [0,1]；`rerank` 只乘一层 [0.75, 1.0] 的系数。
+# **它不改变档位，只改变同档内的先后**——理由是一个实测：DeepSeek 自己的重排分把
+# 上面那条课程页排在自己那批的第一名（1.812），所以拿它定档位等于把这个 bug 原样
+# 搬进来。五源没有这个字段，缺它时给**中性值 0.5**而不是 0：给 0 等于"没有分数就是
+# 最低分"，实测后果是 deepseek 的每一条都压过维基词条（`机器学习` 那题 limit=3 变成
+# 三条 deepseek 商品页，相关 0/3；中性值 0.5 时是 2/3）。
 
-    为什么需要这一层：`_interleave` 按源的收集顺序轮流取，`deepseek` 排在第六个桶
-    ——3 个名额在三轮之后就满了，它一条都进不来（实测：六源都在、顺序不动时，
-    `碳中和` 的结果是 `wikipedia, openalex, wikipedia` 三条，Search 的 3 条全部落选）。
-    换句话说，不特殊处理的话"接了第六个源"在 `limit=3` 上是零效果。
+TITLE_SCORE_EXACT = 1.0
+TITLE_SCORE_FULL = 0.9
+TITLE_SCORE_PHRASE = 0.8
+TITLE_SCORE_TOKENS = 0.5
+TITLE_WEIGHT = 0.5
+LEAD_WEIGHT = 0.3
+FREQ_WEIGHT = 0.2
+# 两处词频的上限。3 = "引用能取证的深度里出现两次以上"；12 = 全文里"通篇在讲"。
+# 都不封顶会让一条把主题词写进页头的目录页刷满词频分——那正是坏样本的形态。
+LEAD_OCCURRENCE_CAP = 3
+BODY_OCCURRENCE_CAP = 12
+# `rerank_score` 的归一化区间。实测它落在 1.49–2.20（越大越相关），1.5–2.0 覆盖
+# 绝大多数取值，超出部分截断——它是**同档内**的微调，不需要精确的量纲。
+RERANK_FLOOR = 1.5
+RERANK_CEIL = 2.0
+RERANK_INFLUENCE = 0.25
+RERANK_NEUTRAL = 0.5
 
-    为什么是 1 席而不是更多：
+# 分数地板：**没有任何词面证据（score == 0）的一条不当依据**。它是那道词面门的
+# 分级版本——门要求"整块出现"，这里只要求"分数大于 0"（标题四档任意一档、或正文里
+# 出现过一次），所以它放行的范围比门宽，同时保住了门那条契约：全站跑题时返回空列表，
+# 而不是把一条零证据的页面塞进材料（`test_all_sources_filtered_returns_empty_list`
+# 钉着这条）。
+#
+# 代价量过，可以忽略：256 条候选里打分为 0 的 22 条，21 条是噪声（听课页/词条撞形），
+# 1 条是被英文词口径漏掉的相关条目——给 `_occurrences` 补上英文词之后它就不是 0 了。
+SCORE_FLOOR = 0.0
+# 跨语言那一档的分数（见 `score_hit`）。0.05 比任何真实词面证据都小：正文里出现过
+# 一次的候选是 `LEAD_WEIGHT / LEAD_OCCURRENCE_CAP` = 0.1，所以"有证据的永远在前"；
+# 而它大于 `SCORE_FLOOR`，所以名额有剩时它仍然能进材料——那是"判据没有说话能力"
+# 的正确读法，不是"这条一定相关"。
+CROSS_LINGUAL_SCORE = 0.05
 
-      - 五源是默认路径（默认开、不要钱、不出境），Search 是可选的补充（默认关、计费、
-        query 出境）。让它抢走一半名额，等于让一个默认关的功能决定默认输出的形状；
-      - `limit=3` 时 2+1 仍然是"多数来自免费源"，而 Search 那条通常是三者里最贴主题的
-        一条（它有 `rerank_score`，五源没有分数）。1 席刚好够"补上五源最弱的那一面"。
+# 去重的相似度阈值：`_token_list`（中文 bigram + 英文整词）在「标题 + 正文前
+# `DEDUPE_TEXT_CHARS` 字」上的 Jaccard。0.60 是量出来的分界——池内真正"同一条资料
+# 从两个源回来"的 13 对在 0.66–1.00，而"同主题不同文"的最高一对在 0.40 以下。
+# 不引新依赖：分词复用检索那套（`knowledge.service._token_list`），语义相似度那套
+# （`optimization` 的余弦）在这里是多余的——要并的是同一篇文章，不是同一个意思。
+DEDUPE_TEXT_CHARS = 200
+DEDUPE_THRESHOLD = 0.60
 
-    顺序是**五源在前、Search 在后**：这是材料的展示顺序，也是 `data.external_used`
-    里"本次依据来自外部检索的 N 条（wikipedia、openalex、deepseek）"的顺序。把补充
-    放在最后，用户看到的第一条仍然是维基/论文——那是默认路径该有的样子。
+# 多样性：每选一条，把"与已选内容最相似"的程度折算成扣分（MMR 的朴素版）。
+# **这一层不按源**——按源去重就是这次要拆掉的东西。0.25 的含义：相似度 1.0 的一条
+# 损失 1/4 分，不足以把一条高分相关命中挤到一条低分噪声后面，但足够在同分附近把
+# 重复的排到后面。
+DIVERSITY_LAMBDA = 0.25
 
-    `limit < 2`（或 Search 没有命中）时**原样走 `_interleave`**：给不出一条的配额，
-    而"limit=1 时全是 Search"会让一次只想要一条依据的调用突然只拿到 Search 的东西。
 
-    开关关着时 `relevant` 里没有任何 `deepseek` 命中，这个函数退化成
-    `_interleave(relevant, limit)` —— 与 `3c40ba6` 逐字节相同（同一批命中、同一个
-    顺序、同一份 `prefer_language`）。
+def _occurrences(query: str, text: str) -> int:
+    """query 的词面在一段文字里出现的**次数**。
+
+    中文词块区分大小写（汉字没有大小写），英文词按小写比——纯英文 query 的
+    `_phrase_terms` 是空的，只数中文词块会让它永远拿不到正文证据（实测：
+    `Cursor` 那题里维基的 `Anysphere` 正文开头就写着它为 Cursor 提供开发服务，
+    只数中文词块时它打分为 0，一条真依据被判成噪声）。
     """
-    search_hits = [hit for hit in relevant if hit.source_name == DEEPSEEK_SOURCE]
-    if not search_hits or limit < 2:
-        return _interleave(relevant, limit, prefer_language=_query_language(query))
-    rest = [hit for hit in relevant if hit.source_name != DEEPSEEK_SOURCE]
-    picked = _interleave(rest, limit - 1, prefer_language=_query_language(query))
-    # Search 的桶内顺序已经是 `rerank_score` 降序（`_parse_deepseek_search`），
-    # 这里取第一条就是它自己排的第一名。
-    return picked + _interleave(search_hits, 1)
+    value = text or ""
+    total = sum(value.count(term) for term in _phrase_terms(query))
+    lowered = value.lower()
+    total += sum(lowered.count(term) for term in _word_terms(query))
+    return total
+
+
+def _title_score(query: str, hit: ExternalHit) -> float:
+    """标题的得分**分四档**：逐字相同 > 整串出现 > 词块出现 > 只有 token 重合。
+
+    分档而不是二值，理由见上面 `TITLE_WEIGHT` 那段（维基词条 vs 图书商品页）。
+    最后一档是 token 覆盖率的折价（0.5 倍）：它只在"标题与 query 共享 bigram 但
+    没有整块命中"时生效，权重低是因为这一档的证据最弱（`用户画像` 的标题里出现
+    `画像` 二字说明不了什么）。
+
+    英文 query 靠 `_word_terms` 那一档：`Cursor` 的标题里出现 `cursor` 就是命中，
+    与中文 query 的"词块出现在标题里"是同一件事。
+    """
+    text = (query or "").strip()
+    title = hit.title or ""
+    if text and title.strip() == text:
+        return TITLE_SCORE_EXACT
+    if text and text in title:
+        return TITLE_SCORE_FULL
+    if any(phrase in title for phrase in _phrase_terms(text)):
+        return TITLE_SCORE_PHRASE
+    words = _word_terms(text)
+    if words and _word_terms(title) & words:
+        return TITLE_SCORE_PHRASE
+    tokens = {token for token in _token_list(title) if token.strip()}
+    query_tokens = [token for token in _token_list(text) if token.strip()]
+    if not query_tokens:
+        return 0.0
+    return TITLE_SCORE_TOKENS * (
+        sum(1 for token in query_tokens if token in tokens) / len(query_tokens))
+
+
+def _rerank_norm(hit: ExternalHit) -> float:
+    """源站自己的重排分 → [0,1]；缺失给中性值（理由见 `RERANK_NEUTRAL`）。"""
+    score = hit.rerank_score
+    if score is None:
+        return RERANK_NEUTRAL
+    span = RERANK_CEIL - RERANK_FLOOR
+    return max(0.0, min(1.0, (score - RERANK_FLOOR) / span))
+
+
+def score_hit(query: str, hit: ExternalHit) -> float:
+    """一条命中的相关度分，落在 [0, 1]。**纯函数、无 IO、可离线重放**。
+
+    构成与系数见上面那一段注释。它是 `_select_hits` 唯一的排序依据，也是这个模块
+    里唯一"函数值可以解释"的地方：任何一个分数都能拆成"标题几分 / 前 300 字几分 /
+    全文几分 / 源站分几分"，所以"为什么这条排第一"永远有答案。
+
+    **跨语言的那一档单独给一个极小分**（`CROSS_LINGUAL_SCORE`）：query 与命中的
+    书写系统没有交集时，词面判据在这里没有说话的能力（中文 query 配一篇纯英文论文，
+    两边没有一个可比的字符），把它当成"零证据"等于用"拼写不同"判"内容无关"——
+    实测里 `注意力机制 → Attention Is All You Need` 就是这样被误杀的。给它一个
+    **比任何真实词面证据都小**的分，效果是"排到最后但不被抹掉"：有词面证据的候选
+    永远排在它前面，名额还有剩时才轮到它。
+    """
+    title = _title_score(query, hit)
+    lead = min(_occurrences(query, _hit_blob(hit)), LEAD_OCCURRENCE_CAP) / LEAD_OCCURRENCE_CAP
+    freq = min(_occurrences(query, hit.text or ""), BODY_OCCURRENCE_CAP) / BODY_OCCURRENCE_CAP
+    evidence = TITLE_WEIGHT * title + LEAD_WEIGHT * lead + FREQ_WEIGHT * freq
+    if evidence <= 0:
+        return CROSS_LINGUAL_SCORE if _cross_lingual(query, hit) else 0.0
+    return evidence * (1.0 - RERANK_INFLUENCE + RERANK_INFLUENCE * _rerank_norm(hit))
+
+
+def _cross_lingual(query: str, hit: ExternalHit) -> bool:
+    """query 与命中的**书写系统有没有交集**。没有交集时词面判据无从比较。
+
+    与 `_relevant_hits` 里那句放行用的是同一个判据（有没有中文），两处必须同源：
+    一处说"判不了"就放行、另一处说"判不了"就当零分，等于同一批命中在两个环节里
+    得到相反的评价。
+    """
+    query_cjk = bool(_CJK_RUN_RE.search(query or ""))
+    blob_cjk = bool(_CJK_RUN_RE.search(_hit_blob(hit)))
+    return query_cjk != blob_cjk
+
+
+def _shingles(hit: ExternalHit) -> frozenset[str]:
+    """去重用的身份：标题 + 正文前 `DEDUPE_TEXT_CHARS` 字的 token 集合。
+
+    用 token（中文 bigram + 英文整词）而不是字符 n-gram：同一篇文章从两个源回来时
+    标题几乎逐字相同，token 集合的重合度就足以判同；而标题里的标点、来源后缀
+    （`- 中国医药信息查询平台`）在这些 token 上本来就不算数。
+    """
+    tokens = _token_list(hit.title) + _token_list((hit.text or "")[:DEDUPE_TEXT_CHARS])
+    return frozenset(token for token in tokens if token.strip())
+
+
+def _similarity(left: ExternalHit, right: ExternalHit) -> float:
+    """两条命中的内容相似度（Jaccard）。空集返回 0：没有可比的内容就不判同。"""
+    first, second = _shingles(left), _shingles(right)
+    if not first or not second:
+        return 0.0
+    return len(first & second) / len(first | second)
+
+
+def _dedupe(
+    ranked: Sequence[ExternalHit], *, threshold: float = DEDUPE_THRESHOLD,
+) -> tuple[list[ExternalHit], int]:
+    """按给定顺序留第一条、并掉后面相似的。返回 `(留下的, 并掉几条)`。
+
+    顺序由调用方先排好（分数降序），所以留下的永远是分数高的那条——与"哪个源先
+    抓到"无关。13 对实测重复（跨源同一篇、同源同文异址）在 0.66–1.00，去重阈值
+    0.60 一条不漏；而"同主题不同文"的最高一对在 0.40 以下，不会被误并。
+    """
+    kept: list[ExternalHit] = []
+    dropped = 0
+    for hit in ranked:
+        if any(_similarity(hit, other) >= threshold for other in kept):
+            dropped += 1
+            continue
+        kept.append(hit)
+    return kept, dropped
+
+
+def _select_hits(
+    query: str, hits: Sequence[ExternalHit], limit: int, *,
+    threshold: float = DEDUPE_THRESHOLD, diversity: float = DIVERSITY_LAMBDA,
+) -> list[ExternalHit]:
+    """全量候选 → 打分 → 排序 → 去重 → 按内容多样性挑前 `limit` 条。
+
+    **没有任何按源的配额**：既不保底（"每个源至少一条"），也不封顶（"每个源最多几条"）。
+    数据说封顶是有害的——同一个池子上加"每源最多 ceil(limit/2)"之后，`limit=8` 的相关
+    条数从 42 掉到 36、噪声从 10 涨到 14：openalex/crossref 恰好是 `城市雨污分流改造`
+    那类工程主题唯一的相关来源，封顶等于把它们挤掉、让 deepseek 的商品页补位。
+
+    "多样性"由两步保：去重（同一条资料只留一次）+ MMR（每选一条就按"与已选内容最
+    相似"扣分）。两步都只看内容，不看源。它们管的是"别拿三条讲同一件事的材料"；
+    "三条来自同一个源但内容不同"是允许的——那正是"好材料恰好都在一处"时的正确输出。
+
+    顺序稳定：同分时保持上游（源站 + 收集顺序），不引入随机。
+
+    打分为 `SCORE_FLOOR`（没有任何词面证据）的候选**不参与**：它是"门"那条契约的
+    分级版本，全站跑题时返回空列表（见 `SCORE_FLOOR`）。
+    """
+    if limit <= 0 or not hits:
+        return []
+    # 地板在排序之前：先把它滤掉，后面的 dedupe/MMR 只在"有一条证据"的候选之间做，
+    # 否则一条零证据的候选会占掉一个名额、也占掉一次相似度比较。
+    scored = [hit for hit in hits if score_hit(query, hit) > SCORE_FLOOR]
+    scored.sort(key=lambda hit: -score_hit(query, hit))
+    unique, dropped = _dedupe(scored, threshold=threshold)
+    if dropped:
+        logger.debug("外部检索：内容去重并掉 %d 条（阈值 %.2f）", dropped, threshold)
+    picked: list[ExternalHit] = []
+    pool = list(unique)
+    while pool and len(picked) < limit:
+        best_index = 0
+        best_value: float | None = None
+        for index, hit in enumerate(pool):
+            overlap = max((_similarity(hit, other) for other in picked), default=0.0)
+            value = score_hit(query, hit) - diversity * overlap
+            if best_value is None or value > best_value:
+                best_value, best_index = value, index
+        picked.append(pool.pop(best_index))
+    return picked
 
 
 def _run_source(name: str, fetch: Any, budget: _Budget | None = None) -> list[ExternalHit]:
@@ -1669,12 +1922,12 @@ def _run_source(name: str, fetch: Any, budget: _Budget | None = None) -> list[Ex
         return []
 
 
-# 单方向检索的源清单与顺序。**顺序不能改**：`_interleave` 按源的收集顺序建桶，
-# 而 `prefer_language` 用的是稳定排序——换了顺序，同一批命中会以另一种次序占名额。
+# 单方向检索的源清单与顺序。顺序现在只影响**同分时的稳定次序**（`_select_hits`
+# 的 `sorted` 是稳定的，同分保持收集顺序）与 `data.external_used` 里那句话的措辞，
+# 不再决定"谁能拿到名额"——名额由分数决定，与源无关。
 #
-# `deepseek` 排在最后不是"它最不重要"，而是**它本来就没有轮到过**：`_interleave`
-# 从第一个桶开始轮流取，3 个名额在第六个桶之前就用完了。所以它需要一个独立席位，
-# 见 `_blend_deepseek`。
+# `deepseek` 排在最后一条历史遗留：它曾经需要独立席位（`_interleave` 轮不到第六个
+# 桶），现在不需要了，但顺序本身没有理由改，改了只是让"同一批候选的展示顺序"变一次。
 DEFAULT_SOURCES: tuple[str, ...] = (
     "wikipedia", "arxiv", "openalex", "crossref", "baike", DEEPSEEK_SOURCE)
 
@@ -1701,7 +1954,8 @@ def _search_one(
     这是两条路共用的那一轮（单方向 6 源、多方向的每个方向 4 源）。出口的三件事
     留给调用方，因为它们的位置不同：
 
-      - 单方向：先聚合 → 按 query 过门 → `_blend_deepseek` 取前 `limit`；
+      - 单方向：聚合全部候选 → `_select_hits` 打分排序（**不过门**，理由见
+        `_search_single`）；
       - 多方向：先按**方向**过门 → 跨方向合并去重 → 方向内按源交替 → 跨方向轮转。
 
     并行在这里而不是在调用方：串行时最坏耗时是六个 10 秒超时相加，而它们都只是
@@ -1951,6 +2205,17 @@ def _direction_gate(
 def _relevant_hits(query: str, hits: Sequence[ExternalHit]) -> list[ExternalHit]:
     """按**词面**相关性过滤命中。判据见下方"判据"一节。
 
+    ## 它现在只服务多方向路径（`_direction_gate`）
+
+    单方向路径**不再拿它当门**，判据的位置从"过/不过"换成了"排在谁前面"
+    （`score_hit`）。读数是直接的：同一份池子上，"门 + 打分"与"只打分"的噪声条数
+    完全相同，而门额外挡掉 2–6 条相关；它挡掉的是"限定语换了说法"的那一类，
+    `城市雨污分流改造` 一题 15 条相关候选里被它挡掉 12 条（`_phrase_terms` 只取
+    中文段前 3 字，`城市雨` 不在「城市排水系统雨污分流改造技术研究」里）。
+
+    保留它的两个理由：方向路径仍然靠它做"主题锚"（方向只有 1-2 条候选、没有排序
+    余地，需要一道硬判据）；以及它下面这些实测记录是"为什么最终选了打分"的依据。
+
     ## 为什么需要这道门
 
     "搜到"不等于"搜准"：外部源按自己的相似度排序，而它们对中文主题的理解偏差
@@ -2093,10 +2358,10 @@ def search_external(
     这是整条外部检索的入口，两条路：
 
       - **单方向**（默认；`directions` 只有一条，或开关关着，或拆方向失败）：五源
-        （外加默认关的第六个 `deepseek`）并行打同一个 query，9 + 4 次请求 / 20 秒，
-        出口一道按 query 的词面门。**第六个源关着时与 `3c40ba6` 逐字节相同**——
-        不发请求、不占预算、不改取样（`_blend_deepseek` 在无 Search 命中时退化成
-        `_interleave`，那条有专门用例钉着）。
+        （外加默认关的第六个 `deepseek`）并行打同一个 query，
+        `_request_limit(limit)` 次请求 / 20 秒，出口**打分排序**（`_select_hits`：
+        按相关度排、内容去重、按内容多样性挑），不再有按源的配额，也不再有一道
+        过/不过的词面门（理由见 `_search_single`）。
       - **多方向**（`MINDMAP_EXTERNAL_DIRECTIONS=1` 且拆出 2-4 个方向）：每个方向各打
         一轮 `DIRECTION_SOURCES`，15 次请求 / 20 秒、每方向 5 次，门按**各自的方向**施加，
         合并去重后跨方向轮转。**默认关**，理由与实测见 `DIRECTIONS_ENV`。
@@ -2291,32 +2556,39 @@ def _plan_directions_sync(topic: str) -> list[str]:
 
 
 def _search_single(query: str, limit: int, started: float) -> _SearchRun:
-    """单方向检索：`3c40ba6` 的 `search_external` 主体 + 一个可选第六源。
+    """单方向检索：全部候选 → 打分 → 排序 → 去重 → 按内容多样性取前 `limit` 条。
 
     单独成函数是为了让"降级"有唯一的落点：`search_external` 里任何一条拆方向失败
-    的支路都汇到这里，而不是各自复制一份预算与门。
+    的支路都汇到这里，而不是各自复制一份预算与选择器。
 
-    **它与 `3c40ba6` 的差别只有一行**：出口的取样从 `_interleave` 换成
-    `_blend_deepseek`。那一行在第六个源关着（默认）时**逐字节退化成原样**——同一批
-    命中、同一个顺序、同一份 `prefer_language`，`test_blend_equals_interleave_when_
-    search_is_absent` 与 `test_default_is_off_and_no_request_is_sent` 两条用例钉着它。
-    其余每一行（预算、门、日志）都没动。
+    **出口从"每源轮流取 + 给 DeepSeek 1 席"换成了 `_select_hits`**。这两条老规则
+    的共同前提是"没有相关性判据，所以用源配额代替判据"；判据有了之后它们只剩成本：
+    同一份池子上，打分排序在 `limit=3` 给 17 相关 / 2 噪声，老规则给 14 / 6。
 
     返回 `_SearchRun` 而不是裸列表：`search_external` 要用后两个数判断"这个空结果
     该不该缓存"（`_worth_caching`），而预算对象里的两个计数只有这里拿得到。
     """
-    budget = _Budget(REQUEST_LIMIT, DEADLINE_SECONDS)
+    budget = _Budget(_request_limit(limit), DEADLINE_SECONDS)
     collected = _search_one(query, limit, budget=budget)
 
-    # 门在**聚合之后、截断之前**：先从各源拿全部候选，再按词面相关性筛，最后才
-    # 交替取前 `limit` 条。顺序不能换——先截断再过滤时，一个被滤掉的噪声槽位是
-    # 空的（3 条变 2 条），而候选池里本来还有真相关的条目可以补位。
-    relevant = _relevant_hits(query, collected)
-    hits = _blend_deepseek(relevant, limit, query)
+    # **不再有词面门**。这句话读起来像删保护，其实是换了一个位置：判据从"过/不过"
+    # 变成"排在谁前面"，而两道口径的读数差得很干脆——同一份池子上，"门 + 打分"与
+    # "只打分"在 `limit=3/6/8/12` 上的**噪声条数完全相同**（2/6/10/14），而门额外
+    # 挡掉了 2–6 条相关（`limit=8` 时 42→40，`limit=12` 时 63→57）。也就是说门在
+    # 打分之后只剩误杀这一个效果。
+    #
+    # 它误杀的是"限定语换了个说法"的那一类，最典型的是 `城市雨污分流改造`：
+    # `_phrase_terms` 只取中文段的前 3 字（`城市雨`），于是「城市排水系统雨污分流
+    # 改造技术研究」「城市内涝治理与雨污分流改造措施」这些**逐字讲这件事**的论文
+    # 全被判无关——实测 15 条相关候选里有 12 条被它挡掉。门原来挡住的噪声，打分排序
+    # 自己就会把它们排到最后。
+    hits = _select_hits(query, collected, limit)
     logger.info(
-        "外部检索：%r 命中 %d 条（%s），候选 %d 条过门 %d 条，请求 %d 次，耗时 %.2fs",
-        query, len(hits), ", ".join(f"{hit.source_name}/{hit.title}" for hit in hits[:3]),
-        len(collected), len(relevant), budget.used, time.perf_counter() - started,
+        "外部检索：%r 命中 %d 条（%s），候选 %d 条，请求 %d 次，耗时 %.2fs",
+        query, len(hits), ", ".join(
+            f"{hit.source_name}/{hit.title}/score={score_hit(query, hit):.2f}"
+            for hit in hits[:3]),
+        len(collected), budget.used, time.perf_counter() - started,
     )
     return _SearchRun(hits, budget.used, budget.failures)
 

@@ -329,49 +329,50 @@ def test_on_by_env_and_one_search_request(monkeypatch):
     # `lang:zh` 真的写进了发出去的 query 里
     assert json.loads(search_calls[0].content)["query"].endswith("lang:zh")
     assert json.loads(search_calls[0].content)["need_content"] is True
-    assert [hit.source_name for hit in hits] == ["deepseek"]
+    # 五源在这份假响应里全是 500，所以结果只可能来自 Search；条数由 `limit` 与打分
+    # 决定，不再由"给 Search 留 1 席"决定。
+    assert hits, "开关打开且只有它活着时应当有命中"
+    assert {hit.source_name for hit in hits} == {"deepseek"}
+    assert len(hits) <= 3
 
 
-# ---------------------------------------------------------------- 6 配额
+# ---------------------------------------------------------------- 6 配额（已撤销）
 
 
-def test_blend_reserves_one_seat_for_deepseek():
-    """六源时五源占 `limit-1` 席、Search 占 1 席；Search 排最后。"""
-    hits = [
-        external.ExternalHit("w1", "t", "https://w/1", "wikipedia", "2026-01-01T00:00:00Z", "zh"),
-        external.ExternalHit("w2", "t", "https://w/2", "wikipedia", "2026-01-01T00:00:00Z", "zh"),
-        external.ExternalHit("a1", "t", "https://a/1", "arxiv", "2026-01-01T00:00:00Z", "zh"),
-        external.ExternalHit("d1", "t", "https://d/1", "deepseek", "2026-01-01T00:00:00Z", "zh"),
-        external.ExternalHit("d2", "t", "https://d/2", "deepseek", "2026-01-01T00:00:00Z", "zh"),
-    ]
-    picked = external._blend_deepseek(hits, 3, "碳中和")
+def test_deepseek_gets_no_reserved_seat():
+    """**不再给 Search 留席位**：它要和五源在同一个分数上排队。
 
-    assert [hit.title for hit in picked] == ["w1", "a1", "d1"]
-
-
-def test_blend_equals_interleave_when_search_is_absent():
-    """没有 Search 命中时，`_blend_deepseek` 必须与 `_interleave` 逐条相同。
-
-    这条是"开关关着时行为不变"的另一半：改的是取样入口，不是取样规则。
+    这里刻意让五源的两条更贴题（标题就是 query）、DeepSeek 那条只是正文里提到——
+    老实现会给它留最后一席，新实现让它落选。撤掉的理由写在
+    `knowledge/external.py` 的"取数策略"一节：配额是"没有判据时"的替代品，而今天
+    的证据是它在害人（五源全挂时它抓回教育平台课程页，照样进材料）。
     """
     hits = [
-        external.ExternalHit("w1", "t", "https://w/1", "wikipedia", "2026-01-01T00:00:00Z", "zh"),
-        external.ExternalHit("a1", "t", "https://a/1", "arxiv", "2026-01-01T00:00:00Z", "en"),
-        external.ExternalHit("w2", "t", "https://w/2", "wikipedia", "2026-01-01T00:00:00Z", "zh"),
-        external.ExternalHit("b1", "t", "https://b/1", "baike", "2026-01-01T00:00:00Z", "zh"),
+        external.ExternalHit("w1", "碳中和是指用碳汇抵消排放。", "https://w/1",
+                             "wikipedia", "2026-01-01T00:00:00Z", "zh"),
+        external.ExternalHit("w2", "碳中和的实现路径包括能源转型。", "https://w/2",
+                             "wikipedia", "2026-01-01T00:00:00Z", "zh"),
+        external.ExternalHit("d1", "某站导航：首页 | 关于我们 | 碳中和", "https://d/1",
+                             "deepseek", "2026-01-01T00:00:00Z", "zh",
+                             rerank_score=1.60),
     ]
-    for limit in (1, 2, 3, 5):
-        assert external._blend_deepseek(hits, limit, "碳中和") == external._interleave(
-            hits, limit, prefer_language="zh")
+    picked = external._select_hits("碳中和", hits, 2)
+
+    assert [hit.title for hit in picked] == ["w1", "w2"], \
+        "Search 抢到了不该给它的名额：配额已经撤销，名额只由分数决定"
 
 
-def test_blend_keeps_interleave_when_limit_is_one():
-    """`limit=1` 不给 Search 席位：那种调用只要一条依据，不该只拿到 Search 的东西。"""
+def test_select_hits_picks_by_score_across_sources():
+    """同一批候选里，名额按分数走、与源无关——六源一视同仁。"""
     hits = [
-        external.ExternalHit("w1", "t", "https://w/1", "wikipedia", "2026-01-01T00:00:00Z", "zh"),
-        external.ExternalHit("d1", "t", "https://d/1", "deepseek", "2026-01-01T00:00:00Z", "zh"),
+        external.ExternalHit("低分", "这里没提那件事。", "https://d/1",
+                             "deepseek", "2026-01-01T00:00:00Z", "zh", rerank_score=2.0),
+        external.ExternalHit("高分", "量子计算是计算范式的一种。", "https://a/1",
+                             "arxiv", "2026-01-01T00:00:00Z", "zh"),
     ]
-    assert [hit.title for hit in external._blend_deepseek(hits, 1, "碳中和")] == ["w1"]
+    picked = external._select_hits("量子计算", hits, 1)
+
+    assert [hit.title for hit in picked] == ["高分"]
 
 
 # ---------------------------------------------------------------- 7 降级与缓存
@@ -474,12 +475,15 @@ def test_source_carries_authority_site_and_scores():
 
 
 def test_request_limit_covers_the_sixth_source():
-    """预算上界 = 五源 9 + Search 1 + 补抓 3 = 13。
+    """预算上界 = 五源固定 5 + 维基逐条抓 `limit` + Search 1 + 补抓 `limit` + 1 余量。
 
     它是一条算术断言，因为那个数字就是"最坏情况下多等多久"的依据：拆成几段写在
-    注释里而不用代码钉住，改一处忘另一处不会有人发现。
+    注释里而不用代码钉住，改一处忘另一处不会有人发现。**`REQUEST_LIMIT` 现在是从
+    `DEFAULT_LIMIT` 算出来的**（`_request_limit`），所以这两条必须同时成立：
+    默认值上等于 13（与改动之前那个常量逐字相同），且随 `limit` 线性涨。
     """
-    assert external.REQUEST_LIMIT == 9 + 1 + external.DEFAULT_LIMIT
+    assert external._request_limit(3) == 13
+    assert external.REQUEST_LIMIT == external._request_limit(external.DEFAULT_LIMIT)
     assert external.DIRECTION_SOURCES == ("wikipedia", "openalex", "crossref", "arxiv")
 
 

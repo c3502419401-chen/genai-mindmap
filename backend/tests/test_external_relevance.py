@@ -367,12 +367,23 @@ def _load_baseline(tmp_path: Path):
     return module
 
 
-def test_search_external_matches_the_baseline_rev(tmp_path, monkeypatch):
-    """`search_external` 与 `a84e763` 逐字段相同——本轮没给这条链加任何一层判据。
+def test_search_external_diverges_from_the_baseline_rev_on_selection_only(tmp_path, monkeypatch):
+    """取样与 `a84e763` **有意不同**，但只有取样不同——判据仍然是纯词面、零外部调用。
 
-    "开关关着时与基线一致"在这里是**更强的一句**：压根没有开关，也没有新分支。
-    如果将来有人把语义重排接进来（哪怕默认关），这条用例就是那道提醒：要么给出
-    达标的实测数字并改掉结论，要么别接。
+    这条用例以前钉的是"与基线逐字段相同"。取样从"每源轮流取"换成"打分排序"之后，
+    那句话不再成立，而它想保护的两件事还在：
+
+      - **不接语义判据**（没有模型调用、没有 embedding、没有阈值）：`calls` 那条在
+        下一条用例里；
+      - **差异可解释**：新旧两份输出必须是同一批候选的两个子集，不能出现"基线里
+        没有的东西"。这一条现在由 `set ⊆ 候选池` 钉住。
+
+    数字（同一份夹具）：基线给 `[维基 最终一致性, 晶体学, baike 最终一致性]`（limit=3），
+    新取样给 `[维基, baike, 晶体学, Eventual Consistency Models]`（limit=8）——**前三
+    条是同一批**，差别只在次序：维基与 baike 都是 `title == query` 的词条，排到前面；
+    晶体学论文靠正文里那句"最终一致性因子"拿到 0.10 分；多出来的第四条是跨语言那条
+    （旧实现的 3 个名额把它挤掉了，而"判不了"不该等于"丢掉"，见 `CROSS_LINGUAL_SCORE`）。
+    这就是这次改动的形状：把"谁先占名额"从源配额换成相关度，而不是换掉判据。
     """
     baseline = _load_baseline(tmp_path)
     sources = _fixture_sources()
@@ -382,9 +393,28 @@ def test_search_external_matches_the_baseline_rev(tmp_path, monkeypatch):
     current = external.search_external("最终一致性")
     old = baseline.search_external("最终一致性")
 
-    assert current, "夹具本身要能过门并产出 3 条，否则这条用例什么也没钉"
-    assert [(hit.title, hit.source_name, hit.url, hit.language) for hit in current] \
-        == [(hit.title, hit.source_name, hit.url, hit.language) for hit in old]
+    assert current, "夹具本身要能产出命中，否则这条用例什么也没钉"
+    titles = [hit.title for hit in current]
+    # 前三名与"旧实现那三条"是同一批，只是次序换了；多出来的（若有）只能是跨语言那条
+    # ——它被旧实现的三个名额挤掉了，而"判不了"不该等于"丢掉"（`CROSS_LINGUAL_SCORE`）。
+    # 这两句刻意对 `limit` 稳健（不比整张列表）：`DEFAULT_LIMIT` 是另一个提交的话题，
+    # 这里只钉"取样换了、候选没丢"。
+    assert titles[:3] == ["最终一致性", "最终一致性", "一种新颖钒,钨异金属八核簇合物"]
+    assert set(titles[3:]) <= {"Eventual Consistency Models"}
+    assert sorted(hit.title for hit in old) == sorted(titles[:3])
+
+
+def test_selection_is_pure_lexical_and_reproducible(monkeypatch):
+    """同一个候选池重放两次，结果逐条相同——取样里没有随机、没有时间依赖。"""
+    _bare_sources(monkeypatch, _fixture_sources())
+
+    first = external.search_external("最终一致性", directions=["最终一致性"])
+    second = external.search_external("最终一致性", directions=["最终一致性"])
+
+    assert [hit.title for hit in first] == [hit.title for hit in second]
+    # 分数也必须是纯函数：同样的入参，两次调用同值
+    for hit in first:
+        assert external.score_hit("最终一致性", hit) == external.score_hit("最终一致性", hit)
 
 
 def test_external_chain_never_calls_rerank(monkeypatch):
@@ -406,7 +436,9 @@ def test_external_chain_never_calls_rerank(monkeypatch):
 
     hits = external.search_external("最终一致性")
 
-    assert [hit.title for hit in hits] == ["最终一致性", "一种新颖钒,钨异金属八核簇合物", "最终一致性"]
+    assert [hit.title for hit in hits][:3] == [
+        "最终一致性", "最终一致性", "一种新颖钒,钨异金属八核簇合物"]
+    assert {hit.title for hit in hits[3:]} <= {"Eventual Consistency Models"}
     assert calls == [], (
         "外部检索链路里出现了重排调用：接它之前先拿 scripts/measure_external_relevance.py "
         "--rerank 量一遍，达标（全相关 ≥16/20、噪声 ≤5）再把结论和这条用例一起改掉")

@@ -521,28 +521,35 @@ def _fixture_sources() -> dict[str, list[external.ExternalHit]]:
 @pytest.mark.parametrize("failure", [
     RuntimeError("模型挂了"), "这不是 JSON", {"directions": ["超导量子比特退相干"]},
 ])
-def test_degrade_is_field_identical_to_the_baseline_rev(tmp_path, monkeypatch, failure):
-    """拆方向失败 → 与 `3c40ba6` **逐字段相同**，请求次数也相同。
+def test_degrade_equals_the_single_direction_path(monkeypatch, failure):
+    """拆方向失败 → 与"显式只给一个方向"**逐字段相同**，请求次数也相同。
 
-    "退化成一个方向"不是"差不多"：同一份预算（9 次 / 20 秒）、同一批五个源、同一道
-    门、同一次 `_interleave`。这条用例把"降级"钉成可执行断言，而不是注释里的承诺。
+    "退化成一个方向"不是"差不多"：同一份预算、同一批五个源、同一次取样。以前这条
+    用例拿 `3c40ba6` 的实现在做对照，取样换成打分排序之后那个对照不再成立——**但
+    它要保护的东西没变**：降级不能是第二套实现。所以对照换成了 `directions=[topic]`
+    那条路（它是唯一的一方向路径），断言从"与旧版本相同"变成"与另一条入口相同"。
+
+    判据强度没有下降：两个入口若哪天分叉（比如降级顺手换了 query、或者少走了一次
+    取样），这里的 title/source/url/language/text 五个字段和 (query, limit) 记录
+    会同时红。
     """
-    baseline = _load_baseline(tmp_path)
     sources = _fixture_sources()
-    current_calls = _pin_sources(monkeypatch, external, sources)
-    old_calls = _pin_sources(monkeypatch, baseline, sources)
+    degraded_calls = _pin_sources(monkeypatch, external, sources)
     monkeypatch.setattr(external, "chat_async", _fake_chat(failure))
 
-    current = external.search_external("最终一致性")
-    old = baseline.search_external("最终一致性")
+    degraded = external.search_external("最终一致性")
+    degraded_records = list(degraded_calls)
 
-    assert current, "夹具本身要能过门并产出多条，否则这条用例什么也没钉"
+    single_calls = _pin_sources(monkeypatch, external, sources)
+    single = external.search_external("最终一致性", directions=["最终一致性"])
+
+    assert degraded, "夹具本身要能产出多条，否则这条用例什么也没钉"
     assert [(hit.title, hit.source_name, hit.url, hit.language, hit.text)
-            for hit in current] == \
-        [(hit.title, hit.source_name, hit.url, hit.language, hit.text) for hit in old]
+            for hit in degraded] == \
+        [(hit.title, hit.source_name, hit.url, hit.language, hit.text) for hit in single]
     # 五个源在线程里并行跑，记录顺序不定，所以比集合而不是比顺序。
-    assert sorted(record[1:] for record in current_calls) == \
-        sorted(record[1:] for record in old_calls), (
+    assert sorted(record[1:] for record in degraded_records) == \
+        sorted(record[1:] for record in single_calls), (
         "两次检索打给源函数的 (query, limit) 必须完全一样："
         "降级路径不该顺手换 query（比如把主题换成方向里的第一条）")
 
@@ -584,7 +591,10 @@ def test_end_to_end_covers_several_aspects(monkeypatch):
 
     monkeypatch.setattr(external, "_search_one", fake_search_one)
 
-    hits = external.search_external("碳中和")
+    # `limit=3` 是这条用例的原意（"返回 3 条时该看到 3 个不同方向"）。写死 3 而不是
+    # 用默认值：`DEFAULT_LIMIT` 会随取数策略变（现在 8），而"三个方向各占一条"这条
+    # 验收线与默认条数无关。
+    hits = external.search_external("碳中和", limit=3)
 
     assert len(hits) == 3
     assert len({hit.direction for hit in hits}) == 3, [h.direction for h in hits]
