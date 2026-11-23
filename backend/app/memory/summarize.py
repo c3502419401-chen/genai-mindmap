@@ -29,12 +29,26 @@
 **崩溃后的幂等**：`memory_sessions` 的行在**所有条目写完之后**才写。进程在中间被
 杀掉 → 没有这一行 → 下次重新总结整个会话 → `text_hash` 去重挡住重复条目。所以
 "重试"这件事不需要额外的状态机。
+
+**观测与命题挂在同一条链上（"事件片"而不是"时间片"）**：会话总结跑完（不管成功、
+0 条还是失败）之后，`induce_propositions` 做两件事——先从 `runs` / `edit_events`
+抽观测（`observations.capture`），再把没被归纳过的观测压成命题
+（`propositions.induce`）。Coco 论文里这一步是常驻 Observer 按时间片跑；2C2G 的机器
+上跑不起常驻进程，而这个仓库已经有一个"上一段工作结束了"的判定，所以把它换成
+**事件片**：一次 run 开始时判一次，顺带归纳。粒度不同，语义一致——都是"一段工作
+结束后归纳一次"。
+
+开关是 `MINDMAP_MEMORY_PROPOSITIONS`（默认开）。默认开的理由：它只在**有未消费观测
+且模型已配置**时才真的发请求，空库上只花两次 SELECT；关掉它等于让这条链永远不跑，
+而"永远不跑"与"跑了但 0 条"在外部表现上一模一样——正是 `router` 的注释里写过的那种
+无法验证的状态。
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import os
 import threading
 from contextlib import closing
 from dataclasses import dataclass
@@ -42,7 +56,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.generation.service import GenerationError, _config, chat_async
-from app.memory import store
+from app.memory import observations, propositions, store
 from app.mindmaps import repository
 
 logger = logging.getLogger(__name__)
@@ -89,7 +103,27 @@ STATUS_DONE = "done"
 STATUS_EMPTY = "empty"
 STATUS_FAILED = "failed"
 
+#: 观测抽取 + 命题归纳这一段的开关。默认开，理由见模块 docstring。
+INDUCE_ENV = "MINDMAP_MEMORY_PROPOSITIONS"
+
+#: 一次触发里最多归纳几轮。每轮消费最多 `propositions.MAX_INPUT_OBSERVATIONS` 条
+#: 观测，所以 5 轮 ≈ 200 条。积压更多时下一次触发接着处理——不会漏，只是分几次。
+INDUCE_ROUNDS = 5
+
 _NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+
+
+def induce_enabled() -> bool:
+    """`MINDMAP_MEMORY_PROPOSITIONS` 是不是开着。清空 = 用默认（开）。
+
+    与 `prefs/style.prompt_enabled` 同一种读法：只有显式的 0/false/no/off 才算关，
+    其余（包括拼错的值）一律按开处理。理由与那处相同——拼错一个值不该静默关掉一整条
+    功能，那是"我明明打开了它却没用"的另一种写法。
+    """
+    value = os.environ.get(INDUCE_ENV)
+    if value is None or not value.strip():
+        return True
+    return value.strip().lower() not in ("0", "false", "no", "off")
 
 
 # ---------------------------------------------------------------- 提示词
@@ -610,6 +644,53 @@ def run_session(session: Session) -> Outcome:
 _INFLIGHT: set[str] = set()
 _LOCK = threading.Lock()
 
+#: 归纳的串行化闸。与 `_INFLIGHT` 分开：那个按会话 id 拦重复，这个拦**跨会话**的
+#: 并发——两个会话同时结束时会各起一个线程，两边都会读到同一批 `unconsumed` 观测，
+#: 于是同一段证据被归纳两遍（`text_hash` 去重能挡住重复命题，挡不住两次调用）。
+_INDUCE_LOCK = threading.Lock()
+
+
+def induce_propositions(
+    *, run_id: str | None = None, session_id: str | None = None,
+    rounds: int = INDUCE_ROUNDS,
+) -> list[propositions.Induction]:
+    """抽一次观测，再把没归纳过的观测压成命题。返回每轮归纳的结果。
+
+    这是"事件片"的实现：粒度是**一段工作结束**，不是论文里常驻 Observer 的时间片。
+    调用点在 `schedule()` 起的后台线程里，所以它慢（两三次模型往返）也不影响任何人。
+
+    拿不到归纳闸时**直接返回空**，不排队等待：那说明另一段工作正在归纳，而它读的是
+    同一张表里的同一批观测——等它做完，这批观测已经不在 `unconsumed` 里了。
+
+    所有异常都吞掉并记 warning：这是一条"有则更好"的旁路，它挂掉不该让会话总结
+    看起来失败（那条链自己已经有失败留痕了）。
+    """
+    if not induce_enabled():
+        logger.debug("观测/命题这一段被 %s 关掉了", INDUCE_ENV)
+        return []
+    if not _INDUCE_LOCK.acquire(blocking=False):
+        logger.debug("另一段工作正在归纳命题，这次跳过")
+        return []
+    try:
+        captured = observations.capture()
+        if not captured.total:
+            # 没有新观测时也继续：上一轮可能因为模型没配置而留下了未消费的观测。
+            logger.debug("观测没有新增，仍然检查一次未归纳的积压")
+        results: list[propositions.Induction] = []
+        for _ in range(max(1, rounds)):
+            outcome = propositions.induce(run_id=run_id, session_id=session_id)
+            results.append(outcome)
+            if outcome.status != STATUS_DONE:
+                # skipped（模型未配置）/ failed（下次重试）/ empty（没积压了）都不该
+                # 继续循环：继续只会在同一批观测上再花一次调用，或者空转。
+                break
+        return results
+    except Exception:  # noqa: BLE001 — 旁路失败不该让会话总结看起来失败
+        logger.warning("观测/命题这一段异常", exc_info=True)
+        return []
+    finally:
+        _INDUCE_LOCK.release()
+
 
 def schedule(session: Session) -> bool:
     """把一次总结丢到后台线程，返回是否真的启动了。
@@ -630,6 +711,11 @@ def schedule(session: Session) -> bool:
     def _run() -> None:
         try:
             run_session(session)
+            # 会话总结跑完之后才做观测/命题：两条链写不同的表，但**顺序是刻意的**
+            # ——归纳要读 `edit_events`，而会话总结不写它；真正的原因是"先把便宜、
+            # 一定有产出的那一段做完"，万一归纳卡住（模型慢），用户拿到的偏好条目
+            # 已经落库了。
+            induce_propositions(run_id=session.session_id, session_id=session.session_id)
         finally:
             with _LOCK:
                 _INFLIGHT.discard(session.session_id)
@@ -663,6 +749,8 @@ def maybe_summarize(*, exclude_run_id: str | None = None) -> bool:
 
 __all__ = [
     "GAP_MINUTES",
+    "INDUCE_ENV",
+    "INDUCE_ROUNDS",
     "MAX_EVENTS",
     "MAX_RUNS",
     "SUMMARY_SYSTEM",
@@ -670,6 +758,8 @@ __all__ = [
     "Session",
     "SessionRun",
     "due",
+    "induce_enabled",
+    "induce_propositions",
     "maybe_summarize",
     "run_session",
     "schedule",
