@@ -4,6 +4,13 @@ from pydantic import BaseModel, Field, model_validator
 from app.contracts.diagnostic import Diagnostic, SuggestResponse
 from app.contracts.mindmap import DiagramContent, MindMapContent, SaveRequest
 from app.contracts.source import Source
+from app.optimization.repair import (
+    AUTO_REPAIRABLE_CODES,
+    RepairItem,
+    RepairSkip,
+    repair as repair_content,
+    repair_summary,
+)
 from app.optimization.service import check, suggest
 
 router = APIRouter(prefix="/optimization", tags=["逻辑优化"])
@@ -59,3 +66,66 @@ def suggest_for_map(body: CheckRequest):
     content = _tree_content(body.content)
     return SuggestResponse(suggestions=suggest(content, map_id=body.map_id),
                            diagnostics=check(content, body.sources))
+
+
+class RepairRequest(CheckRequest):
+    #: 这一趟只修哪几类。缺省三条全修；给了不认识的码是 422（不静默忽略——
+    #: "我选了它、它没生效"是最难查的一类问题）。
+    codes: list[str] | None = Field(default=None, max_length=8)
+
+
+class RepairResponse(BaseModel):
+    #: 修好的树。**客户端要把整棵树换掉**，不是打补丁——修复会删节点、改标题、
+    #: 搬子树，增量补丁描述不了它。
+    content: MindMapContent
+    #: 每一步做了什么 + 它的反操作。撤销靠 `undo`，不靠前端的撤销栈
+    #: （理由见 `optimization/repair.py` 的模块注释）。
+    applied: list[RepairItem]
+    #: 看到了但没修的（超出契约上限、或诊断在处理途中过期）。必须报出来：
+    #: 静默跳过会让"点了一键修复却没变"变成一个查不出来的状态。
+    skipped: list[RepairSkip]
+    #: **修完之后**重跑的 `check()`。界面可以据此说"还剩几条建议"。
+    diagnostics: list[Diagnostic]
+    steps: int
+    #: 一句人话（无修复时是空串）。
+    summary: str
+
+
+# `include_in_schema=False` 是刻意的，不是偷懒：
+#
+# `backend/openapi.json` 与 `frontend/src/api/schema.d.ts` 这一轮**由另一条线在改**
+# （账号系统）。加一条进 schema 的路由就必须重新导出那两个文件，而那正是硬约束里
+# 点名不许碰的东西。与此同时 `tests/test_openapi_snapshot.py` 钉着"快照与代码一致"，
+# 所以"先加路由、稍后补快照"会让全量测试变红——那不是可以留给下一个人的技术债。
+#
+# 于是这一步走"接口存在、快照不动"：路由能调、`openapi.json` 一个字节不变。
+# 代价是这个接口暂时不进自动生成的类型，前端要手写它的类型（`api/client.ts` 里
+# `repairOptimization` 上面那段）。等账号系统落地、快照可以重新导出的那一轮，
+# 删掉这一行、重导快照、把前端的手写类型换成生成的类型——三步都要做，别只做第一步。
+@router.post("/repair", response_model=RepairResponse, include_in_schema=False)
+def repair_map(body: RepairRequest):
+    """三条"修法唯一"的规则自动修到不动点（只支持树型）。
+
+    不自动应用：这个接口只把**修好的树 + 反操作**交给调用方，落地由调用方决定
+    （界面是用户点一下，脚本是它自己决定）。与 `/check` 的口径一致——诊断是事实，
+    修改是动作，动作永远要有人按下扳机。
+    """
+    content = _tree_content(body.content)
+    codes = body.codes
+    if codes is not None:
+        unknown = [code for code in codes if code not in AUTO_REPAIRABLE_CODES]
+        if unknown:
+            raise HTTPException(
+                status_code=422,
+                detail=f"不能自动修的规则：{'、'.join(unknown)}"
+                       f"（可自动修的是 {'、'.join(AUTO_REPAIRABLE_CODES)}）",
+            )
+    result = repair_content(content, **({"codes": codes} if codes is not None else {}))
+    return RepairResponse(
+        content=result.content,
+        applied=result.applied,
+        skipped=result.skipped,
+        diagnostics=result.remaining,
+        steps=result.steps,
+        summary=repair_summary(result),
+    )
