@@ -132,7 +132,92 @@ generated_runs`）正是读这份统计的前提。`run_id` 为空的老 generat
 **③ `label_shrunk` 只看 `user`。** `agent` 的改动是"模型自己又改了一遍"，不是用户的
 偏好。实测 B 图只有 3 条 user 的缩短，不过滤会读成 4 条（多出来的是 agent 的 13→10）。
 
-## 三、提交时机：并进保存请求，不另开端点
+## 二·六、`parent_id`：让"新节点挂在哪"从猜变成可判
+
+`edit_events` 跑了几周，攒下 565 条：`update` 559 / `style` 4 / `remove` 2，而
+**`add` 零条**。不是用户从没加过节点，是"加节点"这件事从来没被记成一行——于是
+"用户新加的节点挂在哪"没有任何样本，任何"这个新节点与哪条论证线同源"的判断都只能猜。
+
+补的是两处，它们各自解决一个不同的问题：
+
+| 位置 | 补什么 | 为什么在这里 |
+|---|---|---|
+| 前端 `mindmap/edit-log.ts` | `EditEvent.parentId`，`add` 事件填上 | `indexForest` 的 `Indexed` 里**本来就有** `parentId`（用于判 `move`）。emit 只是没把它带出来，不是缺数据 |
+| 后端 `mindmaps/edits.py` | `edit_events.parent_id` 列，值从**保存的那棵树**算 | 树是权威、事件是它的描述；描述跟着权威算，不会出现"父 id 指向不存在的节点"这种要另写校验才拦得住的状态 |
+
+### 前端：一个已经算好、却没被带出来的字段
+
+`diffEdits` 的 `indexForest()` 给每个节点建 `{node, parentId, depth, index}`，`parentId`
+早在那里——`move` 事件就是靠它判的。`add` 那条 emit 只是没把它写出来：
+
+```ts
+emit({ kind: 'add', nodeId: id, after: clip(...), depth: entry.depth,
+       parentId: entry.parentId })   // ← 只有这一处是新的
+```
+
+**`undefined` 与 `null` 是两件事**：`undefined` 表示这类事件不记父节点
+（`update` / `style` / `remove` / `edge` / `title` / `generate`），`null` 表示它就是
+某棵子树的根。混成一个值，读的人就分不清"根"和"没记"。
+
+### 后端：为什么不把 `parentId` 塞进请求体
+
+`EditEventIn` 是 `extra="forbid"`，给它加字段就要重导 `openapi.json` 与
+`schema.d.ts`——那是另一条线正在改的两个文件。而这一列要回答的事实，在保存那一刻的
+**树**上是唯一确定的，不需要谁把它抄一遍：
+
+```
+保存 → body.content（整棵树）→ edits.parents_of(content) → node_id → 父 id
+     → INSERT ... parent_id
+```
+
+三个好处，都不是"省事"：
+
+- **不会不一致**：前端算的 `parentId` 与后端的 `parents_of` 用同一套口径（见下），
+  但真正进库的是从落库那棵树算出来的那一份，与 `content` 永远对得上；
+- **不动契约**：`openapi.json` / `schema.d.ts` / `EditEventRow` 一个字节没变；
+- **两种图型免费**：`agent/shapes.roots` 已经是三型统一的读侧适配层。
+
+口径（三处必须逐条一致，否则同一条挂载关系会读出两个答案）：
+
+| 图型 | 什么叫"根" |
+|---|---|
+| 树 | 中心主题（`root`） |
+| 鱼骨 | **六根骨各自是根**——它在画布上挂在主骨上，但那是 `FishboneBone` 的关系，不是 `Node` 的父子关系 |
+| 流程 | **各阶段各自是根**，理由同上（`FlowStage`） |
+
+### 列的语义，一句话
+
+> `parent_id` = **保存那一刻 `node_id` 在树上的父节点**。
+
+所以：`add` 有值（"新节点挂在哪"）；`remove` 一定是 `NULL`（那个节点已经不在树上了
+——不是"删除前的父"，要那个得另记一列）；`title` / `generate` 没有节点所以 `NULL`；
+`edge` 的 `node_id` 是边的源节点，它在树上，于是有值（如实记它，不因为"这条事件不改
+节点"就抹掉一个成立的事实）。
+
+### 列加在哪：为什么不是 `repository.py`
+
+那张表的 DDL 确实在 `mindmaps/repository.py`，而它正在被别人改。补列写在了
+`mindmaps/edits.py::ensure_schema`——`edit_events` 从建表到读写全在那个模块（仓储层
+只剩建表语句与一个索引），所以"这张表后来加的列"归它的唯一使用方补齐，是职责收口。
+
+形状照 `knowledge/library.py::ensure_schema` 与 `memory/store.py::ensure_schema`
+（模块自持 DDL、幂等、拿到连接后立刻调），判据照 `repository._ensure_columns`：
+**只吞 `duplicate column name`**，别的错误继续抛——缺列的后果是 `record()` 的 INSERT
+抛 "no such column" 被它自己的 `except` 吞掉，**所有事件静默丢失**，`total` 恒为 0，
+看着和"没人改过"一模一样。
+
+老行上是 `NULL`，不做回填：`NULL` 在这里有确切含义（"当时没记"），比编出来的空串诚实。
+
+### 读路径：先只服务库内读者
+
+`EditEventRow` 是 `GET /mindmaps/{id}/edits` 的响应模型，给它加字段就要重导
+`openapi.json`。所以这一列现在只有一个读入口 `edits.parent_ids(map_id)`，返回
+`(kind, node_id, parent_id)`，缺省只取 `add` / `move`（"放置动作"）。
+
+**这不是将就**：`node_count` 当初也是先落库、后有统计口径的。等这些读数证明它有用，
+再决定要不要进接口。
+
+
 
 `POST` / `PUT /api/mindmaps` 的请求体里带 `events`（可省略）。
 
