@@ -486,6 +486,9 @@ def test_over_the_readability_limit_is_folded_not_clipped():
     # 被并的 12 支的标题一个不落地在 detail 里（读图的人据此知道少了什么）
     for index in range(8, 20):
         assert f"分支{index}" in rollup.detail
+    # 而这份清单**不能被第三段重写**：它是这个节点唯一的说明（`skip_ids` 里那一格）。
+    # 实测厚批就是这样丢的——聚合节点还在、`含：…` 没了，用户再也说不清"其他 3 项"是哪三项。
+    assert rollup.detail.startswith("含：")
     # 不是"到底了"：这一支还能从这里长回来（`NODE_EXPANDABLE` 的三态）
     assert rollup.expandable == "unknown"
 

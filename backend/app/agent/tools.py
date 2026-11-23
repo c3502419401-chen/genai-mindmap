@@ -9090,7 +9090,15 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     content, detail_report = await _fill_details(
         content, ctx=ctx, topic=args.topic, sections=sections,
         external_rules=external_rules, diagnostics=diagnostics,
-        skip_ids=group_ids, full_text=full_text,
+        # 两级骨架的分组节点**与折叠节点**都不进这份清单，理由不同但都是"它没有说明
+        # 可写"：
+        #   - 分组：它是分类名，写出来只有一句"这一组在讲什么"的空话；
+        #   - 折叠（「其他 N 项」）：它的 `detail` **是那张清单本身**（"含：A；B；C"），
+        #     是这个节点存在的理由。不跳过它，第三段会按"说明少于 40 字"把它重写成
+        #     一段模型 prose——实测厚批两条都是这样：聚合节点还在、`含：…` 没了，
+        #     读图的人再也说不清"其他 3 项"是哪三项。
+        skip_ids=[*group_ids, *fold.rollup_ids],
+        full_text=full_text,
         chapters=tuple(slice_chapters or ()),
         source=sources[0] if slice_chapters else None,
         # 每段说明写多长（`MINDMAP_DETAIL_SCALE`）：口径与节点配额同一行代码，
