@@ -89,7 +89,13 @@ from app.contracts.mindmap import (
     normalize_icon,
 )
 from app.contracts.ops import OpBatch, OpError
-from app.contracts.source import Source, SourceKind, SourceMetadata, SourceUsage
+from app.contracts.source import (
+    Source,
+    SourceKind,
+    SourceMetadata,
+    SourceRef,
+    SourceUsage,
+)
 from app.generation import budget
 from app.generation.service import (
     CONTENT_FREEDOM_CONTRACT,
@@ -1118,6 +1124,202 @@ def _clip_tree(
     return trimmed, total - _count_nodes(trimmed.root)
 
 
+# ---------------------------------------------------------------- 超出可读性：折叠，不裁
+#
+# `_clip_tree` 处理的是"装不下"（契约上限 1000），而"超过可读性"是另一件事：一棵 200
+# 节点的树不是装不下，是读不完。两者用同一个动作的后果是**丢内容**，而且丢得没有规律：
+#
+#     实测（同一批材料、骨架 6 支）→ 落树 5 支、裁 14 个节点；
+#     `initial_nodes=10` 那组更极端：模型写了 39 个节点 3 支齐全，裁完只剩 **1 支**
+#     （前序把第 1 支的深子树吃完，第 2、3 支一个名额都没剩下）。
+#
+# 所以超限时先**折叠**：把某个父节点下面超出 `cap` 个的最后那几个兄弟并成一个
+# 「其他 N 项」节点，被并的那些兄弟的标题进它的 detail、引用取并集。丢的是**层级**，
+# 不是**内容与出处**——它们每一个仍然读得到，每一处出处也仍然点得开。
+#
+# 为什么不是"不裁，只报一句"（另一个能想到的做法）：那条路把问题推给读图的人。
+# 一张 200 节点的画布没人能读完，而"超过可读性建议 80"这句话要用户自己去数——他手上
+# 没有节点计数器。折叠不需要用户做任何事，且它留下的是一个**能看出来**的节点（「其他
+# 7 项」），而不是一个只能从日志里发现的"这次被裁了 12 个"。
+#
+# 四档递进（`FOLD_CAPS`）：8 → 4 → 2。一档折不动（没有父节点超过 cap 个孩子）就换下一
+# 档；三档都折不动说明超出的量平摊在**每一层都已经很窄**的树上（例如 200 个节点、每个
+# 父最多 2 个孩子），那时才退回 `_clip_tree`——那才是"这份材料撑不起这么多节点"。
+#
+# **折叠顺序是自底向上的**（`_fold_pass` 递归里先处理孩子、再处理自己）：先把最深处
+# 的兄弟并起来，一级分支那层最后才动。这条顺序是刻意的——被压窄的分支数是这套机制
+# 最不该再制造的东西，而前序裁剪恰恰总是从一级分支那层开始丢。
+FOLD_CAPS = (8, 4, 2)
+
+#: 折叠节点的 label 模板。`{n}` 是被并进来的兄弟个数。
+#:
+#: 为什么是"其他 N 项"而不是复述其中一个的标题：折叠节点的身份是**一个集合**，任何
+#: 复述都会让读图的人以为它就是那一个，然后对另外几个的消失毫无察觉。带上 N 是这句
+#: label 唯一的信息量——它说"这里原本还有 N 个"。个数在 `data` 与诊断里也能查到，但
+#: 读图的人不会去翻诊断。
+FOLD_LABEL = "其他 {n} 项"
+
+#: 折叠节点的 detail 里最多列几个标题。再多就已经不是"说明"而是清单了；剩下的一律
+#: 汇总成"以及另外 N 项"，与 label 那个 N 同一个口径。
+FOLD_DETAIL_ITEMS = 15
+
+#: 折叠节点带几条引用（= `Node.source_refs` 的 `max_length`）。超出的截掉：这一步是
+#: 收尾，写不进契约就等于把整张图判废。
+FOLD_MAX_REFS = 20
+
+
+@dataclass(frozen=True)
+class _Fold:
+    """一次折叠的账。`clipped` 只在四档都折不动之后的兜底里非零。"""
+
+    #: 造出来的折叠节点 label，按生成顺序。
+    rollups: tuple[str, ...] = ()
+    #: 造出来的折叠节点的 id。**必须单独带出来**：它们是新节点，`_shortened_ids` 只在
+    #: "原来就有、现在孩子变少"的节点里找，找不到它们；而收尾那一步的
+    #: `_stamp_expandable` 会把不在名单里的一律标成 `yes`（= 到底了），那样界面就把
+    #: 唯一能把这些内容长回来的入口灰掉了。
+    rollup_ids: tuple[str, ...] = ()
+    #: 因此少掉的节点总数（被并的兄弟 + 它们的子树）。
+    dropped: int = 0
+    #: 走投无路时真正裁掉的节点数（0 表示没裁）。
+    clipped: int = 0
+
+    @property
+    def happened(self) -> bool:
+        return bool(self.rollups) or self.clipped > 0
+
+
+def _fold_refs(node: Node) -> list[SourceRef]:
+    """一个节点连同它整棵子树的引用（去重、保序）。"""
+    seen: set[tuple[Any, ...]] = set()
+    out: list[SourceRef] = []
+    for item in _iter_nodes(node):
+        for ref in item.source_refs:
+            key = (ref.source_id, ref.page, ref.start, ref.end, ref.quote)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(ref)
+    return out
+
+
+def _rollup_node(tail: list[Node], taken: set[str]) -> Node:
+    """把一组兄弟压成一个节点：label 报个数、detail 列标题、引用取并集。
+
+    三处都是有据可依的，不是随手：
+      - **引用取整棵子树的并集**，不只看被并节点自己那一层：它们的下级也是被这一步
+        折掉的东西，只并第一层会得到一条"引用了 A、B，但 A、B 的内容已经不在图上"的
+        半截记录；
+      - **`expandable="unknown"`**：这不是"到底了"，是"这里还有内容、只是没画出来"。
+        标成 `no` 会让界面把这一支的展开按钮灰掉，而那正是唯一还能把它长回来的入口
+        （`NODE_EXPANDABLE` 的三态就是为这件事分出来的）；
+      - **`detail` 只列标题，不复述每条的说明**：折叠节点的作用是回答"这里原本是哪几个"，
+        把每条说明也搬进来会长成一屏读不完的正文，而那份正文本来就在被折的节点上。
+    """
+    labels = [item.label for item in tail]
+    shown = labels[:FOLD_DETAIL_ITEMS]
+    rest = len(labels) - len(shown)
+    detail = "含：" + "；".join(shown) + (f"；以及另外 {rest} 项" if rest > 0 else "") + "。"
+    refs: list[SourceRef] = []
+    seen: set[tuple[Any, ...]] = set()
+    for item in tail:
+        for ref in _fold_refs(item):
+            key = (ref.source_id, ref.page, ref.start, ref.end, ref.quote)
+            if key in seen:
+                continue
+            seen.add(key)
+            refs.append(ref)
+            if len(refs) >= FOLD_MAX_REFS:
+                break
+        if len(refs) >= FOLD_MAX_REFS:
+            break
+    node_id = new_node_id(taken)
+    taken.add(node_id)
+    return Node(
+        id=node_id, label=FOLD_LABEL.format(n=len(labels)), detail=detail,
+        expandable="unknown", source_refs=refs)
+
+
+def _fold_pass(root: Node, cap: int, taken: set[str]) -> tuple[Node, list[Node]]:
+    """一趟：每个父节点超过 `cap` 个的孩子，从第 `cap + 1` 个起并成一个节点。
+
+    递归里**先处理孩子、再处理自己**（自底向上，理由见 `FOLD_CAPS` 上面那段）。
+    返回 `(新根, 这一趟造出来的折叠节点)`；返回值为空表示这一趟什么都没折
+    ——调用方据此换下一档 cap。
+
+    **判据是 `len(kids) > cap + 1` 而不是 `> cap`，这一个 `+ 1` 是防死循环的**：
+    折完的结果是 `cap 个兄弟 + 1 个聚合节点` = `cap + 1` 个孩子。所以当父节点正好有
+    `cap + 1` 个孩子时，折一次**一个节点都省不下来**，而形状变了（末尾两个并成一个），
+    于是下一轮它仍然"超过 cap 个孩子"、仍然要折——`_fold_tree` 那个 `while` 永远退不
+    出去（实测：`test_the_rollup_takes_the_union_of_refs` 与
+    `test_deep_siblings_fold_before_the_top_level_does` 卡死在这里）。
+
+    要求"至少省一个"之后，这一趟对每个父节点都是**严格递减**的，循环因此必然收敛。
+    """
+    made: list[Node] = []
+
+    def walk(node: Node) -> Node:
+        kids = [walk(child) for child in node.children]
+        if len(kids) <= cap + 1:
+            return node.model_copy(update={"children": kids})
+        rollup = _rollup_node(kids[cap:], taken)
+        made.append(rollup)
+        return node.model_copy(update={"children": [*kids[:cap], rollup]})
+
+    return walk(root), made
+
+
+def _fold_tree(content: MindMapContent, limit: int) -> tuple[MindMapContent, _Fold]:
+    """超过 `limit` 时**折叠**（而不是裁）到 `limit` 以内。
+
+    与 `_clip_tree` 的契约一致：返回的仍是合法内容（关系与附加边按活着的端点重挂，
+    最后走一次 `model_validate`）。三档都折不动时才落到 `_clip_tree`。
+    """
+    before = _count_nodes(content.root)
+    if before <= limit:
+        return content, _Fold()
+    root = content.root
+    taken = set(_node_ids(root))
+    made: list[Node] = []
+    for cap in FOLD_CAPS:
+        while _count_nodes(root) > limit:
+            remaining = _count_nodes(root)
+            root, created = _fold_pass(root, cap, taken)
+            if not created:
+                break
+            made.extend(created)
+            # **二道守卫**：这一趟折出来的东西必须真的减了节点数。`_fold_pass` 的
+            # `cap + 1` 判据已经保证严格递减，但那条保证依赖"聚合节点自己是叶子"这个
+            # 前提——哪天聚合节点改成保留一部分下级，递减就不成立了，而这个 `while`
+            # 会立刻变回死循环。宁可多算一次 `_count_nodes`。
+            if _count_nodes(root) >= remaining:  # pragma: no cover — 见上
+                logger.warning("折叠没有减少节点数（cap=%s / %s 个），停止折叠",
+                               cap, remaining)
+                break
+        if _count_nodes(root) <= limit:
+            break
+    kept_ids = _node_ids(root)
+    folded = content.model_copy(update={
+        "root": root,
+        "relations": [item for item in content.relations
+                      if item.source in kept_ids and item.target in kept_ids],
+        "edges": [edge for edge in content.edges
+                  if edge.source in kept_ids and edge.target in kept_ids],
+    })
+    folded = MindMapContent.model_validate(folded.model_dump())
+    report = _Fold(
+        rollups=tuple(item.label for item in made),
+        rollup_ids=tuple(item.id for item in made),
+        dropped=before - _count_nodes(root))
+    if _count_nodes(root) <= limit:
+        return folded, report
+    # 走到这里：每一层都已经窄到折不动。这才是真的装不下。
+    clipped_content, clipped = _clip_tree(folded, limit)
+    return clipped_content, _Fold(
+        rollups=report.rollups, rollup_ids=report.rollup_ids,
+        dropped=before - _count_nodes(clipped_content.root), clipped=clipped)
+
+
 def _shortened_ids(original: Node, trimmed: Node) -> set[str]:
     """裁剪之后**掉了子节点**的那些节点的 id。
 
@@ -1137,22 +1339,6 @@ def _shortened_ids(original: Node, trimmed: Node) -> set[str]:
 def _count_refs(root) -> int:
     """整棵树的引用条数。逐字校验前后各数一次，差值就是被剔除的条数。"""
     return len(root.source_refs) + sum(_count_refs(child) for child in root.children)
-
-
-def _budget_branches(
-    plan: "_SkeletonPlan | None", titles: Sequence[str], requested: int,
-) -> int:
-    """按支摊时"支"指几个：**画布上的一级节点数**。
-
-    两级时是分组（分组才是画布上的一级，那二十节在它下面）；扁平时是骨架给的那几条；
-    两段式没有骨架产物（`plan is None`，一级分支由模型从图谱里挑），只能按请求条数
-    估——它估错的代价只是每支预算偏大或偏小，不会改结构。
-    """
-    if plan is None:
-        return max(1, requested)
-    if plan.grouped:
-        return max(1, len(plan.groups))
-    return max(1, len(titles))
 
 
 def _pick_sources(ctx: RunContext, source_ids: list[str]) -> list:
@@ -3289,20 +3475,101 @@ def _slice_budget(chapters: int) -> int:
     return max(SECTION_SLICE_MIN_PER_BRANCH, share)
 
 
+# ---------------------------------------------------------------- 一级分支条数：不设限
+#
+# **这一次要几条一级分支，代码不给数。** 这是产品决定，不是默认值的口味。
+#
+# 被它替掉的那套机制是"提示词里写一句最多 N 条"，而那个 N 只有一个来源可用——模型
+# 在**读到材料之前**自己填的工具参数（`GenerateDeepArgs.branches`，字段默认值 5）。
+# 于是三次生成三次被同一句"最多 5 条"框住，实战退化成"root → 5 条竖链 × 3 节点，一个分叉都没有"，
+# 而材料里明明有十几个方面。数的来源是预感，作用却是上限——方向一开始就错。
+#
+# 现在改成**给判据不给数**：材料里有几个方面，就长几条分支。规模因此由材料自己
+# 决定（有材料时还叠着“每个节点必须有引用”那一条——找不到依据的方面写不成节点），
+# 代码只守两条与内容无关的边界：`MIN_BRANCHES`（少于 3 条不成图，是结构下限）与
+# `DEEP_MAX_BRANCHES`（画布承载能力）。
+#
+# 另一半在 `NO_BRANCH_CAP_RULE` 的后半句：上限一松，最容易出的错从“为凑数硬拆”
+# 变成“为整齐硬合”。两个错在同一次调用里会互相拉扯，判据必须把两头都说到。
+NO_BRANCH_CAP_RULE = (
+    "按内容实际包含的方面定条数：层级多就用足，内容单薄就少给；"
+    "不要为了凑数把不同的事塞进同一支，也不要为了整齐把不同的事合成一支。")
+
+
+# 不设上限时替掉「这一次要多大」那一句的**判据**。
+#
+# 它替掉的是 `generation.service._INITIAL_SCALE_LINE`：「第一次生成本身请控制在 80 个节点、
+# 4 层（含中心主题）以内：宁可少两层，也要让每一层都写完整。」——三个数（节点、
+# 层数、以及“宁可少两层”那个取舍）全是配额口径。
+#
+# **为什么是判据而不是一个更大的数**：配额问的是“能写多少”（答案是模型的填额
+# 目标），而这一轮要的是“有多少能写”：有材料时由「每个节点必须有引用」约束（找不到依据的
+# 方面写不成节点），纯主题时由单次输出预算约束。两条都不需要提示词里有一个数。
+#
+# 层数那一半也一样：契约层的 `MAX_TREE_DEPTH=8` 照旧生效（`DETAIL_PROMPT` 自己就写着
+# “层级上限 8 是可读性上限，不是要拆到的目标”），而“本次 4 层”那一个是配额，走人。
+#
+# 后半句“更细的内容留给用户点开某个节点后再展开”原样保留：它不是配额，是产品
+# 分工（`node_expand` 那条路确实存在，而界面上一棵一次长到 8 层的树没人读得完）。
+SCALE_BY_MATERIAL_RULE = (
+    "这一次写多少节点、拆到几层，都由内容决定：还能拆出更具体的方面就继续拆，"
+    "拆不动了就停；不要为了少写几个就把两件事合成一个节点。")
+
+#: 去掉配额那句之后的 `DETAIL_PROMPT`：整树那一路的 system 就是它。
+#:
+#: 为什么不直接改 `generation.service` 里那份常量：它被 `tests/test_budget.py` 按段断言
+#: （`scaled.replace("32 个节点", "80 个节点") == DETAIL_PROMPT`），而它另一半（`MINDMAP_NODE_SCALE`
+#: 那套实验臂）这一轮不动——它仍是“配额是多少”的唯一实现，留着给测量脚本
+#: 与将来的对照用。**变的是生成路径**：那一路的 system 是在本模块拼的，所以换句子发生在这里。
+#:
+#: 两个匹配锚点是刻意的：它们依赖 `DETAIL_PROMPT` 的措辞，而那是一份公共常量。措辞一改
+#: 就必须在这里**失败**而不是静默地什么都不换：静默的后果是“提示词里又出现了
+#: 一个数”，而那正是这一轮唯一要消灭的东西。
+_SCALE_SENTENCE_HEAD = "第一次生成本身请控制在 "
+_SCALE_SENTENCE_TAIL = "更细的内容留给用户点开某个节点后再展开。"
+
+
+def _open_scale_rule(prompt: str) -> str:
+    """把 `prompt` 里那句配额换成 `SCALE_BY_MATERIAL_RULE`。锚点不在就报错。"""
+    head, sep, tail = prompt.partition(_SCALE_SENTENCE_HEAD)
+    if not sep:
+        raise RuntimeError(
+            "生成提示词里已经没有「" + _SCALE_SENTENCE_HEAD +
+            "」了：`generation.service` 那一句改了措辞，同步更新 `tools._open_scale_rule`")
+    _body, sep2, rest = tail.partition(_SCALE_SENTENCE_TAIL)
+    if not sep2:
+        raise RuntimeError(
+            "生成提示词里已经没有「" + _SCALE_SENTENCE_TAIL +
+            "」了：同步更新 `tools._open_scale_rule`")
+    return head + SCALE_BY_MATERIAL_RULE + sep2 + rest
+
+
+#: 整树那一路的 system 里「这一次要多大」那句的定稿。`_generate` 取它，不再取
+#: `detail_prompt(...)`——后者的每一个分支都带一个数。
+#:
+#: 取 `detail_prompt()` 的返回值而不另 import `DETAIL_PROMPT` 常量：那个函数的默认
+#: 分支（`node_limit is None`）**返回的就是常量本身**（`is` 同一性有用例钉着），
+#: 所以两次拿到的是同一份文本，而这里少一个跨模块的常量依赖。
+DETAIL_PROMPT_OPEN = _open_scale_rule(detail_prompt())
+
+
 def _plan_ask(
-    topic: str, branches: int, *, outline: str = "", materials: str = "",
+    topic: str, *, outline: str = "", materials: str = "",
     diagram_type: str = "tree",
 ) -> str:
-    """骨架调用的 user 消息。
+    """骨架调用的 user 消息。**条数那一段永远是判据，不是数**（`NO_BRANCH_CAP_RULE`）。
 
-    期望分支数必须写进 user：只靠 system 里的通用说明时，请求 3 支与 8 支的
-    模型输入一字不差，它只能按自己的直觉给一个数——而 `branches` 是用户在界面
-    上选的值，被无视了。单条长度、互不重叠、逻辑顺序三条也一起重申：system 里
-    虽有，但这是决定骨架质量的三条硬约束，重复一次便宜，骨架歪了整张图都歪。
+    这个函数以前收一个 `branches`，把"最多 N 条"写进 user。撤掉它的理由见
+    `NO_BRANCH_CAP_RULE` 上面那一段：那个 N 的唯一来源是模型在读到材料之前填的
+    工具参数，拿预感当上限。现在没有这个参数，也就没有"某次调用忘了传 None 就
+    退回配额"这条路——不设限是常量，不是一个可以被悄悄绕过的默认值。
+
+    单条长度、互不重叠、逻辑顺序三条照旧重申：system 里虽有，但这是决定骨架质量的
+    三条硬约束，重复一次便宜，骨架歪了整张图都歪。
 
     `outline` 是材料自带的章节（`_skeleton_outline` 的产物），**放在主题之后、
-    条数要求之前**：顺序即权重，先给它看材料的结构，再让它数条数——反过来先
-    见到"最多 8 条"时，它倾向凑满 8 条再找话说。空串表示这份材料没有可用目录，
+    判据之前**：顺序即权重，先给它看材料的结构，再让它按结构定条数——反过来先
+    见到"按方面定条数"时，它倾向先数一个数再找话说。空串表示这份材料没有可用目录，
     那一字不加（与加目录之前逐字相同）。
 
     `materials` 是材料清单（`_material_inventory` 的产物：份数 / 每份文件名与字数），
@@ -3325,8 +3592,7 @@ def _plan_ask(
         parts += ["", outline, ""]
     if materials:
         parts += ["", materials, ""]
-    parts.append(f"根据内容实际包含的方面来定一级分支数量，最多 {branches} 条。")
-    parts.append("材料层次多就用足、内容单薄就少给，不要为了凑数把不同的事塞进同一支。")
+    parts.append(NO_BRANCH_CAP_RULE)
     if materials:
         parts.append(INVENTORY_RULES)
     # 这个数必须与系统提示词和代码截断同源（`GENERATED_LABEL_MAX_CHARS`）。
@@ -3380,6 +3646,34 @@ SECTION_SLICE_PROMPT = (
     "同级之间不要写同一个标题（重复的说法会被画成两块）。\n"
 )
 
+# 有材料时**每个节点都必须有引用**。这一句是三条引用规约（`EVIDENCE_REF_FIELDS` /
+# `FULL_TEXT_EVIDENCE_RULES` / `SECTION_SLICE_REF_RULES`）共用的那半句，抽出来是因为
+# 它替掉的正是那三条里各写一遍的**逃逸口**：「只有你自己补充的内容才给空数组——不挂
+# 引用是对的，编造不是」。
+#
+# 那句话在语义上没错（不编造引用确实比编造好），但它给了一个**恰好模型最爱的出口**：
+# 只要它认为某个节点"这是我补充的"，就可以不挂引用。实测（碳中和那棵，16 个节点）
+# 只有 5 个节点有引用 = 31%，而模型并没有编造——它只是几乎每个节点都自称"补充"。
+# 引用的作用是**约束**，不是**记录**：一旦允许留空，节点数就不再受材料约束，回到了
+# 没有依据也能长的那条路上。
+#
+# 所以现在只留一种正确做法：**材料里找不到依据的方面，不要写成一个节点**。这同时完成
+# 了"规模由材料决定"那件事——材料 424 字，可引的段落就那么几处，节点自然少；材料
+# 66,000 字，可引的多，节点自然多。限额外挂一个数（`INITIAL_MAX_NODES`）反而是多余的，
+# 因为它量的是"能写多少"，而这一句量的是"有多少能写"。
+#
+# 措辞里三处不是随便写的：
+#   - **"每一个节点"** 而不是"凡是内容出自材料"：后者要求模型先自判"这段算不算出自
+#     材料"，而它每次都判成"算我补充的"；
+#   - **"宁可这一支短"**：不给这条出路，模型会为了保住分支数去凑节点——那正是它编造
+#     引用的起点。短是可以接受的；
+#   - **"不要写一个没有出处的节点"**：把话说在**动作**上（写/不写节点），而不是在字段上
+#     （给/不给引用）。字段可以留空，节点不能凭空存在。
+MUST_CITE_EVERY_NODE = (
+    "**每一个节点都必须至少有一条 source_refs**。"
+    "材料里找不到依据的方面，不要写成一个节点——宁可这一支短，"
+    "也不要写一个没有出处的节点。")
+
 # 引用规则：**拼在** system 之后。与 `FULL_TEXT_EVIDENCE_RULES` 同源，只改一处——
 # 范围从"全部材料"收窄到"这一章"，因为模型的输入本来就是这一章，而"只能从本章抄"
 # 是这条路唯一能在机制上成立的引用约束（跨章的句子它根本看不见）。
@@ -3389,8 +3683,7 @@ SECTION_SLICE_REF_RULES = (
     "source_refs 与 label 平级，不要写进任何文字字段。"
     "quote 必须**逐字**照抄上面原文里连续的一段（不超过 300 字），"
     "不要改写、不要概括；start / end 不用写（服务端会按这一章的范围定位并补上），"
-    "page 不用写。**凡是内容出自这一章，就必须给这个节点挂一条 source_refs**；"
-    "只有你自己补充的内容才给空数组——不挂引用是对的，编造不是。\n"
+    "page 不用写。" + MUST_CITE_EVERY_NODE.replace("材料", "这一章") + "\n"
 )
 
 
@@ -3740,6 +4033,7 @@ def _skeleton_block(plan: _SkeletonPlan) -> str:
             lines.append(f"   {group_index}.{branch_index} {branch.label}")
     return "\n".join(lines)
 
+
 # **引用字段的形状**。抽出来是因为它有**三个**消费者：按支分组（`BRANCHED_EVIDENCE_RULES`）、
 # 图谱分组（`GRAPH_EVIDENCE_RULES`）、以及全塞那条路自己写了一份（`FULL_TEXT_EVIDENCE_RULES`
 # 的字段说明与这里同源，只是不要 start/end）。三处各写一份的话，模型在两条路上写出的
@@ -3754,7 +4048,7 @@ EVIDENCE_REF_FIELDS = (
     "evidence_end、evidence_quote 的值；没有 evidence_* 时只抄 quote 里连续的"
     "一段（不超过 300 字），这时不要写 start 和 end。"
     "引文逐字照抄，不要改写、不要概括、不要自己算偏移，也不要写 page。"
-    "自己补的内容 source_refs 给空数组——不挂引用是对的，编造不是。\n"
+    + MUST_CITE_EVERY_NODE + "\n"
 )
 
 # 有证据时拼在 `DETAIL_PROMPT` 之后的那一段。与 `BRANCH_EVIDENCE_RULES` 是同一份
@@ -3802,8 +4096,8 @@ FULL_TEXT_EVIDENCE_RULES = (
     "要写就必须与 quote 对得上，page 不用写。\n"
     "**凡是内容出自材料，就必须给这个节点挂一条 source_refs**；"
     "每一份材料都要用上——一段材料的核心内容应当落在某个节点的 detail 与引用里，"
-    "不要只写最先读到的那一份。只有你自己补充的内容才给空数组："
-    "不挂引用是对的，编造不是。\n"
+    "不要只写最先读到的那一份。"
+    + MUST_CITE_EVERY_NODE + "\n"
 )
 
 # 全塞时的分节表头。为什么要带**字数**：模型据此判断这一份该给多少节点，
@@ -8178,18 +8472,30 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             else FLOW_PLAN_PROMPT if diagram_type == "flowchart"
             else FISHBONE_PLAN_PROMPT
         )
-        # **两级骨架的判定点**：这一次大概会有多少个方面。两个来源取大的那个——
-        # 材料目录的行数（`_skeleton_outline` 拼进去的那一份，覆盖率不够时是 0 行）
-        # 与用户在界面上要的条数（`args.branches`，上限 20）。
+        # **两级骨架的判定点**：这一次大概会有多少个方面。**只数材料的宽度**——
+        # 目录行数（`_skeleton_outline` 拼进去的那一份，覆盖率不够时是 0 行）、图谱
+        # 补的那几条、按章切的章数。
+        #
+        # `args.branches` 已经从式子里拿掉了，理由是它**不是材料宽度**：那是模型在读到
+        # 材料之前填的一个数（字段默认 5），而条数本身这一轮已经不由代码定
+        # （`NO_BRANCH_CAP_RULE`）。拿它当"这次大概有 5 个方面"，等于用一个预感去决定
+        # 要不要给更宽的画布——而预感恒为 5，永远小于阈值 10，于是这一档永不触发。
         #
         # 为什么要**预判**而不是等骨架回来再决定：骨架只调用一次，要让它一次就吐两级，
-        # 这句要求必须在请求里。等回来再判就只能再发一次"请把刚才那 20 条归成 5 组"，
+        # 这句要求必须在请求里。等回来再判就只能再发一次"请把刚才的 20 条归成 5 组"，
         # 那正是这次要避免的第二次调用。
         #
         # 预判错了不致命，两个方向都有出路：判多（要了两级，回来只有 8 支）→
         # `_skeleton_plan` 压平成扁平；判少（要了扁平，回来 20 支）→ 也走扁平，
         # 与改动之前逐字节相同。所以这条判据只影响"什么时候给它更宽的画布"，
         # 不影响成不成功。
+        #
+        # **纯主题因此恒不请求分组**（三项都是 0）：这与改动之前同一条结果——那时
+        # `args.branches` 取默认 5，5 < 10 同样不请求。差别只在于现在这个"不请求"
+        # 是**材料真的没有宽度可说**，而不是"预感恰好不够大"。它留下的那格风险
+        # （模型自由发挥给到十几条一级分支时是一张宽图）由 `SKELETON_GROUP_THRESHOLD`
+        # 之外的机制兜：`_fill_plan_colors` 与画布的横向排布都不按条数截断，而一级
+        # 分支条数超过 20 时 `_cap_plan` 仍按 `DEEP_MAX_BRANCHES`（画布承载）收口。
         #
         # 只有 `tree` 分组：流程图的一级是**阶段**（分组会打断顺序），鱼骨图的一级是
         # 固定的六类（换一套分类就不再是鱼骨图）。
@@ -8199,7 +8505,7 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         # 的兜底见上面那段（`_skeleton_plan` 会压平 / 保持扁平）。
         supplement_items = mixed.supplement.items if mixed is not None else 0
         sections_expected = max(
-            args.branches, len(outline_entries) + supplement_items, len(slice_chapters))
+            len(outline_entries) + supplement_items, len(slice_chapters))
         # 按章切**不请求分组**：这条路的一级分支就是章，本来是一维序列；而分组会多
         # 吃一层深度（`INITIAL_MAX_DEPTH=3`：root → 组 → 章 → 章内要点，章里只剩
         # 一层），把"这一章有 ### 子节"这件事挤没。
@@ -8228,9 +8534,6 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         plan_started = time.perf_counter()
         ask = _plan_ask(
             args.topic,
-            # 按章切时请求的条数**就是章数**：这条路按"一条分支 = 一章"组装，
-            # 少一条就有一章没有支（那一章的覆盖率恒为 0）。
-            len(slice_chapters) if slice_chapters else args.branches,
             outline=outline,
             # 清单紧跟在 `outline` 之后进 prompt：三个条件（有材料、没材料、按章切）
             # 共用同一个渲染器，`sources` 为空时它是空串，`_plan_ask` 一字不加。
@@ -8280,10 +8583,13 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         if not prefs.icons_enabled():
             plan = _strip_plan_icons(plan)
         titles = [branch.label for branch in plan.flat]
-        # 请求的条数在按章切时是**章数**（上面 `_plan_ask` 用的就是它）：拿
-        # `args.branches`（界面上选的 5）去比 12 章，每次都会误报一条"少了 7 条"。
-        requested_branches = len(slice_chapters) if slice_chapters else args.branches
-        if not requested_branches - 1 <= len(titles) <= requested_branches + 1:
+        # **只在按章切时报"条数不对"**：那条路要求"一条分支 = 一章"，少一条就有一章
+        # 没有支（那一章的覆盖率恒为 0），那是结构约定，不是配额。其余情况一律不报——
+        # 已经没有任何地方在要求一个条数了，没有期望就没有落差（以前那条诊断比对的是
+        # 模型自己在工具参数里猜的数，"请求 5 条、模型给了 9 条"里"请求"两个字是假的）。
+        requested_branches = len(slice_chapters) if slice_chapters else None
+        if requested_branches is not None and not (
+                requested_branches - 1 <= len(titles) <= requested_branches + 1):
             diagnostics.append(Diagnostic(
                 level=DiagnosticLevel.warn, code="SKELETON_SIZE_OFF",
                 message=f"请求 {requested_branches} 条一级分支，模型给了 {len(titles)} 条，"
@@ -8373,84 +8679,23 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     # 前提——两组的差异只可能来自第二段，不可能来自收尾。
     structure_seconds = 0.0
     slice_report: dict[str, Any] | None = None
-    # ---- 规模：这一次要求几个节点 ------------------------------------------------
+    # ---- 规模：不再由代码给一个数 -------------------------------------------------
     #
-    # 默认恒为 `INITIAL_MAX_NODES`（80）——与改动前逐字节相同。`MINDMAP_NODE_SCALE=1`
-    # 时由材料决定（判据、系数与三点位实测见 `generation.budget.scaled_initial_nodes`）。
+    # 这一段以前算的是"这一次要求几个节点"（`budget.initial_nodes`：默认 80，开
+    # `MINDMAP_NODE_SCALE` 则按材料伸缩，`MINDMAP_NODE_CAP` 还能手动压），那个数同时
+    # 去了三处：system 里那句"控制在 N 个节点以内"、`_clip_tree` 的上限、`data["node_limit"]`。
     #
-    # **三处必须用同一个数**：system 里那句要求、`_clip_tree` 的上限、`data["node_limit"]`。
-    # 只改一处就会造出"提示词要 32、裁到 80、报 80"这种自相矛盾的产物，而它从数据上
-    # 看是"模型没听话"——排查方向会从一开始就错。
+    # 现在三处只留一处：**不许写进提示词**。理由与本模块 `NO_BRANCH_CAP_RULE` 那一段
+    # 同源——配额是"能写多少"，而这一轮要的是"有多少能写"：有材料时由"每个节点必须
+    # 有引用"约束（找不到依据的方面写不成节点），纯主题时由单次输出预算约束。给一个数
+    # 只会让模型把它当填额目标（实测：材料翻 135 倍、说明总量只涨 30%，见
+    # `docs/GRAPH-SCALE.md`）。
     #
-    # 字数取 `max(material_chars, full_text_chars)`：后者含外部检索补进来的量，那部分
-    # 也在这一次的 prompt 里，规模该把它算进去。
-    initial_nodes = budget.initial_nodes(
-        material_chars=max(material_chars, full_text_chars),
-        sources=len(sources),
-        chapters=len(outline_entries),
-        # `ceiling` 必须显式传**本模块**的那个常量：它是"这一次的上限"的唯一出口，
-        # 用例会 patch `tools.INITIAL_MAX_NODES` 来把上限压到 5 验裁剪。用
-        # `budget.initial_nodes` 的默认参数会绕过那次 patch（两个模块各有一个 80）。
-        ceiling=INITIAL_MAX_NODES,
-    )
+    # 留下的这一个数**换了语义**：`INITIAL_MAX_NODES` 从"不许超过"变成"超过就折叠"
+    # （`_fold_tree`）。它量的是**可读性**，不是产能，所以它与材料无关地固定在那里是
+    # 对的——一棵 300 个节点的图在画布上就是读不完，那与材料多厚没有关系。
+    initial_nodes = INITIAL_MAX_NODES
 
-    # ---- 按支摊：预算不该压掉一级分支数 ------------------------------------------
-    #
-    # 上面那个数是**总量池**，而它同时去了三处（提示词那句 / `_clip_tree` 的上限 /
-    # `data["node_limit"]`）。总量池叠上 `_clip_tree` 的**前序**裁剪会压掉一级分支数：
-    # 名额先被第 1 支的深子树吃光，第 2 支起一个节点都不剩。实测（`docs/GRAPH-SCALE.md`
-    # 第 7 节）——424 字材料、骨架 3 支、`initial_nodes=10`：模型写了 39 个节点、3 支
-    # 齐全，裁完只剩 1 支。用户显式选了 6 条分支，拿到 1 条。
-    #
-    # 所以配额照样按材料算（那是"这次装得下多少"），但**名额怎么分**改成按支：
-    # 提示词说"每条一级分支 M 个"、裁剪按"每支 share 个"、`data` 报折回来的总量。
-    # 三处仍用同一个口径（`initial_nodes` 被改写成折回来的总量），只是这个口径现在
-    # 随支数走——8 支的图比 2 支的图能装下更多节点，这正是它该有的行为。
-    #
-    # 默认路径（`initial_nodes == INITIAL_MAX_NODES`）整段不执行：80 那个量级上前序
-    # 裁剪几乎不触发（三批实测 `cut_nodes=0`），改了等于白改还多一份回归风险。
-    # `MINDMAP_NODE_POOL=1` 也整段不执行：它是"旧口径"的实验臂，用来回答"哪一处改动
-    # 在起作用"——这个改动同时动了提示词与裁剪，没有它就只能对着 git 历史跑。
-    branch_target = 0
-    per_branch: int | None = None
-    if initial_nodes != INITIAL_MAX_NODES and not budget.node_pool_mode():
-        branch_target = _budget_branches(plan, titles, args.branches)
-        per_branch, initial_nodes = budget.branch_budget(
-            initial_nodes=initial_nodes, branches=branch_target,
-            ceiling=INITIAL_MAX_NODES)
-    if initial_nodes != INITIAL_MAX_NODES:
-        # 只说这一次是多大，以及为什么：用户看到一棵 32 节点的树时，得能分辨"模型
-        # 没写完"与"这次就是这么要的"。
-        #
-        # 两条来源分开报：`NODE_CAP_APPLIED` 是**人为设定的配额**（实验旋钮），
-        # `NODE_SCALE_APPLIED` 是**按材料算出来的**。混成一个 code 会让报告里的
-        # "这次为什么是 32" 说不清——四格实验里两格走同一句话就没法归因。
-        #
-        # **按支摊**时再多报一句"共几支、每支几个"：那个总量是 `支数 × 每支` 折出来的，
-        # 只报总数会让"为什么 10 变成 18"看起来像算错了。
-        by_branch = (
-            f"、共 {branch_target} 条一级分支每支 {per_branch} 个"
-            if per_branch is not None else "")
-        cap = budget.node_cap()
-        if cap is not None:
-            diagnostics.append(Diagnostic(
-                level=DiagnosticLevel.info, code="NODE_CAP_APPLIED",
-                message=(
-                    f"这次按 `{budget.NODE_CAP_ENV}={cap}` 手动设定的配额要求 "
-                    f"{initial_nodes} 个节点{by_branch}（优先于 `{budget.NODE_SCALE_ENV}`；"
-                    f"不设该开关时按材料规模或恒为 {INITIAL_MAX_NODES}）"
-                ),
-            ))
-        else:
-            diagnostics.append(Diagnostic(
-                level=DiagnosticLevel.info, code="NODE_SCALE_APPLIED",
-                message=(
-                    f"这次按材料规模要求 {initial_nodes} 个节点{by_branch}"
-                    f"（材料 {max(material_chars, full_text_chars)} 字 / {len(sources)} 份 /"
-                    f" {len(outline_entries)} 章；开关 `{budget.NODE_SCALE_ENV}`）；"
-                    f"不设该开关时恒为 {INITIAL_MAX_NODES}"
-                ),
-            ))
     # 外部来源的可信度提示：两条路共用（第三段也用它），所以必须在 if/else **之前**
     # 定下来。判据只看 `sections` 与来源类型，与"结构那一次怎么发"无关。
     external_rules = (
@@ -8541,7 +8786,8 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             user += (
                 '\n\n写结构时每个节点的引用字段一起写：内容出自上面正文的，挂 source_refs'
                 '（[{"source_id":"…","quote":"逐字抄原文连续一段"}]，source_id 照抄那一节'
-                "标题里的值）；自己补充的内容给空数组 []。"
+                "标题里的值）；**每一个节点都要有一条**，正文里找不到依据的方面不要写成"
+                "一个节点。"
             )
         elif sections and graph_mode:
             # 两段式的证据是按**概念**检索的（query 就是图谱里的实体名），不是按分支。
@@ -8570,11 +8816,10 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             else FISHBONE_TREE_RULES if diagram_type == "fishbone"
             else SKELETON_TREE_RULES
         )
-        # 树规则那一份只改「这一次要多大」那一句（`detail_prompt`）；开关关着时它就是
-        # `DETAIL_PROMPT` 本身，逐字节不变。`per_branch` 给定时那句按支摊（"每条一级
-        # 分支 M 个、这次 K 条"），与下面裁剪用的名额是同一个口径。
-        base_system = detail_prompt(
-            initial_nodes, per_branch=per_branch, branches=branch_target)
+        # 树规则那一份里只有「这一次要多大」那一句与常量不同（`DETAIL_PROMPT_OPEN`：把配额
+        # 换成判据）。不再调 `detail_prompt(...)`：它的每一个分支都带一个数，而这一轮要的就是
+        # “提示词里一个数都不出现”。
+        base_system = DETAIL_PROMPT_OPEN
         if sections and full_text:
             # 全塞：引用规则换成"这是全文"那一套。**不能复用 `BRANCHED_EVIDENCE_RULES`**
             # ——它开头就说"已经按一级分支各做过一次检索"，与这次真的没检索相矛盾；
@@ -8689,42 +8934,48 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
                 ),
             ))
 
-    before_clip = _count_nodes(content.root)
-    clipped = 0
+    # ---- 超出可读性上限：折叠，不裁 ------------------------------------------------
+    #
+    # 这一步以前是 `_clip_tree`：按前序砍尾巴。它有两个已经量到的坏形态（见 `FOLD_CAPS`
+    # 上面那段）——后几条一级分支整条消失，以及小配额下 3 支被砍成 1 支。而"超过 80 个
+    # 节点"**不等于**"装不下"（契约给到 1000），它只意味着画布上读不完，那就该降级而不
+    # 该删。所以这里换成 `_fold_tree`：兄弟并成「其他 N 项」、引用取并集，实在折不动
+    # （每一层都已经窄到 2 支以内）才落到 `_clip_tree`——那才是真的撑不起。
+    #
+    # 两条诊断分开报，因为用户能做的事不同：
+    #   `TREE_FOLDED_TO_READABILITY`  info  内容还在，只是有几处收进了「其他 N 项」；
+    #   `TREE_CLIPPED_TO_INITIAL`     warn  真的丢了内容（折不动之后的兜底）。
+    before_fold = _count_nodes(content.root)
+    fold = _Fold()
     cut_ids: set[str] = set()
-    if before_clip > initial_nodes:
+    if before_fold > initial_nodes:
         original_root = content.root
-        # 按支摊时名额按支均分（`per_branch` 给 `_clip_tree`），否则仍是前序砍尾巴。
-        # 这两条路的差别不是"裁得松不松"，而是"名额不够时缩谁"：前序缩的是后面的整条
-        # 分支，按支缩的是每一支的深度——见 `_clip_tree` 的 docstring。
-        content, clipped = _clip_tree(
-            content, initial_nodes,
-            per_branch=(
-                budget.branch_share(total=initial_nodes, branches=branch_target)
-                if per_branch is not None else None))
+        content, fold = _fold_tree(content, initial_nodes)
         cut_ids = _shortened_ids(original_root, content.root)
-        if per_branch is None:
-            # 默认路径：与加按支摊之前逐字节相同（80 那个量级上几乎不触发，但用例钉着）。
-            message = (
-                f"模型返回了 {before_clip} 个节点，超过初次生成的 {initial_nodes} 个上限，"
-                f"已保留前 {initial_nodes} 个（尾部 {clipped} 个未保留）；"
-                "想要更大的树，请生成后用 node_expand 逐支展开"
-            )
-        else:
-            # 按支摊：报的是"名额怎么分的"，因为这时**总节点数不再是保留量的上限**——
-            # 分完名额外加根可能少一个（整除的余数不补），只说"保留前 N 个"会与事实对不上。
-            message = (
-                f"模型返回了 {before_clip} 个节点，超过初次生成的 {initial_nodes} 个上限，"
-                f"已保留 {_count_nodes(content.root)} 个（{clipped} 个未保留）："
-                f"名额按 {branch_target} 条一级分支均分、每支最多 "
-                f"{budget.branch_share(total=initial_nodes, branches=branch_target)} 个，"
-                f"落树 {len(content.root.children)} 支；"
-                "想要更大的树，请生成后用 node_expand 逐支展开"
-            )
-        diagnostics.append(Diagnostic(
-            level=DiagnosticLevel.warn, code="TREE_CLIPPED_TO_INITIAL",
-            message=message,
-        ))
+        # 折叠节点也必须进这张表：`_stamp_expandable` 把不在表里的一律标成 `yes`
+        # （"到底了"），而聚合节点的意思恰恰相反——它身后那些内容只是没画出来。
+        cut_ids |= set(fold.rollup_ids)
+        if fold.rollups:
+            diagnostics.append(Diagnostic(
+                level=DiagnosticLevel.info, code="TREE_FOLDED_TO_READABILITY",
+                message=(
+                    f"模型写了 {before_fold} 个节点，超过可读性上限 {initial_nodes}；"
+                    f"已把 {len(fold.rollups)} 处并列的兄弟并成「其他 N 项」节点"
+                    f"（共少掉 {fold.dropped - fold.clipped} 个节点，落树 "
+                    f"{_count_nodes(content.root)} 个、{len(content.root.children)} 条一级分支）："
+                    "被并的那些标题仍在聚合节点的 detail 里、引用也一并带上了，"
+                    "它们的展开按钮没有关掉——要长回来就点那个聚合节点"
+                ),
+            ))
+        if fold.clipped:
+            diagnostics.append(Diagnostic(
+                level=DiagnosticLevel.warn, code="TREE_CLIPPED_TO_INITIAL",
+                message=(
+                    f"模型写了 {before_fold} 个节点，折叠到每一层都只剩 2 支以内仍然超过 "
+                    f"{initial_nodes} 个，最后裁掉了 {fold.clipped} 个（这份材料撑不起这么多内容）；"
+                    "想要更大的树，请生成后用 node_expand 逐支展开"
+                ),
+            ))
 
     # 骨架的产物（颜色 / 图标 / flowgraph 的边）套上去。放在裁剪之后：端点表必须
     # 用裁剪后还活着的 id 建，否则 `clean_edges` 会把边留在指向已消失节点的状态。
@@ -9103,10 +9354,12 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             "但这张图的节点没有留下任何引用（模型没写，或写了没通过逐字校验）；"
             "全文就在上下文里，这不代表「材料里没有相关内容」。"
         )
-    if clipped:
+    if fold.happened:
         summary += (
-            f"节点数超过初次生成的 {initial_nodes} 个上限，已保留前 "
-            f"{initial_nodes} 个；想要更大的树，用 node_expand 逐支展开。"
+            f"节点数超过可读性上限 {initial_nodes}：已把 {len(fold.rollups)} 处并列的兄弟"
+            f"并成「其他 N 项」节点（少 {fold.dropped} 个，内容与引用都还在那些聚合节点里）"
+            + (f"，最后裁掉 {fold.clipped} 个" if fold.clipped else "")
+            + "；想要更细的树，用 node_expand 点开聚合节点逐支展开。"
         )
     if detail_report["requested"] and detail_report["filled"] < detail_report["requested"]:
         # 只在**没补全**的时候说一句：补全是常态（结构那一轮按提示词留空、第三段
@@ -9131,14 +9384,18 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         # 树里），所以报**落树后的**实际条数——这是同一个问题的答案，只是来源不同。
         "planned_branches": len(plan.flat) if plan is not None else len(content.root.children),
         # 初次规模的两个上限：报出来才能解释"为什么这棵树只有这么深/这么大"。
-        # 节点上限是**这一次**的值（`MINDMAP_NODE_SCALE` 关着时恒为 80）；深度上限
-        # 仍是常量——材料量只改规模，不改层数（层数由可读性定）。
+        # 节点上限是**可读性上限**（不再是配额：超过就折叠，折不动才裁）。
+        # 深度上限仍是常量——材料量只改规模，不改层数（层数由可读性定）。
         "node_limit": initial_nodes,
         "depth_limit": INITIAL_MAX_DEPTH,
-        # 两个来源：输出被截断（`SalvagedOutput`）、节点被裁剪。都是"少了一块"
+        # 两个来源：输出被截断（`SalvagedOutput`）、节点被折叠或裁掉。都是"少了一块"
         # 而不是失败，而 `ok=true` 与"完整成功"长得一模一样。
-        "partial": bool(truncated or clipped),
-        "cut_nodes": clipped,
+        "partial": bool(truncated or fold.happened),
+        # `cut_nodes` 只数**真裁掉**的那些（折叠不算：折叠的内容还在聚合节点里）。
+        # 两个数分开报，是因为它们对用户的意思相反——折叠是"收起来了"，裁是"没了"。
+        "cut_nodes": fold.clipped,
+        "folded_nodes": fold.dropped - fold.clipped,
+        "folded_rollups": len(fold.rollups),
         # 跨支重复的**节点数**（判据见 `_cross_branch_duplicates`）：库里那张
         # 56 节点的分片图量出来是 6（3 个说法各写 2 遍），这个数就是这次改动最想
         # 改善的指标。只在诊断里说一句"有重复"的话，事后比较两条路还得人肉数。
@@ -9646,7 +9903,7 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         raw_plan = await ask_model(
             plan_system,
             _plan_ask(
-                args.topic, args.branches, outline=outline,
+                args.topic, outline=outline,
                 # 与整树那条逐字同一处（`AGENTS.md`：骨架被两条生成路共用，
                 # 只改一条会得到一个"两个入口对同一批材料给出不同骨架"的分叉）。
                 materials=_material_inventory(sources, has_structure=bool(outline)),
@@ -9678,15 +9935,8 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     # 只给真的要上画布的那几条分配，被丢掉的尾巴不参与配色，否则"第 4 支拿到
     # 第 4 个颜色"这种事会因为一条被截掉的分支而错位。
     branches = _fill_branch_colors(branches)
-    titles = [branch.label for branch in branches]
-    # 数量只做宽容校验（允许 ±1）。为了一两条差异整张重来，成本是又一轮全额调用，
-    # 而多一条少一条对这张图并不致命；即使超出宽容范围也用实际返回的继续，
-    # 只记一条诊断说明"没按要求的条数走"。
-    if not args.branches - 1 <= len(titles) <= args.branches + 1:
-        diagnostics.append(Diagnostic(
-            level=DiagnosticLevel.warn, code="SKELETON_SIZE_OFF",
-            message=f"请求 {args.branches} 条一级分支，模型给了 {len(titles)} 条，已按实际条数继续。",
-        ))
+    # 条数**只做结构下限校验**，没有上限也没有期望值：一级分支有几条由材料与模型
+    # 决定（见 `NO_BRANCH_CAP_RULE`），这里不再出现"请求几条、给了几条"那条诊断。
 
     # 分支节点的 id 在骨架阶段就定好：展开是并发跑的，合并时要按 id 把要点挂回去，
     # 而树这时还不存在——只能先分配 id，合并时一次性落进树里。

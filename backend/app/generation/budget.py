@@ -50,6 +50,12 @@ _ASCII_TOKENS_PER_CHAR = 1 / 4
 # 「这次运行最多要几个节点」的第一次承诺。与 `generation.service` 的提示词、
 # `agent.tools._generate_deep` 的分配算术共用同一个数：三处各写一个 80，改一处
 # 忘一处的结果是"提示词说要 80、工具按 100 分、用户拿到 100"。
+#
+# **`_generate`（整树一次生成）已经不再把它当配额**：提示词里那句"控制在 N 个节点
+# 以内"撤掉了（`agent.tools.DETAIL_PROMPT_OPEN` / `SCALE_BY_MATERIAL_RULE`），这个数
+# 在那条路上换了语义——它现在是**可读性上限**，超过就折叠（`tools._fold_tree`），
+# 不是"不许写"。`budget.initial_nodes` 那三个函数因此只剩测量脚本与分片那条路
+# （`_generate_deep` 的 `node_limit`）在用；生成路径不再读它们。
 INITIAL_MAX_NODES = 80
 
 # 初次生成的深度上限，**按 root 之下算**（与 `GenerateDeepArgs.max_depth` 同口径）。
@@ -295,7 +301,13 @@ NODE_POOL_ENV = "MINDMAP_NODE_POOL"
 
 
 def node_pool_mode() -> bool:
-    """`MINDMAP_NODE_POOL=1` → 退回旧口径（总量池、整句进提示词、前序裁剪）。"""
+    """`MINDMAP_NODE_POOL=1` → 退回旧口径（总量池、整句进提示词、前序裁剪）。
+
+    ⚠ **生成路径已经不再读它**（`agent.tools._generate` 不再算配额，见
+    `INITIAL_MAX_NODES` 上面那段），所以今天设它**什么都不发生**。留着这段与这个
+    函数，是因为它记着"总量池 + 前序裁剪"那个形态的两个失效证据，而"要不要回到那个
+    形态"是将来可能再问一次的问题——那时该看的正是这两段注释，而不是 git 历史。
+    """
     return os.getenv(NODE_POOL_ENV, "").strip().lower() in ("1", "on", "true", "yes")
 
 
