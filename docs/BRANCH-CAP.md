@@ -231,15 +231,14 @@ DEEP_MAX_BRANCHES = 20
 
 这才是与"用户放弃按偏好"自洽的理由，而不是"数据没用"。
 
-复现：
+复现（单行，`cmd` 下已实测；`cmd` 不认反斜杠续行，写多行会直接报语法错）：
 
 ```bat
 cd backend
-python -c "from app.prefs import style; import json,collections; \
-obs=[o for o in style.iter_observations() if o.depth>0]; \
-kept,_=style._dedupe(obs); \
-print(collections.Counter(o.branches for o in kept))"
+python -c "from app.prefs import style; import collections; obs=[o for o in style.iter_observations() if o.depth>0]; kept,_=style._dedupe(obs); print(collections.Counter(o.branches for o in kept))"
 ```
+
+输出：`Counter({5: 23, 3: 11, 4: 8, 6: 7, 1: 2, 7: 2, 12: 1})`（2026-11-23）。
 
 ### 4.3 这条与"用户放弃按偏好"是自洽的
 
