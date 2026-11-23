@@ -30,11 +30,16 @@ def _record_edits(body: SaveRequest, map_id: str) -> None:
 
     `truncated` 只进日志，不落表：往行为事件表里插一条"我截断了"的假事件，会让每个
     统计口径的 `total` 都变脏。它不是丢弃——前端把超出的部分留在队列里等下次保存。
+
+    `parent_id` 从**这次保存的那棵树**算（`edits.parents_of`），不从请求体读一个
+    前端算好的值：树是权威，事件是它的描述，描述跟着权威算就不会出现"父 id 指向
+    一个不存在的节点"。这也让这一列不需要动契约（`EditEventIn` 是
+    `extra="forbid"`，加字段就要重导 `openapi.json` 与 `schema.d.ts`）。
     """
     if body.truncated:
         logger.warning("编辑事件分批：map_id=%s 本次提交 %d 条，另有 %d 条留到下次保存",
                        map_id, len(body.events), body.truncated)
-    edits.record(map_id, body.events)
+    edits.record(map_id, body.events, parents=edits.parents_of(body.content))
 
 
 @router.get("", response_model=list[MapRecord])
