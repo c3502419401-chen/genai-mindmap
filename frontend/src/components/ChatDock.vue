@@ -180,9 +180,9 @@ const externalSearchState = computed<SearchState>(() => {
     return { kind: 'enough', line: '这次带材料，不走联网检索' };
   }
   if (!prefs.externalSearchEnabled) {
-    return { kind: 'off', line: '已关闭：没材料时直接按主题生成，节点上不会有引用' };
+    return { kind: 'off', line: '已关闭：直接按主题生成，节点上不会有引用' };
   }
-  return { kind: 'short', line: '会先去外部搜一轮资料，命中会变成能点回原文的引用（约 4 秒）' };
+  return { kind: 'short', line: '会先去外部搜一轮，命中的资料会变成能点回原文的引用（约 4 秒）' };
 });
 
 const externalSearchHint = computed(() => externalSearchState.value.line);
@@ -240,7 +240,7 @@ const intentHint = computed(() => {
   if (sources.recording) return '正在录音：先松开「按住说话」，再提交。';
   if (materialProblem.value) return materialProblem.value;
   if (pastedMaterial.value && !typed.value) {
-    return '正文已经当材料了：写一句要它怎么整理（比如「按主题分三层」），不写就用材料标题当中心主题。';
+    return '正文已经当材料了：写一句要它怎么整理，不写就用材料标题当中心主题。';
   }
   if (intentState.value === 'create') {
     if (typed.value) {
@@ -262,8 +262,8 @@ const intentHint = computed(() => {
     return '先在画布上选中节点，或直接描述要改哪里（按住 Ctrl 点节点可以多选）。';
   }
   return selectionCount.value === 1
-    ? '优先改这个节点及其子分支；真要动别处也能改，清单里会标出来。'
-    : `优先改这 ${selectionCount.value} 个节点及其子分支；真要动别处也能改，清单里会标出来。`;
+    ? '优先改这个节点及其子分支；别处要动也能动，清单里会标出来。'
+    : `优先改这 ${selectionCount.value} 个节点及其子分支；别处要动也能动，清单里会标出来。`;
 });
 
 const intentHintWarn = computed(() => !!materialProblem.value);
@@ -485,9 +485,9 @@ const detailLabel = computed(() => {
 const detailTitle = computed(() => {
   if (diagnostics.value > 0) return `打开右侧抽屉：${diagnostics.value} 条诊断逐条列出`;
   if (structureAlert.value > 0) {
-    return '打开右侧抽屉：结构检查的建议与诊断逐条列出（建议可以「应用」或「忽略」）';
+    return '打开右侧抽屉：结构检查的建议与诊断逐条列出';
   }
-  return '打开右侧抽屉：改动清单、结构与诊断逐条、生成中的预览';
+  return '打开右侧抽屉：改动清单、结构检查、生成中的预览';
 });
 
 /**
@@ -1114,10 +1114,10 @@ defineExpose({
           >
             <span class="min-w-0 flex-1">
               <template v-if="pastedMaterial.link">
-                这个链接已经读成一份材料，主题框留给"要它做什么"。
+                这个链接已经读成材料，主题框里说要它做什么。
               </template>
               <template v-else>
-                这段正文（{{ pastedMaterial.chars }} 字）已经放进材料，主题框留给"要它做什么"。
+                这段正文（{{ pastedMaterial.chars }} 字）已经放进材料，主题框里说要它做什么。
               </template>
             </span>
             <button
@@ -1137,7 +1137,7 @@ defineExpose({
             class="rounded border border-slate-100 bg-slate-50/60 px-2 py-1"
           >
             <summary class="cursor-pointer text-[11px] text-slate-500">
-              拆解方式与图型<span v-if="options.prefilled.thinking || options.prefilled.diagram" class="text-sky-700">（含来自偏好的预填）</span>
+              拆解方式与图型<span v-if="options.prefilled.thinking || options.prefilled.diagram" class="text-sky-700">（含偏好预填）</span>
             </summary>
             <div class="mt-1 flex flex-col gap-1">
               <div class="flex items-center gap-1.5 text-[11px] text-slate-500">
@@ -1156,7 +1156,7 @@ defineExpose({
               <div class="flex items-center justify-between gap-2 text-[11px]">
                 <p class="leading-tight text-slate-400">
                   按这种方式拆解主题
-                  <span v-if="options.prefilled.thinking" class="text-sky-700">（来自你的偏好：{{ options.thinkingLabel }}）</span>
+                  <span v-if="options.prefilled.thinking" class="text-sky-700">（来自偏好：{{ options.thinkingLabel }}）</span>
                 </p>
                 <label class="flex shrink-0 items-center gap-1 text-slate-500">
                   <input
@@ -1184,7 +1184,7 @@ defineExpose({
               <div class="flex items-center justify-between gap-2 text-[11px]">
                 <p class="leading-tight text-slate-400">
                   {{ options.diagramHint }}
-                  <span v-if="options.prefilled.diagram" class="text-sky-700">（来自你的偏好：{{ options.diagramLabel }}）</span>
+                  <span v-if="options.prefilled.diagram" class="text-sky-700">（来自偏好：{{ options.diagramLabel }}）</span>
                 </p>
                 <label class="flex shrink-0 items-center gap-1 text-slate-500">
                   <input
@@ -1223,7 +1223,7 @@ defineExpose({
                 : 'border-slate-200 text-slate-500 hover:bg-slate-50'"
               :aria-pressed="deepThinking"
               :disabled="runBlocked"
-              title="这一次的生成链走推理模型（骨架 / 结构 / 说明 / 展开都会先想一遍再动手），慢一些，拆解更稳。检索规划与联网检索仍走普通模型；具体模型名由后端配置决定。"
+              title="这一次走推理模型：先想一遍再动手，慢一些，拆解更稳。检索仍走普通模型。"
               @click="deepThinking = !deepThinking"
             >深度思考</button>
             <!-- 「智能搜索」：原来那个联网检索开关。它写的是偏好，所以勾一下就落库。 -->
@@ -1266,8 +1266,8 @@ defineExpose({
                 : 'border-slate-200 text-slate-500 hover:bg-slate-50'"
               :disabled="runBlocked || structure.busy"
               :title="structureAlert > 0
-                ? `这张图有 ${structureAlert} 处值得看一眼的地方；打开右侧抽屉逐条看`
-                : '检查这张图的结构：单子节点、深度上限、同级重名、引用能不能核验。只读，不改任何东西。'"
+                ? `这张图有 ${structureAlert} 处值得看一眼；打开右侧逐条看`
+                : '检查这张图的结构：单子节点、深度上限、同级重名、引用能否核验。只读，不改任何东西。'"
               @click="runStructureCheck"
             >{{ structure.busy ? '检查中…' : structureAlert > 0 ? `检查 · ${structureAlert}` : '检查' }}</button>
             <p class="order-4 min-w-0 flex-1 truncate text-right leading-tight text-slate-400" data-test="external-search-hint">
@@ -1279,7 +1279,7 @@ defineExpose({
               class="order-5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-slate-200 text-slate-600 hover:bg-slate-50 disabled:opacity-40"
               :disabled="runBlocked"
               aria-label="添加材料"
-              title="添加材料（文档 / 图片 / 粘贴文字 / 录音）"
+              title="添加材料（文档 / 图片 / 文本 / 录音）"
               @click="pickFiles"
             >+</button>
             <button
@@ -1344,7 +1344,7 @@ defineExpose({
           <div
             v-if="resumable"
             data-test="resumable-notice"
-            aria-label="上次的运行结果"
+            aria-label="上次的生成结果"
             aria-live="polite"
             class="flex items-center gap-2 rounded-lg border border-sky-200 bg-sky-50 px-2 py-1.5 text-xs text-sky-900"
           >

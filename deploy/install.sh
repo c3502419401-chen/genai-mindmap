@@ -9,7 +9,7 @@
 # → systemd + nginx 配置。前端 dist 不在这里构建（2C2G 上装 node 再打包太慢），
 # 由本机 `npm run build` 后 scp 上来，脚本最后会打印目标路径。
 #
-# 脚本可重复执行：目录存在就跳过、配置覆盖、密码不重设。覆盖配置之前会把当前
+# 脚本可重复执行：目录存在就跳过、配置覆盖。覆盖配置之前会把当前
 # 代码快照到 /var/lib/genai-mindmap/releases/，回滚时直接从那里解包（见 DEPLOY 第 10 节）。
 set -euo pipefail
 
@@ -54,9 +54,9 @@ CERT_DIR="/etc/letsencrypt/live/$DOMAIN"
 say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 
 say "1/6 系统依赖"
-# nginx：静态文件 + 反代；httpd-tools 提供 htpasswd；sqlite 用于在线备份；
+# nginx：静态文件 + 反代；sqlite 用于在线备份；
 # git/tar 用于拉代码；policycoreutils-python-utils 提供 semanage（SELinux 上下文）。
-dnf install -y nginx git tar httpd-tools sqlite policycoreutils-python-utils \
+dnf install -y nginx git tar sqlite policycoreutils-python-utils \
   gcc gcc-c++ make openssl-devel libffi-devel
 
 if [[ $WITH_OFFICE -eq 1 ]]; then
@@ -220,17 +220,16 @@ if [[ -f "$CERT_DIR/fullchain.pem" ]]; then
     "$REPO_DIR/deploy/nginx-tls.conf" >> /etc/nginx/conf.d/genai-mindmap.conf
 fi
 
-# 默认账号 demo，密码随机打印一次；重复执行不会改已有密码
-if [[ ! -f /etc/nginx/.htpasswd-mindmap ]]; then
-  PASS="$(openssl rand -base64 12)"
-  htpasswd -cb /etc/nginx/.htpasswd-mindmap demo "$PASS"
-  chmod 640 /etc/nginx/.htpasswd-mindmap
-  # 不吞错：AL3 上 nginx 的运行用户就叫 nginx，chown 失败说明这台机器的用户组
-  # 与假设不符——留成 root:root 640 的话 nginx 读不到，表现是全站 500 而不是启动报错。
-  chown root:nginx /etc/nginx/.htpasswd-mindmap
-  echo "已创建 Basic Auth 账号：demo / $PASS   （只显示这一次）"
+# 这里原本会建一个 nginx 的 Basic Auth 口令文件（`demo` + 随机密码）。
+# 账号体系上线后那层已经弃用：nginx 配置里不再有 auth_basic，鉴权由应用自己承担
+# （`backend/app/auth/gate.py` 拦匿名、`IdentityMiddleware` 发身份与游客 cookie）。
+# 留着旧文件不会报错，但它是一份没人消费的口令，而且会让人以为门外还有一道锁。
+# nginx 配置刚刚在上一段被重新生成过（已经没有 auth_basic），所以这里删是安全的。
+if [[ -f /etc/nginx/.htpasswd-mindmap ]]; then
+  rm -f /etc/nginx/.htpasswd-mindmap
+  echo "已删除弃用的 /etc/nginx/.htpasswd-mindmap（Basic Auth 由应用层账号体系取代）"
 else
-  echo "已有 /etc/nginx/.htpasswd-mindmap，保留不动；要加账号用 htpasswd -b <文件> <用户名> <密码>"
+  echo "Basic Auth 已弃用，无需口令文件；账号在页面里注册（第一个注册的账号是部署方）"
 fi
 
 # SELinux（AL3 默认 enforcing）要放行两件事，缺一条就有一半功能不可用：
@@ -296,5 +295,5 @@ printf '\n完成。还差三件事：\n'
 printf '  1. 填 %s（MINDMAP_LLM_BASE_URL / API_KEY / MODEL），然后 systemctl restart genai-mindmap\n' "$ENV_DIR/env"
 printf '  2. 本机 npm run build 后把 frontend/dist 传到 %s，然后 chmod -R a+rX 并 restorecon -R\n' "$WEB_ROOT"
 printf '  3. 域名解析到本机后签证书：certbot certonly --webroot -w /var/www/html -d %s，再重跑本脚本\n' "$DOMAIN"
-printf '\n自检：curl -u demo:**** http://127.0.0.1/api/health\n'
+printf '\n自检：curl -s http://127.0.0.1/api/health\n'
 printf '日志：journalctl -u genai-mindmap -n 50 --no-pager；systemctl status nginx\n'

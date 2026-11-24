@@ -32,6 +32,13 @@ import { useStructureStore } from '../stores/structure';
  * 图能有十几条。把它们和"同级重名"并排铺开，用户学会的是无视整块面板——那这个功能
  * 就废了。所以：`warn` / `error` 默认展开，info 折进一个写着"不影响使用"的开关里，
  * 状态行上一个数字都不给它（判据在 `structureHint`）。
+ *
+ * ## 原码默认收起，但随时展开得开
+ *
+ * 诊断码（`DUPLICATE_LABEL`）是内部标识：已知码已经有中文标题，把它留在卡片正文里
+ * 是给写代码的人看的。但它又是排查时唯一能对上后端日志的东西，所以**不删**：每条
+ * 卡片收一个「查看原码」，面板底部再给一个总开关一次全露出来。未知码不受影响——
+ * 它的标题就是原码本身，藏不掉。
  */
 const store = useMindMapStore();
 const sources = useSourcesStore();
@@ -55,6 +62,28 @@ const SUGGESTION_LIMIT = 5;
 
 const attentionOpen = ref(false);
 const suggestionsOpen = ref(false);
+
+/**
+ * 原码显示策略：默认藏起来，能按条展开，也能一下全展开。
+ *
+ * 已知码有中文标题（`diagnosticLabel`），`DUPLICATE_LABEL` 这种内部码留在卡片正文里
+ * 是给写代码的人看的；但它又是排查时唯一能对上后端日志的东西，所以不能删——收进
+ * 「查看原码」，再给一个面板级的总开关（排障时一次全露出来，不用逐条点）。
+ *
+ * 未知码不受影响：它的标题**就是**原码（见 `diagnosticLabel`），藏不掉也不该藏。
+ */
+const showCodes = ref(false);
+const openedCodes = ref<string[]>([]);
+
+function codeVisible(key: string): boolean {
+  return showCodes.value || openedCodes.value.includes(key);
+}
+
+function toggleCode(key: string): void {
+  openedCodes.value = openedCodes.value.includes(key)
+    ? openedCodes.value.filter(item => item !== key)
+    : [...openedCodes.value, key];
+}
 
 const attention = computed(() => check.visibleDiagnostics.filter(item => item.level !== 'info'));
 const hints = computed(() => check.visibleDiagnostics.filter(item => item.level === 'info'));
@@ -149,7 +178,7 @@ const visible = computed(
     </div>
 
     <p v-if="check.neverRun" data-test="structure-empty" class="leading-relaxed text-slate-400">
-      还没检查过这张图。点「检查结构」跑一次：它只读诊断，不改任何东西。
+      还没检查过。点「检查结构」跑一次：只读，不改任何东西。
     </p>
     <p v-else-if="check.ran && !attention.length && !hints.length && !check.visibleSuggestions.length"
       data-test="structure-clean" class="leading-relaxed text-slate-400">
@@ -163,7 +192,7 @@ const visible = computed(
       data-test="structure-stale"
       class="rounded border border-slate-200 bg-slate-50 px-2 py-1 text-[11px] leading-relaxed text-slate-500"
     >
-      这张图在检查之后又改过，下面这份结论可能已经不准了。
+      这张图在检查之后又改过，下面的结论可能不准了。
     </p>
 
     <p v-if="check.error" data-test="structure-error" role="alert"
@@ -246,12 +275,24 @@ const visible = computed(
           >忽略</button>
         </p>
         <!--
-          原码**总是**显示：已知码有中文标题，但"这条到底是哪个码"是排查时唯一的
-          线索；未知码时它更是界面上唯一的标识（标题就是它自己）。
+          原码默认收起：已知码已经有中文标题，`DUPLICATE_LABEL` 这种内部码留在正文里
+          是给写代码的人看的。但它又是排查时唯一能对上后端日志的东西，所以不能删——
+          收进「查看原码」，并用面板级的总开关（`showCodes`）一次全露出来。
+          未知码不受影响：它的标题**就是**原码（`diagnosticLabel` 的 `?? code`）。
         -->
-        <p class="mt-0.5 break-words text-[10px] text-slate-400">
-          <code data-test="diagnostic-code">{{ note.code || '（无码）' }}</code>
-          <span v-if="note.evidence" class="ml-1">依据：{{ note.evidence }}</span>
+        <p class="mt-0.5 flex flex-wrap items-baseline gap-x-1 break-words text-[10px] text-slate-400">
+          <code v-if="codeVisible(note.key)" data-test="diagnostic-code">{{ note.code || '（无码）' }}</code>
+          <!-- 单条开关在总开关打开时就不出现了：那时"收起"归总开关管，两条路互不打架。 -->
+          <button
+            v-if="!showCodes"
+            type="button"
+            data-test="diagnostic-code-toggle"
+            class="text-slate-400 underline decoration-dotted underline-offset-2 hover:text-slate-700"
+            :title="`原码：${note.code || '（无码）'}`"
+            :aria-expanded="codeVisible(note.key)"
+            @click="toggleCode(note.key)"
+          >{{ codeVisible(note.key) ? '收起原码' : '查看原码' }}</button>
+          <span v-if="note.evidence">依据：{{ note.evidence }}</span>
         </p>
       </li>
     </ul>
@@ -287,9 +328,34 @@ const visible = computed(
         >
           <span class="mr-1 rounded bg-slate-100 px-1 text-[10px] text-slate-500">{{ note.label }}</span>
           <span class="break-words">{{ note.message }}</span>
-          <code class="ml-1 text-[10px] text-slate-400">{{ note.code || '（无码）' }}</code>
+          <code
+            v-if="codeVisible(note.key)"
+            data-test="diagnostic-hint-code"
+            class="ml-1 text-[10px] text-slate-400"
+          >{{ note.code || '（无码）' }}</code>
+          <button
+            v-else-if="!showCodes"
+            type="button"
+            data-test="diagnostic-hint-code-toggle"
+            class="ml-1 text-[10px] text-slate-400 underline decoration-dotted underline-offset-2 hover:text-slate-700"
+            :title="`原码：${note.code || '（无码）'}`"
+            @click="toggleCode(note.key)"
+          >查看原码</button>
         </li>
       </ul>
     </div>
+
+    <!--
+      原码总开关：排查时一次全露出来，不用逐条点。放在最底下，正常使用时它不挡路；
+      没有诊断时整块不渲染。
+    -->
+    <button
+      v-if="attention.length || hints.length"
+      type="button"
+      data-test="diagnostic-code-all"
+      class="self-start text-[11px] text-slate-400 underline decoration-dotted underline-offset-2 hover:text-slate-700"
+      :aria-pressed="showCodes"
+      @click="showCodes = !showCodes"
+    >{{ showCodes ? '隐藏原码' : '显示原码' }}</button>
   </section>
 </template>

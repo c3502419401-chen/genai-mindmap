@@ -320,6 +320,13 @@ def _connect() -> sqlite3.Connection:
     return repository.connect()
 
 
+def _owner() -> str:
+    """当前请求的 owner。只在有请求上下文的地方调（线程里会拿到空串）。"""
+    from app.auth import owner as owner_module
+
+    return owner_module.current_owner()
+
+
 def pool_key(*, map_id: str | None = None, run_id: str | None = None) -> str:
     """一次生成用哪个方向池：**有 `map_id` 用它，没有用 `run:<run_id>`**。
 
@@ -431,8 +438,21 @@ def _node_count(payload: dict[str, Any]) -> int:
     return 0
 
 
-def _samples() -> list[Sample]:
-    """从三张表取样本。任何一张表的失败都不影响另外两张。"""
+def _samples(owner: str) -> list[Sample]:
+    """从三张表取样本。任何一张表的失败都不影响另外两张。
+
+    **只有 `memory_items` 按 `owner` 过滤**，另外两张表**故意读全库**：
+
+      - `library_sources` 与 `mindmaps` 在这个产品里是**共享数据**（`docs/DEPLOY.md`
+        写明"多加账号 = 共用一个知识库"），它们的样本描述的是"这台机器上有什么
+        材料、生成过什么图"，不是"某个人偏好什么"；
+      - `memory_items` 是私有的（PR#27 审 P0-2 的形状），把它当共享样本会让别人的
+        偏好变成我的画像方向。
+
+    这条区分不是宽松，是**边界必须与文档一致**：如果连共享表也按 owner 过滤，
+    多人共用一台机器时画像会因为"每个人自己的材料都很少"而集体失效——那个失败
+    比串味更难发现（画像静默变空，生成质量下降但没有任何报错）。
+    """
     collected: list[Sample] = []
     with closing(_connect()) as conn:
         try:
@@ -475,8 +495,8 @@ def _samples() -> list[Sample]:
         try:
             rows = conn.execute(
                 "SELECT text, COALESCE(formed_at, created_at) at FROM memory_items "
-                "ORDER BY created_at DESC LIMIT ?",
-                (_quota("memory"),),
+                "WHERE owner = ? ORDER BY created_at DESC LIMIT ?",
+                (owner, _quota("memory")),
             ).fetchall()
             for row in rows:
                 text = str(row["text"] or "").strip()
@@ -484,6 +504,7 @@ def _samples() -> list[Sample]:
                     collected.append(Sample(text, "memory", row["at"], text[:40]))
         except sqlite3.Error:
             # `memory_items` 在没写过记忆的库上可能整张表都是空的，这不是故障。
+            # 也可能是老库还没补 `owner` 列——那同样不该让整次取样失败。
             pass
     # 同一段文本只取一次（材料与导图可能都写了同一个主题），按出现顺序保留第一个。
     seen: set[str] = set()
@@ -854,17 +875,20 @@ def build_directions_from_sources(sources: Sequence[Any]) -> list[Direction]:
 
 def rebuild(
     map_id: str | None = None, *, sources: Sequence[Any] | None = None,
+    owner: str | None = None,
 ) -> list[Direction]:
     """重算方向并按池键落库。样本不足时**清空这个池**并返回空列表。
-
     两种口径，由 `sources` 是否给出来分开，**不要混着用**：
 
-      - `sources is None`（默认）→ 老全局口径：`_samples()` 三张表的样本 + 现
+      - `sources is None`（默认）→ 老全局口径：`_samples(owner)` 三张表的样本 + 现
         embed（最坏 6 次 HTTP）。这是 `--report` 与面板用的，它会跨图串味，因为
         它本来就是"这个人所有材料"的平均；
       - `sources` 给了 → 这张图的材料（`build_directions_from_sources`，零往返）。
         生成链路走这条（由 `rebuild(map_id=pool, sources=request.sources)` 显式
         触发，或不落库直接算）。
+
+    `owner` 只影响 `_samples` 里 `memory_items` 那一张（见那条 docstring）：
+    记忆是私有的，材料与导图是这台机器共享的。
 
     清空的范围是**这个池**，不是整张表：`DELETE FROM ... WHERE map_id = ?`。
     否则给一张图重建方向会把其它图（以及隔离之前的全局方向）一起抹掉——那是
@@ -877,7 +901,7 @@ def rebuild(
     pool = "" if map_id is None else str(map_id)
     directions = (
         build_directions_from_sources(sources) if sources is not None
-        else build_directions(_samples())
+        else build_directions(_samples(_owner() if owner is None else owner))
     )
     with closing(_connect()) as conn, conn:
         conn.execute(

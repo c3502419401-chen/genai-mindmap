@@ -4,11 +4,27 @@ import json
 import os
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import patch
 from app.main import app
 
 BACKEND = Path(__file__).resolve().parents[1]
+
+#: 门禁要求"有身份"，而这个文件手写 ASGI scope、不经过 `TestClient` 的 cookie 罐。
+#: 直接给一个合法的游客 cookie：**得用 `store.sign_guest()` 现签**，光有 32 位
+#: 小写十六进制不够——游客 cookie 现在是 `<id>.<hmac>`，裸 id 会被当成坏 cookie
+#: 等价于没 cookie（`store.read_guest` 返回 None），于是每个请求都 401。
+#: 签名密钥从库路径派生，所以必须在 `MINDMAP_DB_PATH` 打好之后才签（见 `_cookie()`）。
+#: **同一个测试类里所有请求共用这一个 id**——不共用的话第二次 `PUT` 会撞上
+#: `map_forbidden`（图归上一个游客所有），那看起来像隔离出了 bug，其实是测试自己换了个人。
+GUEST_ID = uuid.uuid4().hex
+
+
+def _guest_cookie() -> bytes:
+    """现签一次游客 cookie。**不能提到模块级常量**：那时 `MINDMAP_DB_PATH` 还没打。"""
+    from app.auth import store as auth_store
+    return f"mm_guest={auth_store.sign_guest(GUEST_ID)}".encode()
 
 
 class ApiTest(unittest.TestCase):
@@ -45,7 +61,8 @@ class ApiTest(unittest.TestCase):
             scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
                      "method": method, "scheme": "http", "path": "/api" + path,
                      "raw_path": ("/api" + path).encode(), "query_string": b"",
-                     "headers": [(b"content-type", b"application/json")],
+                     "headers": [(b"content-type", b"application/json"),
+                                 (b"cookie", _guest_cookie())],
                      "client": ("127.0.0.1", 1), "server": ("test", 80)}
             await app(scope, receive, send)
             status = next(m["status"] for m in messages if m["type"] == "http.response.start")

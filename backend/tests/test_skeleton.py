@@ -16,6 +16,18 @@ from app.contracts.source import SourceKind
 
 BACKEND = Path(__file__).resolve().parents[1]
 
+#: 门禁要求"有身份"。本文件手写 ASGI scope、不经过 `TestClient` 的 cookie 罐，
+#: 所以自己签一个游客 cookie——游客 cookie 是 `<id>.<hmac>`，裸的 32 位十六进制
+#: 已经不算身份了（会被当成坏 cookie，等价于没 cookie）。写死 id 而不是 `uuid4()`：
+#: 出错时日志里那个 id 每次都一样，能一眼看出"是同一个人"还是"换了人"。
+GUEST_ID = "0123456789abcdef0123456789abcdef"
+
+
+def _guest_cookie() -> bytes:
+    """现签一次游客 cookie。签名密钥从库路径派生，必须在 `MINDMAP_DB_PATH` 打好之后调用。"""
+    from app.auth import store as auth_store
+    return f"mm_guest={auth_store.sign_guest(GUEST_ID)}".encode()
+
 MAP = {
     "title": "测试导图",
     "root": {
@@ -32,6 +44,7 @@ MAP = {
 def request(method: str, path: str, body=None):
     """最小 ASGI 调用器，避免额外依赖。"""
     import json as _json
+    import uuid
 
     payload = b"" if body is None else _json.dumps(body, ensure_ascii=False).encode()
     path_only, _, query = path.partition("?")
@@ -49,7 +62,10 @@ def request(method: str, path: str, body=None):
             "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
             "method": method, "path": path_only, "raw_path": path_only.encode(),
             "query_string": query.encode(), "root_path": "", "scheme": "http",
-            "headers": [(b"content-type", b"application/json")],
+            # 门禁要求"有身份"。这里手写 scope、不经过 TestClient 的 cookie 罐，
+            # 所以直接给一个合法游客 id（32 位小写十六进制）。
+            "headers": [(b"content-type", b"application/json"),
+                        (b"cookie", _guest_cookie())],
             "client": ("127.0.0.1", 1234), "server": ("127.0.0.1", 8000),
         }
         await app(scope, receive, send)

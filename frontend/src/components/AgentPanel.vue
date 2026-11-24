@@ -2,7 +2,7 @@
 import { computed, ref } from 'vue';
 
 import { agentDetailVisible, runResultLine } from '../mindmap/run-status';
-import { agentToolLabel, useMindMapStore, type PreviewNode, type ScopedChange } from '../stores/mindmap';
+import { agentToolLabel, agentToolName, useMindMapStore, type PreviewNode, type ScopedChange } from '../stores/mindmap';
 
 /**
  * agent 运行面板：工具进度、生成中的预览、生成落地之后"改了什么"、以及冲突裁决。
@@ -27,19 +27,20 @@ function seconds(ms: number): string {
 /**
  * 一行进度的文案：`{人话} · {耗时}`，进行中不带耗时。
  *
- * 工具名到人话的映射在 store 里（状态行也要用），这里只负责拼耗时；
- * 失败时保留工具名——那种时候用户和排查都需要能对上后端日志。
+ * 工具名到人话的映射在 store 里（状态行也要用），这里只负责拼耗时。失败时用动作
+ * 短名（「生成导图 未成功」）而不是函数名——用户读不到 `mindmap_generate`；要排障
+ * 也够用，因为同一条失败行下面还跟着后端的 `code：message` 原话。
  */
 function rowText(name: string, state: 'running' | 'done', ok: boolean, ms: number): string {
   if (state === 'running') return agentToolLabel(name, 'running');
-  return ok ? `${agentToolLabel(name, 'done')} · ${seconds(ms)}` : `${name} 未成功`;
+  return ok ? `${agentToolLabel(name, 'done')} · ${seconds(ms)}` : `${agentToolName(name)} 未成功`;
 }
 
 function failureReason(summary?: Record<string, unknown>): string {
   // 工具的摘要结构不同，只展示可读字段，避免把诊断对象或缺失值直接插进界面。
   const parts = [summary?.code, summary?.message]
     .filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
-  return parts.join('：') || '工具未返回具体失败原因。';
+  return parts.join('：') || '没有给出原因。';
 }
 
 /** 只把工具调用摘出来显示；stage 文案已经有单独的状态行了。 */
@@ -206,7 +207,7 @@ const scopeSummary = computed(() => {
   const head = `带着「已选 ${store.generationSelection.length} 个节点」发起：`
     + `${total} 处改动里 ${inScopeCount.value} 处在选中范围内`;
   return outScopeCount.value > 0
-    ? `${head}，${outScopeCount.value} 处改到了范围外——那是模型判断必须一起动的地方，看一眼对不对。`
+    ? `${head}，${outScopeCount.value} 处改到了范围外——模型判断那里必须一起动，看一眼对不对。`
     : `${head}，没有改到范围外。`;
 });
 
@@ -490,7 +491,7 @@ function cancel() {
       role="status"
       class="mt-2 rounded border border-amber-200 bg-amber-50 px-2 py-1.5 leading-relaxed text-amber-900"
     >
-      <p class="font-medium">模型这次只回了文字，没有调用工具</p>
+      <p class="font-medium">模型这次只回了文字，没有生成导图</p>
       <p v-if="textOnlyNote.text" class="mt-1 whitespace-pre-wrap break-words text-[11px]">
         {{ textOnlyNote.text }}
       </p>

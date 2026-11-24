@@ -496,11 +496,12 @@ def test_empty_allowed_codes_do_nothing():
 
 
 def _client():
-    from fastapi.testclient import TestClient
+    # 门禁（`app/auth/gate.py`）之后，任何 `/api/` 请求都必须先"有身份"；这些用例
+    # 关心的是"有身份时这个接口对不对"，身份由 `guest_client()` 补齐（与
+    # `test_optimization_rules.py` 同一个写法）。
+    from conftest import guest_client
 
-    from app.main import app
-
-    return TestClient(app)
+    return guest_client()
 
 
 def _body(root: dict, **extra) -> dict:

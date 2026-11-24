@@ -27,6 +27,12 @@ yarn-error.log*
 .DS_Store
 Thumbs.db
 
+# 代理客户端的本机配置：`clash-verge.yaml` 里只有 `mixed-port: 7890` 这种
+# "我这台机器上代理开在哪个端口"的信息，对别人没有任何意义。它随一次上游提交
+# 混进来过，所以除了删掉那个文件，这里也留一条规则防止再被带进来。
+clash-verge.yaml
+clash*.yaml
+
 # runtime data
 data/
 uploads/
@@ -61,6 +67,11 @@ codex-raw-*.log
 # 真浏览器验证的临时目录（截图、种子脚本、对比脚本）。产物值得留，但不该进版本库
 .visioncheck/
 
+# review 时随手导出的补丁（`.review-pr23.diff` 这种）：是给当时那次评审看的，
+# 结论留在 PR 评论里就够了，文件本身进版本库只会让后人以为它还有用。
+.review-*.diff
+.review-*.patch
+
 # 鱼骨几何的一次性验证脚本与截图（.visioncheck 的兄弟目录，同样不进版本库）
 frontend/verify-fishbone.html
 frontend/verify-fishbone.ts
@@ -69,3 +80,10 @@ frontend/verify-shots/
 # 本地启动脚本：里面是真实的 API key（DeepSeek + 阿里 MaaS）。
 # 启动方式见文件本身；要给别人用就照 .env.example 另写一份带占位符的。
 run-backend.bat
+
+# Basic Auth 口令文件（`htpasswd -c … `）。nginx 那层已经弃用（鉴权在应用层的
+# 账号体系里），但这条规则留着：它是 `htpasswd` 的默认产物名，里面是密码哈希，
+# 和 `.env` 同一类东西。哪天有人想起来在外层反代上加一道口令，这条正好挡住
+# "提交一次就把口令发给所有能读仓库的人"。
+.htpasswd
+**/.htpasswd

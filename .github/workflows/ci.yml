@@ -15,7 +15,11 @@ concurrency:
 jobs:
   backend:
     name: backend (pytest)
-    runs-on: ubuntu-latest
+    # `ubuntu-latest` 已经迁到 26.04（2026-11 实测：日志里 Runner Image 就是
+    # ubuntu-26.04），但那个标签会随着迁移窗口再变。CI 的机器版本不该跟着别人的
+    # 日程走：某天 `-latest` 换到别的发行版时，失败会表现为"依赖装不上"或"某个
+    # 系统库换了名字"，与本项目改了什么毫无关系。写死能换版本的大版本号。
+    runs-on: ubuntu-26.04
     defaults:
       run:
         working-directory: backend
@@ -54,7 +58,7 @@ jobs:
 
   frontend:
     name: frontend (vitest + build)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     defaults:
       run:
         working-directory: frontend

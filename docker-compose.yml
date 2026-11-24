@@ -1,0 +1,137 @@
+# genai-mindmap 单机容器化部署
+#
+#   docker compose up -d --build
+#   打开 http://<主机>/           前端
+#   打开 http://<主机>/api/health  后端健康检查（返回 {"status":"ok","version":...}）
+#
+# 与 deploy/ 下那套 systemd 部署**互斥，别同时跑**：两边都占 8000（后端）与
+# 80（nginx），而且会指向同一个 SQLite 文件的两份副本。选一套，见 docs/DOCKER.md。
+#
+# 配置全部走同目录下的 .env（照 backend/.env.example 抄一份，见 docs/DOCKER.md）。
+# compose 文件里的 ${VAR} 就是从这里读的，`docker compose config` 能验证解析结果。
+
+name: genai-mindmap
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+      args:
+        # 国内机器换成 https://mirrors.aliyun.com/pypi/simple
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+        # .doc / .ppt 的格式转换（约 1.5GB）默认不装。
+        # 要支持旧格式就 `WITH_OFFICE=1 docker compose build backend`。
+        # 注意 2.5GB 的体积预算会被它顶穿，见 docs/DOCKER.md。
+        WITH_OFFICE: ${WITH_OFFICE:-0}
+    image: genai-mindmap-backend:local
+    env_file:
+      # 后端**没有** dotenv：它读的是进程环境变量，所以这里不是"加载 .env 文件"，
+      # 而是 compose 替你把这些键一条条注入进程环境。缺文件时 compose 直接报错，
+      # 与 systemd 的 EnvironmentFile 不带 `-` 前缀是同一个用意：不许静默带空配置跑。
+      - .env
+    environment:
+      # 这四个是"容器内必须覆盖"的，不覆盖就会写进镜像的只读层或算错缓存位置。
+      #
+      # 1) 数据库。必须是卷上的路径；不设的话会回落到
+      #    backend/app/mindmaps/repository.py:19 的 app/../data/mindmaps.db
+      #    （也就是 /app/backend/data），容器一删就没了。
+      #    知识库、块向量、外部检索缓存在同一个 SQLite 文件里，所以一个卷就够。
+      MINDMAP_DB_PATH: /data/mindmaps.db
+      # 2) docling 的缓存目录缺省是 Path.home()/".cache"/"docling"
+      #    （site-packages/docling/datamodel/settings.py:72），HOME 必须是**可写**的。
+      #    systemd 单元里这一条是 HOME=/var/lib/genai-mindmap，同源问题：HOME 不
+      #    可写时，首次解析 docx/pptx 下载版面模型会失败，而报错看着像模型问题。
+      HOME: /data
+      # 3) HuggingFace 的缓存（docling 从 HF 拉版面/表格模型）。落卷，别落镜像层。
+      HF_HOME: /models/huggingface
+      # 4) docling 自己的模型目录。不设时由 HOME 决定（= /data/.cache/docling）；
+      #    显式指到 /models 是为了让"模型缓存"这一个卷说清自己装了什么，
+      #    备份 / 搬运时不用在 /data 里翻 .cache。
+      DOCLING_CACHE_DIR: /models/docling
+      # 可选：国内直连 huggingface.co 通常不通，指到镜像站。
+      # 与本文件无关的说明：docs/DEPLOY.md 第 11 节记录这条**没有做过端到端验证**。
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://hf-mirror.com}
+      # 外部检索（中文维基 / 快懂百科 / arXiv / …）的出口。
+      # 代码缺省值是 http://127.0.0.1:7897（作者本机的 Clash，见
+      # app/knowledge/external.py:196），**在容器里这个地址指向容器自己**，
+      # 100% 连不上。这里默认改成 none（直连），要代理就自己在 .env 里写
+      # host.docker.internal:7897 之类。
+      MINDMAP_EXTERNAL_PROXY: ${MINDMAP_EXTERNAL_PROXY:-none}
+    volumes:
+      # SQLite（导图 / 运行记录 / 知识库 / 向量缓存 / 外部检索缓存）
+      - mindmap-data:/data
+      # docling 的版面与表格模型（首次解析 PDF/DOCX 时下载，几百 MB）
+      - mindmap-models:/models
+    # 宿主机**不发布** 8000：线上形态是"nginx 发静态 + 同机反代 127.0.0.1:8000"，
+    # 后端不该直接对公网。前端容器通过 compose 内网用 service 名 backend 访问它。
+    # 真要本机调试就临时加一行：
+    #   ports: ["127.0.0.1:8000:8000"]
+    expose:
+      - "8000"
+    restart: unless-stopped
+    # 一个最小 init 进程兜底僵尸进程。容器里 PID 1 是 uvicorn，它不 reap 别人
+    # （docling 会把 python 子进程拉起来做格式转换）。`--workers 1` 时影响有限，
+    # 但代价为零，且少了它会变成"跑久了进程表全是 defunct"这种只能在现场查的事。
+    init: true
+    # 生成预算最长 600 秒（RunBudget.max_seconds）。`docker compose down` /
+    # 重启时给正在收尾的 SSE 连接一点时间，与 systemd 的 TimeoutStopSec=90 同量级。
+    stop_grace_period: 90s
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import urllib.request, sys
+          sys.exit(0 if urllib.request.urlopen("http://127.0.0.1:8000/api/health", timeout=4).status == 200 else 1)
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      # docling 是懒加载（app/ingestion/service.py:242-253，首次解析才 import，
+      # 初始化十几秒），但模块级没有 import torch，所以 /api/health 冷启动很快。
+      # start_period 主要留给容器内的首次启动开销。
+      start_period: 40s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    image: genai-mindmap-frontend:local
+    # 唯一的公网入口。要换成 8080 就写 "8080:80"。
+    ports:
+      - "${WEB_PORT:-80}:80"
+    # 这里原先挂一个 Basic Auth 密码文件（`${HTPASSWD_FILE}` → nginx），用来护住
+    # 容器版的模型设置面板。账号体系上线后那层已弃用：鉴权在应用层
+    # （`backend/app/auth/gate.py` 拦匿名、`IdentityMiddleware` 发身份与游客 cookie），
+    # 而全站口令反而会挡住"游客每天 3 次免费"——过不去拿不到游客 cookie。
+    # 现在前端容器不需要任何挂载，全部内容都在镜像里。
+    depends_on:
+      backend:
+        # 等 /api/health 真返回 ok 再起 nginx 的健康探针意义上的"就绪"。
+        # 注意这一条**不是**启动顺序的保证：docker/nginx.conf 里用的是
+        # 变量 + 内嵌 DNS 解析，即使后端还没起来 nginx 也能起来并返回 502，
+        # 而不是直接退出。两者一起才有"能起来 + 起来了才知道"。
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      # wget 是 alpine 自带（busybox），不用额外装 curl。
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  mindmap-data:
+  mindmap-models:

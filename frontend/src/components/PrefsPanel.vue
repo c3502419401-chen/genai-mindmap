@@ -136,7 +136,7 @@ onMounted(() => {
 
     <template v-if="open">
       <p class="mt-1 leading-relaxed text-slate-400">
-        跨对话记住的稳定事实。图型与拆解方式会在下次新建时预填进下拉，你仍可以当场改掉。
+        记住你的习惯，下次新建时预填进下拉，你仍可以当场改掉。
       </p>
 
       <!-- 建议：候选，不是事实。点「不用」什么都不写。 -->
@@ -185,7 +185,6 @@ onMounted(() => {
             <div class="min-w-0 flex-1">
               <p class="font-medium text-slate-700">
                 {{ keyLabel(item.key) }}
-                <span class="font-normal text-slate-400">{{ item.key }}</span>
               </p>
               <template v-if="editing === item.key">
                 <textarea
@@ -292,7 +291,7 @@ onMounted(() => {
         >添加备注</button>
         <p class="mt-1 leading-relaxed text-slate-400">
           <template v-if="canAddNote">
-            备注最多 8 条、合计 500 字；超了会被拒绝并提示先删一条，不会悄悄截断。
+            最多 8 条、合计 500 字。
           </template>
           <template v-else>已经 8 条了，要加新的请先删一条。</template>
         </p>

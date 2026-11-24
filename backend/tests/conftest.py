@@ -58,6 +58,10 @@ CREDENTIALS = (
     # 宿主机上配了 LLM key 时，Search 的用例会真的打出去。
     "MINDMAP_DEEPSEEK_TOOLS_API_KEY",
     "MINDMAP_DEEPSEEK_TOOLS_BASE_URL",
+    # 公共免费密钥（`generation/quota.PUBLIC_KEY_ENV`）。**必须清**：它的存在本身就是
+    # "免费额度开了"这个开关（`quota.enabled()` 就是 `bool(public_key())`），宿主机上
+    # 配过它会让几百条生成用例的 `api_key_source` 一起变成 `public`。
+    "MINDMAP_FREE_TIER_API_KEY",
 )
 
 # 其余会改变行为的环境变量：开关、本地模型目录、外部程序路径。
@@ -93,6 +97,9 @@ BEHAVIOUR = (
     # 是空表 = 拼出来是空串 = 既有断言逐字节不变"正是接线时要验的那条前提。
     # 置 0 会让所有生成用例都不经过"读了画像表但没读到"那条路。
     "MINDMAP_STYLE_PROMPT",
+    # 每人每天的公共免费次数（`generation/quota.LIMIT_ENV`）。清空 = 用默认的 3。
+    # 不清的话宿主机上为了压测把它调成 100，会让断言"第三次之后 429"整批变绿。
+    "MINDMAP_FREE_QUOTA_LIMIT",
 )
 
 SWITCHES = ("MINDMAP_HYBRID_SEARCH", "MINDMAP_QUERY_EXPANSION", "MINDMAP_PARENT_RETRIEVAL",
@@ -138,7 +145,13 @@ SWITCHES = ("MINDMAP_HYBRID_SEARCH", "MINDMAP_QUERY_EXPANSION", "MINDMAP_PARENT_
             # 节点预算的旧口径（`budget.NODE_POOL_ENV`：总量池 + 前序裁剪）。置 0 =
             # 按支摊（默认）。清空与置 0 效果相同，但置 0 更明确：宿主机上留着
             # `MINDMAP_NODE_POOL=1` 时，`test_branch_budget` 里那两条对照会一起变绿。
-            "MINDMAP_NODE_POOL")
+            "MINDMAP_NODE_POOL",
+            # 免费档（`generation/free_models.ENABLED_ENV`）。**置 0**：它默认关，
+            # 而打开之后 `resolve()` 会把模型名换成 `:free` 那个、并给请求体加
+            # `reasoning_effort`——既有那几百条断言钉的都是"模型名来自配置"，
+            # 在这里清空等于让它们全部走部署方那把钥匙的免费档。
+            # 需要它的用例自己 `setenv(..., "1")` 并替换 `free_models` 的缓存。
+            "MINDMAP_FREE_TIER")
 
 # 图存储的连接参数。清空而不是设默认值：URI/USER/DATABASE 有代码默认，PASSWORD
 # 没有——"没配"必须是可见的未配置状态，否则宿主机上跑着的 Neo4j 会被单测连上。
@@ -200,6 +213,36 @@ def reset_graph_driver():
     graph_store.close_driver()
     yield
     graph_store.close_driver()
+
+
+#: 门禁（`app/auth/gate.py`）打开之后，任何走 HTTP 的写法都必须先"有身份"。
+#:
+#: 测试里没有浏览器，所以 `guest_client()` 就是"拿到一个游客身份"的全部——它等价于
+#: 前端启动时调的那次 `GET /api/auth/me`。**不要**为了省事把门禁在测试里关掉：那会让
+#: 几千条断言里没有一条覆盖到"门禁真的在拦人"，而这条口径出错的后果是整站 401 或者
+#: 整站敞着，两种都只有在线上才看得见。
+def guest_client():
+    """起一个**带游客身份**的 `TestClient`：先 `GET /api/auth/me` 拿 cookie。
+
+    绝大多数既有 HTTP 用例都该用它。它们的断言关心的从来不是"没有身份能不能访问"
+    （那是 `tests/test_gate.py` 的事），而是"有身份时这个接口对不对"——所以这里
+    自动补上身份，而不是给它们逐个加断言。
+
+    用法与 `TestClient(app)` 相同：`with guest_client() as api:` 或 `client = guest_client()`。
+    需要"匿名"的用例直接 `TestClient(app)`（见 `tests/test_gate.py`）。
+    """
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    client = TestClient(app)
+    # `/api/auth/me` 是全站唯一发游客 cookie 的地方（见 `app/auth/router.py`）。
+    # 断言它 200 是必要的：如果它哪天变成了需要身份，这一层会静默地什么 cookie
+    # 都拿不到，然后所有用例都以"401"的形式失败，而真正的原因在另一个文件里。
+    response = client.get("/api/auth/me")
+    assert response.status_code == 200, f"游客身份拿不到：{response.status_code} {response.text}"
+    assert client.cookies.get("mm_guest"), "`/api/auth/me` 没发游客 cookie，门禁会挡住后面每一条请求"
+    return client
 
 
 @pytest.fixture(autouse=True)

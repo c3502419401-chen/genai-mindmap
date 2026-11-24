@@ -25,14 +25,27 @@ _MAX_REQUEST_ID_LENGTH = 128
 
 
 class AppError(Exception):
-    """业务异常基类：携带业务 code、中文说明、HTTP 状态和原始细节。"""
+    """业务异常基类：携带业务 code、中文说明、HTTP 状态和原始细节。
 
-    def __init__(self, code: str, message: str, status: int = 400, detail: Any = None) -> None:
+    `headers` 是给少数"响应头本身有意义"的场景准备的，目前只有一处：
+    登录被限速时的 `Retry-After`——它告诉客户端"过几秒再试"，写进响应体的话
+    标准客户端（以及任何中间层的重试逻辑）都读不到。
+    """
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        status: int = 400,
+        detail: Any = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.status = status
         self.detail = detail
+        self.headers = dict(headers) if headers else None
 
 
 # 能从 detail 文案判断出业务含义时用描述性 code，判断不出就退回 http_{status}。
@@ -119,7 +132,8 @@ def _error_response(
 
 def _app_error_handler(request: Request, exc: AppError) -> JSONResponse:
     return _error_response(request, status=exc.status, code=exc.code,
-                           message=exc.message, detail=exc.detail)
+                           message=exc.message, detail=exc.detail,
+                           headers=exc.headers)
 
 
 def _http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:

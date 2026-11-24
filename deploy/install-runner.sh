@@ -122,7 +122,7 @@ cat <<EOF
 
 装好了。接下来：
   1. 回仓库 Settings → Actions → Runners，确认有一台 idle 的 genai-ecs
-  2. 打一个 tag 试试：git tag v0.4.9-deploy && git push origin v0.4.9-deploy
+  2. 打一个 tag 试试：git tag v0.5.0 && git push origin v0.5.0
   3. 看到 Actions 的 Deploy 跑绿之后，把安全组的 22 端口关掉，
      并删掉 root 的 authorized_keys 里的部署公钥（Workbench 不受影响）
 

@@ -30,6 +30,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Query, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.auth import owner
 from app.core.errors import AppError
 from app.memory import store
 
@@ -116,8 +117,12 @@ def list_memories(limit: int = Query(default=200, ge=1, le=2000)) -> list[Memory
 
     它同时是这套东西的**死表探测器**：表一直为空，说明自动总结要么没触发过
     （会话之间没隔够 `GAP_MINUTES`），要么每次都总结了 0 条。两种都不报错。
+
+    **只列这个人自己的**：记忆里存的是"关于这个人的推断"（在做哪些项目、习惯
+    怎样），跨账号读等于让所有人共享一份人格画像。加账号之前没有这条边界，因为
+    那时只有一个人。
     """
-    return [_item(row) for row in store.items(limit)]
+    return [_item(row) for row in store.items(limit, owner=owner.current_owner())]
 
 
 @router.post("", response_model=AddedMemory, status_code=status.HTTP_201_CREATED)
@@ -137,14 +142,19 @@ def add_memory(body: AddMemoryRequest) -> AddedMemory:
             status=422,
             detail={"kind": body.kind, "allowed": list(store.KINDS)},
         )
-    added = store.add(body.text, body.kind, source=store.SOURCE_USER_EXPLICIT)
+    added = store.add(body.text, body.kind, owner=owner.current_owner(),
+                      source=store.SOURCE_USER_EXPLICIT)
     return AddedMemory(item=_item(added.item), created=added.created)
 
 
 @router.delete("/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_memory(item_id: str) -> Response:
-    """硬删。404 而不是幂等 204：界面上"这条已经不在了"与"我删了但没删掉"必须分开。"""
-    if not store.delete(item_id):
+    """硬删。404 而不是幂等 204：界面上"这条已经不在了"与"我删了但没删掉"必须分开。
+
+    别人的记忆同样回 404（`owner` 参与 `WHERE`）：既不删，也不告诉对方"这个 id
+    存在但不属于你"——那本身就是一条不该泄漏的事实。
+    """
+    if not store.delete(item_id, owner=owner.current_owner()):
         raise AppError(
             code="memory_not_found",
             message="没有这条记忆，可能已经被删掉了",
@@ -167,7 +177,7 @@ def search_memory(
 
     与生成时走的是同一个 `store.recall`，所以这里看到的分数就是模型会拿到的排序。
     """
-    hits = store.recall(q, top_k=top_k, touch=False)
+    hits = store.recall(q, top_k=top_k, touch=False, owner=owner.current_owner())
     return SearchResult(
         query=q,
         hits=[MemoryHit(
@@ -175,7 +185,7 @@ def search_memory(
             score=hit.score, age_days=hit.age_days, created_at=hit.item.created_at,
             formed_at=hit.item.formed_at,
         ) for hit in hits],
-        scanned=store.count(),
+        scanned=store.count(owner=owner.current_owner()),
         top_k=top_k,
         min_cosine=store.MIN_COSINE,
     )

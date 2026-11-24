@@ -12,13 +12,33 @@ import logging
 
 from fastapi import APIRouter, HTTPException, Query, status
 
+from app.auth import identity as identity_module
+from app.auth import owner as owner_module
+from app.auth import store as auth_store
 from app.contracts.edits import EditEventRow, EditHealth, EditSummary
 from app.contracts.mindmap import MapRecord, SaveRequest, UpdateRequest
+from app.core.errors import AppError
 from app.mindmaps import edits, repository
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/mindmaps", tags=["导图管理"])
+
+
+def _deployer() -> bool:
+    """当前请求是不是部署方（这台机器上第一个注册的账号）。
+
+    与 `settings/router.py::_deployer` 同一个判据，也同一个理由：不给 `MINDMAP_ADMIN`
+    环境变量，因为那会多一种"忘了设 / 设错了"的故障形态，而这台机器上第一个注册的人
+    只可能是部署它的人。两处各写一份是因为它们读的是两套不同的东西（那边判"能不能改
+    共享配置"，这里判"能不能接管无主的历史导图"），合并成一个公共函数反而会让改一个
+    影响另一个。
+    """
+    user = identity_module.current_user()
+    if user is None:
+        return False
+    first = auth_store.first_user()
+    return first is not None and first.id == user.id
 
 
 def _record_edits(body: SaveRequest, map_id: str) -> None:
@@ -39,7 +59,8 @@ def _record_edits(body: SaveRequest, map_id: str) -> None:
     if body.truncated:
         logger.warning("编辑事件分批：map_id=%s 本次提交 %d 条，另有 %d 条留到下次保存",
                        map_id, len(body.events), body.truncated)
-    edits.record(map_id, body.events, parents=edits.parents_of(body.content))
+    edits.record(map_id, body.events, parents=edits.parents_of(body.content),
+                 owner=owner_module.current_owner())
 
 
 @router.get("", response_model=list[MapRecord])
@@ -81,9 +102,18 @@ def get_map(map_id: str):
 
 @router.put("/{map_id}", response_model=MapRecord)
 def update_map(map_id: str, body: UpdateRequest):
-    result = repository.update_map(map_id, body.version, body.content)
+    result = repository.update_map(map_id, body.version, body.content, allow_unowned=_deployer())
     if result == "missing":
         raise HTTPException(status_code=404, detail="导图不存在")
+    if result == "forbidden":
+        # 403 而不是 404：这张图你**看得见**（读是共享的），所以假装它不存在只会让人
+        # 以为自己的图丢了。说清是权限问题，并给出唯一可行的下一步（另存为一份新的）。
+        raise AppError(
+            code="map_forbidden",
+            message="这张导图不是你创建的，只有创建者能改。想保留自己的版本，"
+                    "可以用「另存为」新建一份。",
+            status=403,
+        )
     if result == "conflict":
         # 内容没落库，事件也就无处归属：一起拒。重试一次两者都补上，
         # 不会出现"事件已写、内容被拒"这种统计漂移。

@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,12 +15,26 @@ from app.main import app
 
 BACKEND = Path(__file__).resolve().parents[1]
 
+#: 门禁要求"有身份"，而这里手写 ASGI scope、不经过 `TestClient` 的 cookie 罐。
+#: 用 `store.sign_guest()` 现签一个游客 cookie——裸的 32 位十六进制已经不够了
+#: （游客 cookie 是 `<id>.<hmac>`，没签名会被当成坏 cookie 等价于没 cookie）。
+#: **整个文件共用一个**：换来换去会让"上一段存下的图"在下一段变成别人的，
+#: 而报错看起来像隔离逻辑坏了。
+GUEST_ID = uuid.uuid4().hex
+
+
+def _guest_cookie() -> bytes:
+    """现签一次游客 cookie。签名密钥从库路径派生，必须在 `MINDMAP_DB_PATH` 打好之后调用。"""
+    from app.auth import store as auth_store
+    return f"mm_guest={auth_store.sign_guest(GUEST_ID)}".encode()
+
 
 def request(method: str, path: str, body=None, headers=None):
     """最小 ASGI 调用器（写法同 test_skeleton.request，额外回传响应头）。"""
     payload = b"" if body is None else json.dumps(body, ensure_ascii=False).encode()
     path_only, _, query = path.partition("?")
-    raw_headers = [(b"content-type", b"application/json")]
+    raw_headers = [(b"content-type", b"application/json"),
+                   (b"cookie", _guest_cookie())]
     for key, value in (headers or {}).items():
         raw_headers.append((key.lower().encode(), value.encode()))
 

@@ -104,6 +104,7 @@ from app.generation.service import (
     EXTERNAL_TRUST_RULES,
     MIN_BRANCHES,
     GenerationError,
+    apply_free_tier_ceiling,
     chat_async,
     detail_prompt,
     estimate_input_tokens,
@@ -390,6 +391,90 @@ def library_available() -> bool:
     """
     return (library_search_enabled()
             and library_source_count(drop_external=library_drop_external()) > 0)
+
+
+# ---------------------------------------------------------------- 库参与生成
+#
+# 知识库此前只有**一条**入口：模型自己想起来调 `rag_query`。`_generate` 的三步
+# （骨架 / 结构 / 说明）一次都不碰库，于是"库里有 1265 块切好的原文"这件事对
+# "什么都没上传、只给一个主题"的生成完全没有影响——用户看到的是纯模型知识。
+#
+# 这一段把同一个检索（`search_parent(..., library=True)`，与 `rag_query` 逐字段相同）
+# 挪到 `_intake` 里：**生成之前由代码主动查一次库**，过门的父块作为一节证据拼进
+# prompt。
+#
+# ## 三源优先级
+#
+#   ① `request.sources`（用户这次传的）→ ② 库检索（本地、免费、0.1–1 秒）→
+#   ③ 外部检索（联网、6 秒、会失败）。
+#
+# "补足"的判据是**已有材料字数**：`_intake` 在外部检索之后算一次
+# `len(sources)` 的合计，低于 `LIBRARY_SUPPLEMENT_CHARS`（3000）才查库。三条依据：
+#
+#   - 3000 字 ≈ 6 个父块（450–700 字/块），是一棵 20 节点树"每节点一条引用"的
+#     下限（20 × ~100 字引文 + 冗余）。低于它，用户那批材料撑不起这棵树；
+#   - 实测库能提供的量就在这个量级：10 个主题过门后合计 424 / 467 / 2566 / 4286 /
+#     4700 字（见 `docs/LIBRARY-IN-GENERATE.md` 第 1 节）。用户自己给到 3000 字以上
+#     时，库的边际贡献已被材料覆盖，而**库里没有一份是用户上传的**——两份不同主题的
+#     材料混在一起只会让"按支检索"面对一堆无关候选；
+#   - 不用 `SHORT_MATERIAL_CHARS`（300）当这道闸：那个数管的是"材料太短、切不出可
+#     检索单元"，与"库能不能补"是两件事。300–3000 字之间恰恰是最需要补的区间。
+#
+# ## 为什么门用 reranker 的分，而不是 BM25 / 余弦
+#
+# 这是本能力能不能成立的全部。实测量了三档（`docs/LIBRARY-IN-GENERATE.md` 第 1 节）：
+#
+#   - `score` 是 RRF 名次分（第 1 名恒 0.0164、第 8 名恒 0.0147），**没有绝对含义**，
+#     任何阈值都筛不了；
+#   - `score_bm25` **方向是反的**：库里真相关但用词泛的主题（「海绵城市建设」，8 条
+#     全部相关）BM25 只有 1.31–1.89，而库里没有的主题（「量子计算的基本原理」）撞上
+#     课程大纲里的"基本/原理/计算"拿到 6.11–9.94。按 BM25≥5 过门 = 挡掉 8 条真证据、
+#     放进 4 条噪声；
+#   - `score_vector` 区分度不够：噪声能到 0.571（量子计算），真相关能低到 0.562
+#     （碳中和那两篇摘要），两个分布重叠。
+#
+# `rerank_score`（[0,1] 的 cross-encoder 概率）在两档上分得开：8 个主题里真相关
+# 0.584–0.890、无关 0.191–0.294，中间空着 0.29→0.58。所以门取 0.6。
+#
+# **代价是每次生成多 0.9–1.4 秒**（rerank 一次往返；不开重排时库检索本身 18–200ms）。
+#
+# **重排不可用时 fail-closed**：`MINDMAP_RERANK=0` 或 reranker 挂了时 `rerank_score`
+# 全是 None，门就没有判据。这时**不用库**并报一条诊断——上面那三档数字说明，没有
+# rerank 的库命中一半以上是跑题块，宁可不补。
+LIBRARY_IN_GENERATE_ENV = "MINDMAP_LIBRARY_IN_GENERATE"
+# 已有材料合计到这个字数就不查库（依据见上面那段）。
+LIBRARY_SUPPLEMENT_CHARS = 3000
+# 一次库检索取几条父块。与 `rag_query` 的缺省 top_k 同量级：8 条父块 ≈ 4000–5600 字，
+# 再多也只是把 prompt 撑长，而模型能用的引用数由节点数决定。
+LIBRARY_GENERATE_TOP_K = 8
+# 过门线。实测真相关最低 0.584、无关最高 0.294（8 个主题）。
+LIBRARY_RELEVANCE_GATE = 0.6
+# 过门的命中少于这个数就不补：一条命中撑不起一节证据，只会在 prompt 里留一句
+# 与其它材料对不上的孤证，而它占掉的仍是"每个节点都要引用"的额度。
+LIBRARY_MIN_HITS = 2
+
+
+def library_in_generate_enabled() -> bool:
+    """生成时是否主动查库。默认**关**，显式写 `1/on/true/yes` 才算开。
+
+    判定方式与 `library_search_enabled` / `external_knowledge_enabled` 同一套
+    （正列举真值），缺省值不同是刻意的：这个能力会改变"有材料/没材料"这条主分支
+    的形状（库命中会让 `sources` 变成非空，于是模型被要求每个节点都写引用），
+    要由数字与用户选择决定，不由默认值决定。
+    """
+    return (os.getenv(LIBRARY_IN_GENERATE_ENV, "0").strip().lower()
+            in LIBRARY_SEARCH_TRUTHY)
+
+
+# 库检索没补上时的原因。取值与 `_library_supplement` 的出口一一对应，
+# `_library_supplement_diagnostic` 每种给一句不同的话——"这次没用库"有五种来路，
+# 折成一句"没命中"会让"重排没开"与"库里确实没有"看起来一模一样。
+LIBRARY_SKIP_NO_LIBRARY = "no_library"
+LIBRARY_SKIP_ENOUGH_MATERIAL = "enough_material"
+LIBRARY_SKIP_NO_HIT = "no_hit"
+LIBRARY_SKIP_NO_RERANK = "no_rerank"
+LIBRARY_SKIP_FEW_HITS = "few_hits"
+LIBRARY_SKIP_ERROR = "error"
 
 
 # ---------------------------------------------------------------- 外部知识检索开关
@@ -1397,8 +1482,13 @@ def _max_tokens(ctx: RunContext) -> int:
     夹的是 `max_tokens_cap()` 而不是字面常量：那个函数把
     `MINDMAP_LLM_MAX_TOKENS` 与服务端 400 里学到的上限取小（见它的 docstring）。
     qwen 系列只认 32768 时，配一个环境变量就能让这条出口跟着降下来。
+
+    再夹一次免费档的 16000（`apply_free_tier_ceiling`）：不发请求的地方也读这个
+    数，用它反推"这次装得下几个节点"。少这一道时免费档会按 65536 规划批次，而
+    实际只发 16000，规划出的节点数根本写不完。
     """
-    return min(ctx.request.budget.max_output_tokens, max_tokens_cap())
+    return apply_free_tier_ceiling(
+        min(ctx.request.budget.max_output_tokens, max_tokens_cap()))
 
 
 async def _chat(
@@ -4071,6 +4161,85 @@ BRANCHED_EVIDENCE_RULES = (
 # 那条路不需要、而整树这条路必须解决的问题）。
 EVIDENCE_SECTION_HEADER = "第 {index} 支「{title}」的检索结果（evidence 数组）："
 
+# ---------------------------------------------------------------- 库证据这一节
+#
+# `MINDMAP_LIBRARY_IN_GENERATE` 打开时，`_intake` 会从知识库召回到几段原文，由
+# `_library_evidence_section` 渲染成 `sections` 里的**最后一节**。
+#
+# 为什么是一节独立证据，而不是并进 `sources`：见 `_Intake` 的 docstring（按支检索
+# 会把它当语料，20 支各切一遍 = 噪声重新进来）。这一节的形状因此更接近 `full_text`
+# 那套而不是"第 N 支的 evidence 数组"——它不属于任何一支，是**主题级**的补充。
+#
+# 两条措辞必须明写，各有来路：
+#   - **"不是用户这次传的材料"**：模型会把 user 里的每一段都当成"用户的材料"，
+#     然后在 content/诊断里说"依据来自用户提供的材料"。库里的东西与用户材料在
+#     界面上是两种来源（一个随请求来、一个是持久资产），说错就是错的账；
+#   - **"库里没有的方面不要硬写"**：这一节只有几段，而主题可能覆盖十支。不写这句
+#     时模型会把一节材料摊到全部二十个节点上（实测 `MUST_CITE_EVERY_NODE` 下它
+#     宁可重复引同一句）。宁可让树小一点，也不要一棵靠同一段话反复支撑的树。
+LIBRARY_EVIDENCE_HEADER = (
+    "知识库检索到的相关原文（**不是本次上传的材料**，是库里以前存下的来源；"
+    "共 {count} 段 / {chars} 字）："
+)
+
+LIBRARY_EVIDENCE_RULES = (
+    "\nuser 消息末尾还有一节「知识库检索到的相关原文」——它不是本次上传的材料，"
+    "是知识库（以前入库的来源）里与主题最相关的几段。那几段与其它证据同等有效，"
+    "**引用可以照抄**：source_id 与区间照那一节每段末尾给的值，quote 逐字抄原文；"
+    "这一节不属于任何一支，任何分支都可以引用它。"
+    "但它只是**几段**，不是整份材料：库里没有覆盖到的方面，就不要为了凑节点硬写。"
+    + EVIDENCE_REF_FIELDS
+)
+
+# 库那一节**末尾**那句（拼在 user 里，紧挨着输出位置）。
+#
+# 为什么同一个要求要写两遍（system 一次、user 末尾一次）：这是全塞那条路上的
+# 实测教训（`_generate` 里 `FULL_TEXT_EVIDENCE_RULES` 之后那段注释）——system 里
+# 那句距离输出位置隔着一整节正文时，模型**一条引用都不写**，而同一次调用里它明明
+# 把正文的内容用上了。这里更险：库节在 `sources` 为空时是 user 里唯一的证据段，
+# system 又刚说过"这不是你上传的材料"，模型很容易把它当背景知识。
+LIBRARY_SECTION_FOOTER = (
+    "\n\n上面每一段都可以引用：`source_id` 照抄该段最后的 `source_id:` 值，"
+    "start / end 取 `evidence_start` / `evidence_end`，quote 逐字抄正文里连续的一段。"
+    '引用写在节点自己的 source_refs 数组里，例如 {"source_id":"…","start":0,'
+    '"end":12,"quote":"…"}；source_refs 与 label、detail 平级，不要写进 detail。'
+    "**每一个节点都要有一条**：上面这几段没有覆盖到的方面，不要写成节点。"
+)
+
+
+def _library_evidence_section(
+    supplement: _LibrarySupplement, *, cite: bool = True,
+) -> str:
+    """把过门的父块渲染成 `sections` 里的那一节。
+
+    每段一个标题行（份名 / 序号 / 字符区间 / 字数），正文是父块原文，末尾单独一行
+    写 `source_id` 与两个偏移——引用要照抄的就是这三个值。
+
+    为什么把 `source_id` 单独放在最后一行而不是塞进标题：标题是给人读的（文件名
+    可能很长，混进 uuid 会把它挤掉），而模型抄引用时找的是"这一段属于哪个来源"
+    这个明确的位置。两者分开，模型抄错的概率更低，且 `evidence_*` 那一组值就在
+    同一处，不用跨行拼。
+
+    `cite=False` 是给骨架那一次用的（它只定一级分支、不写引用）：那一轮拼
+    `LIBRARY_SECTION_FOOTER` 等于让模型去写它这一轮被明确禁止写的字段。
+    """
+    lines = [LIBRARY_EVIDENCE_HEADER.format(
+        count=len(supplement.hits), chars=supplement.chars)]
+    by_id = {source.id: source for source in supplement.sources}
+    for index, hit in enumerate(supplement.hits, start=1):
+        source = by_id.get(hit.source_id)
+        name = (source.filename if source is not None and source.filename
+                else hit.source_id[:8])
+        lines.append(
+            f"\n【库 {index}｜{name}｜第 {hit.start}–{hit.end} 字】\n"
+            f"{hit.quote.strip()}\n"
+            f'source_id: "{hit.source_id}"  evidence_start: {hit.start}  '
+            f"evidence_end: {hit.end}"
+        )
+    text = "\n".join(lines)
+    return text + LIBRARY_SECTION_FOOTER if cite else text
+
+
 
 # ---------------------------------------------------------------- 全塞：正文进 prompt
 #
@@ -5805,6 +5974,179 @@ def _needs_supplementary(raw: Any, slots: list[_Slot]) -> bool:
 
 
 @dataclass(frozen=True)
+class _LibrarySupplement:
+    """生成前那次库检索的产物：过门的父块 + 它们所属的**整份**来源 + 账。
+
+    `hits` 与 `sources` 是两件不同的东西，不能合并：
+
+      - `hits` 是**父块**（450–700 字，`start`/`end`/`quote` 都是原文坐标）。它是
+        进 prompt 的东西——把整份 26K 字的开发文档贴进 prompt 会把上下文撑爆；
+      - `sources` 是命中的 `source_id` 用 `library.load()` 取回来的**整份原文**，
+        带持久 id。它是收尾校验要的东西：`verify_source_refs` 用
+        `{source.id: source}` 查原文，只给块文本时模型写的引用会被判
+        `SOURCE_TEXT_UNAVAILABLE` 静默剔掉（与 `_verify_sources` 的 docstring
+        同一个坑）。
+
+    所以这一节里"给模型看块、给校验器看全文"是刻意的分工，不是重复取数。
+
+    `skip` 为空串表示补上了；其余取值见 `LIBRARY_SKIP_*`。`chunks` / `sources` /
+    `seconds` 三个数只给诊断用——"这次用了库"与"这次没用"必须能分辨。
+    """
+
+    hits: list[EvidenceHit]
+    sources: list[Source]
+    skip: str = ""
+    seconds: float = 0.0
+
+    @property
+    def chars(self) -> int:
+        """过门父块的合计字数（**不是**整份来源的字数）。"""
+        return sum(hit.end - hit.start for hit in self.hits)
+
+
+def _library_supplement_diagnostic(
+    supplement: _LibrarySupplement, *, cite: bool = True,
+) -> Diagnostic | None:
+    """库这一步给人看的那一行。补上了报账，没补上说清为什么。
+
+    与 `GRAPH_INGEST_*` 同一条规矩：一个会花掉秒级时间、会改变提示词形状的步骤，
+    必须在诊断里留下"做了/没做/为什么"。`_LibrarySupplement` 恒为 None 的两种来路
+    （开关关着、库不可用）由调用点各说各的，这里只管真正查过的那些。
+
+    `cite` 只有 `_generate` 那边是 True。`_generate_deep` 把库片段**只给骨架**看
+    （一级分支从哪儿来），它的引用路径（按支证据 / 章内证据）一条都没接库——所以
+    那边的诊断不能承诺"引用可以照抄"，否则用户会看到一句代码做不到的话。
+    """
+    if not supplement.skip:
+        if cite:
+            message = (
+                f"这次没有材料，从知识库里检索了 {len(supplement.hits)} 段相关原文"
+                f"（{len(supplement.sources)} 份来源 / {supplement.chars} 字 / "
+                f"{supplement.seconds:.1f} 秒），已作为独立的一节证据交给模型；"
+                "这些片段的出处与本次材料同等对待，引用可以照抄。")
+        else:
+            message = (
+                f"这次没有材料，从知识库里检索了 {len(supplement.hits)} 段相关原文"
+                f"（{len(supplement.sources)} 份来源 / {supplement.chars} 字 / "
+                f"{supplement.seconds:.1f} 秒），已交给模型用来定一级分支；"
+                "这条生成路的引用来自按支检索，所以这一次不会有库片段的引用。")
+        return Diagnostic(
+            level=DiagnosticLevel.info, code="LIBRARY_SUPPLEMENT", message=message)
+    if supplement.skip == LIBRARY_SKIP_ENOUGH_MATERIAL:
+        # 正常出口，不报：材料够就不该查库，报出来只是噪声。
+        return None
+    if supplement.skip == LIBRARY_SKIP_NO_RERANK:
+        return Diagnostic(
+            level=DiagnosticLevel.warn, code="LIBRARY_SUPPLEMENT_SKIPPED",
+            message=(
+                "这次没用知识库：库命中的相关性只能靠重排分数判断，而重排这次没有生效"
+                "（`MINDMAP_RERANK` 关着，或 reranker 调用失败）。没有这道门时实测一半"
+                "以上的命中是跑题块（「城市雨污分流改造」8 条里 6 条来自开发文档），"
+                "所以宁可不补。"),
+        )
+    if supplement.skip == LIBRARY_SKIP_FEW_HITS:
+        return Diagnostic(
+            level=DiagnosticLevel.info, code="LIBRARY_SUPPLEMENT_SKIPPED",
+            message=(
+                f"这次没用知识库：检索到了片段，但过相关性门的只有 {len(supplement.hits)} "
+                f"段（至少要 {LIBRARY_MIN_HITS} 段）。一条孤证撑不起一节证据。"),
+        )
+    if supplement.skip == LIBRARY_SKIP_NO_HIT:
+        return Diagnostic(
+            level=DiagnosticLevel.info, code="LIBRARY_SUPPLEMENT_SKIPPED",
+            message="这次没用知识库：库里没有与这个主题相关的片段（检索返回空）。",
+        )
+    if supplement.skip == LIBRARY_SKIP_ERROR:
+        return Diagnostic(
+            level=DiagnosticLevel.warn, code="LIBRARY_SUPPLEMENT_SKIPPED",
+            message=("这次没用知识库：库检索出错（详见日志），已按没有库证据继续生成。"),
+        )
+    return Diagnostic(
+        level=DiagnosticLevel.info, code="LIBRARY_SUPPLEMENT_SKIPPED",
+        message="这次没用知识库：库里没有可检索的材料。",
+    )
+
+
+async def _library_supplement(
+    topic: str, ctx: RunContext, *, existing_chars: int,
+) -> _LibrarySupplement:
+    """生成前查一次库，返回**过门的父块**与它们所属的整份来源。
+
+    四道闸，每一道都是"少查一次"而不是"查了再丢"：
+
+      1. 开关（`MINDMAP_LIBRARY_IN_GENERATE`，默认关）——关着时这个函数只做一次
+         布尔判断，零查询、零网络；
+      2. 已有材料够（`existing_chars >= LIBRARY_SUPPLEMENT_CHARS`）——判据与依据见
+         `LIBRARY_SUPPLEMENT_CHARS` 那段注释；
+      3. 库可用（`library_available()`，它自己会剔掉外部检索那批，见那里的 docstring）；
+      4. 相关性门（`rerank_score >= LIBRARY_RELEVANCE_GATE`），重排不可用时按失败处理
+         ——理由与三档实测见 `LIBRARY_RELEVANCE_GATE` 上面的注释。
+
+    检索本身放在线程池里：`search_parent` 是同步函数，里面有一次 embedding 往返
+    （0.9–1.4 秒），直接在事件循环里跑会把这期间的所有并发堵死。
+
+    **命中区间记进 `ctx.evidence`、来源记进 `ctx.library_sources`**：模型照这一节
+    抄的引用必须在收尾校验时查得到原文（`_verify_sources`），也必须参与
+    `SOURCE_REF_OUTSIDE_EVIDENCE` 那道"引的这句在命中的那段里吗"。两件都在这里做，
+    调用点不用管。
+    """
+    if not library_in_generate_enabled():
+        # 调用点（`_intake`）已经判过开关，这里再判一次是给"直接调用本函数"留的
+        # 保险：开关关着时返回一个 `skip` 非空的对象，调用方不会误读成"查过但没命中"。
+        return _LibrarySupplement([], [], LIBRARY_SKIP_NO_LIBRARY)
+    if existing_chars >= LIBRARY_SUPPLEMENT_CHARS:
+        return _LibrarySupplement([], [], LIBRARY_SKIP_ENOUGH_MATERIAL)
+    if not library_available():
+        return _LibrarySupplement([], [], LIBRARY_SKIP_NO_LIBRARY)
+
+    query = (topic or "").strip()
+    if not query:
+        return _LibrarySupplement([], [], LIBRARY_SKIP_NO_HIT)
+
+    started = time.perf_counter()
+    try:
+        hits = await asyncio.to_thread(
+            search_parent, [], query, LIBRARY_GENERATE_TOP_K,
+            library=True, drop_external=library_drop_external())
+    except Exception as exc:  # noqa: BLE001 — 库是加分项，坏了不该废掉整次生成
+        logger.warning("生成前的库检索失败（%s）：%s",
+                       type(exc).__name__, str(exc)[:160])
+        return _LibrarySupplement([], [], LIBRARY_SKIP_ERROR,
+                                  time.perf_counter() - started)
+    seconds = time.perf_counter() - started
+
+    if not hits:
+        return _LibrarySupplement([], [], LIBRARY_SKIP_NO_HIT, seconds)
+    if all(hit.rerank_score is None for hit in hits):
+        # 一条都没有重排分 = 重排这一步没跑（开关关着 / 调用失败降级）。门没有判据，
+        # 按失败处理，理由见 `LIBRARY_RELEVANCE_GATE` 上面那段实测。
+        return _LibrarySupplement([], [], LIBRARY_SKIP_NO_RERANK, seconds)
+
+    kept = [hit for hit in hits
+            if (hit.rerank_score or 0.0) >= LIBRARY_RELEVANCE_GATE]
+    if len(kept) < LIBRARY_MIN_HITS:
+        return _LibrarySupplement(kept, [], LIBRARY_SKIP_FEW_HITS, seconds)
+
+    # 取回整份原文（持久 id）。`_remember_library_hits` 就是 `_rag` 用的那一份实现：
+    # 查不到（被 prune 删了）只跳过那一份并记 warning，不让整次生成失败。它把结果
+    # 记进 `ctx.library_sources`，于是 `_verify_sources` 收尾时认这些来源。
+    before = set(ctx.library_sources)
+    _remember_library_hits(kept, ctx)
+    sources = [source for source_id, source in ctx.library_sources.items()
+               if source_id not in before]
+    if not sources:
+        # 命中的来源一份都取不回来（库被换掉 / 被清空）：保留 `hits` 只为让诊断说出
+        # 真实条数，但**不参与生成**——没有整份原文，模型的引用一定过不了校验。
+        return _LibrarySupplement(kept, [], LIBRARY_SKIP_NO_LIBRARY, seconds)
+
+    ctx.record_evidence([
+        EvidenceSpan(hit.source_id, hit.start, hit.end, hit.leaf_start, hit.leaf_end)
+        for hit in kept
+    ])
+    return _LibrarySupplement(kept, sources, "", seconds)
+
+
+@dataclass(frozen=True)
 class _Intake:
     """生成前那三段材料处理的产物。两个生成工具共用同一份实现。
 
@@ -5837,6 +6179,19 @@ class _Intake:
     它与 `ingested` 互斥、不能合并：`ingested is None` 有四种来路，而"没做"这件事
     对用户有四句不同的话要说（没配 / 连不上 / 冷却 / 有目录）。原来这四种全部沉默，
     用户只能看到"图里没有这批材料"这个结果，看不到任何决定。
+
+    `library` 是"生成前主动查库"的产物（`MINDMAP_LIBRARY_IN_GENERATE`，默认关）。
+    它**不并进 `sources`**，这是一条硬边界：
+
+      - `sources` 是"按支检索的语料"。库命中的整份来源动辄 26K 字（`AGENT_PLAN.md`），
+        并进去之后每一支都会在它上面切块，20 支 × 无关块 = 噪声重新进来，而噪声是
+        这个功能唯一要防的东西；
+      - 它也不进 `full_text_chars`：那个数的语义是"真的会被整份拼进 prompt 的字数"，
+        库来源从来不会被整份拼进去（进 prompt 的是命中的父块）。
+
+    所以库证据走**单独一节**（`_library_evidence_section`），由 `_generate` 拼到
+    `sections` 末尾。开关关着时它是 None，`sources` / `full_text` / `full_text_chars`
+    与加这个能力之前逐字段相同。
     """
 
     sources: list[Source]
@@ -5848,6 +6203,7 @@ class _Intake:
     full_text_chars: int = 0
     ingested: dict[str, Any] | None = None
     graph_ingest_skip: tuple[str, ...] = ()
+    library: _LibrarySupplement | None = None
 
 
 async def _intake(topic: str, ctx: RunContext) -> _Intake:
@@ -5875,6 +6231,12 @@ async def _intake(topic: str, ctx: RunContext) -> _Intake:
     它必须排在短材料那道闸之后（太短的材料先被换成 `hint_block`，`sources` 已经是
     空的），也必须排在外部检索之后（外部补进来的那几份同样可以整份塞进去）。
     阈值取 0 或负数时这个信号恒为 False，这条路上的一切与加它之前逐字节相同。
+
+    **库检索排在外部检索之后、`full_text` 判定之前**（`_library_supplement`，默认关）：
+    顺序就是三源优先级（用户材料 → 库 → 外部），而 `full_text` 必须在它之前算定
+    ——库命中不改 `sources`、也不改 `full_text_chars`（理由见 `_Intake` 的
+    docstring），所以这一步对那两行**一个字节都不改**。开关关着时它是一次布尔
+    判断、零查询、零网络。
     """
     picked = [source for source in _pick_sources(ctx, []) if (source.text or "").strip()]
     material_chars = sum(len((source.text or "").strip()) for source in picked)
@@ -5906,20 +6268,38 @@ async def _intake(topic: str, ctx: RunContext) -> _Intake:
                 if external is not None else None)
     full_text_chars = sum(len((source.text or "").strip()) for source in sources)
     full_text = bool(sources) and 0 < full_text_chars <= FULL_TEXT_MATERIAL_CHARS
+    # 判"够不够"用 `full_text_chars`（用户材料 + 外部检索合计）而不是
+    # `material_chars`：三源优先级里库是**第二**顺位，用户没给料但外部已经补上
+    # 3000 字以上时，库再补一批不同主题的片段只会把两份互不相干的材料混进同一棵树。
+    library = await _library_supplement(
+        topic, ctx, existing_chars=full_text_chars) if library_in_generate_enabled() else None
     out = _Intake(sources, short_material, material_chars, hint_block, external,
-                  full_text, full_text_chars, ingested, tuple(ingest_skip))
+                  full_text, full_text_chars, ingested, tuple(ingest_skip), library)
     # "这一次到底吃了几份材料"是好几条分支的判据（骨架条数、全塞、按章切），而它
     # 在日志里从来没有过一行：出问题时只能靠"界面上看到几份"与 SSE 里 external_search
     # 的 count 去推——那两处一个是请求给的、一个是检索报的，都不是**这一步的产物**。
     # 级别取 warning 不是手滑：本仓库的 app logger 没有配置 handler，root 默认
     # WARNING，info 一律看不见（`检索材料入图` 那些 info 行在 backend.log 里一条都没有）。
-    logger.warning(
-        "材料入口：%d 份 / %d 字（外部检索 %s，入图 %s）｜%s",
-        len(out.sources), full_text_chars,
-        "未走" if external is None else f"补 {len(external.sources)} 份",
-        "未做" if ingested is None else "已做",
-        "、".join((source.filename or source.id)[:28] for source in out.sources) or "（无）",
-    )
+    if library is None:
+        # 开关关着时这一行与加这个能力之前**逐字相同**：那一条"逐字节相同"的约定
+        # 连日志也包括，否则"关掉之后就与旧版本一致"这句话在排查时对不上。
+        logger.warning(
+            "材料入口：%d 份 / %d 字（外部检索 %s，入图 %s）｜%s",
+            len(out.sources), full_text_chars,
+            "未走" if external is None else f"补 {len(external.sources)} 份",
+            "未做" if ingested is None else "已做",
+            "、".join((source.filename or source.id)[:28] for source in out.sources) or "（无）",
+        )
+    else:
+        logger.warning(
+            "材料入口：%d 份 / %d 字（外部检索 %s，入图 %s，库 %s）｜%s",
+            len(out.sources), full_text_chars,
+            "未走" if external is None else f"补 {len(external.sources)} 份",
+            "未做" if ingested is None else "已做",
+            "未补" if library.skip else f"补 {len(library.hits)} 段",
+            "、".join((source.filename or source.id)[:28] for source in out.sources)
+            or "（无）",
+        )
     return out
 
 
@@ -8350,6 +8730,10 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     # 真的会被拼进 prompt 的那份字数（含外部检索补进来的）。与 `material_chars`
     # （只数用户随请求带来的）分开报：诊断里说"合计 X 字"必须能与 prompt 对上。
     full_text_chars = intake.full_text_chars
+    # 生成前主动查库的产物（`MINDMAP_LIBRARY_IN_GENERATE`，默认关）。它**不进
+    # `sources`、不进 `full_text_chars`**，走单独一节证据（理由见 `_Intake` 的
+    # docstring）。开关关着时 `intake.library` 是 None，下面三处消费点全部跳过。
+    library = intake.library
 
     diagnostics: list[Diagnostic] = []
     # 入图那一步的账（开关关着时恒为 None，什么都不加——键集与加它之前逐字节相同）。
@@ -8361,6 +8745,13 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         skip = _graph_ingest_skip_diagnostic(reason)
         if skip is not None:
             diagnostics.append(skip)
+    if library is not None:
+        # 库这一步的账：补上了报"几段 / 几份 / 多少字 / 多久"，没补上说清为什么
+        # （六种来路六句话，见 `_library_supplement_diagnostic`）。与入图那一步同一条
+        # 规矩——一个会花掉秒级时间、会改变提示词形状的步骤必须留下决定。
+        note = _library_supplement_diagnostic(library)
+        if note is not None:
+            diagnostics.append(note)
     thinking = thinking_block(ctx.request.thinking_model)
     # 图型：请求层权威（理由与 `_generate_deep` 同一段注释——模型看不见界面，
     # `diagram_type` 只要默认值存在它就会走默认值）。
@@ -8557,8 +8948,17 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
                 else _mixed_plain_rules(mixed.plain))
         # 没有可检索材料时补那两句纯文本契约（与 `_generate_deep` 的骨架段同一条
         # 判定）：它们不含输出格式，不会与 `PLAN_PROMPT` 的"只返回 branches"打架。
+        #
+        # 库补了片段时**只补前一句**：`DETAIL_NO_SOURCE_RULES` 说的是"没有可标出处的
+        # 材料"，而这一轮的 user 末尾正摆着库里的原文——两句话并存会让骨架以为这批
+        # 片段不算数，于是照样按"凭主题自由发挥"定分支，而分支决定整棵树的覆盖。
+        library_block = (
+            "\n\n" + _library_evidence_section(library, cite=False)
+            if library is not None and library.hits else "")
         if not sources:
-            plan_system += "\n" + CONTENT_FREEDOM_CONTRACT + DETAIL_NO_SOURCE_RULES
+            plan_system += "\n" + CONTENT_FREEDOM_CONTRACT
+            if not library_block:
+                plan_system += DETAIL_NO_SOURCE_RULES
         plan_started = time.perf_counter()
         ask = _plan_ask(
             args.topic,
@@ -8570,6 +8970,10 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             materials=_material_inventory(sources, has_structure=bool(outline)),
             diagram_type=diagram_type,
         )
+        # 库片段也给骨架那一次看：一级分支是整棵树的覆盖上限，只给结构那一步看
+        # 的话，分支仍会按模型的先验（政策背景/技术路径/案例分析）铺开，而库里那几段
+        # 只能挂在其中一两支上——树与证据错位。开关关着时 `library_block` 恒空。
+        ask += library_block
         if slice_chapters:
             # 拼在 `_plan_ask` 的返回值**之后**，不改进那个函数：它与
             # `PLAN_PROMPT` 一起被逐字节回归用例钉着（`test_outline.py`）。
@@ -8698,6 +9102,17 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             if evidence is not None
         ]
     )
+    # 库那一节挂在**最后**（`MINDMAP_LIBRARY_IN_GENERATE`，默认关）：它不属于任何
+    # 一支、也不是整份材料，放末尾之后上面那几条"按支分组 / 按材料分节"的表头仍然
+    # 说的是它们各自的那批，模型不会把库片段当成第 N 支的证据。
+    #
+    # 它与 `full_text` **可以同时成立**（用户传了 300–3000 字的薄材料时：既够
+    # `SHORT_MATERIAL_CHARS`、又不够 `LIBRARY_SUPPLEMENT_CHARS`），所以不能写成
+    # 上面那条三元表达式的另一臂——那样会把全塞的正文挤掉。
+    library_section = ""
+    if library is not None and library.hits:
+        library_section = _library_evidence_section(library)
+        sections = [*sections, library_section]
 
     # ---- 第三步（按章切）：每章一次调用，组装成整棵树 ---------------------------
     #
@@ -8868,6 +9283,13 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             # 引用留空。**不把 `sources` 判成 None**：模型在本次运行前几轮可能已经
             # `rag_query` 到过真片段，逐字校验照跑，留下的只可能是真依据。
             system = base_system + thinking + shape_rules + DETAIL_NO_SOURCE_RULES
+        elif library_section:
+            # 这次没有可检索的用户材料/外部检索，但库补了几段（
+            # `MINDMAP_LIBRARY_IN_GENERATE`）。**不能走下面 `else` 那一支**：那里拼的
+            # `DETAIL_NO_SOURCE_RULES` 明说"没有可标出处的材料"，而 user 末尾正摆着
+            # 一节库原文——模型会照着 system 那句话把库里的句子当自己的知识写，
+            # 引用一条不给，于是这次库检索白查。
+            system = (base_system + thinking + shape_rules + LIBRARY_EVIDENCE_RULES)
         else:
             system = base_system + thinking + DETAIL_NO_SOURCE_RULES
             if graph_mode:
@@ -8876,6 +9298,10 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
                 # 挑"的规则，少了它模型拿到的是一张没有图谱的普通整树提示词，而 user 里
                 # 那段实体清单会被它当成参考信息随手引用。
                 system += shape_rules
+        if library_section and sources:
+            # 既有本次材料、又有库片段（薄材料那种：300–3000 字）。上面那几支的引用
+            # 规则都只说"从本组抄 / 从正文抄"，库那一节没有归属，要单独补一句。
+            system += LIBRARY_EVIDENCE_RULES
         if graph_mode:
             # 关系规则放在**最后**：它与输出形状（`relations` 数组）绑在一起，而模型对
             # 紧挨着输出位置的那段话最敏感（同 `_detail_ask` 末尾那句自查）。
@@ -9792,6 +10218,14 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         skip = _graph_ingest_skip_diagnostic(reason)
         if skip is not None:
             diagnostics.append(skip)
+    if intake.library is not None:
+        # 与 `_generate` 同一份诊断。**这条路只说骨架那半句**：库片段在这条路上只进
+        # 骨架那次调用（定一级分支），不进每支的展开——把 5 段库原文拼进 20 次展开
+        # 是 20 倍的输入代价。所以这里的 `LIBRARY_SUPPLEMENT` 文案不能声称"引用可以
+        # 照抄"，改由 `_library_supplement_diagnostic(..., cite=False)` 说清。
+        note = _library_supplement_diagnostic(intake.library, cite=False)
+        if note is not None:
+            diagnostics.append(note)
     # 思维模型两条路都要拼：骨架决定怎么分块，展开决定每块怎么拆。
     thinking = thinking_block(ctx.request.thinking_model)
 
@@ -9925,6 +10359,13 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     )
     plan_system = base_plan if slicing else (
         base_plan + "\n" + CONTENT_FREEDOM_CONTRACT + DETAIL_NO_SOURCE_RULES)
+    # 库补了片段时把后一句换掉（与 `_generate` 同一处、同一个理由）：user 末尾正摆着
+    # 库里的原文，再说"没有可标出处的材料"会让骨架照旧凭主题铺分支。
+    library_block = (
+        "\n\n" + _library_evidence_section(intake.library, cite=False)
+        if intake.library is not None and intake.library.hits else "")
+    if library_block and not slicing:
+        plan_system = base_plan + "\n" + CONTENT_FREEDOM_CONTRACT
     # 与整树那条同一句、同一位置（理由见 `_generate` 里那段注释）：它要在
     # `PLAN_PROMPT` 的「目录为空时自行归纳」之后，才压得住那一句。
     if graph_outline:
@@ -9944,7 +10385,7 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
                 # 只改一条会得到一个"两个入口对同一批材料给出不同骨架"的分叉）。
                 materials=_material_inventory(sources, has_structure=bool(outline)),
                 diagram_type=diagram_type,
-            ) + hint_block)
+            ) + hint_block + library_block)
     except GenerationError as exc:
         return _fail("generation_failed", f"骨架生成失败：{exc}")
 

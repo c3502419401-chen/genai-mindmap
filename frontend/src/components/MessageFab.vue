@@ -105,7 +105,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', closeOnEscape));
       </header>
       <div ref="listRef" class="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-3 py-2">
         <p v-if="!chat.messages.length" class="text-xs leading-relaxed text-slate-400">
-          还没有消息。写一个主题生成之后，你说过的话和它的回复都会按时间记在这里。
+          还没有消息。写一个主题生成之后，对话会按时间记在这里。
         </p>
         <article
           v-for="message in chat.messages"

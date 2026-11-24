@@ -33,7 +33,7 @@ describe('模型原话', () => {
     const wrapper = mount(AgentPanel);
     const panel = wrapper.text();
 
-    expect(panel).toContain('模型这次只回了文字，没有调用工具');
+    expect(panel).toContain('模型这次只回了文字，没有生成导图');
     expect(panel).toContain('机器学习分监督与无监督');
     expect(panel).toContain('直接说更简单');
   });

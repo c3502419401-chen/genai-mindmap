@@ -372,14 +372,19 @@ def test_observations_skip_unparsable_candidate():
 
 
 def test_style_profile_schema_is_the_agreed_one():
-    """表结构与约定一致：`key, value, samples, confidence, updated_at`。"""
+    """表结构与约定一致：`owner, key, value, samples, confidence, updated_at`。
+
+    `owner` 是 PR#27 审出来的那条（P0-2）：`style_profile` 是**观察**，观察只能进
+    自己的画像。它排在第一位，因为复合主键是 `(owner, key)`——同一台机器上两个人
+    各自的"平均分支数"必须能同时存在。
+    """
     from contextlib import closing
 
     from app.mindmaps import repository
 
     with closing(repository.connect()) as conn:
         columns = [row[1] for row in conn.execute("PRAGMA table_info(style_profile)")]
-    assert columns == ["key", "value", "samples", "confidence", "updated_at"]
+    assert columns == ["owner", "key", "value", "samples", "confidence", "updated_at"]
 
 
 def test_style_does_not_touch_user_prefs():

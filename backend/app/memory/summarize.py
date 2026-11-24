@@ -194,12 +194,19 @@ class Session:
     用最后一条的 id 才能让"这个会话"在任何时刻都是一个确定的、可重新算出同一个值
     的标识。用第一次的 id 也行，但那个值要等到会话结束才稳定，而我们在开始总结的
     那一刻就已经知道结束了。
+
+    **`owner` 是这段会话属于谁**，必须在 `due()` 里由请求侧定下来并随对象一路带到
+    结束。原因写起来很短、犯起来很贵：总结跑在 `threading.Thread` 里，那里读不到
+    请求的 `ContextVar`，自己调 `current_owner()` 只会拿到空串——于是所有人的会话
+    都被总结成"无主"记忆，于是所有人都读得到（PR#27 审查里那条 P0-2）。所以 owner
+    是**数据**，不是环境。
     """
 
     session_id: str
     started_at: str
     ended_at: str
     runs: tuple[SessionRun, ...]
+    owner: str = ""
 
 
 @dataclass(frozen=True)
@@ -233,12 +240,19 @@ def _llm_ready() -> bool:
     return True
 
 
-def _recent_runs(limit: int, exclude_run_id: str | None) -> list[Any]:
-    sql = "SELECT run_id, status, request, created_at, updated_at FROM runs"
-    params: tuple[Any, ...] = ()
+def _recent_runs(limit: int, exclude_run_id: str | None, owner: str) -> list[Any]:
+    """这个人的最近若干次运行。
+
+    `owner` 是 `WHERE` 的一部分，不是过滤后的检查：跨账号总结的后果不是"看到别人的
+    goal"，而是"把别人的会话总结成记忆、再注入到自己的生成提示词里"——一条 A 的
+    项目名会出现在 B 的图里，而 B 从来没提过它。
+    """
+    sql = ("SELECT run_id, status, request, created_at, updated_at FROM runs "
+           "WHERE owner = ?")
+    params: tuple[Any, ...] = (owner,)
     if exclude_run_id:
-        sql += " WHERE run_id <> ?"
-        params = (exclude_run_id,)
+        sql += " AND run_id <> ?"
+        params = (*params, exclude_run_id)
     sql += " ORDER BY created_at DESC, run_id DESC LIMIT ?"
     with closing(repository.connect()) as conn:
         return conn.execute(sql, (*params, limit)).fetchall()
@@ -276,7 +290,12 @@ def _summarized(session_id: str) -> bool:
     return row is not None
 
 
-def due(*, exclude_run_id: str | None = None, now: datetime | None = None) -> Session | None:
+def due(
+    *,
+    exclude_run_id: str | None = None,
+    owner: str = "",
+    now: datetime | None = None,
+) -> Session | None:
     """有没有一个"刚结束、还没总结过"的会话；没有则 None。
 
     调用点只有一个：`agent.router.stream_run` 在**认领完这次运行之后**（所以当前
@@ -284,11 +303,15 @@ def due(*, exclude_run_id: str | None = None, now: datetime | None = None) -> Se
 
     纯读、同步、毫秒级：三次 sqlite 查询（runs 若干行、memory_sessions 一行），
     没有网络，没有模型。真正的重活在 `run_session` 里，跑在后台线程。
+
+    `owner` 由调用方（请求侧）传进来并放进返回的 `Session`：这个方法本身跑在事件
+    循环里、能读 `ContextVar`，但复用它的线程不能——所以在这里定下来，而不是留给
+    后面某处再问一次"这是谁的"。
     """
     if not _llm_ready():
         logger.debug("会话总结跳过：模型未配置")
         return None
-    rows = _recent_runs(_RUN_SCAN, exclude_run_id)
+    rows = _recent_runs(_RUN_SCAN, exclude_run_id, owner)
     if not rows:
         return None
     head = rows[0]
@@ -327,6 +350,7 @@ def due(*, exclude_run_id: str | None = None, now: datetime | None = None) -> Se
         started_at=members[-1]["created_at"],
         ended_at=head["updated_at"],
         runs=tuple(_session_run(row) for row in reversed(members)),
+        owner=owner,
     )
     if _summarized(session.session_id):
         return None
@@ -335,8 +359,8 @@ def due(*, exclude_run_id: str | None = None, now: datetime | None = None) -> Se
 
 # ---------------------------------------------------------------- 输入
 
-def _events(started_at: str, ended_at: str) -> list[Any]:
-    """这次会话期间（含结束后一个间隔内）的编辑事件。
+def _events(started_at: str, ended_at: str, owner: str) -> list[Any]:
+    """这次会话期间（含结束后一个间隔内）、**属于这个人**的编辑事件。
 
     窗口的尾巴要延长 `GAP_MINUTES`：**用户的修改几乎总在运行结束之后发生**。只取
     `[started_at, ended_at]` 的话，"他连续三次把图型改成鱼骨图"这件事在事件里一条
@@ -345,6 +369,14 @@ def _events(started_at: str, ended_at: str) -> list[Any]:
     用 `recorded_at`（服务端入库时刻）而不是 `at`（前端时钟）：前端的时钟不可信，
     而窗口边界判错会让一次改动落进相邻的会话。库里所有时间戳都是 UTC 的
     `...Z` 定长格式，字符串比较与时间顺序一致。
+
+    **归属靠 `edit_events.owner`**：那一列直接记"谁做的这次改动"。老行上它是空串
+    （不知道是谁，与 `mindmaps` / `runs` 的老行同一口径），所以升级前的历史不会被
+    算进任何人的画像——宁可少一条"他删了三个节点"，也不能把别人的操作写进我的偏好。
+
+    早先这里靠 `run_id IN (SELECT run_id FROM runs WHERE owner = ?)` 回查，那条路
+    有个洞：**手工编辑（`kind` 全是 user 的那批）根本没有 `run_id`**，会被整批排除，
+    总结里永远看不到"他改了什么"——而这恰恰是总结里信息量最大的那一半。
     """
     end = store.parse_time(ended_at)
     if end is None:
@@ -353,9 +385,9 @@ def _events(started_at: str, ended_at: str) -> list[Any]:
     with closing(repository.connect()) as conn:
         rows = conn.execute(
             "SELECT actor, kind, field, before, after, depth, subtree_size, node_count "
-            "FROM edit_events WHERE recorded_at >= ? AND recorded_at <= ? "
+            "FROM edit_events WHERE recorded_at >= ? AND recorded_at <= ? AND owner = ? "
             "ORDER BY recorded_at DESC, id DESC LIMIT ?",
-            (started_at, tail, MAX_EVENTS),
+            (started_at, tail, owner, MAX_EVENTS),
         ).fetchall()
     return list(reversed(rows))
 
@@ -462,14 +494,17 @@ def user_text(session: Session, events: list[Any], known: list[str]) -> str:
     return "\n".join(lines)
 
 
-def _known_memories(limit: int = 40) -> list[str]:
-    """把已有的记忆给模型看一眼，避免同一条被反复总结。
+def _known_memories(owner: str, limit: int = 40) -> list[str]:
+    """把**这个人**已有的记忆给模型看一眼，避免同一条被反复总结。
 
     去重靠 `text_hash`，而哈希只认一字不差的文本。「标题去掉人名」与「标题里不要
     写人名」是两条不同的哈希，却是同一件事。这一段的成本是 40 × 100 字 ≈ 2700 字，
     收益是少掉一整类"同一句偏好有五种说法"的重复。
+
+    只给这个人的：把别人的记忆当"已知"喂进提示词，等于让模型按别人的偏好去判断
+    "这条要不要记"，而且那几十条文本本身也泄露给了这一轮的模型调用。
     """
-    return [item.text for item in store.items(limit)]
+    return [item.text for item in store.items(limit, owner=owner)]
 
 
 # ---------------------------------------------------------------- 解析与写库
@@ -546,12 +581,17 @@ def _mark(session_id: str, status: str, count: int, detail: str | None) -> None:
 def _persist(
     session: Session, parsed: list[tuple[str, str, str | None]],
 ) -> tuple[int, int]:
-    """落库；返回 (有效条数, 真正新增条数)。"""
+    """落库；返回 (有效条数, 真正新增条数)。
+
+    写进 `session.owner` 名下（不是"当前是谁"——这条线程里没有"当前"，见
+    `Session.owner` 的说明）。
+    """
     created = 0
     for text, kind, formed_at in parsed:
         try:
             added = store.add(
                 text, kind,
+                owner=session.owner,
                 source=store.SOURCE_SUMMARY,
                 source_run_id=session.session_id,
                 session_id=session.session_id,
@@ -579,8 +619,8 @@ async def _summarize(session: Session) -> object:
     """
     return await chat_async(
         SUMMARY_SYSTEM,
-        user_text(session, _events(session.started_at, session.ended_at),
-                  _known_memories()),
+        user_text(session, _events(session.started_at, session.ended_at, session.owner),
+                  _known_memories(session.owner)),
         max_tokens=SUMMARY_MAX_TOKENS,
     )
 
@@ -732,14 +772,17 @@ def schedule(session: Session) -> bool:
     return True
 
 
-def maybe_summarize(*, exclude_run_id: str | None = None) -> bool:
+def maybe_summarize(*, exclude_run_id: str | None = None, owner: str = "") -> bool:
     """给 `agent.router.stream_run` 的一行入口：判一次、起一个后台线程。
 
     放在**认领完这次运行之后**、返回流之前。位置不能更早（认领之前调用会看不到
     当前运行，`exclude_run_id` 就无从排除），也不能更晚（生成一开始就没人关心
     上一次会话了）。
+
+    `owner` 在这里定下来并交给 `schedule` → `run_session`：本函数跑在请求线程里、
+    能读 `ContextVar`，而总结线程不能。这是整条路上唯一一个"还知道这是谁的"位置。
     """
-    session = due(exclude_run_id=exclude_run_id)
+    session = due(exclude_run_id=exclude_run_id, owner=owner)
     if session is None:
         return False
     logger.info("上一个会话（%s，%d 次运行）已结束，开始总结",

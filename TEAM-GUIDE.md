@@ -68,7 +68,7 @@ npm test
 npm run build
 ```
 
-当前基线（2026-11-21，合入 PR #6「半棵树交付 + 检查点 + 从检查点续写」之后）：后端 2383 个测试通过 / 37 skip（pytest，另有 29 个 subtest）、前端 999 个 vitest 用例（63 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
+当前基线（2026-11-24，合入 `coworker/main`（账号系统 + 限量免费额度）之后）：后端 3077 个测试通过 / 37 skip（pytest，另有 29 个 subtest）、前端 1076 个 vitest 用例（67 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
 
 本机跑后端测试时如果出现 `LegacyOfficeTest::test_xls_cell_formatting` 失败、报 `No module named 'xlrd'`，是本地依赖没装齐（`.xls` 直读要用它），`pip install xlrd` 即可，不是代码问题。
 
@@ -85,7 +85,7 @@ npm run build
 ```
 backend/
   app/
-    main.py            应用装配，注册 8 组路由（30 个路径 / 34 个端点）
+    main.py            应用装配，注册 11 组路由（38 个路径 / 43 个端点）
     contracts/         数据契约（改这里要通知另一个人）
       mindmap.py       ContentBase 与三个子类（树 / 流程图 / 鱼骨图）、Node、请求响应模型
       source.py        Source / SourceUsage / SourceRef（节点引用）
@@ -99,16 +99,18 @@ backend/
     knowledge/         切块 / 混合检索 / rerank / 知识库（只读入口 + 生成时入库）/ 外部检索
     memory/            记忆模块（生成时注入相关记忆、会话结束总结）
     prefs/             用户偏好（读写 + 从历史推建议）
+    settings/          模型服务配置（页面内改地址/密钥/模型，落 SQLite 单行表，回落环境变量）
+    auth/              账号与会话（scrypt 口令、sessions 表、HttpOnly cookie、身份中间件 + 门禁中间件）
     agent/             AI 代理（工具循环 / op 执行器 / SSE v2 / 运行台账，生成与编辑的唯一入口）
     export/            导出 puml / markdown / opml / json
     mindmaps/          保存 / 读取 / 版本冲突 / 改动日志
-  tests/               2383 个测试通过 / 37 skip（另有 29 个 subtest）
+  tests/               3077 个测试通过 / 37 skip（另有 29 个 subtest）
 frontend/
   src/
     App.vue            工作台（画布居中、左侧材料、右侧对话与详情，含保存、打开、冲突弹层、导出、来源面板）
     main.ts            入口（挂 Pinia 与 Vue Flow 样式，启动时探测上次未收尾的运行）
     styles.css         Tailwind 入口
-    api/client.ts      fetch 封装 + ApiError（导图 CRUD 4 个、导入 1 个、改动日志 3 个、上传 1 个、导出 4 个、agent 流与台账 4 个、偏好 4 个、记忆 4 个、知识库 2 个）
+    api/client.ts      fetch 封装 + ApiError（导图 CRUD 4 个、导入 1 个、改动日志 3 个、上传 1 个、导出 4 个、agent 流与台账 4 个、偏好 4 个、记忆 4 个、知识库 2 个、账号 5 个）
     api/types.ts       契约 v2 的 TS 镜像（手写，读起来比生成类型省事）
     api/schema.d.ts    openapi-typescript 从 backend/openapi.json 生成，勿手改
     api/contract-check.ts 编译期断言：镜像与生成类型的键集合、形状必须一致
@@ -124,14 +126,15 @@ frontend/
     mindmap/run-status.ts 运行台账的状态映射
     sources/input.ts   来源收集常量与校验（格式白名单、字数与大小上限）
     audio/             浏览器录音（16kHz WAV）与 WAV 头处理
-    components/        AgentPanel / RecordButton / SourceInputs / ChatDock / MessageFab / NodeToolbar / VoicePress / HistoryDrawer / PrefsPanel
+    components/        AgentPanel / RecordButton / SourceInputs / ChatDock / MessageFab / NodeToolbar / VoicePress / HistoryDrawer / PrefsPanel / SettingsPanel
     stores/mindmap.ts  Pinia：内容、布局、选中、编辑、撤销重做、保存状态、agent 生成落地、运行台账
     stores/sources.ts  Pinia：来源列表
     stores/chat.ts     Pinia：对话消息
     stores/prefs.ts    Pinia：用户偏好
+    stores/settings.ts Pinia：模型服务配置（读 / 存 / 测试连接）
     demo/presets.ts    三张预置演示导图（生产也带，点按钮才加载）
     dev/samples.ts     开发期布局示例（仅 `npm run dev` 动态加载）
-  tests/               926 个 vitest 用例（纯函数 / 布局 / store / 编辑 / 保存 / 界面 / 引用 / agent / 对话 / 记忆 / 导入 / 三种图型）
+  tests/               1055 个 vitest 用例（纯函数 / 布局 / store / 编辑 / 保存 / 界面 / 引用 / agent / 对话 / 记忆 / 导入 / 三种图型 / 偏好与体检 / 模型设置）
 docs/
   FLOW.md              端到端流程 ← 先读这个
   API.md               每条路由实现到什么程度
@@ -173,7 +176,7 @@ START_HERE.md          原始的骨架说明
 
 ---
 
-## 5 接口一览（30 个路径 / 34 个端点）
+## 5 接口一览（38 个路径 / 43 个端点）
 
 ```
 基础
@@ -225,8 +228,21 @@ DELETE /api/memory/{item_id}       删除一条记忆
 
 检索与知识库
 POST /api/knowledge/search         检索（桩，返回空）
+POST /api/knowledge/fetch          贴一个 URL，抓回正文变成一份材料（受 MINDMAP_EXTERNAL_DEEPSEEK_FETCH 约束）
 GET  /api/knowledge/library        知识库列表（含被引用次数）
 GET  /api/knowledge/library/{id}   单份材料正文预览（前 4000 字）
+
+模型服务（页面内配置，改完立即生效）
+GET  /api/settings/model           当前生效值 + 每个字段的来源（库 / 环境变量 / 未配）
+PUT  /api/settings/model           改地址 / 密钥 / 模型名（密钥只回打码值，清空要显式声明）
+POST /api/settings/model/test      测试连接（失败也是 200 + 结论，不是 5xx）
+
+账号与会话（`/api/` 下必须带身份：游客或登录都算，匿名 401 `auth_required`）
+GET  /api/auth/me                  当前是谁（永远 200）；全站唯一发游客 cookie 的地方
+POST /api/auth/register            注册并直接登录（重名 409，不区分大小写）
+POST /api/auth/login               登录（账号或密码不对统一 401，不区分是哪一项）
+POST /api/auth/logout              登出（幂等，本来没登录也是 204）
+POST /api/auth/password            改密码（需已登录 + 旧密码；改完撤销全部会话）
 ```
 
 ---
@@ -278,7 +294,7 @@ W1 两条线并行：B 做 D1–D3，A 做 D2 契约 + D4 画布 + D5 部署，W
 1. **诊断面板**（RPeGio，F15）：接 `POST /api/optimization/check` 与 `/suggest`，把 `diagnostics` 渲染出来（单子节点、深度上限、重复标签、引用核验失败原因），建议仍是候选、需用户确认。
 2. **v2 的界面渲染**（RPeGio，F09/F10）：契约 v2 两端已落地，缺的是画布的多布局与主题样式渲染；`relations` / `style` / `pos` 目前只落库、没有界面读它们。
 3. **真实密钥环境整体验收**（RPeGio 与陈嘉涛）：真实模型链路只在 2026-11-04 的单份英文论文样本上量过（`docs/LLM-OUTLINE-ACCURACY.md`），中文样本、语音、图片都还没有系统评测。
-4. **上线**（RPeGio，F22，2026-11-10 已出可执行方案）：`deploy/install.sh` 一条命令在 Alibaba Cloud Linux 3 上装完 systemd + nginx + Python 3.12，同源反代因此不需要 CORS，Basic Auth 挡在前面，步骤见 `docs/DEPLOY.md` 第 9 节。**没做**：`Dockerfile` 与 compose——2C2G 上构建 docling+torch 镜像容易 OOM，演示窗口只有一个，容器化等验收后再补。
+4. **上线**（RPeGio，F22，2026-11-10 已出可执行方案）：`deploy/install.sh` 一条命令在 Alibaba Cloud Linux 3 上装完 systemd + nginx + Python 3.12，同源反代因此不需要 CORS，**鉴权在应用层**（门禁 + 账号体系；nginx 那层 Basic Auth 已弃用），步骤见 `docs/DEPLOY.md` 第 9 节。**没做**：`Dockerfile` 与 compose 已写但从未在任何机器上构建过——2C2G 上构建 docling+torch 镜像容易 OOM，演示窗口只有一个，容器化等验收后再补。
 
 已完成：**把引用搬到界面上**（F08，2026-11-07，`fc8f82f`）——节点右上角显示引用条数，选中后在右侧详情面板列出来源名与位置（`第 19–37 字`，有页码时一并给出），点一条在抽屉里看原文并把命中句标黄；原文不落库，跨会话只剩生成时记下的 `quote`。
 

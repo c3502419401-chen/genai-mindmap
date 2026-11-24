@@ -138,12 +138,12 @@ def test_recall_without_embedding_returns_nothing(monkeypatch):
     """向量服务不可用 → 空列表，不抛。记忆检索失败不该让一次生成变错。"""
     monkeypatch.delenv("MINDMAP_EMBEDDING_API_KEY", raising=False)
     put("标题去掉人名", BASE)
-    assert store.recall("标题") == []
+    assert store.recall("标题", owner="") == []
 
 
 def test_recall_on_empty_table_returns_nothing(monkeypatch):
     fake_embedding(monkeypatch, {"标题": BASE})
-    assert store.recall("标题") == []
+    assert store.recall("标题", owner="") == []
 
 
 def test_recall_skips_rows_under_the_cosine_floor(monkeypatch):
@@ -156,7 +156,7 @@ def test_recall_skips_rows_under_the_cosine_floor(monkeypatch):
     fake_embedding(monkeypatch, {"查询": BASE})
     put("刚写但不太相关", unit(store.MIN_COSINE - 0.05))
     put("刚写且相关", unit(0.9))
-    hits = store.recall("查询")
+    hits = store.recall("查询", owner="")
     assert [hit.text for hit in hits] == ["刚写且相关"]
 
 
@@ -164,8 +164,8 @@ def test_recall_respects_top_k(monkeypatch):
     fake_embedding(monkeypatch, {"查询": BASE})
     for index in range(10):
         put(f"条目 {index}", unit(0.9))
-    assert len(store.recall("查询", top_k=3)) == 3
-    assert len(store.recall("查询")) == min(store.TOP_K, 10)
+    assert len(store.recall("查询", top_k=3, owner="")) == 3
+    assert len(store.recall("查询", owner="")) == min(store.TOP_K, 10)
 
 
 def test_top_k_is_six():
@@ -183,7 +183,7 @@ def test_decay_only_reorders_and_never_drops(monkeypatch):
     """
     fake_embedding(monkeypatch, {"查询": BASE})
     put("很久以前就有的偏好", unit(0.8), created_days_ago=300)
-    hits = store.recall("查询")
+    hits = store.recall("查询", owner="")
     assert len(hits) == 1
     assert hits[0].text == "很久以前就有的偏好"
     assert hits[0].decay < 0.01
@@ -199,7 +199,7 @@ def test_old_but_more_relevant_can_still_outrank_new(monkeypatch):
     fake_embedding(monkeypatch, {"查询": BASE})
     put("很贴合的旧偏好", unit(0.95), created_days_ago=10)   # 0.95 × 0.784 ≈ 0.745
     put("不太相关的新偏好", unit(0.45), created_days_ago=0)  # 0.45 × 1.0   = 0.450
-    hits = store.recall("查询")
+    hits = store.recall("查询", owner="")
     assert [hit.text for hit in hits] == ["很贴合的旧偏好", "不太相关的新偏好"]
     assert hits[0].score > hits[1].score
 
@@ -218,7 +218,7 @@ def test_new_and_old_mix_into_one_score_table(monkeypatch):
     for index, age in enumerate(ages):
         put(f"旧的偏好 {index}", unit(0.70), created_days_ago=age)
 
-    hits = store.recall("机器学习 复习提纲", top_k=20)
+    hits = store.recall("机器学习 复习提纲", top_k=20, owner="")
     assert len(hits) == 20, "20 条全在候选里"
     scores = [hit.score for hit in hits]
     assert scores == sorted(scores, reverse=True), "score 必须单调不增"
@@ -246,7 +246,7 @@ def test_default_top_k_keeps_the_newer_ones(monkeypatch):
         put(f"新的 {index}", unit(0.84))
     for index, age in enumerate([7, 30, 90, 180, 350]):
         put(f"旧的 {index}", unit(0.70), created_days_ago=age)
-    hits = store.recall("查询")
+    hits = store.recall("查询", owner="")
     assert len(hits) == store.TOP_K
     # 5 条新的分数相同、写入时刻也相同，它们之间的先后是确定的但没有含义，
     # 所以按集合比。第 6 个名额给的是 7 天那条旧记忆（0.70 × 0.851 ≈ 0.596），
@@ -263,7 +263,7 @@ def test_recall_uses_formed_at_when_present(monkeypatch):
     """
     fake_embedding(monkeypatch, {"查询": BASE})
     put("今天刚总结出来的旧习惯", unit(0.8), created_days_ago=0, formed_at=stamp(365))
-    hit = store.recall("查询")[0]
+    hit = store.recall("查询", owner="")[0]
     assert hit.age_days == pytest.approx(365, abs=1.0)
     assert hit.decay < 0.001
 
@@ -273,7 +273,7 @@ def test_recall_stable_orders_ties_by_recency(monkeypatch):
     fake_embedding(monkeypatch, {"查询": BASE})
     put("先写的", unit(0.9), created_days_ago=1)
     put("后写的", unit(0.9), created_days_ago=0)
-    assert [hit.text for hit in store.recall("查询")] == ["后写的", "先写的"]
+    assert [hit.text for hit in store.recall("查询", owner="")] == ["后写的", "先写的"]
 
 
 def test_recall_skips_rows_from_another_embedding_model(monkeypatch):
@@ -285,20 +285,20 @@ def test_recall_skips_rows_from_another_embedding_model(monkeypatch):
     put("旧模型算的向量", BASE)
     with closing(repository.connect()) as conn, conn:
         conn.execute(f"UPDATE {store.ITEM_TABLE} SET model = 'text-embedding-v2'")
-    assert store.recall("查询") == []
+    assert store.recall("查询", owner="") == []
 
 
 def test_recall_skips_rows_without_a_vector(monkeypatch):
     fake_embedding(monkeypatch, {"查询": BASE})
     put("没有向量的那条", None)
-    assert store.recall("查询") == []
+    assert store.recall("查询", owner="") == []
 
 
 def test_recall_touch_marks_last_used(monkeypatch):
     """`touch=True` 刷 `last_used_at`；它不参与排序，只是观测值。"""
     fake_embedding(monkeypatch, {"查询": BASE})
     item_id = put("被检索到的", unit(0.9))
-    store.recall("查询", touch=True)
+    store.recall("查询", touch=True, owner="")
     with closing(repository.connect()) as conn:
         row = conn.execute(
             f"SELECT last_used_at FROM {store.ITEM_TABLE} WHERE id = ?", (item_id,)
@@ -310,7 +310,7 @@ def test_recall_does_not_touch_by_default(monkeypatch):
     """默认不写库：`recall` 在只读语境里（HTTP 的 `/search`）必须保持只读。"""
     fake_embedding(monkeypatch, {"查询": BASE})
     item_id = put("不该被标记", unit(0.9))
-    store.recall("查询")
+    store.recall("查询", owner="")
     with closing(repository.connect()) as conn:
         row = conn.execute(
             f"SELECT last_used_at FROM {store.ITEM_TABLE} WHERE id = ?", (item_id,)
@@ -371,13 +371,13 @@ def test_query_text_without_materials_falls_back_to_the_topic():
 def test_prompt_for_is_empty_without_hits(monkeypatch):
     """没有命中 → **空串**，调用方据此整段跳过（不注入"（暂无记忆）"）。"""
     fake_embedding(monkeypatch, {"纯主题": BASE})
-    assert store.prompt_for(_Request("纯主题")) == ""
+    assert store.prompt_for(_Request("纯主题"), owner="") == ""
 
 
 def test_prompt_for_renders_the_header_and_lines(monkeypatch):
     fake_embedding(monkeypatch, {"纯主题": BASE})
     put("标题倾向去掉人名", unit(0.9))
-    text = store.prompt_for(_Request("纯主题"))
+    text = store.prompt_for(_Request("纯主题"), owner="")
     assert text.startswith(store.MEMORY_HEADER)
     assert "- 标题倾向去掉人名" in text
 
@@ -386,7 +386,7 @@ def test_prompt_for_marks_the_hits_as_used(monkeypatch):
     """注入路径 `touch=True`：这条数据是"这套东西有没有被用上"的唯一凭据。"""
     fake_embedding(monkeypatch, {"纯主题": BASE})
     item_id = put("被注入的那条", unit(0.9))
-    store.prompt_for(_Request("纯主题"))
+    store.prompt_for(_Request("纯主题"), owner="")
     with closing(repository.connect()) as conn:
         row = conn.execute(
             f"SELECT last_used_at FROM {store.ITEM_TABLE} WHERE id = ?", (item_id,)

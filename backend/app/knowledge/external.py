@@ -361,10 +361,11 @@ BAIKE_WIKI_URL = "https://www.baike.com/wiki/"
 DEEPSEEK_DEFAULT_BASE = "https://api.deepseek.com/v1"
 DEEPSEEK_SEARCH_PATH = "/tools/search"
 DEEPSEEK_FETCH_PATH = "/tools/fetch"
-# 凭据：**先看专用的那个，再回落到 LLM 通道的 key**。理由很实际——本仓的
-# `MINDMAP_LLM_BASE_URL` / `MINDMAP_LLM_API_KEY` 通常就是指向 DeepSeek 的那一对，
-# 让用户把同一个 key 抄两遍只会多一处会过期的地方；而真的换供应商时（LLM 走别家、
-# tools 仍用 DeepSeek），专用变量是唯一的出口。
+# 凭据：**先看专用的那个，再回落到主模型那条路**。理由很实际——本仓的主模型
+# 端点/密钥（页面「模型设置」里保存的值，或没保存过时的 `MINDMAP_LLM_BASE_URL` /
+# `MINDMAP_LLM_API_KEY`）通常就是指向 DeepSeek 的那一对，让用户把同一个 key 抄两遍
+# 只会多一处会过期的地方；而真的换供应商时（LLM 走别家、tools 仍用 DeepSeek），
+# 专用变量是唯一的出口。回落顺序的唯一实现在 `_deepseek_config()`。
 DEEPSEEK_KEY_ENV = "MINDMAP_DEEPSEEK_TOOLS_API_KEY"
 DEEPSEEK_BASE_ENV = "MINDMAP_DEEPSEEK_TOOLS_BASE_URL"
 # 它自己的出口。缺省**直连**（`none`），理由见模块 docstring 的"代理"一节：经本机
@@ -1255,22 +1256,39 @@ DEEPSEEK_SOURCE = "deepseek"
 def _deepseek_config() -> tuple[str, str]:
     """`(base, key)`。base 去掉尾部斜杠；key 缺失时返回空串。
 
-    两级回落，顺序写死在这里（全仓只有这一处读这两个变量）：
+    三级回落，顺序写死在这里（全仓只有这一处读这两个变量）：
 
-      1. `MINDMAP_DEEPSEEK_TOOLS_BASE_URL` / `MINDMAP_DEEPSEEK_TOOLS_API_KEY`；
-      2. `MINDMAP_LLM_BASE_URL` / `MINDMAP_LLM_API_KEY`（本仓通常就指向 DeepSeek）；
+      1. `MINDMAP_DEEPSEEK_TOOLS_BASE_URL` / `MINDMAP_DEEPSEEK_TOOLS_API_KEY`
+         （这个源**专属**的变量，优先它）；
+      2. `app/settings/store.resolve()` 的生效值——页面「模型设置」里保存过的值，
+         没有才回落到 `MINDMAP_LLM_BASE_URL` / `MINDMAP_LLM_API_KEY`；
       3. base 再缺省成 `DEEPSEEK_DEFAULT_BASE`。
+
+    第 2 档走 `store.resolve()` 而不是自己 `os.getenv` 那两个名字，是与另外三处出口
+    （生成、agent 工具循环、视觉提取）保持同一套口径：用户在面板里换了 key，这条
+    外部检索的路也必须跟着换。只把前三条路改掉、留着这里读旧环境变量，就是
+    AGENTS.md 那条"改一个能力的入口，要检查所有会走到它的路径"警告的典型翻版——
+    面板显示"已保存"，生成走得通，而"贴个链接让模型读正文"这一步在旧 key 上 401。
+
+    专属变量排在最前是有意义的：它可以指向**另一家**服务（一个专门给 tools 用的
+    端点），面板管的是主模型那条路，两者不该互相覆盖。
 
     **key 没有缺省值**：没有 key 时这个源不该发请求，返回空串让调用方走"配置缺失"
     那条路——而不是拿一个空 Bearer 去换 401，那种日志看起来像"接口鉴权炸了"。
     """
+    # 函数内 import：本模块在 `app.knowledge` 里被较早导入，`settings.store` 顶层
+    # 虽然只依赖 `core.errors`，但把这条边留在函数里，等于保证"外部检索这个可选
+    # 源"不会参与应用启动时的导入顺序。与 `ingestion/vision_pdf._config()` 同一手法。
+    from app.settings import store as _settings_store
+
     base = os.getenv(DEEPSEEK_BASE_ENV, "").strip().rstrip("/")
-    if not base:
-        base = os.getenv("MINDMAP_LLM_BASE_URL", "").strip().rstrip("/")
+    key = os.getenv(DEEPSEEK_KEY_ENV, "").strip()
+    if not base or not key:
+        resolved = _settings_store.resolve()
+        base = base or resolved.base_url
+        key = key or resolved.api_key
     if not base:
         base = DEEPSEEK_DEFAULT_BASE
-    key = (os.getenv(DEEPSEEK_KEY_ENV, "").strip()
-           or os.getenv("MINDMAP_LLM_API_KEY", "").strip())
     return base, key
 
 
@@ -1577,8 +1595,8 @@ def _deepseek_search(
     if not key:
         budget.note_failure()
         logger.warning(
-            "外部检索：DeepSeek Search 开着但没有 key（%s 或 MINDMAP_LLM_API_KEY）",
-            DEEPSEEK_KEY_ENV)
+            "外部检索：DeepSeek Search 开着但没有 key（%s，或页面「模型设置」/"
+            "MINDMAP_LLM_API_KEY）", DEEPSEEK_KEY_ENV)
         return []
     timeout = budget.take(slot)
     if timeout is None:

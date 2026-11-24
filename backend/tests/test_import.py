@@ -26,14 +26,13 @@ import unittest
 import zipfile
 from io import BytesIO
 
-from fastapi.testclient import TestClient
+from conftest import guest_client
 
 from app.contracts.mindmap import FishboneContent, FlowContent, MindMapContent
 from app.export.service import to_json, to_markdown, to_opml, to_puml
 from app.importing.detect import detect_format
 from app.importing.errors import ParseFailure, UnsupportedFormat
 from app.importing.service import parse_import
-from app.main import app
 
 
 def build(**overrides) -> dict:
@@ -737,7 +736,7 @@ class InterfaceTest(unittest.TestCase):
         content = MindMapContent.model_validate(build(
             edges=[{"id": "e1", "source": "m1", "target": "t1", "label": "是"}]))
         payload = to_markdown(content).encode("utf-8")
-        with TestClient(app) as client:
+        with guest_client() as client:
             response = client.post(
                 "/api/mindmaps/import",
                 files={"file": ("规划.md", payload, "text/markdown")})
@@ -752,7 +751,7 @@ class InterfaceTest(unittest.TestCase):
         body = build()
         body["root"]["source_refs"] = [{"source_id": "x", "quote": "y"}]
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
-        with TestClient(app) as client:
+        with guest_client() as client:
             response = client.post(
                 "/api/mindmaps/import",
                 files={"file": ("r.json", payload, "application/json")})
@@ -762,7 +761,7 @@ class InterfaceTest(unittest.TestCase):
         self.assertEqual(set(warnings[0]), {"code", "message"})
 
     def test_unknown_format_returns_400_unsupported(self):
-        with TestClient(app) as client:
+        with guest_client() as client:
             response = client.post(
                 "/api/mindmaps/import",
                 files={"file": ("a.csv", b"a,b\n1,2\n", "text/csv")})
@@ -770,7 +769,7 @@ class InterfaceTest(unittest.TestCase):
         self.assertEqual(response.json()["code"], "unsupported_format")
 
     def test_broken_file_returns_400_parse_failed(self):
-        with TestClient(app) as client:
+        with guest_client() as client:
             response = client.post(
                 "/api/mindmaps/import",
                 files={"file": ("a.json", b'{"root": {', "application/json")})
@@ -780,7 +779,7 @@ class InterfaceTest(unittest.TestCase):
     def test_import_does_not_touch_the_database(self):
         """只解析不落库：导入一次之后列表里不该多出记录。"""
         content = MindMapContent.model_validate(build())
-        with TestClient(app) as client:
+        with guest_client() as client:
             before = client.get("/api/mindmaps").json()
             response = client.post(
                 "/api/mindmaps/import",

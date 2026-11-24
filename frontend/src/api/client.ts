@@ -1,8 +1,11 @@
 import type {
   AgentEvent,
   AgentRunRequest,
+  AuthUser,
+  ChangePasswordRequest,
   CheckResponse,
   CreateTextSourceResponse,
+  Credentials,
   EditEventPayload,
   EditEventRow,
   EditHealth,
@@ -12,13 +15,19 @@ import type {
   LibrarySource,
   MapRecord,
   DiagramContent,
+  ModelSettings,
   Pref,
   PrefSuggestion,
   RunDetail,
   RunSummary,
+  SaveModelSettingsRequest,
+  SaveModelSettingsResponse,
   SavedPref,
   Source,
   SuggestResponse,
+  TestModelSettingsRequest,
+  TestModelSettingsResponse,
+  WhoAmI,
 } from './types';
 import type { EditEvent } from '../mindmap/edit-log';
 
@@ -69,6 +78,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   try {
     response = await fetch(`${BASE}${path}`, {
       ...init,
+      // 会话是 HttpOnly cookie，必须让浏览器带上它。`same-origin` 是缺省值，够用
+      // 于"前端与后端同一个源"（生产就这样，开发时 Vite 代理 `/api` 也是）；但
+      // `VITE_API_BASE` 指向另一个端口时它就不带了——而那个场景下同源策略放行的
+      // 正是我们自己（见 `app/main.py` 的 CORS `allow_credentials=True`）。
+      // 写 `include` 两个场景都对，且它让"这个请求要凭证"这件事在代码里可见。
+      credentials: 'include',
       headers: { 'Content-Type': 'application/json', ...init?.headers },
     });
   } catch {
@@ -238,6 +253,8 @@ async function postSse<T>(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
       signal,
+      // 与 `request()` 同一个理由：会话 cookie 不带上，生成请求就是"未登录"的。
+      credentials: 'include',
     });
   } catch (error) {
     if ((error as Error).name === 'AbortError') return;
@@ -404,7 +421,9 @@ export async function uploadDocument(file: File, signal?: AbortSignal): Promise<
 
   let response: Response;
   try {
-    response = await fetch(`${BASE}/ingestion/files`, { method: 'POST', body: form, signal });
+    response = await fetch(`${BASE}/ingestion/files`, {
+      method: 'POST', body: form, signal, credentials: 'include',
+    });
   } catch {
     throw new ApiError(0, 'network_error', '无法连接后端，请确认服务已启动。');
   }
@@ -483,6 +502,97 @@ export function listPrefSuggestions(): Promise<PrefSuggestion[]> {
   return request<PrefSuggestion[]>('/prefs/suggestions');
 }
 
+// ---- 模型设置 ----
+
+/**
+ * 当前生效的模型配置与每一项的来源。
+ *
+ * **响应里没有明文密钥**，只有 `api_key_masked`（`…abcd`）。面板打开时调一次，
+ * 之后每次保存都拿响应就地更新，不重拉——重拉会多一次"刚存的值还没刷新到界面"
+ * 的窗口。
+ */
+export function getModelSettings(): Promise<ModelSettings> {
+  return request<ModelSettings>('/settings/model');
+}
+
+/**
+ * 保存。**改完立即生效，不用重启后端**：所有模型出口每次调用都重新解析配置。
+ *
+ * 空串的语义按字段不同（见 `SaveModelSettingsRequest`）：`api_key` 空串 = 不改，
+ * `base_url` / `model` 空串 = 回落环境变量。
+ */
+export function saveModelSettings(
+  body: SaveModelSettingsRequest,
+): Promise<SaveModelSettingsResponse> {
+  return request<SaveModelSettingsResponse>('/settings/model', {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  });
+}
+
+/**
+ * 发一次最小 chat 请求（`max_tokens=1`）验证地址 / 密钥 / 模型名。
+ *
+ * `ok=false` 时**不是异常**：它是"这次连不上"的结论，HTTP 状态仍是 200，调用方
+ * 把 `message` 直接显示在面板里。只有三项都没配才会抛 `ApiError`（400）。
+ */
+export function testModelSettings(
+  body: TestModelSettingsRequest = {},
+): Promise<TestModelSettingsResponse> {
+  return request<TestModelSettingsResponse>('/settings/model/test', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+// ---- 账号与会话 ----
+//
+// 这一组**没有 token 参数，也没有 token 返回值**：会话是 HttpOnly cookie，浏览器
+// 自己带、自己存。代价是每个请求都得带凭证（`request()` 里已经 `credentials:
+// 'same-origin'`），收益是 XSS 偷不到它——JS 连读都读不到。
+//
+// 这一批只把调用面搭起来，界面还没有登录入口（见 `app/auth/__init__.py`：门禁按
+// 接口逐个打开，先有身份层再上门）。
+
+/**
+ * 当前是谁。**永远 200**，未登录时 `kind` 是 `'guest'` 或 `'anonymous'`。
+ *
+ * 它会顺手发游客 cookie（全站唯一发它的地方），所以**界面启动时该调一次**——
+ * 不调的话这台浏览器就没有编号，免费额度那一批会把它当成"没来过"。
+ */
+export function whoAmI(): Promise<WhoAmI> {
+  return request<WhoAmI>('/auth/me');
+}
+
+/** 注册。成功即登录（201 + 会话 cookie），不需要再走一次登录。 */
+export function register(body: Credentials): Promise<AuthUser> {
+  return request<AuthUser>('/auth/register', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+/** 登录。账号或密码不对统一 401 `auth_bad_credentials`（不区分是哪一项错）。 */
+export function login(body: Credentials): Promise<AuthUser> {
+  return request<AuthUser>('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+/** 登出。幂等：本来就没登录也是 204。 */
+export function logout(): Promise<void> {
+  return request<void>('/auth/logout', { method: 'POST' });
+}
+
+/** 改密码。需要已登录 + 旧密码；改完**所有设备都要重新登录**（会话全撤销）。 */
+export function changePassword(body: ChangePasswordRequest): Promise<void> {
+  return request<void>('/auth/password', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
 // ---- 知识库 ----
 
 /**
@@ -538,6 +648,7 @@ export async function exportMindMap(
       // 后端四种导出统一取 `note or label`（JSON 除外，它全字段照抄），这里直接发
       // 原样内容：前端不再自己做"把正文折进标题"的拼接，避免同一份内容两端拼出两种结果。
       body: JSON.stringify({ content }),
+      credentials: 'include',
     });
   } catch {
     throw new ApiError(0, 'network_error', '无法连接后端，请确认服务已启动。');
@@ -568,7 +679,9 @@ export async function importMindMap(
 
   let response: Response;
   try {
-    response = await fetch(`${BASE}/mindmaps/import`, { method: 'POST', body: form, signal });
+    response = await fetch(`${BASE}/mindmaps/import`, {
+      method: 'POST', body: form, signal, credentials: 'include',
+    });
   } catch {
     throw new ApiError(0, 'network_error', '无法连接后端，请确认服务已启动。');
   }

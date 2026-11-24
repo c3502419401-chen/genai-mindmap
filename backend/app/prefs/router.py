@@ -62,6 +62,25 @@ def list_prefs() -> list[service.Pref]:
     return service.list_all()
 
 
+@router.get("/{pref_key}", response_model=service.Pref)
+def get_pref(pref_key: str) -> service.Pref:
+    """读一条。不存在 404，不是 200 + null。
+
+    **为什么要这个端点**：`/api/prefs/{pref_key}` 之前只挂了 `PUT` / `DELETE`，于是
+    `GET /api/prefs/style` 这类请求会命中这条路径却被判成"方法不允许"（405）。405
+    的字面意思是"这个资源存在，但这个方法不行"，而实际含义是"根本没有这个偏好"——
+    同一件事两种错法，排查时会往错误的方向翻代码。现在未知键是 404，与 `DELETE`
+    的口径一致。
+    """
+    pref = service.get(pref_key)
+    if pref is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "pref_not_found", "message": f"没有这条偏好：{pref_key}"},
+        )
+    return pref
+
+
 @router.put("/{pref_key}", response_model=service.Saved)
 def set_pref(pref_key: str, body: SetPrefRequest) -> service.Saved:
     """写一条。同值重复提交返回 `changed=false`，且不刷新 `updated_at`。

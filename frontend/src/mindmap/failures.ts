@@ -59,7 +59,7 @@ export const CONNECTION_LOST = 'connection_lost';
  *
  * 它与 `CONNECTION_LOST` 是同一种处境："流还在、字不来了"。分两个名字只因为一个
  * 是 store 合成的（EOF 没等到终态帧），一个是客户端抛的（`reader.read()` 失败）。
- * 不给它一条映射的话，这类失败会落到兜底的"这次运行没有成功"——把一句确定的
+ * 不给它一条映射的话，这类失败会落到兜底的"这次生成没有成功"——把一句确定的
  * "连接断了、重试有意义"说成含糊的通用失败。
  */
 export const STREAM_INTERRUPTED = 'stream_interrupted';
@@ -88,7 +88,7 @@ function retryBlocker(input: FailureInput, pointless?: string): string | undefin
   // 「正在跑」排在「没发出过请求」前面：这两个条件同时成立时（上一轮的失败卡片
   // 还没被新一轮清掉），用户最需要知道的是"再等一下"，而不是"这一轮什么都没发"。
   if (input.running) return '正在跑，等这一轮结束。';
-  if (!input.canRetry) return '这一轮还没真正发出请求，没有可以重复的东西；改好上面的输入再点生成。';
+  if (!input.canRetry) return '这一轮还没真正发出请求；改好上面的输入再点生成。';
   return undefined;
 }
 
@@ -107,64 +107,95 @@ function explain(input: FailureInput): FailureGuide {
   switch (input.code) {
     case 'model_not_configured':
       // 唯一一个"重试一百次也是同一个结果"的失败，所以它是唯一一个把重试按死的。
+      //
+      // 指引必须**先指面板**：这个功能本身就是为了"不用登服务器改环境变量再重启"。
+      // 只说环境变量会把有面板入口的用户指去找运维，而他要找的那个开关就在页面上。
       return {
         title: '模型还没配置好',
         next:
-          '这不是网络或额度问题：后端没有可用的模型配置。让部署的人把 MINDMAP_LLM_BASE_URL、'
-          + 'MINDMAP_LLM_API_KEY、MINDMAP_LLM_MODEL 填进服务端环境变量并重启，再回来重试。',
+          '不是网络或额度问题。打开页面右上角的「模型设置」，填好地址、密钥和模型名，'
+          + '保存后直接重试，不用重启。没有那个入口说明这个部署没开面板，'
+          + '让部署的人配 MINDMAP_LLM_BASE_URL / MINDMAP_LLM_API_KEY / MINDMAP_LLM_MODEL。',
         actions: [retryAction(retryBlocker(input, '配置没改之前，重试还是同一个结果。')), COPY_ACTION],
+        retryable: false,
+      };
+    case 'free_quota_exhausted':
+      // 第二个"重试一百次也是同一个结果"的失败，而且它比 `model_not_configured`
+      // 更容易被当成网络问题：错误发生在一个正常工作的服务上，只是今天这一格用完了。
+      //
+      // 指引必须给出**两条都能立刻走的路**，而不是只说"等明天"：填自己的密钥是
+      // 当场就能解决的动作，而且正好把这个用户从"蹭公共额度"变成"花自己的钱"，
+      // 那对他和对部署方都更好。顺序上先说"明天会自己恢复"，因为那是零成本的那条。
+      return {
+        title: '今天的免费次数用完了',
+        next:
+          '免费额度每天零点恢复，明天再来就行。想现在继续，'
+          + '打开页面右上角的「模型设置」填自己的密钥——填了就不再受这个限制。',
+        actions: [
+          retryAction(
+            retryBlocker(input, '免费额度今天已经用完了，重试不会多出次数。'),
+          ),
+          COPY_ACTION,
+        ],
+        retryable: false,
+      };
+    case 'auth_required':
+      // 门禁回的 401。它只会在一种情况下出现：页面里的游客/会话 cookie 没了——
+      // 换了浏览器、清了 Cookie、会话过期（30 天），或者后端换了库。这不是"你操作
+      // 错了"，所以指引必须**先给动作**（刷新一下就会拿到新身份），再说额度那句，
+      // 否则用户会以为是自己刚才哪个按钮点坏了。
+      return {
+        title: '这一页的身份过期了',
+        next:
+          '刷新一下页面就好：刷新时会自动分配一个游客身份（每天有 3 次免费生成），'
+          + '想长期保存自己的图就注册一个账号。已经画在画布上的内容刷新后会丢，'
+          + '先点「保存」——不过保存同样需要身份，所以这里只能重来。',
+        actions: [retryAction(retryBlocker(input, '刷新页面才能拿到新身份，重试还是会被拦。')), COPY_ACTION],
         retryable: false,
       };
     case 'budget_exhausted':
       return explainBudget(input);
     case 'too_many_failures':
       return {
-        title: '连续失败太多次，先停下了',
+        title: '连续出错太多次，先停下了',
         next:
-          '这一轮里有工具反复失败（同一件事试了太多次）。先看一眼材料是不是都解析好了，'
-          + '再把目标说小一点；已经长出来的那部分如果没有落到画布，先重试一次。',
+          '同一个步骤反复失败。先看一眼材料是不是都解析好了，再把目标说小一点重试。',
         actions: [retryAction(retryBlocker(input)), COPY_ACTION],
         retryable: true,
       };
     case 'unexpected_finish':
       return {
-        title: '模型的回复没有正常收尾',
+        title: '回复被截断了',
         next:
-          '模型这次是被长度上限或内容过滤截断的，不是网络断了。把目标说得具体一点再跑，'
-          + '通常就好了；如果反复出现，把下面的原话发给维护的人。',
+          '不是网络断了，是长度上限或内容过滤。把目标说得更具体再试；老是出现就把下面的原话发给维护的人。',
         actions: [retryAction(retryBlocker(input)), COPY_ACTION],
         retryable: true,
       };
     case 'generation_failed':
       return {
         title: '模型这一轮出错了',
-        next:
-          '上游模型服务返回了错误或超时。这类失败**重试有意义**——多半是限流或临时故障；'
-          + '连着两次都这样就隔一会儿再试。',
+        next: '多半是限流或临时故障，重试有意义；连着两次都这样，隔一会儿再试。',
         actions: [retryAction(retryBlocker(input)), COPY_ACTION],
         retryable: true,
       };
     case 'agent_failed':
       return {
-        title: '生成过程中出错了',
-        next:
-          '这是服务端的内部错误，不是你的操作问题。重试一次通常能过；'
-          + '反复出现的话把下面的原话发给维护的人，那是排障唯一的线索。',
+        title: '服务端出错了',
+        next: '不是你的操作问题。重试一次通常能过；反复出现就把下面的原话发给维护的人。',
         actions: [retryAction(retryBlocker(input)), COPY_ACTION],
         retryable: true,
       };
     case 'no_progress':
       return {
-        title: '模型一直在原地打转',
-        next:
-          '它连着很多步没有产出任何新内容。把目标拆成几件小事分别跑，比一次说一大段更容易成功。',
+        title: '模型卡住了',
+        next: '它连着很多步没有产出新内容。把目标拆成几件小事分别试，比一次说一大段更容易成功。',
         actions: [retryAction(retryBlocker(input)), COPY_ACTION],
         retryable: true,
       };
     case 'run_in_progress':
       return {
-        title: '这一次已经有人在跑了',
-        next: '同一个运行编号正在被处理，重复提交不会再开第二次。等它结束，或者到页面右侧读它的结果。',
+        title: '这一轮已经在跑了',
+        next: '重复提交不会再开第二次。等它结束，或者到页面右侧读它的结果。',
         actions: [retryAction(retryBlocker(input, '等服务端那一轮结束再试。')), COPY_ACTION],
         retryable: false,
       };
@@ -178,9 +209,7 @@ function explain(input: FailureInput): FailureGuide {
     case NO_CONTENT:
       return {
         title: '模型这次没有产出导图',
-        next:
-          '它回了一段话却没有调用生成工具。把主题写得更像"要一张什么结构的图"，'
-          + '或者直接重试一次——这是最容易复现也最容易过去的一种。',
+        next: '它回了一段话却没生成图。把主题写得更像"要一张什么结构的图"，或者直接重试一次。',
         actions: [retryAction(retryBlocker(input)), COPY_ACTION],
         retryable: true,
       };
@@ -189,16 +218,16 @@ function explain(input: FailureInput): FailureGuide {
       return {
         title: '连接中断了',
         next:
-          '结果可能不完整。已经长出来的部分如果没有落到画布，重试一次；'
-          + '注意重新生成会花掉同样多的模型额度。',
+          '结果可能不完整。已经长出来的部分如果没落到画布，重试一次；'
+          + '重新生成会再花掉同样多的模型额度。',
         actions: [retryAction(retryBlocker(input)), COPY_ACTION],
         retryable: true,
       };
     default:
       return {
-        title: '这次运行没有成功',
+        title: '这次生成没有成功',
         next: message
-          ? '可以先重试一次；如果一直这样，把下面的原话发给维护的人。'
+          ? '可以先重试一次；一直这样就把下面的原话发给维护的人。'
           : '可以先重试一次。',
         actions: [retryAction(retryBlocker(input)), COPY_ACTION],
         retryable: true,
@@ -219,9 +248,7 @@ function explainBudget(input: FailureInput): FailureGuide {
   if (limit === 'max_repairs') {
     return {
       title: '这一轮修不好，先停下了',
-      next:
-        '模型交出来的内容反复过不了校验（层级、字段、引用那一类）。把目标说得更具体，'
-        + '或者换一份更短的材料再跑。',
+      next: '模型交出来的内容反复过不了校验。把目标说得更具体，或者换一份更短的材料。',
       actions,
       retryable: true,
     };
@@ -230,10 +257,8 @@ function explainBudget(input: FailureInput): FailureGuide {
     ? '工具调用次数'
     : limit === 'max_model_calls' ? '模型调用次数' : '时间';
   return {
-    title: `${what}用完了`,
-    next:
-      `模型在${what}上限之内没能把这张图长完。把目标写小一点（一次只做一两个分支，`
-      + '或者先出一张骨架再让它逐块补）重试，通常就能跑完。',
+    title: `${what}不够用`,
+    next: `这一次的${what}上限之内没能把图长完。把目标写小一点（比如一次只做一两个分支）再重试。`,
     actions,
     retryable: true,
   };

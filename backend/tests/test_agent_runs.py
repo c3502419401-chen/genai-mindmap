@@ -13,12 +13,12 @@ import asyncio
 import json
 import sqlite3
 import threading
-import pytest
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from unittest.mock import patch
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, Field

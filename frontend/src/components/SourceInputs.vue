@@ -75,7 +75,7 @@ async function onPickFiles(event: Event) {
       rows="3"
       :disabled="generating"
       class="resize-y rounded-md border border-slate-300 p-2 text-sm outline-none focus:border-slate-500 disabled:opacity-50"
-      placeholder="把要整理成导图的文字贴在这里，它会作为一份「材料」参与生成"
+      placeholder="把要整理的文字贴在这里，它会作为一份材料参与生成"
     />
     <button
       type="button"
@@ -84,7 +84,7 @@ async function onPickFiles(event: Event) {
       @click="sources.addDraft()"
     >添加文本到来源</button>
     <p class="text-xs leading-relaxed text-slate-400">
-      这里加的东西都算材料；写主题、说「怎么改」在画布底部那个对话框里。
+      这里加的都算材料；写主题、说「怎么改」在画布底部那个对话框里。
     </p>
 
     <label
@@ -121,7 +121,7 @@ async function onPickFiles(event: Event) {
       >清空来源</button>
     </div>
     <p v-if="!sources.items.length" class="text-xs leading-relaxed text-slate-400">
-      添加多个来源后一起生成；不加材料也行，直接在画布底部的对话框里写一个主题。
+      多个来源会一起生成；不加材料也行。
     </p>
     <ul v-else aria-label="待生成来源" class="flex flex-col gap-2">
       <li v-for="item in sources.items" :key="item.key" class="rounded-md border border-slate-200 p-2">

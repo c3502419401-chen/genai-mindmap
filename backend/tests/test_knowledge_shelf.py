@@ -27,12 +27,11 @@ import json
 import sqlite3
 
 import pytest
-from fastapi.testclient import TestClient
+from conftest import guest_client
 
 from app.contracts.mindmap import MindMapContent
 from app.contracts.source import Source, SourceKind
 from app.knowledge import library, shelf
-from app.main import app
 from app.mindmaps import repository
 
 
@@ -80,17 +79,24 @@ def _save_map(*, usage: list[str], refs: list[str] = (), title: str = "用到了
 
 
 def _insert_raw_map(map_id: str, content: str) -> None:
-    """绕过契约直接往导图表塞一行原始 `content`：模拟坏 JSON / 旧版本残留。"""
+    """绕过契约直接往导图表塞一行原始 `content`：模拟坏 JSON / 旧版本残留。
+
+    **显式列出列名**而不是 `INSERT ... VALUES (?, 1, ?, ...)`：`mindmaps` 后来加了
+    `owner` 列（最小数据隔离），按位置写的 INSERT 会在加列当天静默错位——把时间戳写进
+    第 4 列、`owner` 拿不到值，而报错是"NOT NULL constraint failed"，看起来与
+    "这行数据坏了"完全无关。
+    """
     with repository.connect() as conn:
         conn.execute(
-            "INSERT INTO mindmaps VALUES (?, 1, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            "INSERT INTO mindmaps (id, version, content, updated_at) "
+            "VALUES (?, 1, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
             (map_id, content),
         )
 
 
 @pytest.fixture
 def client():
-    with TestClient(app) as api:
+    with guest_client() as api:
         yield api
 
 

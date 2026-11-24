@@ -174,13 +174,19 @@ describe('按 code 通用渲染：后端加码时前端不用改', () => {
     const panel = wrapper.get('[data-test="structure-check"]');
     expect(panel.text()).toContain('NEAR_DUPLICATE_BRANCH');
     expect(panel.text()).toContain('语义近乎重复');
+    // 未知码的标题就是码本身（`diagnosticLabel` 的 `?? code`），所以它藏不掉；
+    // 但它同样能展开出原码那一行，跟已知码走同一条路。
+    const toggle = panel.get('[data-test="diagnostic-code-toggle"]');
+    expect(panel.find('[data-test="diagnostic-code"]').exists()).toBe(false);
+    await toggle.trigger('click');
+    expect(panel.get('[data-test="diagnostic-code"]').text()).toBe('NEAR_DUPLICATE_BRANCH');
     // 未知 kind 也照原样显示，并且**没有**「应用」按钮
     expect(panel.text()).toContain('near-dedupe');
     expect(panel.findAll('[data-test="suggestion-apply"]')).toHaveLength(0);
     expect(panel.text()).toContain('这类建议还没有对应的应用动作');
   });
 
-  it('已知 code 给人话，但原码同时留在界面上', async () => {
+  it('已知 code 给人话，原码默认收起、点开才露出来', async () => {
     stubFetch({ check: [DUPLICATE] });
     const wrapper = mountApp();
     const structure = useStructureStore();
@@ -191,7 +197,52 @@ describe('按 code 通用渲染：后端加码时前端不用改', () => {
 
     const panel = wrapper.get('[data-test="structure-check"]');
     expect(panel.text()).toContain('同级重名');
+    // 默认收起：卡片正文里没有 `DUPLICATE_LABEL`，只有一个能点开的入口
+    expect(panel.find('[data-test="diagnostic-code"]').exists()).toBe(false);
+    expect(panel.text()).not.toContain('DUPLICATE_LABEL');
+    const toggle = panel.get('[data-test="diagnostic-code-toggle"]');
+    expect(toggle.attributes('title')).toContain('DUPLICATE_LABEL');
+
+    // 点开之后原码准确到位（不是只给个空壳）
+    await toggle.trigger('click');
     expect(panel.get('[data-test="diagnostic-code"]').text()).toBe('DUPLICATE_LABEL');
+    // 还能再点回去——收与放两种状态都钉住
+    await panel.get('[data-test="diagnostic-code-toggle"]').trigger('click');
+    expect(panel.find('[data-test="diagnostic-code"]').exists()).toBe(false);
+  });
+
+  it('面板底部的「显示原码」一次展开全部诊断，排障不用逐条点', async () => {
+    stubFetch({
+      check: [
+        DUPLICATE,
+        { level: 'warn', code: 'DEPTH_LIMIT', node_id: 'n4', message: '这一支太深了' },
+        { level: 'info', code: 'SINGLE_CHILD', node_id: 'n1', message: '节点「监督学习」只有一个子节点' },
+      ],
+    });
+    const wrapper = mountApp();
+    const structure = useStructureStore();
+    useMindMapStore().preview(structuredClone(TREE), 'right');
+    await structure.run();
+    await flushPromises();
+
+    const panel = wrapper.get('[data-test="structure-check"]');
+    expect(panel.findAll('[data-test="diagnostic-code"]')).toHaveLength(0);
+    const all = panel.get('[data-test="diagnostic-code-all"]');
+    expect(all.text()).toBe('显示原码');
+
+    await all.trigger('click');
+    // 两条 warn 的原码一次全露；info 折在「提示」里，展开后也一起露
+    expect(panel.findAll('[data-test="diagnostic-code"]').map(item => item.text()))
+      .toEqual(['DUPLICATE_LABEL', 'DEPTH_LIMIT']);
+    // 总开关开着时单条的「查看/收起」不出现，收起归总开关管
+    expect(panel.find('[data-test="diagnostic-code-toggle"]').exists()).toBe(false);
+    await panel.get('[data-test="diagnostic-hints-toggle"]').trigger('click');
+    expect(panel.get('[data-test="diagnostic-hint-code"]').text()).toBe('SINGLE_CHILD');
+    expect(panel.get('[data-test="diagnostic-code-all"]').text()).toBe('隐藏原码');
+    // 关掉之后全部收回去，包括展开过的那条提示
+    await panel.get('[data-test="diagnostic-code-all"]').trigger('click');
+    expect(panel.findAll('[data-test="diagnostic-code"]')).toHaveLength(0);
+    expect(panel.find('[data-test="diagnostic-hint-code"]').exists()).toBe(false);
   });
 
   it('有动作入口但在别处的 kind：说清怎么去做，而不是"暂不支持"', () => {

@@ -944,6 +944,170 @@ export interface PrefSuggestion {
   message: string;
 }
 
+// ---- 模型设置（`/api/settings/model`）----
+//
+// 镜像 `backend/app/settings/router.py`。这一组类型里没有**一个**明文字段——
+// 密钥只有 `api_key_masked`（`…abcd`）。这不是风格问题：`GET` 的响应会出现在
+// devtools 的 Network 面板里，也会被用户截图发到群里。
+
+/**
+ * 当前生效的模型配置（镜像后端 `ModelSettings`）。
+ *
+ * `*_source` 是 `saved` / `env` / `unset` 三个值之一，界面据此标注每一项
+ * 「面板里设的」「来自环境变量」。**不返回明文密钥**是这张契约的硬约束。
+ */
+export interface ModelSettings {
+  /** OpenAI 兼容端点，已去掉末尾斜杠（否则拼出来是 `//chat/completions`）。 */
+  base_url: string;
+  base_url_source: string;
+  /** 打码后的密钥：`…abcd`（只露末 4 位）；没配时是空串。**永远不是明文**。 */
+  api_key_masked: string;
+  api_key_source: string;
+  /** 有没有密钥。界面用它决定"清除密钥"按钮可不可点。 */
+  api_key_set: boolean;
+  model: string;
+  model_source: string;
+  /** 显式配的「深度思考」模型名；空串 = 没配，走 `_model_for` 的启发式。 */
+  deep_model: string;
+  deep_model_source: string;
+  /** 勾了深度思考时**实际会发出去**的名字（可能来自启发式，如 `deepseek-reasoner`）。 */
+  deep_model_effective: string;
+  /** `MINDMAP_LLM_MODE` 的原值。`demo` 表示"配好了也不会调模型"，**只读**。 */
+  llm_mode: string;
+  /** 地址 / 密钥 / 模型名三项齐了没有。判据与后端 `_config()` 一致。 */
+  configured: boolean;
+  /**
+   * 当前这个人能不能改**全站共享**的那份配置（`scope: "instance"`）。
+   *
+   * 真值只属于部署方——这台机器上第一个注册的账号。界面上"本站共享配置"那一块
+   * 据此决定显不显示：藏起来不是为了保密，是因为给所有人显示一个点了就 403 的
+   * 表单项，比看不见更糟。
+   */
+  can_edit_instance: boolean;
+  /**
+   * 全站共享那一行（`owner = ''`）的**原始内容**。只有部署方拿得到，别人是 `null`。
+   *
+   * 与上面那几个字段的区别：那些是"我这次生成会用哪份配置"（会一路回落到环境
+   * 变量），这里是"共享那一行存了什么"。部署方把它清空之后，`base_url` 会回落成
+   * 环境变量里的值，而 `instance.base_url` 如实变成空串。
+   */
+  instance: InstanceSettings | null;
+  /** 库里那一行最后保存的时刻；没保存过是 `null`。 */
+  updated_at?: string | null;
+}
+
+/**
+ * 全站共享那一行（`owner = ''`）的样子。只有部署方能看到。
+ *
+ * 游客、以及还没填自己密钥的账号，生成时用的就是这一份——所以面板有必要让部署方
+ * 看到它现在配的是什么，否则"游客说用不了"时无从对照。
+ */
+export interface InstanceSettings {
+  base_url: string;
+  /** 打码后的密钥：`…abcd`；没配时是空串。**永远不是明文**。 */
+  api_key_masked: string;
+  api_key_set: boolean;
+  model: string;
+  deep_model: string;
+  /** 三项齐了没有。不齐时借它兜底的人依旧没有可用配置。 */
+  configured: boolean;
+  updated_at?: string | null;
+}
+
+/** `PUT /settings/model` 的请求体。**每个字段的"空"含义不同**。 */
+export interface SaveModelSettingsRequest {
+  /** 省略 = 不改；空串 = 清掉覆盖、回落环境变量。 */
+  base_url?: string | null;
+  /**
+   * 省略或**空串** = 不改。界面上那个框显示打码值，用户不动它时提交的就是空串。
+   * 要清空必须 `clear_api_key: true`——把空串当"清空"，等于每次改模型名就抹一次密钥。
+   */
+  api_key?: string | null;
+  /** 省略 = 不改；空串 = 清掉覆盖、回落环境变量。 */
+  model?: string | null;
+  deep_model?: string | null;
+  /** 显式清除已保存的密钥。与同时提交 `api_key` 冲突（400 `settings_clear_conflict`）。 */
+  clear_api_key: boolean;
+  /**
+   * 写到哪一行：`user`（缺省）= 你自己那行；`instance` = 全站共享那行。
+   *
+   * `instance` 只有部署方可以，别人 403 `settings_forbidden`——权限判定在后端，
+   * 这里只是把两个作用域区分开。缺省值刻意是 `user`：老客户端（与不传这个字段的
+   * 调用）行为与改造前一致。
+   */
+  scope?: 'user' | 'instance';
+}
+
+/** `PUT` 的响应：写入后的生效配置 + 这次有没有真的改变（同值重复保存是 `false`）。 */
+export interface SaveModelSettingsResponse extends ModelSettings {
+  changed: boolean;
+  /**
+   * 需要提醒用户的一句话，通常是"地址改了，之前那次连接成功的结论不再成立"。
+   *
+   * 空值 = 没什么要说的。**只提醒不阻止**：合法用法里有"先填地址、等供应商开白名单"，
+   * 强制当场测通会把这条路堵死。
+   */
+  notice?: string | null;
+}
+
+/** `POST /settings/model/test` 的请求体：可选的临时覆盖，空字段 = 用当前生效值。 */
+export interface TestModelSettingsRequest {
+  base_url?: string | null;
+  api_key?: string | null;
+  model?: string | null;
+}
+
+/**
+ * 一次测试连接的结论。`ok=false` 也是 **200**——它是结论，不是 HTTP 失败。
+ *
+ * 真正的业务错误（三项都没配）才走 400：那时连测都没法测。
+ */
+export interface TestModelSettingsResponse {
+  ok: boolean;
+  /** 可直接显示的一句中文，例如「密钥被拒绝（401）」或「连接正常（320 毫秒）」。 */
+  message: string;
+  /** 这次真正拿去测的模型名。 */
+  model: string;
+  /** 对端 HTTP 状态码；超时/连不上时是 `null`。 */
+  status?: number | null;
+  latency_ms: number;
+}
+
+// ---- 账号与会话（`/api/auth/*`）----
+//
+// 会话本身是 **HttpOnly cookie**，所以这里的类型里没有 token 字段——浏览器替我们
+// 保管，JS 拿不到（那正是它防 XSS 的方式）。前端只需要知道"现在是谁"。
+//
+// `kind` 由后端算而不是前端拼：`user ? 'user' : guest_id ? 'guest' : 'anonymous'`
+// 三个分支写在界面里，迟早会在某处漏掉一个，而漏掉的表现是"游客被当成已登录"。
+
+/** 对外的账号形状。**不含任何口令相关字段**。 */
+export interface AuthUser {
+  id: string;
+  username: string;
+  created_at: string;
+}
+
+/** `GET /api/auth/me` 的响应：当前是谁。未登录时 `user` 为 `null`，**永远是 200**。 */
+export interface WhoAmI {
+  user?: AuthUser | null;
+  /** 这台浏览器的游客编号。已登录时可能为 `null`（登录请求不一定带游客 cookie）。 */
+  guest_id?: string | null;
+  kind: 'user' | 'guest' | 'anonymous';
+}
+
+/** 注册与登录共用的请求体。 */
+export interface Credentials {
+  username: string;
+  password: string;
+}
+
+/** 改密码：需要旧密码，并且需要已经登录。 */
+export interface ChangePasswordRequest {
+  current_password: string;
+  new_password: string;
+}
+
 // ---- 编辑日志（统计"用户最常改什么"）----
 //
 // 这几个类型是**日志载荷**，不是导图契约：它们的形状由 `POST/PUT /mindmaps` 的

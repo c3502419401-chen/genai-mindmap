@@ -111,12 +111,31 @@ MAX_RUNS = 400
 _NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
 
 _CREATE = f"""CREATE TABLE IF NOT EXISTS {STYLE_TABLE} (
+    owner      TEXT NOT NULL DEFAULT '',
+    key        TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    samples    INTEGER NOT NULL,
+    confidence REAL NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (owner, key)
+)"""
+
+#: 老库里 `style_profile` 的主键只有 `key`。SQLite 改不了主键，只能改名重建
+#: （与 `user_prefs` / `model_settings` 同一套两段式，理由也一样）。
+_LEGACY_TABLE = f"{STYLE_TABLE}_legacy_v1"
+
+_LEGACY_CREATE = f"""CREATE TABLE {_LEGACY_TABLE} (
     key        TEXT PRIMARY KEY,
     value      TEXT NOT NULL,
     samples    INTEGER NOT NULL,
     confidence REAL NOT NULL,
     updated_at TEXT NOT NULL
 )"""
+
+#: 老表的行归谁：无主（`''`）。部署方第一次 `refresh()` 时
+#: `_adopt_legacy()` 把它们认领到自己名下——单用户升级不丢已算好的画像，
+#: 多人环境里这些行只可能是升级前那台机器主人的数据。
+_NO_OWNER = ""
 
 _CONTENT_ADAPTER: TypeAdapter[DiagramContent] = TypeAdapter(DiagramContent)
 
@@ -230,8 +249,72 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     与 `memory_items` / `library_sources` 建在同一时刻的理由一样：读它的路径
     （每次生成前拼提示词）在热路径上，多一个"发现表不存在 → 建表"的分支只会在
     最不该出错的地方多一条可能出错的路径。
+
+    **加 `owner` 之后主键必须变成 `(owner, key)`**：画像描述的是"这个人的图长什么
+    样"，一个全局画像等于让新用户在第一次生成时就拿到别人的形状结论——而那段文字
+    是直接进提示词的，比列表里看到一行别人的数据更影响输出。SQLite 改不了主键，
+    所以走两段式：改名 → 建新表 → 搬行 → 删老表。每一步都 commit（`connect()` 的
+    调用方不会替我们提交，见 `settings.store._migrate_legacy` 的实测记录）。
     """
     conn.execute(_CREATE)
+    columns = {
+        str(row["name"]) for row in conn.execute(f"PRAGMA table_info({STYLE_TABLE})")}
+    legacy = _table_exists(conn, _LEGACY_TABLE)
+    if not columns or ("owner" in columns and not legacy):
+        return
+    if "owner" not in columns:
+        # 老表：先改名，再建新表。改名之后 `PRAGMA table_info(STYLE_TABLE)` 是空集，
+        # 所以后面必须重新查，不能复用上面的 `columns`。
+        conn.execute(f"ALTER TABLE {STYLE_TABLE} RENAME TO {_LEGACY_TABLE}")
+        conn.commit()
+    conn.execute(_CREATE)
+    if legacy or _table_exists(conn, _LEGACY_TABLE):
+        conn.execute(
+            f"INSERT OR IGNORE INTO {STYLE_TABLE} "
+            f"(owner, key, value, samples, confidence, updated_at) "
+            f"SELECT ?, key, value, samples, confidence, updated_at FROM {_LEGACY_TABLE}",
+            (_NO_OWNER,))
+        conn.commit()
+        conn.execute(f"DROP TABLE IF EXISTS {_LEGACY_TABLE}")
+        conn.commit()
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone()
+    return row is not None
+
+
+def _owner() -> str:
+    """当前请求的 owner。**只在有请求上下文的地方调**。
+
+    与 `prefs.service._owner()` 同一条：线程里读不到 `ContextVar`，所以
+    `refresh()` 这类可能被脚本/后台调用的入口必须把 owner 传成形参，
+    这里只是"没人传时的缺省值"。
+    """
+    from app.auth import owner as owner_module
+
+    return owner_module.current_owner()
+
+
+def _adopt_legacy() -> None:
+    """把升级前的无主画像认领给部署方（只在部署方调用时发生一次）。
+
+    为什么不干脆把无主行当成"所有人的"：那会让每位新用户第一次生成就收到一份
+    别人的风格结论。为什么不用"谁先来归谁"：部署方是这台机器的主人，那些行本来
+    就是他的数据，判据用 `is_deployer()` 而不是"第一个读到的人"。
+    """
+    from app.auth import owner as owner_module
+
+    if not owner_module.is_deployer():
+        return
+    try:
+        with closing(_connect()) as conn, conn:
+            conn.execute(f"UPDATE {STYLE_TABLE} SET owner = ? WHERE owner = ?",
+                         (owner_module.current_owner(), _NO_OWNER))
+    except Exception as exc:  # noqa: BLE001 — 认领失败不该让生成失败
+        logger.warning("无主风格画像的认领没有成功（%s），这次按空画像处理",
+                       type(exc).__name__)
 
 
 def _connect() -> sqlite3.Connection:
@@ -304,14 +387,19 @@ def observe(run_id: str, content: DiagramContent) -> Observation:
     )
 
 
-def _observations() -> list[Observation]:
-    """读出所有可用的历史运行，逐条数形状。坏数据跳过并记数。"""
+def _observations(owner: str) -> list[Observation]:
+    """读出**这个人**所有可用的历史运行，逐条数形状。坏数据跳过并记数。
+
+    `owner` 进 `WHERE`：这张表读的是 `runs.candidate`（整棵树）。跨账号读的后果
+    不只是"看到别人的图"，而是把别人的形状统计进我的画像、再把结论写进我的提示词
+    ——一段对别人成立、对我无根据的硬约束会一直跟着每一次生成。
+    """
     with closing(_connect()) as conn:
         rows = conn.execute(
             "SELECT run_id, candidate FROM runs "
-            "WHERE status = 'done' AND candidate IS NOT NULL "
+            "WHERE owner = ? AND status = 'done' AND candidate IS NOT NULL "
             "ORDER BY created_at DESC, run_id LIMIT ?",
-            (MAX_RUNS,),
+            (owner, MAX_RUNS),
         ).fetchall()
     result: list[Observation] = []
     broken = 0
@@ -513,50 +601,61 @@ def summarize(observations: list[Observation]) -> dict[str, Param]:
 # ---------------------------------------------------------------- 落库与读回
 
 
-def refresh() -> dict[str, Param]:
-    """重算一遍并落库；样本不足时**清空**这张表并返回空字典。
+def refresh(owner: str | None = None) -> dict[str, Param]:
+    """重算**这个人**的画像并落库；样本不足时**清空他那一份**并返回空字典。
 
     清空而不是留着旧值：`style_profile` 描述的是"现在的数据支持什么结论"。样本
     被删到 5 条以下时留着 20 条时的结论，会让画像与它自称的依据脱节——而那正是
     "我明明写了它却没生效"的镜像（"它明明写着这样，可数据早就不支持了"）。
+
+    **只删自己那份**（`WHERE owner = ?`）：清空是"我的依据没了"，不该顺手把别人的
+    画像也抹掉——那是最难查的一种数据丢失（对方下次生成突然没有风格段，而他
+    什么都没做）。
     """
-    params = summarize(_observations())
+    who = _owner() if owner is None else owner
+    _adopt_legacy()
+    params = summarize(_observations(who))
     with closing(_connect()) as conn, conn:
         if not params:
-            conn.execute(f"DELETE FROM {STYLE_TABLE}")
+            conn.execute(f"DELETE FROM {STYLE_TABLE} WHERE owner = ?", (who,))
             return {}
         for item in params.values():
             conn.execute(
-                f"""INSERT INTO {STYLE_TABLE} (key, value, samples, confidence, updated_at)
-                    VALUES (?, ?, ?, ?, {_NOW})
-                    ON CONFLICT(key) DO UPDATE SET
+                f"""INSERT INTO {STYLE_TABLE}
+                        (owner, key, value, samples, confidence, updated_at)
+                    VALUES (?, ?, ?, ?, ?, {_NOW})
+                    ON CONFLICT(owner, key) DO UPDATE SET
                         value      = excluded.value,
                         samples    = excluded.samples,
                         confidence = excluded.confidence,
                         updated_at = excluded.updated_at""",
-                (item.key, item.dump(), item.samples, item.confidence),
+                (who, item.key, item.dump(), item.samples, item.confidence),
             )
         # 参数集合是常量，但表里可能存着上一版实现留下的键：删掉不在 `PARAMS` 里的
         # 行，"8 个参数"这件事才是表本身的性质，而不是读的时候再过滤一遍。
         marks = ",".join("?" * len(PARAMS))
-        conn.execute(f"DELETE FROM {STYLE_TABLE} WHERE key NOT IN ({marks})",
-                     tuple(PARAMS))
+        conn.execute(
+            f"DELETE FROM {STYLE_TABLE} WHERE owner = ? AND key NOT IN ({marks})",
+            (who, *PARAMS))
     logger.info("风格画像已更新：%d 个参数（样本 %d–%d 条）", len(params),
                 min(item.samples for item in params.values()),
                 max(item.samples for item in params.values()))
     return params
 
 
-def read() -> dict[str, Param]:
-    """读现成的画像。空字典 = 没算过或样本不足。**不触发重算**。
+def read(owner: str | None = None) -> dict[str, Param]:
+    """读**这个人**现成的画像。空字典 = 没算过或样本不足。**不触发重算**。
 
     读与算分开：`read()` 在每次生成前被调一次，它必须是纯读（一次本地查询、
     零 HTTP）；重算要读几十条 candidate 并解析成 pydantic 模型，那是 `refresh()`
     的活，由脚本或面板按钮触发。
     """
+    who = _owner() if owner is None else owner
+    _adopt_legacy()
     with closing(_connect()) as conn:
         rows = conn.execute(
-            f"SELECT key, value, samples, confidence FROM {STYLE_TABLE}").fetchall()
+            f"SELECT key, value, samples, confidence FROM {STYLE_TABLE} WHERE owner = ?",
+            (who,)).fetchall()
     params = {
         str(row["key"]): Param.load(
             str(row["key"]), str(row["value"]),
@@ -631,7 +730,9 @@ def enabled() -> bool:
         "0", "false", "no", "off"}
 
 
-def prompt_block(params: dict[str, Param] | None = None) -> str:
+def prompt_block(
+    params: dict[str, Param] | None = None, owner: str | None = None,
+) -> str:
     """画像 → 拼进 **user 消息末尾**的那一段；没有可说的返回**空串**。
 
     **为什么是 user 末尾而不是 system**：这条规律在本仓库已经验证过三次
@@ -645,8 +746,11 @@ def prompt_block(params: dict[str, Param] | None = None) -> str:
 
     只写置信度 ≥ `PROMPT_MIN_CONFIDENCE` 的参数。够不着的宁可不写：一句"大概 4 层"
     会让模型当成硬约束去凑，而那正是这一段要防的事。
+
+    `params` 与 `owner` 二选一：前者是已经算好的参数（用例与 A/B 脚本直接给），
+    后者用于"自己去读那个人的画像"。两个都不给就按当前请求的身份读。
     """
-    current = read() if params is None else params
+    current = read(owner) if params is None else params
     if not current:
         return ""
     lines: list[str] = []
@@ -672,7 +776,7 @@ def prompt_block(params: dict[str, Param] | None = None) -> str:
     return "\n".join([STYLE_HEADER, *lines, SHAPE_RULE])
 
 
-def provenance() -> dict[str, Any]:
+def provenance(owner: str | None = None) -> dict[str, Any]:
     """这批画像**是由什么样的数据算出来的**——不是给运行打标签，是让画像自报家底。
 
     用户问过一个问题："要不要在画像里加一条『数据来源是测试还是真实使用』的标记？"
@@ -696,7 +800,7 @@ def provenance() -> dict[str, Any]:
     验收图的标题是脚手架）。**它们降低影响，但不消除污染**：一份才是测试产物
     的库，`dominant_share` 会诚实地高到 0.5 以上。
     """
-    observations = _observations()
+    observations = _observations(_owner() if owner is None else owner)
     usable = [item for item in observations if item.depth > 0]
     kept, folded = _dedupe(usable)
     shapes: dict[str, int] = {}
@@ -716,9 +820,9 @@ def provenance() -> dict[str, Any]:
     }
 
 
-def describe() -> dict[str, Any]:
+def describe(owner: str | None = None) -> dict[str, Any]:
     """面板/脚本要的一份完整视图：8 个参数 + 是否启用 + 这批数据的来路。"""
-    params = read()
+    params = read(owner)
     return {
         "enabled": bool(params),
         "min_samples": MIN_SAMPLES,
@@ -732,13 +836,13 @@ def describe() -> dict[str, Any]:
             "confidence": param.confidence,
             "detail": param.detail,
         } for key, param in params.items()},
-        "provenance": provenance(),
+        "provenance": provenance(owner),
     }
 
 
-def iter_observations() -> Iterator[Observation]:
-    """调试/脚本入口：逐条吐出原始观测（不落库、不汇总）。"""
-    yield from _observations()
+def iter_observations(owner: str | None = None) -> Iterator[Observation]:
+    """调试/脚本入口：逐条吐出**这个人的**原始观测（不落库、不汇总）。"""
+    yield from _observations(_owner() if owner is None else owner)
 
 
 __all__ = [

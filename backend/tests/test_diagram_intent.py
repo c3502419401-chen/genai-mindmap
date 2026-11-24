@@ -23,6 +23,7 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from starlette.requests import Request
 
 from app.agent import diagram_intent, runs
 from app.agent import router as agent_router
@@ -175,6 +176,18 @@ def _request(goal: str, *, diagram_type: str | None = None,
         goal=goal, intent=intent, diagram_type=diagram_type,  # type: ignore[arg-type]
         budget=RunBudget(max_model_calls=12, max_output_tokens=32768),
     )
+
+
+def _http_request(client: tuple[str, int] = ("10.0.0.9", 50000)) -> Request:
+    """给直接调 `stream_run()` 的用例造一个最小 `Request`。
+
+    `stream_run()` 现在要第二个参数（免费额度按 IP 记账），而它只用得到
+    `request.scope` 里的 `headers` 与 `client` 两项——起一个 `TestClient` 走 HTTP
+    会把"解析发生在开流之前"这条断言变成一条端到端用例，反而看不见台账写入的
+    先后顺序。
+    """
+    return Request({"type": "http", "method": "POST", "path": "/api/agent/runs/stream",
+                    "headers": [], "client": client, "scheme": "http"})
 
 
 class TestApplyOnTheRequest:
@@ -452,7 +465,7 @@ class TestRouterWiring:
 
         async def scenario():
             with patch.object(agent_router, "run", new=fake_run):
-                response = await agent_router.stream_run(request)
+                response = await agent_router.stream_run(request, _http_request())
                 return [chunk async for chunk in response.body_iterator]
 
         chunks = asyncio.run(scenario())
@@ -475,7 +488,7 @@ class TestRouterWiring:
 
         async def scenario():
             with patch.object(agent_router, "run", new=fake_run):
-                response = await agent_router.stream_run(request)
+                response = await agent_router.stream_run(request, _http_request())
                 return [chunk async for chunk in response.body_iterator]
 
         asyncio.run(scenario())

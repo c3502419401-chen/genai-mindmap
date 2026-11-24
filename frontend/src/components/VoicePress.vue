@@ -207,7 +207,7 @@ onBeforeUnmount(() => {
       已超过 60 秒，将分段识别，转写会慢一些
     </p>
     <p v-if="state === 'recording'" class="text-[11px] text-slate-400">
-      录音在本地进行，松手后才会上传转写。
+      录音在本地进行，松手后才上传转写。
     </p>
     <p v-if="error" class="text-[11px] leading-relaxed text-rose-600" role="alert">{{ error }}</p>
   </div>

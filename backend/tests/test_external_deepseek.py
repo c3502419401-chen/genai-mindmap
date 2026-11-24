@@ -27,13 +27,13 @@ from typing import Any
 
 import httpx
 import pytest
+from conftest import guest_client
 from fastapi.testclient import TestClient
 
 from app.agent import tools as agent_tools
 from app.contracts.source import SourceKind
 from app.knowledge import external
 from app.knowledge import external_cache
-from app.main import app
 
 # 真实响应（2026-11 实测，正文截短到几十字）。三个结果刻意覆盖三种情形：
 #   1. 正常命中（中文站、有 content）；
@@ -419,11 +419,79 @@ def test_missing_key_counts_as_a_source_failure(monkeypatch):
     """
     monkeypatch.setenv(external.DEEPSEEK_SEARCH_ENV, "1")
     monkeypatch.delenv(external.DEEPSEEK_KEY_ENV, raising=False)
+    monkeypatch.delenv("MINDMAP_LLM_API_KEY", raising=False)
     budget = external._Budget(4, 10.0)
 
     assert external._deepseek_search("碳中和", budget, 3) == []
     assert budget.failures == 1
     assert budget.used == 0            # 一次请求都没发
+
+
+def test_the_key_saved_in_the_panel_is_used_here_too(monkeypatch):
+    """**页面「模型设置」里保存的 key，这条外部检索的路也要用上。**
+
+    这是 AGENTS.md 第一条（"改一个能力的入口，要检查所有会走到它的路径"）的可执行
+    版本。`_deepseek_config()` 过去只读 `MINDMAP_LLM_BASE_URL` / `MINDMAP_LLM_API_KEY`
+    两个环境变量，于是会出现一个特别难查的分叉：面板里保存了新 key、生成（走
+    `generation._config()`）立刻用上了，但"贴一条链接让它读正文"仍在旧 key 上 401——
+    界面上两件事都叫"模型配置"。
+
+    这里刻意**不设**任何 `MINDMAP_LLM_*` 环境变量，只往库里写一条配置，然后看
+    Search 请求带出去的 Authorization 是谁。
+    """
+    from app.settings import store as settings_store
+
+    monkeypatch.setenv(external.DEEPSEEK_SEARCH_ENV, "1")
+    monkeypatch.delenv(external.DEEPSEEK_KEY_ENV, raising=False)
+    monkeypatch.delenv("MINDMAP_LLM_API_KEY", raising=False)
+    monkeypatch.delenv(external.DEEPSEEK_BASE_ENV, raising=False)
+    monkeypatch.delenv("MINDMAP_LLM_BASE_URL", raising=False)
+    settings_store.clear()
+
+    # 用户刚在面板里填的（base 指向一个假域名，用来确认连 base 也一起换了）。
+    settings_store.save(
+        base_url="https://panel.example.com/v1",
+        api_key="sk-from-the-panel-9999",
+        model="deepseek-chat",
+    )
+
+    calls: list[httpx.Request] = []
+    _patch(monkeypatch, _routes(calls=calls))
+
+    external.search_external("机器学习的主要方向", limit=3)
+
+    search_calls = [r for r in calls if r.url.path.endswith("/tools/search")]
+    assert search_calls, "开关开着、面板里有 key，却没发 Search 请求"
+    assert search_calls[0].headers["authorization"] == "Bearer sk-from-the-panel-9999"
+    # base 也跟着面板走：专属变量没设时不该还去连默认域名。
+    assert search_calls[0].url.host == "panel.example.com"
+
+
+def test_the_dedicated_variable_still_wins_over_the_panel(monkeypatch):
+    """专属的 `MINDMAP_DEEPSEEK_TOOLS_*` 排最前：它可以指向**另一家**服务。
+
+    面板管的是"主模型那条路"，不是"所有调模型的地方"。有人把外部检索挂在另一个
+    中转站上，那条配置不该被主模型的设置顶掉。
+    """
+    from app.settings import store as settings_store
+
+    monkeypatch.setenv(external.DEEPSEEK_SEARCH_ENV, "1")
+    monkeypatch.setenv(external.DEEPSEEK_KEY_ENV, "sk-dedicated-1111")
+    monkeypatch.delenv(external.DEEPSEEK_BASE_ENV, raising=False)
+    settings_store.clear()
+    settings_store.save(
+        base_url="https://panel.example.com/v1",
+        api_key="sk-from-the-panel-9999",
+        model="deepseek-chat",
+    )
+
+    calls: list[httpx.Request] = []
+    _patch(monkeypatch, _routes(calls=calls))
+
+    external.search_external("机器学习的主要方向", limit=3)
+
+    search_calls = [r for r in calls if r.url.path.endswith("/tools/search")]
+    assert search_calls[0].headers["authorization"] == "Bearer sk-dedicated-1111"
 
 
 def test_cached_hits_keep_the_sort_metadata(monkeypatch):
@@ -491,7 +559,8 @@ def test_request_limit_covers_the_sixth_source():
 
 
 def _api() -> TestClient:
-    return TestClient(app)
+    # 门禁上线之后，这些用例走的是"有身份时接口对不对"，身份由 `guest_client()` 补齐。
+    return guest_client()
 
 
 def test_fetch_endpoint_is_off_by_default(monkeypatch):

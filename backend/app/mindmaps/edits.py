@@ -121,6 +121,7 @@ def record(
     events: Sequence[EditEventIn],
     *,
     parents: Mapping[str, str | None] | None = None,
+    owner: str = "",
 ) -> int:
     """把一批事件写进 `edit_events`，返回写入条数。
 
@@ -142,12 +143,17 @@ def record(
     **失败不抛。** 调用方是保存接口，那时内容已经落库；为了统计写失败而让用户看到
     "保存失败"、进而重试撞 409，方向完全是错的。这里只记 warning——服务端日志里
     有 map_id 与条数，够定位。
+
+    `owner` 是**谁做的这次改动**，与 `map_id`（哪张图）是两件事：图是共享的，
+    但"他把标题改短了"这条观察只能进他自己的记忆总结。`owner` 由调用方显式给，
+    不能在这里读 `current_identity()`——那条约定来自 `app/auth/owner.py`（后台线程
+    读不到 ContextVar，而这条路径以后可能从线程里调）。
     """
     if not events:
         return 0
     index = parents or {}
     rows = [
-        (map_id, event.run_id, event.actor, event.kind, event.node_id, event.field,
+        (map_id, event.run_id, owner, event.actor, event.kind, event.node_id, event.field,
          event.before, event.after, event.depth, event.subtree_size, event.change_count,
          event.node_count, index.get(event.node_id), event.at)
         for event in events
@@ -157,9 +163,10 @@ def record(
             ensure_schema(conn)
             conn.executemany(
                 f"""INSERT INTO edit_events
-                        (map_id, run_id, actor, kind, node_id, field, before, after, depth,
-                         subtree_size, change_count, node_count, {PARENT_COLUMN}, at, recorded_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, {_NOW}), {_NOW})""",
+                        (map_id, run_id, owner, actor, kind, node_id, field, before, after,
+                         depth, subtree_size, change_count, node_count, {PARENT_COLUMN}, at,
+                         recorded_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, {_NOW}), {_NOW})""",
                 rows,
             )
     except Exception:  # noqa: BLE001 — 统计写失败不该让用户的保存失败

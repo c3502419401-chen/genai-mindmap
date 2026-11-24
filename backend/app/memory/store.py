@@ -168,6 +168,7 @@ _NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
 
 _CREATE_ITEMS = f"""CREATE TABLE IF NOT EXISTS {ITEM_TABLE} (
     id            TEXT PRIMARY KEY,
+    owner         TEXT NOT NULL DEFAULT '',
     text          TEXT NOT NULL,
     kind          TEXT NOT NULL,
     source        TEXT NOT NULL,
@@ -254,9 +255,9 @@ _CREATE_EDGES = f"""CREATE TABLE IF NOT EXISTS {EDGE_TABLE} (
 def ensure_schema(conn: sqlite3.Connection) -> None:
     """建五张表。由 `repository.connect()` 在同一个连接上调用，幂等。
 
-    **`text_hash` 上是一条 UNIQUE 索引**，不是普通索引：去重是这个设计的硬要求
-    （同一条偏好在两次会话里被总结出来，不该变成两条），而"先查再插"在并发下会
-    漏——总结管线与手工添加可能同时写。UNIQUE 让数据库来裁决，`INSERT OR IGNORE`
+    **`(owner, text_hash)` 上是一条 UNIQUE 索引**，不是普通索引：去重是这个设计的
+    硬要求（同一条偏好在两次会话里被总结出来，不该变成两条），而"先查再插"在并发
+    下会漏——总结管线与手工添加可能同时写。UNIQUE 让数据库来裁决，`INSERT OR IGNORE`
     读到 `rowcount=0` 就知道已经存在。
 
     之所以不是 `(text_hash, kind)` 联合唯一：同一条文本只该存在一次，与它的档位
@@ -266,10 +267,23 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     后三张表（观测 / 命题 / 边）与 `memory_items` **在同一时刻、同一个连接上**建，
     理由与 `runs` / `edit_events` 那几处完全相同：读它们的路径都在热路径上（每次
     run 开始抽一次观测），多一个"发现表不存在 → 建表"的分支没有好处。
+
+    **加 `owner` 之后唯一键必须跟着变**，否则两个人说同一句话时，第二个人写不
+    进去——`INSERT OR IGNORE` 会静默返回"已经存在"，而那一条是别人的、他列表里
+    永远看不到。老索引因此要显式 DROP：`CREATE UNIQUE INDEX IF NOT EXISTS` 撞名时
+    **什么都不做**，光改建表语句换不掉线上那条单列索引（与 `user_prefs` 换主键
+    同一个坑）。
     """
     conn.execute(_CREATE_ITEMS)
-    conn.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{ITEM_TABLE}_hash "
-                 f"ON {ITEM_TABLE}(text_hash)")
+    # 老库补 `owner` 列。`CREATE TABLE IF NOT EXISTS` 不会给已有的表补列，
+    # 而缺列的表现是 `SELECT ... WHERE owner = ?` 抛 `no such column`——被
+    # `prompt_for` 的调用方吞成"这次没有相关记忆"，看起来和"记忆是空的"一样。
+    from app.mindmaps.repository import _ensure_columns
+
+    _ensure_columns(conn, ITEM_TABLE, {"owner": "TEXT NOT NULL DEFAULT ''"})
+    conn.execute(f"DROP INDEX IF EXISTS idx_{ITEM_TABLE}_hash")
+    conn.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{ITEM_TABLE}_owner_hash "
+                 f"ON {ITEM_TABLE}(owner, text_hash)")
     conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{ITEM_TABLE}_created "
                  f"ON {ITEM_TABLE}(created_at)")
     conn.execute(_CREATE_SESSIONS)
@@ -493,13 +507,14 @@ def add(
     text: str,
     kind: str = "preference",
     *,
+    owner: str = "",
     source: str = SOURCE_SUMMARY,
     source_run_id: str | None = None,
     session_id: str | None = None,
     formed_at: str | None = None,
     embed: bool = True,
 ) -> Added:
-    """写一条记忆；文本已存在时返回已有那条（`created=False`），不重复写。
+    """写一条记忆；同一 owner 下文本已存在时返回已有那条（`created=False`）。
 
     **`created_at` 是总结时刻，不是"这条事发生的时刻"**。两者分开存：
     `created_at` 是审计事实（"这条是什么时候被写进来的"），`formed_at` 是模型对
@@ -509,6 +524,14 @@ def add(
     为什么不把 `formed_at` 直接写进 `created_at`：那会让"这条记忆是哪次会话总结
     出来的"变成一个需要反推的问题，而 `session_id` / `source_run_id` 正是为回答
     它存在的。审计事实被模型推断覆盖，是一种不可逆的信息丢失。
+
+    **`owner` 必须由调用方给**，不能在这里读 `current_identity()`：总结管线跑在
+    `threading.Thread` 里（`summarize.schedule`），而 `ContextVar` 不跨线程——
+    在那里调 `current_owner()` 会拿到空串，于是所有人的记忆都被写成实例行、
+    于是所有人都读得到。这也正是 PR#27 审查里那条 P0-2 的形状。
+
+    去重也按 `(owner, text_hash)`：A 的"我在做绩效项目"不能挡住 B 写同一句话
+    （`INSERT OR IGNORE` 的 UNIQUE 索引是复合的，见 `ensure_schema`）。
     """
     cleaned = _check_text(text)
     if kind not in WRITABLE_KINDS:
@@ -519,7 +542,8 @@ def add(
 
     with closing(_connect()) as conn, conn:
         existing = conn.execute(
-            f"SELECT * FROM {ITEM_TABLE} WHERE text_hash = ?", (digest,)).fetchone()
+            f"SELECT * FROM {ITEM_TABLE} WHERE owner = ? AND text_hash = ?",
+            (owner, digest)).fetchone()
         if existing is not None and existing["vector"] is not None:
             # 去重命中且向量齐全：一次 embedding 都不该再付。这是常态——
             # 同一条偏好会在好几次会话里被反复总结出来。
@@ -540,10 +564,10 @@ def add(
 
         item_id = uuid4().hex
         conn.execute(
-            f"INSERT INTO {ITEM_TABLE} (id, text, kind, source, created_at, formed_at, "
+            f"INSERT INTO {ITEM_TABLE} (id, owner, text, kind, source, created_at, formed_at, "
             f"source_run_id, session_id, text_hash, model, dim, vector) "
-            f"VALUES (?, ?, ?, ?, {_NOW}, ?, ?, ?, ?, ?, ?, ?)",
-            (item_id, cleaned, kind, source, formed_at, source_run_id, session_id,
+            f"VALUES (?, ?, ?, ?, ?, {_NOW}, ?, ?, ?, ?, ?, ?, ?)",
+            (item_id, owner, cleaned, kind, source, formed_at, source_run_id, session_id,
              digest, model, None if vector is None else len(vector),
              None if vector is None else vector_cache.pack(vector)),
         )
@@ -551,24 +575,32 @@ def add(
     return Added(item=_row(row), created=True)
 
 
-def delete(item_id: str) -> bool:
-    """硬删一条。返回是否真的删掉了——404 与"删了但没删掉"必须分得开。"""
+def delete(item_id: str, *, owner: str) -> bool:
+    """硬删一条。返回是否真的删掉了——404 与"删了但没删掉"必须分得开。
+
+    `owner` 参与 `WHERE`：别人的记忆不该因为知道 id 就能删。列表接口本来就不会
+    把别人的 id 给出去，但"只有列表里出现过的 id 才删得掉"这种隐式约束迟早会被
+    一个直接构造的请求打破。
+    """
     with closing(_connect()) as conn, conn:
-        result = conn.execute(f"DELETE FROM {ITEM_TABLE} WHERE id = ?", (item_id,))
+        result = conn.execute(
+            f"DELETE FROM {ITEM_TABLE} WHERE id = ? AND owner = ?", (item_id, owner))
     return result.rowcount == 1
 
 
-def count() -> int:
+def count(*, owner: str) -> int:
     with closing(_connect()) as conn:
-        return int(conn.execute(f"SELECT COUNT(*) FROM {ITEM_TABLE}").fetchone()[0])
+        return int(conn.execute(
+            f"SELECT COUNT(*) FROM {ITEM_TABLE} WHERE owner = ?", (owner,)).fetchone()[0])
 
 
-def items(limit: int = 200) -> list[Item]:
-    """最近的若干条，新的在前。供 HTTP 列表与总结时的"已知记忆"用。"""
+def items(limit: int = 200, *, owner: str) -> list[Item]:
+    """这个人的最近若干条，新的在前。供 HTTP 列表与总结时的"已知记忆"用。"""
     with closing(_connect()) as conn:
         rows = conn.execute(
-            f"SELECT * FROM {ITEM_TABLE} ORDER BY created_at DESC, id LIMIT ?",
-            (max(1, limit),)).fetchall()
+            f"SELECT * FROM {ITEM_TABLE} WHERE owner = ? "
+            f"ORDER BY created_at DESC, id LIMIT ?",
+            (owner, max(1, limit))).fetchall()
     return [_row(row) for row in rows]
 
 
@@ -594,22 +626,25 @@ class Hit:
         return self.item.text
 
 
-def _candidates(limit: int = MAX_SCAN) -> list[sqlite3.Row]:
-    """读出参与检索的行（含向量列）。"""
+def _candidates(limit: int = MAX_SCAN, *, owner: str) -> list[sqlite3.Row]:
+    """读出参与检索的行（含向量列），**只读这个人的**。"""
     with closing(_connect()) as conn:
-        total = int(conn.execute(f"SELECT COUNT(*) FROM {ITEM_TABLE}").fetchone()[0])
+        total = int(conn.execute(
+            f"SELECT COUNT(*) FROM {ITEM_TABLE} WHERE owner = ?", (owner,)).fetchone()[0])
         if total > limit:
             logger.warning("记忆表共 %d 行，超过本次检索上限 %d，只取最近的 %d 行"
                            "（更旧的这次不参与：要让它无偏，该上向量索引而不是调大这个数）",
                            total, limit, limit)
         return conn.execute(
-            f"SELECT * FROM {ITEM_TABLE} ORDER BY created_at DESC, id LIMIT ?",
-            (limit,)).fetchall()
+            f"SELECT * FROM {ITEM_TABLE} WHERE owner = ? "
+            f"ORDER BY created_at DESC, id LIMIT ?",
+            (owner, limit)).fetchall()
 
 
 def recall(
     query: str,
     *,
+    owner: str,
     top_k: int = TOP_K,
     min_cosine: float = MIN_COSINE,
     now: datetime | None = None,
@@ -644,7 +679,7 @@ def recall(
     vector = query_vector(query)
     if vector is None:
         return []
-    rows = _candidates()
+    rows = _candidates(owner=owner)
     if not rows:
         return []
     model = embedding_model()
@@ -739,7 +774,7 @@ def query_text(request: object) -> str:
     return "\n".join(parts)
 
 
-def prompt_for(request: object) -> str:
+def prompt_for(request: object, *, owner: str) -> str:
     """一次生成要在 system 里注入的记忆那一段；没有可注入的返回**空串**。
 
     空串而不是"（暂无相关记忆）"：一个空的小标题会让模型以为"这个人的记忆是空的"
@@ -749,12 +784,15 @@ def prompt_for(request: object) -> str:
     检索**只在这里发生一次**（由 `agent.service._loop` 在进入轮次之前在后台线程
     调一次）。放进 `_system_text` 会让每一轮都检索一遍：骨架 1 次 + 结构 1 次 +
     detail 2 次 + 工具循环 N 轮，每次 embedding 0.3–1 秒，延迟翻几倍。
+
+    `owner` 是形参不是现读的：这条路径在 `asyncio.to_thread` 里跑，ContextVar
+    不过线程边界（与 `add()` 同一条理由）。
     """
     query = query_text(request)
     if not query:
         return ""
     started = time.perf_counter()
-    hits = recall(query, touch=True)
+    hits = recall(query, owner=owner, touch=True)
     if not hits:
         logger.debug("记忆检索：query %d 字，无命中（%.0fms）",
                      len(query), (time.perf_counter() - started) * 1000)

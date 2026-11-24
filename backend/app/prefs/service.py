@@ -43,6 +43,7 @@ from typing import Literal, get_args, get_origin
 from pydantic import BaseModel, ConfigDict
 
 from app.agent.contracts import AgentRunRequest
+from app.auth import owner
 from app.contracts.mindmap import DIAGRAM_LABELS
 from app.core.errors import AppError
 from app.generation.service import THINKING_MODELS
@@ -319,23 +320,59 @@ def _connect() -> sqlite3.Connection:
     return repository.connect()
 
 
+def _owner() -> str:
+    """这一行数据归谁。**每次读写都现算**，不缓存：同一个进程里并发的两个请求
+    会看到各自的身份，缓存它就等于把 A 的偏好在 B 的请求里用一遍（`ContextVar`
+    存在的唯一理由就是这个）。
+
+    加账号之前写下的那些行（`owner = ''`）由部署方在第一次访问时继承，见
+    `_adopt_legacy()`。
+    """
+    return owner.current_owner()
+
+
+def _adopt_legacy() -> None:
+    """把"加账号之前"写下的偏好一次性记到部署方名下。
+
+    老库里的 `user_prefs` 行没有 owner 可言——那时这台机器只有一个用户，而这个人
+    只可能是部署它的人。不继承的后果是：单用户装升级上来，用户打开面板发现自己的
+    备注、图型、图标开关全没了，而库里那些行还在、只是没人读得到。
+
+    **只部署方能触发**，与 `mindmaps.update_map(allow_unowned=...)` 同一个判据：
+    多用户部署里老行不能被随机某个人继承走。做完之后 `owner = ''` 的行就不再有，
+    所以这段只在升级后的第一次访问里真的做一次活。
+    """
+    if not owner.is_deployer():
+        return
+    mine = _owner()
+    if not mine:
+        return
+    with closing(_connect()) as conn, conn:
+        conn.execute("UPDATE user_prefs SET owner = ? WHERE owner = ''", (mine,))
+
+
 def rows() -> list[Pref]:
-    """所有偏好，**不带** `last_applied_at`。
+    """当前这个人自己的偏好，**不带** `last_applied_at`。
 
     `set` / `get` / `prompt_notes` 走这条：它们不关心"上次什么时候生效"，
     而反查 `runs` 是这张表之外的一次扫描。
     """
+    _adopt_legacy()
     with closing(_connect()) as conn:
         # 备注按写入先后排（`note.1` < `note.10`），A/B 类按更新时间。两类混在一起
         # 排序没有意义，所以键在前、时间在后：同一类内部的相对顺序稳定就够。
         result = conn.execute(
-            "SELECT * FROM user_prefs ORDER BY pref_key").fetchall()
+            "SELECT * FROM user_prefs WHERE owner = ? ORDER BY pref_key",
+            (_owner(),)).fetchall()
     return [_row(row) for row in result]
 
 
 def get(key: str) -> Pref | None:
+    _adopt_legacy()
     with closing(_connect()) as conn:
-        row = conn.execute("SELECT * FROM user_prefs WHERE pref_key = ?", (key,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM user_prefs WHERE owner = ? AND pref_key = ?",
+            (_owner(), key)).fetchone()
     return _row(row) if row else None
 
 
@@ -346,15 +383,18 @@ def _last_applied() -> dict[str, str]:
     偏好"标出来）。在 Python 里展开而不是用 SQLite 的 `json_each`：`json1` 在
     发行版之外不一定编译进去，而这张表在这个量级上（几十到几百行）解析一遍
     只要几毫秒。真到了上万行，该加的是索引与 TTL，不是把查询写得更早。
+
+    **只看自己那几次运行**：这是"这条偏好上次真的生效是什么时候"，别人的运行
+    与这个人的偏好无关——跨账号读会让界面上的日期变成"这台机器上有人用过它"。
     """
     with closing(_connect()) as conn:
         # `updated_at` 必须一起 SELECT：SQLite 允许在 `ORDER BY` 里用没取出来的列，
         # 但取不到它的值。少了这一列，界面显示的"上次生效"会变成"我们什么时候查
         # 的"——一个永远等于今天的日期，看着很好，其实是假的。
         records = conn.execute(
-            "SELECT request, updated_at FROM runs WHERE status = 'done' "
+            "SELECT request, updated_at FROM runs WHERE status = 'done' AND owner = ? "
             "ORDER BY updated_at DESC, run_id LIMIT ?",
-            (_APPLIED_SCAN,),
+            (_owner(), _APPLIED_SCAN),
         ).fetchall()
     applied: dict[str, str] = {}
     for record in records:
@@ -407,15 +447,16 @@ def set(  # noqa: A001 — 与 `list_all` / `get` / `delete` 同一组动词，�
     with closing(_connect()) as conn, conn:
         changed = conn.execute(
             f"""INSERT INTO user_prefs
-                    (pref_key, pref_value, scope, source, source_run_id, created_at, updated_at)
-                VALUES (?, ?, 'global', ?, ?, {_NOW}, {_NOW})
-                ON CONFLICT(pref_key) DO UPDATE SET
+                    (owner, pref_key, pref_value, scope, source, source_run_id,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, 'global', ?, ?, {_NOW}, {_NOW})
+                ON CONFLICT(owner, pref_key) DO UPDATE SET
                     pref_value    = excluded.pref_value,
                     source        = excluded.source,
                     source_run_id = excluded.source_run_id,
                     updated_at    = excluded.updated_at
                 WHERE user_prefs.pref_value <> excluded.pref_value""",
-            (key, text, source, source_run_id),
+            (_owner(), key, text, source, source_run_id),
         ).rowcount == 1
     written = get(key)
     if written is None:  # pragma: no cover — upsert 成功路径上必有一行
@@ -434,13 +475,20 @@ def delete(key: str) -> bool:
     """
     with closing(_connect()) as conn, conn:
         return conn.execute(
-            "DELETE FROM user_prefs WHERE pref_key = ?", (key,)).rowcount == 1
+            "DELETE FROM user_prefs WHERE owner = ? AND pref_key = ?",
+            (_owner(), key)).rowcount == 1
 
 
 def clear() -> int:
-    """清空（只在用例与本地调试用）。"""
+    """清空（只在用例与本地调试用）。
+
+    **只清当前这个人自己的**。加账号之前它是 `DELETE FROM user_prefs`（整张表），
+    而一个"本地调试用"的函数清掉全站所有账号的备注，是那种只在多用户部署上出现、
+    且看起来像"我的备注自己没了"的故障。
+    """
     with closing(_connect()) as conn, conn:
-        return conn.execute("DELETE FROM user_prefs").rowcount
+        return conn.execute(
+            "DELETE FROM user_prefs WHERE owner = ?", (_owner(),)).rowcount
 
 
 # ---------------------------------------------------------------- 读路径：谁在用
@@ -476,12 +524,15 @@ def _recent_choices(field: str, limit: int) -> list[str]:
 
     只认 `done`：被取消/失败的那几次可能只是同一次意图的半截重试（前端每次点击
     都是新 run_id），拿它们当证据会让"最近 3 次"变成"刚才那 3 秒"。
+
+    **只认自己那几次**：候选建议是"你最近三次都选了 X"，别人的三次不构成对
+    这个人习惯的观察——那会让建议变成一句"这台机器上有人喜欢鱼骨图"。
     """
     with closing(_connect()) as conn:
         records = conn.execute(
-            "SELECT request FROM runs WHERE status = 'done' "
+            "SELECT request FROM runs WHERE status = 'done' AND owner = ? "
             "ORDER BY updated_at DESC, run_id LIMIT ?",
-            (_SUGGESTION_SCAN,),
+            (_owner(), _SUGGESTION_SCAN),
         ).fetchall()
     values: list[str] = []
     for record in records:

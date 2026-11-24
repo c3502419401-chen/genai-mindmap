@@ -1,0 +1,95 @@
+# 构建上下文是仓库根目录（两个 Dockerfile 都在 docker/ 下，compose 里 context: .）。
+#
+# 这份文件的唯一职责是**别把不该进构建上下文的东西塞进去**。它不是 .gitignore 的
+# 副本，两个理由：
+#   1. .gitignore 管"什么不进版本库"，这里管"什么不进构建上下文"——.venv 与
+#      node_modules 在 .gitignore 里，但它们真实存在于工作树里（本机 .venv 有
+#      1.4GB、node_modules 几百 MB），不排除的话每次 build 都要把它们打包发给
+#      dockerd，慢到以为卡死，而且 .venv 里的东西也不该进镜像。
+#   2. 有些东西要提交但**不该**进镜像（tests/、scripts/、docs/、.github/），
+#      反过来 backend/.env.example 要进版本库但不该进镜像。
+#
+# 校验方式（本机没有 docker，只能静态核）：
+#   git ls-files | 逐条比对下面的规则，确认 COPY 的每个源都在"未被排除"的一边。
+#   见 docs/DOCKER.md 的"静态核验"一节。
+
+# ---------------------------------------------------------------- 版本库内部
+.git
+.github
+.agents
+.gitattributes
+.gitignore
+
+# ---------------------------------------------------------------- 依赖与虚拟环境
+# 最大的两块。Docker 会在构建上下文里**真的**读它们，不是只占个文件名。
+**/.venv
+**/venv
+**/node_modules
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/.coverage
+**/coverage.xml
+**/htmlcov
+**/*.tsbuildinfo
+
+# ---------------------------------------------------------------- 产物
+**/dist
+**/dist-ssr
+**/build
+
+# ---------------------------------------------------------------- 运行期数据与密钥
+# 数据库绝不能进镜像：镜像层是不可变的，而且会把真实用户数据带到每一台机器上。
+**/data
+**/uploads
+**/exports
+**/*.db
+**/*.db-journal
+**/*.db-wal
+**/*.db-shm
+**/*.log
+
+# .env 系列：真实密钥只在宿主机上，靠 compose 的 env_file 注入。
+# 这里**不需要**任何 `!.env.example` 式的例外：镜像不需要 .env 文件，后端启动
+# 时读的是进程环境变量（代码里没有 dotenv 加载），模板文件只在宿主机上给人看。
+.env
+.env.*
+**/.env
+**/.env.*
+
+# ---------------------------------------------------------------- 与容器无关的材料
+# 文档、评估语料、测量脚本、测试都不进镜像。backend/app 里没有一处读仓库里的
+# 非 .py 文件（已逐条核过：app/ 下只有 .py），所以运行期不需要它们。
+#
+# **frontend/tests 是例外，必须留着**：frontend/tsconfig.json 的 include 是
+# ["src", "tests", "vite.config.ts"]，而 `npm run build` 第一步就是
+# `vue-tsc --noEmit`。把 tests/ 排除掉，镜像里那次类型检查覆盖的文件集就比
+# CI 少一块——"本地绿、镜像也绿"会变成"少查了也绿"。前端镜像里会 COPY 它。
+docs
+tests
+backend/tests
+backend/scripts
+backend/openapi.json
+backend/pytest.ini
+backend/.env.example
+README.md
+TEAM-GUIDE.md
+NEXT-PLAN.md
+START_HERE.md
+AGENTS.md
+clash-verge.yaml
+run-backend.bat
+
+# 编辑器 / 系统垃圾
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+.visioncheck
+
+# Basic Auth 口令文件（`htpasswd` 的默认产物）。容器版已经不用它了，但保留这条
+# 规则的成本是零，而它挡的是"把密码哈希打进镜像层"这种事后很难收回的事。
+.htpasswd
+**/.htpasswd

@@ -5,6 +5,162 @@
     "version": "dev"
   },
   "paths": {
+    "/api/auth/me": {
+      "get": {
+        "tags": [
+          "账号"
+        ],
+        "summary": "Who Am I",
+        "description": "当前是谁。顺便补发游客 cookie（全站唯一发它的地方）。",
+        "operationId": "who_am_i_api_auth_me_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WhoAmI"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/auth/register": {
+      "post": {
+        "tags": [
+          "账号"
+        ],
+        "summary": "Register",
+        "description": "注册并**直接登录**（返回 201 + 会话 cookie）。\n\n注册完不自动登录的话，用户要在同一个页面上把刚敲的密码再敲一遍——那不是安全，\n那只是让第一次使用的体验变差。注册成功意味着这条口令刚刚被验证过（是我们\n亲手 hash 的），没有额外的信任问题。",
+        "operationId": "register_api_auth_register_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Credentials"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserView"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/auth/login": {
+      "post": {
+        "tags": [
+          "账号"
+        ],
+        "summary": "Login",
+        "description": "登录。账号或密码不对统一 401 `auth_bad_credentials`（理由见 `store.authenticate`）。\n\n**限速在哈希之前**：先问 `throttle.retry_after()`，被限就直接 429，连那次\n36 毫秒的 scrypt 都不花。顺序反过来的话，限速本身成了新的放大器——攻击者\n用被拒的请求把服务器算力耗光。",
+        "operationId": "login_api_auth_login_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Credentials"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserView"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/auth/logout": {
+      "post": {
+        "tags": [
+          "账号"
+        ],
+        "summary": "Logout",
+        "description": "登出：撤销这次会话并清 cookie。\n\n幂等：没登录、或者 cookie 已经无效，也返回 204。界面上的\"退出登录\"点两次\n不该第二次报错——它不是\"删除资源\"，是\"让这台浏览器变成未登录\"。\n\n响应对象在这里**新建**而不是复用注入的那个：注入的 `Response` 是给\n\"在返回模型的同时补 header\"用的，而这条路由的返回体就是它自己。",
+        "operationId": "logout_api_auth_logout_post",
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          }
+        }
+      }
+    },
+    "/api/auth/password": {
+      "post": {
+        "tags": [
+          "账号"
+        ],
+        "summary": "Change Password",
+        "description": "改密码。**需要已经登录**，并且要再输一次旧密码。\n\n两道都是必要的：只凭会话就能改密码，意味着一次 XSS（拿到会话）就能永久接管\n账号；只凭旧密码不看会话，等于把\"知道你密码的人\"和\"已经登录的人\"混为一谈。\n\n改完撤销全部会话（含当前这条），然后清 cookie：用户要在所有设备上重新登录。\n这不是\"顺手多做一步\"——改密码最常见的动机就是\"我怀疑有人进过我的号\"。",
+        "operationId": "change_password_api_auth_password_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChangePasswordRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/mindmaps": {
       "get": {
         "tags": [
@@ -869,7 +1025,7 @@
           "AI 代理"
         ],
         "summary": "Mark Run Applied",
-        "description": "这次生成的结果**被保存进库了**。前端在保存成功后调用一次，幂等。\n\n\"生成过但没保存\"与\"生成过、也存下来了\"只能靠这个时间戳分开：那份内容可能被\nPUT 到一张已有导图上（推不出新记录），也可能用户存成了另一张。用 `mindmaps`\n表反推，得到的全是猜。",
+        "description": "这次生成的结果**被保存进库了**。前端在保存成功后调用一次，幂等。\n\n\"生成过但没保存\"与\"生成过、也存下来了\"只能靠这个时间戳分开：那份内容可能被\nPUT 到一张已有导图上（推不出新记录），也可能用户存成了另一张。用 `mindmaps`\n表反推，得到的全是猜。\n\n按 owner 过滤：否则知道别人 `run_id` 的人能替他标掉这一位，那条记录再也不会\n出现在他的「上次的结果」里——一条安静的数据丢失。",
         "operationId": "mark_run_applied_api_agent_runs__run_id__applied_post",
         "parameters": [
           {
@@ -952,6 +1108,47 @@
       }
     },
     "/api/prefs/{pref_key}": {
+      "get": {
+        "tags": [
+          "用户偏好"
+        ],
+        "summary": "Get Pref",
+        "description": "读一条。不存在 404，不是 200 + null。\n\n**为什么要这个端点**：`/api/prefs/{pref_key}` 之前只挂了 `PUT` / `DELETE`，于是\n`GET /api/prefs/style` 这类请求会命中这条路径却被判成\"方法不允许\"（405）。405\n的字面意思是\"这个资源存在，但这个方法不行\"，而实际含义是\"根本没有这个偏好\"——\n同一件事两种错法，排查时会往错误的方向翻代码。现在未知键是 404，与 `DELETE`\n的口径一致。",
+        "operationId": "get_pref_api_prefs__pref_key__get",
+        "parameters": [
+          {
+            "name": "pref_key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pref Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Pref"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
       "put": {
         "tags": [
           "用户偏好"
@@ -1044,7 +1241,7 @@
           "记忆"
         ],
         "summary": "List Memories",
-        "description": "最近的若干条，新的在前。\n\n它同时是这套东西的**死表探测器**：表一直为空，说明自动总结要么没触发过\n（会话之间没隔够 `GAP_MINUTES`），要么每次都总结了 0 条。两种都不报错。",
+        "description": "最近的若干条，新的在前。\n\n它同时是这套东西的**死表探测器**：表一直为空，说明自动总结要么没触发过\n（会话之间没隔够 `GAP_MINUTES`），要么每次都总结了 0 条。两种都不报错。\n\n**只列这个人自己的**：记忆里存的是\"关于这个人的推断\"（在做哪些项目、习惯\n怎样），跨账号读等于让所有人共享一份人格画像。加账号之前没有这条边界，因为\n那时只有一个人。",
         "operationId": "list_memories_api_memory_get",
         "parameters": [
           {
@@ -1134,7 +1331,7 @@
           "记忆"
         ],
         "summary": "Delete Memory",
-        "description": "硬删。404 而不是幂等 204：界面上\"这条已经不在了\"与\"我删了但没删掉\"必须分开。",
+        "description": "硬删。404 而不是幂等 204：界面上\"这条已经不在了\"与\"我删了但没删掉\"必须分开。\n\n别人的记忆同样回 404（`owner` 参与 `WHERE`）：既不删，也不告诉对方\"这个 id\n存在但不属于你\"——那本身就是一条不该泄漏的事实。",
         "operationId": "delete_memory_api_memory__item_id__delete",
         "parameters": [
           {
@@ -1393,6 +1590,117 @@
           },
           "502": {
             "description": "抓取失败：地址打不开、正文为空（`code=fetch_failed`）"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/settings/model": {
+      "get": {
+        "tags": [
+          "模型设置"
+        ],
+        "summary": "Read Model Settings",
+        "description": "当前生效的配置 + 每一项的来源。\n\n`changed` 之类的写入信息不在这里——`GET` 只回答\"现在是什么\"。",
+        "operationId": "read_model_settings_api_settings_model_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelSettings"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "模型设置"
+        ],
+        "summary": "Save Model Settings",
+        "description": "保存。**改完立即生效**：所有出口每次调用都重新 `resolve()`，没有进程内缓存。\n\n`store.SettingsError`（`AppError` 子类）由 `core/errors.py` 的统一出口转成\n`{code, message, detail, request_id}`——错误码分得开，界面才能说清\"是地址不合法\n还是密钥太长\"。",
+        "operationId": "save_model_settings_api_settings_model_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveModelSettingsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SaveModelSettingsResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/settings/model/test": {
+      "post": {
+        "tags": [
+          "模型设置"
+        ],
+        "summary": "Test Model Settings",
+        "description": "发一次最小 chat 请求，验证地址 / 密钥 / 模型名。\n\n**为什么是 200 而不是 4xx**：失败原因分成\"地址不通\"\"密钥被拒\"\"模型不存在\"\n三种，界面要按 `ok` 显示在面板里（一句红字），而不是让前端把 4xx 当成\"请求\n没发出去\"。真正的业务错误（比如三项都没配）走 400，因为那时连测都没法测。",
+        "operationId": "test_model_settings_api_settings_model_test_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/TestModelSettingsRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TestModelSettingsResponse"
+                }
+              }
+            }
           },
           "422": {
             "description": "Validation Error",
@@ -1685,6 +1993,29 @@
         ],
         "title": "Body_import_mindmap_api_mindmaps_import_post"
       },
+      "ChangePasswordRequest": {
+        "properties": {
+          "current_password": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Current Password"
+          },
+          "new_password": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "New Password"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "current_password",
+          "new_password"
+        ],
+        "title": "ChangePasswordRequest"
+      },
       "CheckRequest": {
         "properties": {
           "content": {
@@ -1802,6 +2133,30 @@
           "source"
         ],
         "title": "CreateTextSourceResponse"
+      },
+      "Credentials": {
+        "properties": {
+          "username": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Username"
+          },
+          "password": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Password"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "username",
+          "password"
+        ],
+        "title": "Credentials",
+        "description": "注册与登录共用的请求体。\n\n字段给 `min_length` 是为了让\"空密码\"在 Pydantic 这一层就被 422 拦住，而不是\n落到 `store` 里再抛业务错——两种错误在界面上都是红字，但前者不需要一次\n数据库往返。真正的长度规则仍在 `store` 里（8–200），这里只是挡明显空的。"
       },
       "Diagnostic": {
         "properties": {
@@ -2880,6 +3235,57 @@
         "title": "ImportWarningPayload",
         "description": "一条导入告警。只有 `code` 与 `message`（定位信息写进 message 正文）。"
       },
+      "InstanceSettings": {
+        "properties": {
+          "base_url": {
+            "type": "string",
+            "title": "Base Url"
+          },
+          "api_key_masked": {
+            "type": "string",
+            "title": "Api Key Masked"
+          },
+          "api_key_set": {
+            "type": "boolean",
+            "title": "Api Key Set"
+          },
+          "model": {
+            "type": "string",
+            "title": "Model"
+          },
+          "deep_model": {
+            "type": "string",
+            "title": "Deep Model"
+          },
+          "configured": {
+            "type": "boolean",
+            "title": "Configured"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "base_url",
+          "api_key_masked",
+          "api_key_set",
+          "model",
+          "deep_model",
+          "configured"
+        ],
+        "title": "InstanceSettings",
+        "description": "全站共享那一行（`owner = ''`）的样子。\n\n**只给部署方**（`can_edit_instance` 为真时才出现在响应里）。给别人看没有用：\n他们改不了，那是\"一片点不动的表单\"；而 `base_url` 是部署方用的供应商，不该\n成为所有人的可见信息。"
+      },
       "KnowledgeHit": {
         "properties": {
           "source_id": {
@@ -3396,6 +3802,102 @@
           "root"
         ],
         "title": "MindMapContent"
+      },
+      "ModelSettings": {
+        "properties": {
+          "base_url": {
+            "type": "string",
+            "title": "Base Url"
+          },
+          "base_url_source": {
+            "type": "string",
+            "title": "Base Url Source"
+          },
+          "api_key_masked": {
+            "type": "string",
+            "title": "Api Key Masked"
+          },
+          "api_key_source": {
+            "type": "string",
+            "title": "Api Key Source"
+          },
+          "api_key_set": {
+            "type": "boolean",
+            "title": "Api Key Set"
+          },
+          "model": {
+            "type": "string",
+            "title": "Model"
+          },
+          "model_source": {
+            "type": "string",
+            "title": "Model Source"
+          },
+          "deep_model": {
+            "type": "string",
+            "title": "Deep Model"
+          },
+          "deep_model_source": {
+            "type": "string",
+            "title": "Deep Model Source"
+          },
+          "deep_model_effective": {
+            "type": "string",
+            "title": "Deep Model Effective"
+          },
+          "llm_mode": {
+            "type": "string",
+            "title": "Llm Mode"
+          },
+          "configured": {
+            "type": "boolean",
+            "title": "Configured"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          },
+          "can_edit_instance": {
+            "type": "boolean",
+            "title": "Can Edit Instance",
+            "default": false
+          },
+          "instance": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InstanceSettings"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "base_url",
+          "base_url_source",
+          "api_key_masked",
+          "api_key_source",
+          "api_key_set",
+          "model",
+          "model_source",
+          "deep_model",
+          "deep_model_source",
+          "deep_model_effective",
+          "llm_mode",
+          "configured"
+        ],
+        "title": "ModelSettings",
+        "description": "生效的模型配置。**密钥只有打码值**。"
       },
       "Node-Input": {
         "properties": {
@@ -4214,6 +4716,184 @@
         "title": "RunSummary",
         "description": "列表里的一行：**不带结果正文**。\n\n结果是一整棵树。20 条一起下发，等于每次进页面先传几十万字节，只为显示一句\n\"上次有一次生成还没保存\"。真要那份内容时点「查看」，走 `GET /runs/{run_id}`。"
       },
+      "SaveModelSettingsRequest": {
+        "properties": {
+          "base_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Url"
+          },
+          "api_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Key"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "deep_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deep Model"
+          },
+          "clear_api_key": {
+            "type": "boolean",
+            "title": "Clear Api Key",
+            "default": false
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "user",
+              "instance"
+            ],
+            "title": "Scope",
+            "default": "user"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "SaveModelSettingsRequest",
+        "description": "`PUT /settings/model` 的请求体。**每个字段的\"空\"含义不同**（见 `store.save`）。\n\n  - `api_key` 省略或空串 → **不改**（界面上那个框显示打码值，用户不动它就发空串）；\n    要清空必须 `clear_api_key: true`。\n  - `base_url` / `model` / `deep_model` 省略 → 不改；空串 → 清掉库里的覆盖，\n    回落到环境变量。\n  - `scope`：`\"user\"`（缺省）= 写你自己那行；`\"instance\"` = 写全站共享那行\n    （只有部署方可以，别人 403 `settings_forbidden`）。\n\n`extra=\"forbid\"` 是仓库的默认风格：拼错字段名时宁可 422，也不要静默忽略——\n\"我把密钥填进 `apikey` 了，保存成功但没生效\"是最难自查的一类失败。"
+      },
+      "SaveModelSettingsResponse": {
+        "properties": {
+          "base_url": {
+            "type": "string",
+            "title": "Base Url"
+          },
+          "base_url_source": {
+            "type": "string",
+            "title": "Base Url Source"
+          },
+          "api_key_masked": {
+            "type": "string",
+            "title": "Api Key Masked"
+          },
+          "api_key_source": {
+            "type": "string",
+            "title": "Api Key Source"
+          },
+          "api_key_set": {
+            "type": "boolean",
+            "title": "Api Key Set"
+          },
+          "model": {
+            "type": "string",
+            "title": "Model"
+          },
+          "model_source": {
+            "type": "string",
+            "title": "Model Source"
+          },
+          "deep_model": {
+            "type": "string",
+            "title": "Deep Model"
+          },
+          "deep_model_source": {
+            "type": "string",
+            "title": "Deep Model Source"
+          },
+          "deep_model_effective": {
+            "type": "string",
+            "title": "Deep Model Effective"
+          },
+          "llm_mode": {
+            "type": "string",
+            "title": "Llm Mode"
+          },
+          "configured": {
+            "type": "boolean",
+            "title": "Configured"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          },
+          "can_edit_instance": {
+            "type": "boolean",
+            "title": "Can Edit Instance",
+            "default": false
+          },
+          "instance": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InstanceSettings"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "changed": {
+            "type": "boolean",
+            "title": "Changed"
+          },
+          "notice": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Notice"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "base_url",
+          "base_url_source",
+          "api_key_masked",
+          "api_key_source",
+          "api_key_set",
+          "model",
+          "model_source",
+          "deep_model",
+          "deep_model_source",
+          "deep_model_effective",
+          "llm_mode",
+          "configured",
+          "changed"
+        ],
+        "title": "SaveModelSettingsResponse",
+        "description": "保存的结果：写入后的生效配置 + 这次有没有真的改变。\n\n`changed=False` 是\"这次提交没有改变任何东西\"（同值重复保存不刷 `updated_at`）。\n不返回这个布尔值，界面上就会出现\"我刚存过\"的假象。\n\n`notice` 是**改了地址之后要额外说的一句话**：地址一变，之前那次连接成功的结论\n就不再证明这个新地址通得过了。这里不强制先测通再落库（那会让\"我想先填好、等\n供应商开白名单\"这种正常操作变成不可能），但要让界面有机会提醒一句。"
+      },
       "SaveRequest": {
         "properties": {
           "content": {
@@ -4819,6 +5499,88 @@
         "title": "SuggestionKind",
         "description": "建议的**动作**名词，不是诊断码。\n\n用户看到的是\"点一下会发生什么\"，所以值域按动作分，不按诊断分：同一个\n`NEAR_DUPLICATE_LABEL` 与 `DUPLICATE_LABEL` 都是 `dedupe`，因为对用户来说\n要做的是同一件事。`expand` / `add_detail` 是 F15 那一轮补的——`fill` 说的是\n\"整张图缺了哪一块\"（结构级），而\"这一支没展开\"与\"这几个节点没有说明\"是\n节点级的两件事，混进 `fill` 会让按钮文案说不清要点哪里。"
       },
+      "TestModelSettingsRequest": {
+        "properties": {
+          "base_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Url"
+          },
+          "api_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Key"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "TestModelSettingsRequest",
+        "description": "`POST /settings/model/test` 的请求体：可选的临时覆盖。\n\n空字段 = 用**当前生效**的值。这样面板可以\"先测再存\"：用户在输入框里改了地址\n或模型名，不必先落库就能验一次。密钥同样：不填就用已保存/环境变量里那把，\n所以\"我只改模型名\"的场景不需要再手打一遍 key。"
+      },
+      "TestModelSettingsResponse": {
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "title": "Ok"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "model": {
+            "type": "string",
+            "title": "Model"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "latency_ms": {
+            "type": "integer",
+            "title": "Latency Ms",
+            "default": 0
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "ok",
+          "message",
+          "model"
+        ],
+        "title": "TestModelSettingsResponse",
+        "description": "一次测试连接的结论。`ok=false` 也是 200——它是结论，不是 HTTP 失败。"
+      },
       "Theme": {
         "properties": {
           "preset": {
@@ -4913,6 +5675,31 @@
         ],
         "title": "UpdateRequest"
       },
+      "UserView": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "username": {
+            "type": "string",
+            "title": "Username"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "username",
+          "created_at"
+        ],
+        "title": "UserView",
+        "description": "对外的账号形状。**不含 `password_hash`，也不含任何 id 之外的东西**。"
+      },
       "ValidationError": {
         "properties": {
           "loc": {
@@ -4952,6 +5739,45 @@
           "type"
         ],
         "title": "ValidationError"
+      },
+      "WhoAmI": {
+        "properties": {
+          "user": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UserView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "guest_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Guest Id"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "user",
+              "guest",
+              "anonymous"
+            ],
+            "title": "Kind",
+            "default": "anonymous"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "WhoAmI",
+        "description": "`GET /me` 的响应：当前是谁。\n\n`kind` 是三种状态的名字，不是调试信息：界面上\"未登录 / 游客 / 已登录\"要显示\n不同的东西，而由后端算比前端自己拼（`user ? 'user' : guest_id ? 'guest' : ...`）\n更不容易在一处漏掉。"
       },
       "app__contracts__diagnostic__Suggestion": {
         "properties": {

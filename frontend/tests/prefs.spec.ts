@@ -130,7 +130,7 @@ describe('预填：偏好决定初始值，用户的选择决定最终值', () =
 
     expect((wrapper.get('#thinking-model').element as HTMLSelectElement).value).toBe('feynman');
     // 用户必须看得出这个值不是他此刻选的
-    expect(wrapper.get('[data-test="intent-box"]').text()).toContain('来自你的偏好：流程图');
+    expect(wrapper.get('[data-test="intent-box"]').text()).toContain('来自偏好：流程图');
   });
 
   it('请求体里带的是**界面上显示的那个值**，并标进 prefs_applied', async () => {
@@ -158,7 +158,7 @@ describe('预填：偏好决定初始值，用户的选择决定最终值', () =
 
     await wrapper.get('#diagram-type').setValue('flowchart');
     // 来源标注消失：这个值是他自己选的
-    expect(wrapper.get('[data-test="intent-box"]').text()).not.toContain('来自你的偏好');
+    expect(wrapper.get('[data-test="intent-box"]').text()).not.toContain('来自偏好');
 
     await wrapper.get(INTENT).setValue('做一张图');
     await wrapper.get(SUBMIT).trigger('click');

@@ -351,7 +351,7 @@ describe('画布底部那一行', () => {
     expect(wrapper.find(STATUS).exists()).toBe(false);
   });
 
-  it('「上次的运行结果」现在挂在状态行上，不是右栏', async () => {
+  it('「上次的生成结果」现在挂在状态行上，不是右栏', async () => {
     stubFetch();
     const wrapper = mountApp();
     const store = useMindMapStore();
@@ -360,9 +360,9 @@ describe('画布底部那一行', () => {
     } as never;
     await wrapper.vm.$nextTick();
 
-    const notice = wrapper.get('[aria-label="上次的运行结果"]');
+    const notice = wrapper.get('[aria-label="上次的生成结果"]');
     expect(notice.text()).toContain('还没保存');
-    expect(wrapper.get(DRAWER).text()).not.toContain('上次的运行结果');
+    expect(wrapper.get(DRAWER).text()).not.toContain('上次的生成结果');
     // 它本身就是全部内容：不需要再给一个"明细"
     expect(wrapper.find('[data-test="run-status-detail"]').exists()).toBe(false);
   });

@@ -145,7 +145,7 @@ def test_samples_skip_boilerplate_mindmaps():
             "INSERT INTO mindmaps (id, version, content, updated_at) VALUES"
             " ('m1', 1, ?, '2026-11-19T00:00:00.000Z')",
             (json.dumps(small, ensure_ascii=False),))
-    assert profile._samples() == []
+    assert profile._samples("") == []
 
 
 def test_samples_are_deduplicated_by_text():
@@ -161,7 +161,7 @@ def test_samples_are_deduplicated_by_text():
                 " metadata, created_at, last_used_at) VALUES (?, ?, ?, 'text', ?, '{}',"
                 " '2026-11-19T00:00:00.000Z', '2026-11-19T00:00:00.000Z')",
                 (f"s{index}", f"h{index}", name, body))
-    texts = [sample.text for sample in profile._samples()]
+    texts = [sample.text for sample in profile._samples("")]
     assert texts == ["a.txt\n同一份材料", "b.txt\n另一份"]
 
 

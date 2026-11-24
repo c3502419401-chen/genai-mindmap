@@ -32,6 +32,9 @@
  */
 import type { components } from './schema';
 import type {
+  AuthUser,
+  ChangePasswordRequest,
+  Credentials,
   ImportResult,
   ImportWarning,
   LibraryEntry,
@@ -47,11 +50,18 @@ import type {
   NodeStyle,
   Pref,
   PrefSuggestion,
+  ModelSettings,
+  InstanceSettings,
+  SaveModelSettingsRequest,
+  SaveModelSettingsResponse,
   SavedPref,
   Source,
   SourceRef,
   SourceSpan,
   SourceUsage,
+  TestModelSettingsRequest,
+  TestModelSettingsResponse,
+  WhoAmI,
 } from './types';
 
 type Schemas = components['schemas'];
@@ -96,6 +106,32 @@ export const checks = {
   libraryEntryKeys: true satisfies SameKeys<LibraryEntry, Schemas['LibraryEntry']>,
   libraryListKeys: true satisfies SameKeys<LibraryList, Schemas['LibraryList']>,
   librarySourceKeys: true satisfies SameKeys<LibrarySource, Schemas['LibrarySource']>,
+  // 模型设置：这五条是密钥保护契约的编译期一半。`ModelSettings` 里若出现任何
+  // 明文字段（`api_key` 而不是 `api_key_masked`），这里会红——比 code review 可靠，
+  // 因为加字段的人往往只是想"顺手把值也带出来"。
+  modelSettingsKeys: true satisfies SameKeys<ModelSettings, Schemas['ModelSettings']>,
+  // 共享配置那一行：同样不许带明文密钥——它是"别人也在用"的那份配置，泄露面比
+  // 自己的更大。
+  instanceSettingsKeys: true satisfies
+    SameKeys<InstanceSettings, Schemas['InstanceSettings']>,
+  saveModelSettingsRequestKeys: true satisfies
+    SameKeys<SaveModelSettingsRequest, Schemas['SaveModelSettingsRequest']>,
+  saveModelSettingsResponseKeys: true satisfies
+    SameKeys<SaveModelSettingsResponse, Schemas['SaveModelSettingsResponse']>,
+  testModelSettingsRequestKeys: true satisfies
+    SameKeys<TestModelSettingsRequest, Schemas['TestModelSettingsRequest']>,
+  testModelSettingsResponseKeys: true satisfies
+    SameKeys<TestModelSettingsResponse, Schemas['TestModelSettingsResponse']>,
+
+  // 账号：这三条守的是"`AuthUser` 里不许出现口令相关字段"。后端 `UserView` 刻意
+  // 不含 `password_hash`，镜像若为了显示方便顺手加一个（或加个 `token`，因为
+  // "cookie 看不见所以想自己留一份"），这里会红。会话走 HttpOnly cookie 就是为了
+  // 让 JS 拿不到它，多一个 token 字段等于把那道防线绕开。
+  authUserKeys: true satisfies SameKeys<AuthUser, Schemas['UserView']>,
+  whoAmIKeys: true satisfies SameKeys<WhoAmI, Schemas['WhoAmI']>,
+  credentialsKeys: true satisfies SameKeys<Credentials, Schemas['Credentials']>,
+  changePasswordKeys: true satisfies
+    SameKeys<ChangePasswordRequest, Schemas['ChangePasswordRequest']>,
 
   // ---- 字段形状 ----
   contentShape: true satisfies SameShape<MindMapContent, Schemas['MindMapContent-Output']>,
@@ -123,4 +159,13 @@ export const checks = {
   libraryEntryShape: true satisfies SameShape<LibraryEntry, Schemas['LibraryEntry']>,
   libraryListShape: true satisfies SameShape<LibraryList, Schemas['LibraryList']>,
   librarySourceShape: true satisfies SameShape<LibrarySource, Schemas['LibrarySource']>,
+  modelSettingsShape: true satisfies SameShape<ModelSettings, Schemas['ModelSettings']>,
+  instanceSettingsShape: true satisfies
+    SameShape<InstanceSettings, Schemas['InstanceSettings']>,
+  saveModelSettingsResponseShape: true satisfies
+    SameShape<SaveModelSettingsResponse, Schemas['SaveModelSettingsResponse']>,
+  testModelSettingsResponseShape: true satisfies
+    SameShape<TestModelSettingsResponse, Schemas['TestModelSettingsResponse']>,
+  authUserShape: true satisfies SameShape<AuthUser, Schemas['UserView']>,
+  whoAmIShape: true satisfies SameShape<WhoAmI, Schemas['WhoAmI']>,
 };

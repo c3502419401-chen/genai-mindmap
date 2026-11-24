@@ -523,11 +523,9 @@ def test_live_model_finds_a_synonym_pair_the_rules_cannot_see():
 
 
 def _client():
-    from fastapi.testclient import TestClient
+    from conftest import guest_client
 
-    from app.main import app
-
-    return TestClient(app)
+    return guest_client()
 
 
 _FISH = {"content": {"title": "t", "problem": "p",

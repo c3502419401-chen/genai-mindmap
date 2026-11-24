@@ -193,12 +193,11 @@ function dismiss(): void {
           data-test="import-warning"
           class="rounded bg-amber-50 px-2 py-1 leading-relaxed text-amber-900"
         >
-          <span class="mr-1 font-mono text-[10px] text-amber-600">{{ warning.code }}</span>
           {{ warning.message }}
         </li>
       </ul>
       <p v-if="warnings.length" class="mt-1.5 leading-relaxed text-slate-500">
-        导入的内容算「未保存的修改」，确认无误后点保存才会写进库。
+        导入的内容算未保存的修改，点保存才会写进库。
       </p>
     </div>
   </div>

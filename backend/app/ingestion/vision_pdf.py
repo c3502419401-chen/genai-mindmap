@@ -99,17 +99,30 @@ class VisionUnavailable(Exception):
 
 
 def _config() -> tuple[str, str, str]:
-    base = os.getenv("MINDMAP_LLM_BASE_URL", "").strip().rstrip("/")
-    key = os.getenv("MINDMAP_LLM_API_KEY", "").strip()
-    model = os.getenv("MINDMAP_LLM_MODEL", "").strip()
+    """视觉提取要用的（地址，密钥，模型名）。
+
+    **与生成侧同一处来源**：`app/settings/store.resolve()`（页面「模型设置」里存过的
+    值 → 环境变量 → 空）。这里原先自己读三个环境变量，于是用户在面板里改完端点后，
+    生成换了、视觉提取还在打旧地址——那种"半生效"最难查，因为两条路都各自看起来
+    是对的。
+    """
+    from app.settings import store as _settings_store
+
+    resolved = _settings_store.resolve()
+    base, key, model = resolved.base_url, resolved.api_key, resolved.model
     # 演示模式必须不联网：其它接口在 demo 下走本地占位，视觉提取若照样调 API，
     # 会出现"演示模式却在烧 token"，与整个项目的模式约定冲突。
-    mode = os.getenv("MINDMAP_LLM_MODE", "demo").strip().lower()
+    #
+    # 注意：`MINDMAP_LLM_MODE` 仍然**只**从环境变量读，面板改不动它——它是部署方
+    # 定的开关（"这台机器要不要联网"），不是用户的模型配置。面板只把它显示出来，
+    # 好让"模型配好了但视觉提取说 demo"有据可查。
+    mode = os.getenv(_settings_store.LLM_MODE_ENV, "demo").strip().lower()
     if mode != "model":
         raise VisionUnavailable(
             f"当前是 {mode} 模式，不做视觉提取（需要 MINDMAP_LLM_MODE=model）")
     if not base or not key or not model:
-        raise VisionUnavailable("未配置模型地址、密钥或模型名，无法做视觉提取")
+        raise VisionUnavailable(
+            "未配置模型地址、密钥或模型名，无法做视觉提取（可在页面「模型设置」里填写）")
     return base, key, model
 
 

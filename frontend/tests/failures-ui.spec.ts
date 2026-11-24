@@ -59,6 +59,8 @@ describe('失败卡片', () => {
     const text = wrapper.text();
 
     expect(text).toContain('模型还没配置好');
+    // 首选路径是页面右上角的面板（这个功能就是为了不用登服务器），环境变量是兜底。
+    expect(text).toContain('模型设置');
     // 用户能做的动作必须写出来：光说"配置有问题"，他还是不知道该改哪。
     expect(text).toContain('MINDMAP_LLM_API_KEY');
 

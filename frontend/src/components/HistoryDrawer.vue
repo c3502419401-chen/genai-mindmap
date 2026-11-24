@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 
+import AuthPanel from './AuthPanel.vue';
 import ImportMindmap from './ImportMindmap.vue';
 import PrefsPanel from './PrefsPanel.vue';
 import { exportLabel, type ExportFormat } from '../api/client';
@@ -216,6 +217,9 @@ function onExportChange(event: Event): void {
           双击节点改文字，Tab 加子节点，Enter 加兄弟，Delete 删除，Ctrl+Z 撤销。
         </p>
       </div>
+
+      <!-- 账号：当前身份与登录/注册。低频动作，和保存/打开同级放在抽屉里。 -->
+      <AuthPanel />
 
       <!-- 偏好与节点详情：两个原来在顶栏右侧的入口 -->
       <div class="mt-4 flex items-center gap-2 border-t border-slate-200 pt-3">

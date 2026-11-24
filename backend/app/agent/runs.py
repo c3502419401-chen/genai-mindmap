@@ -165,6 +165,14 @@ class RunRecord:
     #:
     #: `finish` 交出新的候选时会把它清掉：那一刻 `candidate` 不再是被截下来的半成品。
     checkpointed_at: str | None = None
+    #: 这次生成是谁发起的（owner 字符串，与 `mindmaps.owner` 同一套口径）。
+    #:
+    #: **`runs` 的可见性比导图更严**：导图读共享（团队协作要能看别人的图），而
+    #: `runs` 里是还没保存的树、模型的思考过程和失败原因——那些属于发起它的人。
+    #: 所以列表与详情都按这一列过滤，压不过去就是"不存在"。
+    #:
+    #: 老行上是空串：加账号之前生成的记录，没有主人可考，于是对所有人都不可见。
+    owner: str = ""
 
 
 @dataclass(frozen=True)
@@ -252,13 +260,14 @@ def _record(row: sqlite3.Row) -> RunRecord:
         model=row["model"],
         served_model=row["served_model"],
         reasoning=row["reasoning"],
+        owner=(row["owner"] or "") if "owner" in row.keys() else "",
         partial=None if raw_partial is None else bool(raw_partial),
         partial_reason=row["partial_reason"] if "partial_reason" in row.keys() else None,
         checkpointed_at=row["checkpointed_at"] if "checkpointed_at" in row.keys() else None,
     )
 
 
-def begin(run_id: str, request: dict[str, Any]) -> Claim:
+def begin(run_id: str, request: dict[str, Any], *, owner: str | None = None) -> Claim:
     """认领一次运行：新 id 建行，旧 id 按它的状态分三种去向。
 
     - 不存在 → 建一行 `running`，`claimed=True`（这次真跑）。
@@ -283,8 +292,20 @@ def begin(run_id: str, request: dict[str, Any]) -> Claim:
     `{"intent": "create"}`，前端载入时按 create 重置 `mapId`，用户点保存会变成新建
     一条而不是覆盖原记录。`candidate` 反过来**必须**留着：重开跑的是"在已有树上
     继续"，抹掉它等于把这次续写的起点删了。
+
+    **重开只允许本人**：`WHERE ... AND owner = ?`。没有这个条件时，任何知道别人
+    `run_id` 的人都能把他的 `failed` 行重开成自己的——`UPDATE` 里那句 `owner = ?`
+    会把行改归发起人，原主人之后连 `GET /runs/{id}` 都是 404（审查实测过这条：
+    B 用 A 的 `failed` id 发一次流，那行就变成 B 的了）。老行（`owner = ''`，加账号
+    之前留下的）因此谁都不能重开：它们是没有主人的历史草稿，重新生成一次比"猜
+    该归谁"更安全，也不需要再引入一个"部署方可以接管别人的行"的旁路。
     """
     payload = None if not request else json.dumps(request, ensure_ascii=False)
+    if owner is None:
+        from app.auth.identity import current_identity
+        from app.settings.store import owner_of
+
+        owner = owner_of(current_identity())
     # 先把僵住的 `running` 行收掉，再认领。顺序不能反：这一行如果是上一次崩溃
     # 留下的化石，先 `sweep` 才能把它判成 `failed`，下面那条 `UPDATE` 才有资格
     # 重开它。放在事务外面，是因为 `sweep_abandoned` 自己开一条 `BEGIN IMMEDIATE`，
@@ -297,9 +318,9 @@ def begin(run_id: str, request: dict[str, Any]) -> Claim:
         conn.execute("BEGIN IMMEDIATE")
         try:
             created = conn.execute(
-                "INSERT OR IGNORE INTO runs (run_id, status, request, created_at, updated_at) "
-                f"VALUES (?, ?, ?, {_NOW}, {_NOW})",
-                (run_id, STATUS_RUNNING, payload),
+                "INSERT OR IGNORE INTO runs (run_id, status, request, created_at, updated_at, owner) "
+                f"VALUES (?, ?, ?, {_NOW}, {_NOW}, ?)",
+                (run_id, STATUS_RUNNING, payload, owner),
             )
             claimed = created.rowcount == 1
             if not claimed:
@@ -308,9 +329,12 @@ def begin(run_id: str, request: dict[str, Any]) -> Claim:
                     f"partial = NULL, partial_reason = NULL, checkpointed_at = NULL, "
                     # 重开是**另一个请求**在用这行跑，`request` 必须换成这一轮的摘要；
                     # 空摘要（内部调用方不传）用 COALESCE 保住旧值，等于"这次没带摘要"。
-                    f"request = COALESCE(?, request), updated_at = {_NOW} "
-                    "WHERE run_id = ? AND status IN (?, ?)",
-                    (STATUS_RUNNING, payload, run_id, *RESTARTABLE_STATUSES),
+                    # `owner` 不换：`WHERE ... AND owner = ?` 已经限定只有本人能重开，
+                    # 这一句在语义上是冗余的自证（写回同一个值），留着是为了让 SQL
+                    # 自解释"这行的主人还是他"。
+                    f"request = COALESCE(?, request), owner = ?, updated_at = {_NOW} "
+                    "WHERE run_id = ? AND status IN (?, ?) AND owner = ?",
+                    (STATUS_RUNNING, payload, owner, run_id, *RESTARTABLE_STATUSES, owner),
                 )
                 claimed = reopened.rowcount == 1
             conn.execute("COMMIT")
@@ -489,8 +513,32 @@ def sweep_abandoned(*, seconds: int = RUN_ABANDONED_SECONDS) -> list[str]:
 
 
 def get(run_id: str) -> RunRecord | None:
+    """按 id 取一行，**不过滤 owner**。
+
+    只给内部调用方用（`stream_run` 判"这个 run_id 现在什么状态"、重放、`sweep`）。
+    对外那条 `GET /runs/{run_id}` 必须用 `get_for(run_id, owner)`：`run_id` 是客户端
+    自己生成并传上来的，猜中一个就等于读到别人还没保存的树，这与"runs 只对发起者
+    可见"是同一条口径的两半。
+    """
     with closing(_connect()) as conn:
         row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+    return _record(row) if row else None
+
+
+def get_for(run_id: str, owner: str | None = None) -> RunRecord | None:
+    """按 id 取一行，**并且必须属于 `owner`**（缺省按当前身份算）。
+
+    别人的行一律返回 `None`，让调用方回 404——不是 403：`run_id` 是随机 id，
+    "这个 id 存在但不属于你"本身就是一条不该给的信息。
+    """
+    if owner is None:
+        from app.auth.identity import current_identity
+        from app.settings.store import owner_of
+
+        owner = owner_of(current_identity())
+    with closing(_connect()) as conn:
+        row = conn.execute(
+            "SELECT * FROM runs WHERE run_id = ? AND owner = ?", (run_id, owner)).fetchone()
     return _record(row) if row else None
 
 
@@ -499,6 +547,7 @@ def pending(
     limit: int = 20,
     statuses: Sequence[str] = (STATUS_DONE,),
     unresolved_only: bool = True,
+    owner: str | None = None,
 ) -> list[RunRecord]:
     """有结果、而且后来没被保存过的运行，最新的在前。
 
@@ -518,41 +567,59 @@ def pending(
     `unresolved_only=False` 时不去管"保存过没有"，只按状态列：那是查台账的用法
     （"上次那次失败到底怎么失败的"），与"提醒用户"是两件事，所以做成一个开关
     而不是两条 SQL。
+
+    `owner` 缺省按当前身份算，**并且永远是过滤条件**：这一列不是可选优化，而是
+    "`runs` 只对发起者可见"这条口径本身。想让某一行对所有人可见，那是导图的事，
+    由 `mindmaps` 那张表回答。
     """
     if not statuses:
         return []
+    if owner is None:
+        from app.auth.identity import current_identity
+        from app.settings.store import owner_of
+
+        owner = owner_of(current_identity())
     placeholders = ", ".join("?" for _ in statuses)
     unresolved = ("AND candidate IS NOT NULL AND applied_at IS NULL"
                   ) if unresolved_only else ""
     with closing(_connect()) as conn:
         rows = conn.execute(
             f"""SELECT * FROM runs
-                 WHERE status IN ({placeholders}) {unresolved}
+                 WHERE status IN ({placeholders}) AND owner = ? {unresolved}
                  ORDER BY updated_at DESC, run_id
                  LIMIT ?""",
-            (*statuses, max(1, limit)),
+            (*statuses, owner, max(1, limit)),
         ).fetchall()
     return [_record(row) for row in rows]
 
 
-def mark_applied(run_id: str) -> bool:
+def mark_applied(run_id: str, *, owner: str | None = None) -> bool:
     """这次生成的结果**被保存进库了**。幂等：已经有时间戳就不再改。
 
     前端在保存成功之后调用一次。删掉候选层之后它是"生成过但没保存"的唯一反向证据：
     没有它，每次生成都会在下次进页面时重新问一遍"要不要捡回上次的结果"。
+
+    `owner` 是过滤条件而不是可选项：否则知道别人 `run_id` 的人能替他标掉这一位，
+    那条记录再也不会出现在他的「上次的结果」里——一条安静的数据丢失。
     """
-    return _mark(run_id, "applied_at")
+    return _mark(run_id, "applied_at", owner=owner)
 
 
-def _mark(run_id: str, column: str) -> bool:
+def _mark(run_id: str, column: str, *, owner: str | None = None) -> bool:
     # 只有一个固定列名会走到这里，不是拼接外部输入。
     assert column == "applied_at"
+    if owner is None:
+        from app.auth.identity import current_identity
+        from app.settings.store import owner_of
+
+        owner = owner_of(current_identity())
     with closing(_connect()) as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
             changed = conn.execute(
-                f"UPDATE runs SET {column} = COALESCE({column}, {_NOW}) WHERE run_id = ?",
-                (run_id,),
+                f"UPDATE runs SET {column} = COALESCE({column}, {_NOW}) "
+                "WHERE run_id = ? AND owner = ?",
+                (run_id, owner),
             )
             conn.execute("COMMIT")
         except BaseException:
@@ -578,6 +645,7 @@ __all__ = [
     "checkpoint",
     "finish",
     "get",
+    "get_for",
     "inactive",
     "mark_applied",
     "pending",

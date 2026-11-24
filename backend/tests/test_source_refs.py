@@ -4,9 +4,10 @@ import json
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi.testclient import TestClient
 from pydantic import ValidationError
 import pytest
+
+from conftest import guest_client
 
 from app.contracts.diagnostic import DiagnosticLevel
 from app.contracts.mindmap import MindMapContent, Node
@@ -16,7 +17,6 @@ from app.generation.service import (
     _demo_content,
     validate_generated_content,
 )
-from app.main import app
 from app.mindmaps import repository
 from app.optimization.service import check
 from app.optimization.source_refs import EvidenceSpan, verify_source_refs
@@ -84,7 +84,7 @@ def client(monkeypatch):
     monkeypatch.setenv("MINDMAP_DB_PATH", str(db_file))
     monkeypatch.setenv("MINDMAP_LLM_MODE", "model")
     try:
-        with TestClient(app) as api:
+        with guest_client() as api:
             yield api
     finally:
         db_file.unlink(missing_ok=True)
@@ -328,7 +328,9 @@ def test_existing_database_records_load_without_migration(client):
     conn = repository.connect()
     try:
         with conn:
-            conn.execute("INSERT INTO mindmaps VALUES (?, ?, ?, ?)",
+            # 显式列名：`mindmaps` 有 `owner` 列之后，按位置写会把时间戳挤到别的列上。
+            conn.execute("INSERT INTO mindmaps (id, version, content, updated_at) "
+                         "VALUES (?, ?, ?, ?)",
                          ("legacy", 1, json.dumps(legacy), "2026-01-01T00:00:00Z"))
     finally:
         conn.close()
@@ -337,7 +339,14 @@ def test_existing_database_records_load_without_migration(client):
     content = response.json()["content"]
     assert content["root"]["source_refs"] == content["root"]["children"][0]["source_refs"] == []
     assert content["source_usage"] == []
-    assert client.put("/api/mindmaps/legacy", json={"version": 1, "content": content}).status_code == 200
+    # 这一行的 `owner` 是空串（它早于账号这件事），只有部署方能改。注册一个人让他成为
+    # 部署方（这台机器上第一个注册的账号），这条路径才走得通——用游客会得到 403，
+    # 那是**正确的**行为，不是缺陷（见 `repository.update_map` 的 `allow_unowned`）。
+    registered = client.post("/api/auth/register",
+                             json={"username": "legacy_keeper", "password": "password123"})
+    assert registered.status_code == 201
+    assert client.put("/api/mindmaps/legacy",
+                      json={"version": 1, "content": content}).status_code == 200
 
 
 # ---------------------------------------------------------------- 父块返回模式

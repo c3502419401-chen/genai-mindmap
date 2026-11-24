@@ -234,7 +234,7 @@ def test_user_text_carries_runs_and_events(monkeypatch):
     session = summarize.due()
     assert session is not None
     text = summarize.user_text(session, summarize._events(
-        session.started_at, session.ended_at), [])
+        session.started_at, session.ended_at, ""), [])
     assert "机器学习 复习提纲" in text
     assert "图型: fishbone" in text
     assert "diagram_type.default=fishbone" in text
@@ -254,7 +254,7 @@ def test_events_window_covers_the_minutes_after_a_run(monkeypatch):
     add_event(minutes_ago=100, before="窗口之外的旧改动", after="不该出现")
     session = summarize.due()
     assert session is not None
-    rows = summarize._events(session.started_at, session.ended_at)
+    rows = summarize._events(session.started_at, session.ended_at, "")
     texts = [row["before"] for row in rows]
     assert "长标题一二三四五六七八九十" in texts
     assert "窗口之外的旧改动" not in texts
@@ -275,7 +275,7 @@ def test_identical_consecutive_edits_collapse_with_a_count(monkeypatch):
                   after="三要素界定学习", minutes_ago=minutes)
     session = summarize.due()
     text = summarize.user_text(session, summarize._events(
-        session.started_at, session.ended_at), [])
+        session.started_at, session.ended_at, ""), [])
     assert text.count("以Mitchell三要素界定学习 → 三要素界定学习") == 1
     assert "（×3）" in text
     assert "3 处，合并连续重复后 1 条" in text
@@ -290,7 +290,7 @@ def test_non_consecutive_edits_are_not_collapsed(monkeypatch):
     add_event(field="label", before="长标题", after="短标题", minutes_ago=26)
     session = summarize.due()
     text = summarize.user_text(session, summarize._events(
-        session.started_at, session.ended_at), [])
+        session.started_at, session.ended_at, ""), [])
     assert text.count("长标题 → 短标题") == 2
     assert "×2" not in text
 
@@ -302,7 +302,7 @@ def test_generate_events_have_no_subject(monkeypatch):
     add_event(kind="generate", field=None, node_count=23, minutes_ago=45)
     session = summarize.due()
     text = summarize.user_text(session, summarize._events(
-        session.started_at, session.ended_at), [])
+        session.started_at, session.ended_at, ""), [])
     assert "这次生成落了 23 个节点" in text
     assert "他这次生成" not in text
 
@@ -400,7 +400,7 @@ def test_run_session_writes_items_and_marks_the_session(monkeypatch):
     outcome = summarize.run_session(session)
     assert (outcome.status, outcome.produced, outcome.created) == (
         summarize.STATUS_DONE, 2, 2)
-    assert store.count() == 2
+    assert store.count(owner="") == 2
     with closing(repository.connect()) as conn:
         row = conn.execute(
             f"SELECT status, item_count FROM {store.SESSION_TABLE} WHERE session_id = ?",
@@ -417,7 +417,7 @@ def test_run_session_records_the_provenance(monkeypatch):
     fake_model(monkeypatch, {"memories": [{"text": "标题去掉人名"}]})
     summarize.run_session(session)
 
-    item = store.items()[0]
+    item = store.items(owner="")[0]
     assert item.session_id == "r1"
     assert item.source_run_id == "r1"
     assert item.source == store.SOURCE_SUMMARY
@@ -433,7 +433,7 @@ def test_run_session_with_zero_items_is_a_valid_outcome(monkeypatch):
 
     outcome = summarize.run_session(session)
     assert (outcome.status, outcome.produced) == (summarize.STATUS_EMPTY, 0)
-    assert store.count() == 0
+    assert store.count(owner="") == 0
     summarize._mark  # 用于断言下面那一行确实写进去了
     with closing(repository.connect()) as conn:
         row = conn.execute(
@@ -453,7 +453,7 @@ def test_run_session_deduplicates_against_existing_items(monkeypatch):
 
     outcome = summarize.run_session(session)
     assert (outcome.produced, outcome.created) == (1, 0)
-    assert store.count() == 1
+    assert store.count(owner="") == 1
 
 
 def test_run_session_records_a_model_failure(monkeypatch, caplog):

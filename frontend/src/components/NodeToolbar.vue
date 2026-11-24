@@ -186,7 +186,7 @@ function setColor(value: string): void {
         data-test="node-action-expand"
         class="rounded px-2 py-1 text-[11px] text-slate-700 hover:bg-slate-100 disabled:opacity-40"
         :disabled="store.agentRunning || selected?.node.expandable === 'no'"
-        title="展开这一支（补 3 个子节点）"
+        title="展开这一支，补 3 个子节点"
         @click="expand"
       >展开</button>
       <button

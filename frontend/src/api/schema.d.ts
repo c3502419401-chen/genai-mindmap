@@ -4,6 +4,126 @@
  */
 
 export interface paths {
+    "/api/auth/me": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Who Am I
+         * @description 当前是谁。顺便补发游客 cookie（全站唯一发它的地方）。
+         */
+        get: operations["who_am_i_api_auth_me_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/auth/register": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Register
+         * @description 注册并**直接登录**（返回 201 + 会话 cookie）。
+         *
+         *     注册完不自动登录的话，用户要在同一个页面上把刚敲的密码再敲一遍——那不是安全，
+         *     那只是让第一次使用的体验变差。注册成功意味着这条口令刚刚被验证过（是我们
+         *     亲手 hash 的），没有额外的信任问题。
+         */
+        post: operations["register_api_auth_register_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/auth/login": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Login
+         * @description 登录。账号或密码不对统一 401 `auth_bad_credentials`（理由见 `store.authenticate`）。
+         *
+         *     **限速在哈希之前**：先问 `throttle.retry_after()`，被限就直接 429，连那次
+         *     36 毫秒的 scrypt 都不花。顺序反过来的话，限速本身成了新的放大器——攻击者
+         *     用被拒的请求把服务器算力耗光。
+         */
+        post: operations["login_api_auth_login_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/auth/logout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Logout
+         * @description 登出：撤销这次会话并清 cookie。
+         *
+         *     幂等：没登录、或者 cookie 已经无效，也返回 204。界面上的"退出登录"点两次
+         *     不该第二次报错——它不是"删除资源"，是"让这台浏览器变成未登录"。
+         *
+         *     响应对象在这里**新建**而不是复用注入的那个：注入的 `Response` 是给
+         *     "在返回模型的同时补 header"用的，而这条路由的返回体就是它自己。
+         */
+        post: operations["logout_api_auth_logout_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/auth/password": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Change Password
+         * @description 改密码。**需要已经登录**，并且要再输一次旧密码。
+         *
+         *     两道都是必要的：只凭会话就能改密码，意味着一次 XSS（拿到会话）就能永久接管
+         *     账号；只凭旧密码不看会话，等于把"知道你密码的人"和"已经登录的人"混为一谈。
+         *
+         *     改完撤销全部会话（含当前这条），然后清 cookie：用户要在所有设备上重新登录。
+         *     这不是"顺手多做一步"——改密码最常见的动机就是"我怀疑有人进过我的号"。
+         */
+        post: operations["change_password_api_auth_password_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/mindmaps": {
         parameters: {
             query?: never;
@@ -420,6 +540,9 @@ export interface paths {
          *     "生成过但没保存"与"生成过、也存下来了"只能靠这个时间戳分开：那份内容可能被
          *     PUT 到一张已有导图上（推不出新记录），也可能用户存成了另一张。用 `mindmaps`
          *     表反推，得到的全是猜。
+         *
+         *     按 owner 过滤：否则知道别人 `run_id` 的人能替他标掉这一位，那条记录再也不会
+         *     出现在他的「上次的结果」里——一条安静的数据丢失。
          */
         post: operations["mark_run_applied_api_agent_runs__run_id__applied_post"];
         delete?: never;
@@ -483,7 +606,17 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /**
+         * Get Pref
+         * @description 读一条。不存在 404，不是 200 + null。
+         *
+         *     **为什么要这个端点**：`/api/prefs/{pref_key}` 之前只挂了 `PUT` / `DELETE`，于是
+         *     `GET /api/prefs/style` 这类请求会命中这条路径却被判成"方法不允许"（405）。405
+         *     的字面意思是"这个资源存在，但这个方法不行"，而实际含义是"根本没有这个偏好"——
+         *     同一件事两种错法，排查时会往错误的方向翻代码。现在未知键是 404，与 `DELETE`
+         *     的口径一致。
+         */
+        get: operations["get_pref_api_prefs__pref_key__get"];
         /**
          * Set Pref
          * @description 写一条。同值重复提交返回 `changed=false`，且不刷新 `updated_at`。
@@ -520,6 +653,10 @@ export interface paths {
          *
          *     它同时是这套东西的**死表探测器**：表一直为空，说明自动总结要么没触发过
          *     （会话之间没隔够 `GAP_MINUTES`），要么每次都总结了 0 条。两种都不报错。
+         *
+         *     **只列这个人自己的**：记忆里存的是"关于这个人的推断"（在做哪些项目、习惯
+         *     怎样），跨账号读等于让所有人共享一份人格画像。加账号之前没有这条边界，因为
+         *     那时只有一个人。
          */
         get: operations["list_memories_api_memory_get"];
         put?: never;
@@ -550,6 +687,9 @@ export interface paths {
         /**
          * Delete Memory
          * @description 硬删。404 而不是幂等 204：界面上"这条已经不在了"与"我删了但没删掉"必须分开。
+         *
+         *     别人的记忆同样回 404（`owner` 参与 `WHERE`）：既不删，也不告诉对方"这个 id
+         *     存在但不属于你"——那本身就是一条不该泄漏的事实。
          */
         delete: operations["delete_memory_api_memory__item_id__delete"];
         options?: never;
@@ -681,6 +821,60 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/settings/model": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read Model Settings
+         * @description 当前生效的配置 + 每一项的来源。
+         *
+         *     `changed` 之类的写入信息不在这里——`GET` 只回答"现在是什么"。
+         */
+        get: operations["read_model_settings_api_settings_model_get"];
+        /**
+         * Save Model Settings
+         * @description 保存。**改完立即生效**：所有出口每次调用都重新 `resolve()`，没有进程内缓存。
+         *
+         *     `store.SettingsError`（`AppError` 子类）由 `core/errors.py` 的统一出口转成
+         *     `{code, message, detail, request_id}`——错误码分得开，界面才能说清"是地址不合法
+         *     还是密钥太长"。
+         */
+        put: operations["save_model_settings_api_settings_model_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/settings/model/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Test Model Settings
+         * @description 发一次最小 chat 请求，验证地址 / 密钥 / 模型名。
+         *
+         *     **为什么是 200 而不是 4xx**：失败原因分成"地址不通""密钥被拒""模型不存在"
+         *     三种，界面要按 `ok` 显示在面板里（一句红字），而不是让前端把 4xx 当成"请求
+         *     没发出去"。真正的业务错误（比如三项都没配）走 400，因为那时连测都没法测。
+         */
+        post: operations["test_model_settings_api_settings_model_test_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/health": {
         parameters: {
             query?: never;
@@ -805,6 +999,13 @@ export interface components {
             /** File */
             file: string;
         };
+        /** ChangePasswordRequest */
+        ChangePasswordRequest: {
+            /** Current Password */
+            current_password: string;
+            /** New Password */
+            new_password: string;
+        };
         /** CheckRequest */
         CheckRequest: {
             /** Content */
@@ -843,6 +1044,20 @@ export interface components {
         /** CreateTextSourceResponse */
         CreateTextSourceResponse: {
             source: components["schemas"]["Source"];
+        };
+        /**
+         * Credentials
+         * @description 注册与登录共用的请求体。
+         *
+         *     字段给 `min_length` 是为了让"空密码"在 Pydantic 这一层就被 422 拦住，而不是
+         *     落到 `store` 里再抛业务错——两种错误在界面上都是红字，但前者不需要一次
+         *     数据库往返。真正的长度规则仍在 `store` 里（8–200），这里只是挡明显空的。
+         */
+        Credentials: {
+            /** Username */
+            username: string;
+            /** Password */
+            password: string;
         };
         /** Diagnostic */
         Diagnostic: {
@@ -1407,6 +1622,30 @@ export interface components {
             /** Message */
             message: string;
         };
+        /**
+         * InstanceSettings
+         * @description 全站共享那一行（`owner = ''`）的样子。
+         *
+         *     **只给部署方**（`can_edit_instance` 为真时才出现在响应里）。给别人看没有用：
+         *     他们改不了，那是"一片点不动的表单"；而 `base_url` 是部署方用的供应商，不该
+         *     成为所有人的可见信息。
+         */
+        InstanceSettings: {
+            /** Base Url */
+            base_url: string;
+            /** Api Key Masked */
+            api_key_masked: string;
+            /** Api Key Set */
+            api_key_set: boolean;
+            /** Model */
+            model: string;
+            /** Deep Model */
+            deep_model: string;
+            /** Configured */
+            configured: boolean;
+            /** Updated At */
+            updated_at?: string | null;
+        };
         /** KnowledgeHit */
         KnowledgeHit: {
             /** Source Id */
@@ -1617,6 +1856,44 @@ export interface components {
              * @enum {string}
              */
             diagram_type: "tree" | "flowchart" | "fishbone";
+        };
+        /**
+         * ModelSettings
+         * @description 生效的模型配置。**密钥只有打码值**。
+         */
+        ModelSettings: {
+            /** Base Url */
+            base_url: string;
+            /** Base Url Source */
+            base_url_source: string;
+            /** Api Key Masked */
+            api_key_masked: string;
+            /** Api Key Source */
+            api_key_source: string;
+            /** Api Key Set */
+            api_key_set: boolean;
+            /** Model */
+            model: string;
+            /** Model Source */
+            model_source: string;
+            /** Deep Model */
+            deep_model: string;
+            /** Deep Model Source */
+            deep_model_source: string;
+            /** Deep Model Effective */
+            deep_model_effective: string;
+            /** Llm Mode */
+            llm_mode: string;
+            /** Configured */
+            configured: boolean;
+            /** Updated At */
+            updated_at?: string | null;
+            /**
+             * Can Edit Instance
+             * @default false
+             */
+            can_edit_instance: boolean;
+            instance?: components["schemas"]["InstanceSettings"] | null;
         };
         /** Node */
         "Node-Input": {
@@ -1966,6 +2243,90 @@ export interface components {
             node_count?: number | null;
         };
         /**
+         * SaveModelSettingsRequest
+         * @description `PUT /settings/model` 的请求体。**每个字段的"空"含义不同**（见 `store.save`）。
+         *
+         *       - `api_key` 省略或空串 → **不改**（界面上那个框显示打码值，用户不动它就发空串）；
+         *         要清空必须 `clear_api_key: true`。
+         *       - `base_url` / `model` / `deep_model` 省略 → 不改；空串 → 清掉库里的覆盖，
+         *         回落到环境变量。
+         *       - `scope`：`"user"`（缺省）= 写你自己那行；`"instance"` = 写全站共享那行
+         *         （只有部署方可以，别人 403 `settings_forbidden`）。
+         *
+         *     `extra="forbid"` 是仓库的默认风格：拼错字段名时宁可 422，也不要静默忽略——
+         *     "我把密钥填进 `apikey` 了，保存成功但没生效"是最难自查的一类失败。
+         */
+        SaveModelSettingsRequest: {
+            /** Base Url */
+            base_url?: string | null;
+            /** Api Key */
+            api_key?: string | null;
+            /** Model */
+            model?: string | null;
+            /** Deep Model */
+            deep_model?: string | null;
+            /**
+             * Clear Api Key
+             * @default false
+             */
+            clear_api_key: boolean;
+            /**
+             * Scope
+             * @default user
+             * @enum {string}
+             */
+            scope: "user" | "instance";
+        };
+        /**
+         * SaveModelSettingsResponse
+         * @description 保存的结果：写入后的生效配置 + 这次有没有真的改变。
+         *
+         *     `changed=False` 是"这次提交没有改变任何东西"（同值重复保存不刷 `updated_at`）。
+         *     不返回这个布尔值，界面上就会出现"我刚存过"的假象。
+         *
+         *     `notice` 是**改了地址之后要额外说的一句话**：地址一变，之前那次连接成功的结论
+         *     就不再证明这个新地址通得过了。这里不强制先测通再落库（那会让"我想先填好、等
+         *     供应商开白名单"这种正常操作变成不可能），但要让界面有机会提醒一句。
+         */
+        SaveModelSettingsResponse: {
+            /** Base Url */
+            base_url: string;
+            /** Base Url Source */
+            base_url_source: string;
+            /** Api Key Masked */
+            api_key_masked: string;
+            /** Api Key Source */
+            api_key_source: string;
+            /** Api Key Set */
+            api_key_set: boolean;
+            /** Model */
+            model: string;
+            /** Model Source */
+            model_source: string;
+            /** Deep Model */
+            deep_model: string;
+            /** Deep Model Source */
+            deep_model_source: string;
+            /** Deep Model Effective */
+            deep_model_effective: string;
+            /** Llm Mode */
+            llm_mode: string;
+            /** Configured */
+            configured: boolean;
+            /** Updated At */
+            updated_at?: string | null;
+            /**
+             * Can Edit Instance
+             * @default false
+             */
+            can_edit_instance: boolean;
+            instance?: components["schemas"]["InstanceSettings"] | null;
+            /** Changed */
+            changed: boolean;
+            /** Notice */
+            notice?: string | null;
+        };
+        /**
          * SaveRequest
          * @description 保存一份导图，**顺带提交这一次保存里攒下的改动日志**。
          *
@@ -2200,6 +2561,41 @@ export interface components {
          * @enum {string}
          */
         SuggestionKind: "dedupe" | "merge" | "link" | "fill" | "drop" | "expand" | "add_detail" | "cross_map";
+        /**
+         * TestModelSettingsRequest
+         * @description `POST /settings/model/test` 的请求体：可选的临时覆盖。
+         *
+         *     空字段 = 用**当前生效**的值。这样面板可以"先测再存"：用户在输入框里改了地址
+         *     或模型名，不必先落库就能验一次。密钥同样：不填就用已保存/环境变量里那把，
+         *     所以"我只改模型名"的场景不需要再手打一遍 key。
+         */
+        TestModelSettingsRequest: {
+            /** Base Url */
+            base_url?: string | null;
+            /** Api Key */
+            api_key?: string | null;
+            /** Model */
+            model?: string | null;
+        };
+        /**
+         * TestModelSettingsResponse
+         * @description 一次测试连接的结论。`ok=false` 也是 200——它是结论，不是 HTTP 失败。
+         */
+        TestModelSettingsResponse: {
+            /** Ok */
+            ok: boolean;
+            /** Message */
+            message: string;
+            /** Model */
+            model: string;
+            /** Status */
+            status?: number | null;
+            /**
+             * Latency Ms
+             * @default 0
+             */
+            latency_ms: number;
+        };
         /** Theme */
         Theme: {
             /**
@@ -2237,6 +2633,18 @@ export interface components {
             /** Version */
             version: number;
         };
+        /**
+         * UserView
+         * @description 对外的账号形状。**不含 `password_hash`，也不含任何 id 之外的东西**。
+         */
+        UserView: {
+            /** Id */
+            id: string;
+            /** Username */
+            username: string;
+            /** Created At */
+            created_at: string;
+        };
         /** ValidationError */
         ValidationError: {
             /** Location */
@@ -2249,6 +2657,25 @@ export interface components {
             input?: unknown;
             /** Context */
             ctx?: Record<string, never>;
+        };
+        /**
+         * WhoAmI
+         * @description `GET /me` 的响应：当前是谁。
+         *
+         *     `kind` 是三种状态的名字，不是调试信息：界面上"未登录 / 游客 / 已登录"要显示
+         *     不同的东西，而由后端算比前端自己拼（`user ? 'user' : guest_id ? 'guest' : ...`）
+         *     更不容易在一处漏掉。
+         */
+        WhoAmI: {
+            user?: components["schemas"]["UserView"] | null;
+            /** Guest Id */
+            guest_id?: string | null;
+            /**
+             * Kind
+             * @default anonymous
+             * @enum {string}
+             */
+            kind: "user" | "guest" | "anonymous";
         };
         /** Suggestion */
         app__contracts__diagnostic__Suggestion: {
@@ -2289,6 +2716,141 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    who_am_i_api_auth_me_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WhoAmI"];
+                };
+            };
+        };
+    };
+    register_api_auth_register_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Credentials"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UserView"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    login_api_auth_login_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Credentials"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UserView"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    logout_api_auth_logout_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    change_password_api_auth_password_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChangePasswordRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     list_maps_api_mindmaps_get: {
         parameters: {
             query?: never;
@@ -3002,6 +3564,37 @@ export interface operations {
             };
         };
     };
+    get_pref_api_prefs__pref_key__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                pref_key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Pref"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     set_pref_api_prefs__pref_key__put: {
         parameters: {
             query?: never;
@@ -3345,6 +3938,92 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    read_model_settings_api_settings_model_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelSettings"];
+                };
+            };
+        };
+    };
+    save_model_settings_api_settings_model_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SaveModelSettingsRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SaveModelSettingsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    test_model_settings_api_settings_model_test_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["TestModelSettingsRequest"] | null;
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TestModelSettingsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
             };
         };
     };

@@ -193,7 +193,7 @@ def test_identical_skips_a_text_the_user_wrote_explicitly(monkeypatch):
 
     assert revision.skipped == "explicit"
     assert propositions.count() == 0
-    assert store.items()[0].kind == "preference"
+    assert store.items(owner="")[0].kind == "preference"
 
 
 def test_identical_promotes_a_summary_item(monkeypatch):
@@ -206,7 +206,7 @@ def test_identical_promotes_a_summary_item(monkeypatch):
     put_obs("obs-b")
     added = store.add("他习惯中文术语", "fact", source=store.SOURCE_SUMMARY)
     propositions.revise(draft("他习惯中文术语", "obs-a", "obs-b"), allowed={})
-    assert store.items()[0].kind == propositions.KIND
+    assert store.items(owner="")[0].kind == propositions.KIND
     assert propositions.prop(added.item.id) is not None
 
 
@@ -607,7 +607,7 @@ def test_prune_orphans_removes_a_proposition_without_its_row(monkeypatch):
     assert propositions.prop(added.item.id) is None
     assert propositions.prune_orphans() >= 1
     assert propositions.prop(added.item.id) is None
-    assert all(item.id != added.item.id for item in store.items())
+    assert all(item.id != added.item.id for item in store.items(owner=""))
 
 
 # ---------------------------------------------------------------- 事件片的接线

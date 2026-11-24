@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "要部署的 tag（必须已存在，例如 v0.4.8-deploy）"
+        description: "要部署的 tag（必须已存在，例如 v0.5.0；纯版本号，不带 -deploy 后缀）"
         required: true
 
 concurrency:
@@ -20,8 +20,10 @@ permissions:
 
 jobs:
   # 在 GitHub 托管的机器上构建：不占 ECS 的 2G 内存，也不用给它装 node。
+  # 不用 `ubuntu-latest`：那个标签会随 GitHub 的迁移窗口换发行版，某天换掉时
+  # 失败会表现成"依赖装不上"，与这次发布改了什么毫无关系。CI 里同一处理由。
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7

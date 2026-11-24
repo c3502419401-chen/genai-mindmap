@@ -1027,19 +1027,21 @@ describe('面板文案与生成结果', () => {
 
     const rows = wrapper.findAll('ol > li');
     expect(rows).toHaveLength(1);
-    expect(rows[0].text()).toContain('mindmap_generate 未成功');
+    // 失败行也要说人话：用户看到的是动作名，不是 `mindmap_generate` 这种函数名。
+    expect(rows[0].text()).toContain('生成导图 未成功');
+    expect(rows[0].text()).not.toContain('mindmap_generate');
     expect(rows[0].find('p').text()).toBe('invalid_map：模型返回的导图不合法：引用与原文不匹配');
     expect(rows[0].find('p').isVisible()).toBe(true);
   });
 
   it.each([
-    { summary: undefined, expected: '工具未返回具体失败原因。' },
-    { summary: {}, expected: '工具未返回具体失败原因。' },
-    { summary: { diagnostics: [], failed_branches: ['分支一'] }, expected: '工具未返回具体失败原因。' },
+    { summary: undefined, expected: '没有给出原因。' },
+    { summary: {}, expected: '没有给出原因。' },
+    { summary: { diagnostics: [], failed_branches: ['分支一'] }, expected: '没有给出原因。' },
     { summary: { code: 'generation_failed' }, expected: 'generation_failed' },
     { summary: { message: '模型服务返回 HTTP 429' }, expected: '模型服务返回 HTTP 429' },
-    { summary: { code: null, message: { detail: '异常对象' } }, expected: '工具未返回具体失败原因。' },
-    { summary: { code: '', message: '  ' }, expected: '工具未返回具体失败原因。' },
+    { summary: { code: null, message: { detail: '异常对象' } }, expected: '没有给出原因。' },
+    { summary: { code: '', message: '  ' }, expected: '没有给出原因。' },
   ])('失败摘要缺字段或字段不可读时仍能渲染：$expected', ({ summary, expected }) => {
     const wrapper = panel((store) => {
       store.agentEvents = [{
@@ -1051,6 +1053,18 @@ describe('面板文案与生成结果', () => {
     expect(wrapper.find('ol > li > p').text()).toBe(expected);
     expect(wrapper.text()).not.toContain('undefined');
     expect(wrapper.text()).not.toContain('[object Object]');
+  });
+
+  it('没见过的工具名原样显示，不硬编一个中文词', () => {
+    const wrapper = panel((store) => {
+      store.agentEvents = [{
+        type: 'tool_end', seq: 1, call_id: 'c1', name: 'brand_new_tool', ok: false,
+        result_summary: {},
+      }];
+    });
+
+    // 翻不出来就照原样写：至少能和后端日志对上，比编一个词强
+    expect(wrapper.get('ol > li').text()).toContain('brand_new_tool 未成功');
   });
 
   it('成功工具不显示失败原因，重试成功不会盖掉之前失败的原因', () => {

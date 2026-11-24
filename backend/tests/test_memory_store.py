@@ -95,14 +95,14 @@ def test_tables_are_created_with_the_other_tables():
         names = {row[0] for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert {store.ITEM_TABLE, store.SESSION_TABLE} <= names
-    assert store.count() == 0
+    assert store.count(owner="") == 0
 
 
 def test_schema_is_idempotent():
     """连两次不炸、不重复建。表是每次 connect 都会执行的 DDL。"""
     repository.connect().close()
     repository.connect().close()
-    assert store.count() == 0
+    assert store.count(owner="") == 0
 
 
 def test_text_hash_is_unique(monkeypatch):
@@ -204,16 +204,16 @@ def test_delete_reports_whether_it_happened(monkeypatch):
     """硬删。返回 False 让 HTTP 层能给出 404，而不是幂等 204。"""
     fake_embedding(monkeypatch)
     item = store.add("要删掉的").item
-    assert store.delete(item.id) is True
-    assert store.delete(item.id) is False
-    assert store.count() == 0
+    assert store.delete(item.id, owner="") is True
+    assert store.delete(item.id, owner="") is False
+    assert store.count(owner="") == 0
 
 
 def test_items_are_newest_first(monkeypatch):
     fake_embedding(monkeypatch)
     store.add("第一条")
     store.add("第二条")
-    assert [item.text for item in store.items()] == ["第二条", "第一条"]
+    assert [item.text for item in store.items(owner="")] == ["第二条", "第一条"]
 
 
 # ---------------------------------------------------------------- 时间解析

@@ -36,9 +36,9 @@ MINDMAP_SOFFICE_CMD="C:\Program Files\LibreOffice\program\soffice.exe"   # Windo
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `MINDMAP_LLM_MODE` | `demo`（仅 PDF 视觉这条） | `demo` 不联网走本地占位；`model` 才调模型。**PDF 视觉提取只在 `model` 下工作**。agent 生成只认显式的 `demo`：不设这个变量不会自动降级成占位图，缺模型配置会直接报错 |
-| `MINDMAP_LLM_BASE_URL` | — | 模型服务地址，须以 `http://` 或 `https://` 开头 |
-| `MINDMAP_LLM_API_KEY` | — | 密钥，只从环境变量读 |
-| `MINDMAP_LLM_MODEL` | — | 模型名，由服务商决定。当前线上用 `z-ai/glm-5.3-flash`（经 `https://api.commandcode.ai/provider/v1`），先前用 `deepseek-flash` |
+| `MINDMAP_LLM_BASE_URL` | — | 模型服务地址，须以 `http://` 或 `https://` 开头。**可被页面内的设置面板覆盖**（见下） |
+| `MINDMAP_LLM_API_KEY` | — | 密钥。**可被页面内的设置面板覆盖**（落库为明文，与 `EnvironmentFile` 同一信任边界） |
+| `MINDMAP_LLM_MODEL` | — | 模型名，由服务商决定。当前线上用 `z-ai/glm-5.3-flash`（经 `https://api.commandcode.ai/provider/v1`），先前用 `deepseek-flash`。**可被设置面板覆盖** |
 | `MINDMAP_DB_PATH` | `backend/data/mindmaps.db` | SQLite 文件路径 |
 | `MINDMAP_SOFFICE_CMD` | 自动探测 | 可选，LibreOffice 可执行文件路径 |
 | `DASHSCOPE_API_KEY` | — | 语音转写用。阿里云百炼控制台创建，`sk-` 开头 |
@@ -47,6 +47,38 @@ MINDMAP_SOFFICE_CMD="C:\Program Files\LibreOffice\program\soffice.exe"   # Windo
 | `MINDMAP_NLI_MIN_FREE_MB` | `300` | 可用内存低于此值就不加载模型（仅 Linux 可检测） |
 | `MINDMAP_LIBRARY_SEARCH` | `1` | 生成时要不要从本地知识库捞材料。**线上按演示口径置 `0`**（纯展示，等记忆模块落地再开）；它不影响 `GET /api/knowledge/library` 只读入口 |
 | `MINDMAP_LIBRARY_REMEMBER` | `1` | 生成时把用到的材料收进知识库（只认 `"0"` 为关）。与上面那个开关独立 |
+| `MINDMAP_SETTINGS_ALLOW_PRIVATE` | 空（关） | 允不允许把模型地址指向本机 / 内网。关着时"测试连接"与生成都会拒（`probe._refuse()`），因为**这个面能用已存密钥当内网探针**。要连 Ollama / LM Studio / 同机自建端点就设 `1`；它同时放开本机与内网，没有更细的粒度。**云元数据地址（`169.254.169.254`、`metadata.google.internal`、`100.100.100.200` 等）这个开关也打不开**——那里没有模型，只有临时凭证 |
+| `MINDMAP_FREE_TIER` | 空（关） | 走 Command Code coding plan 里当前标 `:free` 的模型（免费额度那一档用的就是它）。打开后，**只有借用部署方配置的人**（自己没填密钥）会换成免费模型，并自动带 `reasoning_effort=low`、把 `max_tokens` 夹到 4000–16000 之间（下限防止思考吃光额度，上限防止它按 6.5 万 token 的预算思考几十分钟）。默认关：打开它等于改变"这一次生成花谁的钱"，已有部署升级后不该静默变成又慢又受每日次数限制。详见 `docs/FREE-MODELS.md` |
+| `MINDMAP_FREE_TIER_API_KEY` | 空（关） | **公共免费密钥**：配了它就有"每 IP 每天 3 次免费生成"，没配就完全没有额度这回事。它本身就是开关（不再有单独的 `MINDMAP_FREE_QUOTA`——那只会多出"配了钥匙忘开开关"的状态）。用的是**部署方那把钥匙**，所以只有"没有自己密钥"的人会走到；且地址也必须是部署方选的（`base_url_source` 是 `instance`/`env`），**调用方自己写的地址永远领不到这把钥匙**。详见 `docs/FREE-MODELS.md` 第 8 节 |
+| `MINDMAP_FREE_QUOTA_LIMIT` | `3` | 每个 IP 每天的免费次数上限（1–100）。写错或越界退回 3 并留一条 warning |
+| `TZ` | （系统默认） | **部署这台机器时建议显式设成 `Asia/Shanghai`**：免费额度按**本地日期**跨天重置，容器/systemd 默认是 UTC 的话"明天"会从北京时间早八点开始 |
+
+**四个 `MINDMAP_LLM_*` 的优先级：当前身份自己的页面设置 > 本站共享设置 > 环境变量 > 未配置。** 回落是**逐字段**的——只改了模型名、地址与密钥仍从环境变量来。面板保存后立即生效（1 秒 TTL 的进程内缓存，按 owner 分键，单 worker 下等于即时；多 worker 时另一个进程最多滞后 1 秒）。`MINDMAP_LLM_MODE` **不进库**：它是部署方定的"这台机器要不要联网"，面板只显示、不能改。面板只接受 OpenAI 兼容接口（实际请求的是"地址 + `/chat/completions`"）。密钥只回打码值（`…abcd`），要清空必须显式声明。**打码值不是密钥**：把它原样 `PUT` 回去会被拒（400 `settings_api_key_masked`）而不是当成新密钥存下来——否则库里那把真密钥会被字面量顶掉，而接口照旧说"已配置"、之后每次调用都 401。这条对直接调接口的人尤其重要：界面上那个值只出现在 placeholder 里，正常点击不会提交它。
+
+**模型配置按人分开存（BYOK）。** `model_settings` 的主键是 `owner`：`''` 是**本站共享配置**（游客免费额度用的就是它），`user:<id>` 是某个账号，`guest:<id>` 是某台浏览器的游客。**游客也能存自己的密钥**——他不想填而已，不是不许。回落链见上一条，中间那一档（共享配置）必须存在，否则刚注册、还没填密钥的人一条路都走不了；它只在你自己缺那个字段时生效，不然 BYOK 会被公共配置永久盖住。`api_key_source` 因此多一档 `instance`（借来的），与 `saved`（自己的）分开报——合并会让"清除自己那行、回到公共配置"变成不敢点的按钮。
+
+**部署方 = 这台机器上第一个注册的账号**，没有 `MINDMAP_ADMIN` 环境变量。只有他能改共享那一行（`PUT` 带 `scope: "instance"`，别人 403 `settings_forbidden`），也只有他能看见它（`GET` 的 `instance` 字段，别人是 `null`）。判定按 `created_at`、`id` 兜底，登出不影响；他删号之前别把这件事忘了——台上只有一个账号时，那个账号就是部署方。老库（单行 `CHECK (id = 1)`）启动时自动迁移成 `owner = ''` 那一行，两段式可续、幂等，搬迁过程中进程被杀下次会补完。
+
+**改地址之后保存会带一句 `notice`**："上次「测试连接」的结论对新地址不成立，建议现在点一次"。只提醒不阻拦——"先把地址填好、等供应商开白名单"是正常操作，强制先测通会把这条路堵死。同值重复保存、以及从"什么都没配"到"填了个地址"的首次配置都不提醒（没有旧结论可作废）。
+
+**地址不许指向本机 / 内网 / 云元数据地址。** 这个面最贵的失误不是"填错"，是"被改写"：无鉴权时 `PUT` 换掉 `base_url`、再 `POST /model/test`（空 body 走回落生效值这条免费路径），已存密钥就随 `Authorization` 头送到了那个地址——攻击者既不需要知道密钥，也不需要读得到响应。所以现在有三道：门禁要求这一面**必须有身份**（`backend/app/auth/gate.py`，nginx 那层 Basic Auth 已弃用）；`backend/app/settings/probe.py::_refuse()` 在发请求**之前**拒掉本机、内网、链路本地、保留地址（`MINDMAP_SETTINGS_ALLOW_PRIVATE=1` 可放开，见上表）与云元数据地址（开关也打不开）；公网地址必须 `https://`（`http://` 会让密钥明文过中间每一跳；私网不查这一条，本机 Ollama 常开在 http）。它仍不是"防住内网"的完整方案（DNS rebinding、302 跳内网、公网域名解析到私网都挡不住），挡的是成本最低的那一步。
+
+**密钥与地址绑定（`api_key_host`）——第二层，挡"已经改好地址"之后的安静形状。** 上面那些挡的是"填个地址就把密钥送出去"，发生在测试连接那一刻。但还有一个形状不经过测试连接：改完地址（这一步本来没有密钥出门），下一次**正常生成**就会带着库里那把密钥去访问新地址。所以 `model_settings` 多一列 `api_key_host`，记"这把密钥被哪台主机保存过"，`store.resolve()` 只在当前生效地址的主机名与锚点一致时才交出明文；不一致时 `api_key_source` 变成 `unbound`、`api_key` 为空、`configured` 变 `false`，界面上那一栏提示"重新粘贴一次"。
+
+三个边界：① **只比主机名**，不比端口与路径——`/v1` 换 `/v2`、Ollama 11434 挪到 11435 都不该逼人重填，为这些变动弹提示只会训练出"看到提示就再粘一次"的习惯；换主机才意味着"换了一个会收到这把密钥的对方"。② 锚点**落库**而不是每次读时算，算的话它会跟着新地址一起漂，绑定等于不存在。③ 老库升级时该列补成空串，此时按那一行自己的 `base_url` 兜底——否则升级当天所有人的已存配置会一起被判成"未配置"。重新粘贴一次密钥就是唯一的恢复动作，`POST /model/test` 在这个状态下回 400 `settings_key_unbound` 并且**一个字节都不发**。
+
+**免费档（`MINDMAP_FREE_TIER`）：模型名是运行时现问的，不写死。** 打开之后，`store.resolve()` 会问一次部署方那台端点的 `GET /models`，挑出当前 id 以 `:free` 结尾、且 `supported_endpoints` 里带 `/chat/completions` 的那些，按"上下文大的优先、同大按 id 升序"排第一个来用。**这份名单会变**——平台会新上架免费模型，也会把已有的下架，所以这里一个模型名都没硬编码；`docs/FREE-MODELS.md` 记着实测数据与坑。四条运维要点：① 拉一次列表要 20 秒以上，所以它是后台线程 + 1 小时 TTL 缓存，**永远不会出现在请求路径上**（冷启动第一次会报"免费档还没准备好"，点一次重试就好）；② 免费模型**也要密钥**（不带 key 直接 401），只是那次调用不收费，所以这一档用的是部署方那把钥匙，`model_source` 会报 `free`；③ 上游偶发 429 / 524，一次运行内会按候选序列换下一个免费模型，全试完才报错；④ **免费档单次生成要 4–6 分钟**（付费档约 100 秒的同一张图），`RunBudget.max_seconds` 默认 600 秒余量偏薄——把免费档当主路径前先确认它不是唯一开关，或把 `MINDMAP_LLM_MAX_TOKENS` 留在默认（免费档的 `max_tokens` 上限由代码夹在 16000；**往下是跟这个变量的**：把它设成 2000，免费档最后也只发 2000，只有往上调才顶不过 16000 这道夹子）。用户自己填了密钥就完全不进这一档。
+
+**公共免费额度（`MINDMAP_FREE_TIER_API_KEY`）：每 IP 每天 3 次，用完 429。** 配了这把钥匙，没有自己密钥的人就能借它生成，`api_key_source` 报 `public`。四件要知道的事：
+
+1. **按 IP 认人**（`X-Real-IP` 优先，其次 `X-Forwarded-For` 的最后一跳，最后 socket 对端）。按 cookie 的话清一下就重置，按账号的话注册一个就重置——两种都让"限 3 次"变成空话。代价是同一 NAT 后面的人共享一个池，**校园网就是这个情况**。
+
+   **这一条成立的前提是"后端不能被直连"**：`X-Real-IP` 是请求方自己写的头，两份 nginx 配置都写 `X-Real-IP $remote_addr` 覆盖它——默认部署下客户端改不了。但 `deploy/genai-mindmap.service` 把 uvicorn 绑在 `127.0.0.1`、compose 只 `expose` 不发布端口，这两件事**不是安全余量，是这个机制的组成部分**。如果有人把 8000 端口直接放出去（或者外层反代忘了覆盖这个头），每次换一个 `X-Real-IP` 就能把"每天 3 次"变成无限（审查实测：同 IP 第 3 次 429，换头之后全部 200）。登录限速不受影响——它按 IP 与账号两个桶取严，伪造这个头只能刷新 IP 桶，动不了账号桶。
+2. **扣在开流之前**（`runs.begin` 之前），所以并发请求不会都看到"还剩 1 次"；代价是失败那次可能白扣一格，所以收尾时"最后没有候选"会 `refund()` 回去——**半棵树交付算有产出、照扣**（那一次真的调过模型）。
+3. **用完是 429 `free_quota_exhausted` + `Retry-After`（到明天零点的秒数）**，不开流、不建 `runs` 行、不发任何模型调用。界面上的失败卡片会把重试按死，并同时给出"明天恢复"与"去填自己的密钥"两条路。
+4. **降级方向是放开**：额度表读写失败当作还有额度。反过来会把所有人关在门外，而攻击者没法让表坏掉（他得先拿写锁）。
+
+**地址必须是部署方选的，这是这一档的安全前提。** 判据是 `base_url_source ∈ {instance, env}` **且** `api_key_source ∈ {instance, env, unset}`。只看"没有自己的密钥"是不行的：那样任何人 `PUT /api/settings/model {"base_url": "https://attacker.example/v1"}`（**不带密钥**，连 `settings_key_unbound` 都不经过）就能把公共钥匙领走——这正是 P0-1 修过的形状，而且只要一步。用户自己写地址却不填密钥时**不给他公共钥匙**，`configured` 为假、界面说"去填密钥"，这是加公共额度之前的行为。
 
 ## 4. 各格式的依赖与耗时
 
@@ -225,7 +257,7 @@ git describe --tags # 本方案第一次上线后才会打第一个部署 tag；
 
    ```bash
    # 本机：从要部署的 tag 导出（自动排除 .git / node_modules）
-   git archive --format=tar.gz -o genai-mindmap.tar.gz v0.4.0-deploy
+   git archive --format=tar.gz -o genai-mindmap.tar.gz v0.5.0
    scp genai-mindmap.tar.gz root@<ECS_IP>:/root/
 
    # 服务器
@@ -259,14 +291,14 @@ sudo bash deploy/install.sh --domain mindmap.example.com --version v0.4.7
 
 | 步骤 | 内容 |
 |---|---|
-| 1 | `dnf` 装 nginx / htpasswd / sqlite / 编译基础件 |
+| 1 | `dnf` 装 nginx / sqlite / 编译基础件 |
 | 2 | 没有 swap 就加 2G（2G 内存解析 PDF、装 torch 都要余量） |
 | 3 | 建 `genai` 系统用户；代码到 `/opt/genai-mindmap`；数据到 `/var/lib/genai-mindmap`；`/etc/genai-mindmap/env` 权限 0640；覆盖前把当前代码快照到 `/var/lib/genai-mindmap/releases/`（保留 5 份，回滚用） |
 | 4 | 用 `uv` 装独立 CPython 3.12（避开系统 python3.6）并建 venv、装 `backend/requirements.txt`（默认走阿里云 PyPI 镜像） |
 | 5 | 装 systemd 单元并启动（只 1 个 worker，理由见下） |
-| 6 | 装 nginx 站点配置（IPv6 关闭时只监听 v4）、生成 Basic Auth 账号 `demo`（随机密码只打印一次）、放行 SELinux 反代与静态目录上下文、装每日备份 cron |
+| 6 | 装 nginx 站点配置（IPv6 关闭时只监听 v4）、删除上一代遗留的 Basic Auth 口令文件（账号体系已接管鉴权）、放行 SELinux 反代与静态目录上下文、装每日备份 cron |
 
-重复执行是安全的，但有两处**故意不覆盖**：`/etc/genai-mindmap/env`（密钥）与 `/etc/nginx/.htpasswd-mindmap`（账号密码）。
+重复执行是安全的。只有一处**故意不覆盖**：`/etc/genai-mindmap/env`（密钥）。
 
 ### 9.3 填密钥（运行时注入，不进仓库）
 
@@ -316,7 +348,7 @@ sudo bash deploy/install.sh --domain mindmap.example.com   # 检测到证书后�
 
 ```bash
 curl -s http://127.0.0.1:8000/api/health                  # 后端活着
-curl -su demo:<密码> https://mindmap.example.com/api/health # 反代通
+curl -s https://mindmap.example.com/api/health # 反代通（免身份，门禁放行它）
 sudo ss -lntup | grep -E ':(80|443|8000)'                 # 8000 只能听 127.0.0.1
 ```
 
@@ -334,12 +366,25 @@ sudo /usr/local/bin/genai-mindmap-backup       # 手动备份，产物在 /var/b
 
 恢复备份：`gunzip -c /var/backups/genai-mindmap/mindmaps-<时间>.db.gz > /var/lib/genai-mindmap/mindmaps.db`，然后 `chown genai:genai` 并重启服务。
 
-加演示账号：`sudo htpasswd /etc/nginx/.htpasswd-mindmap alice`。
+**账号在页面里注册，不用命令行。** 打开站点 → 抽屉里的「账号」区 → 注册。**第一个注册的账号就是部署方**（见第 3 节第 5 条），他能改全站共享的模型配置。nginx 那层 Basic Auth 已弃用，`/etc/nginx/.htpasswd-mindmap` 会被重跑的 `install.sh` 删掉——它现在是一份没人消费的口令，留着只会让人以为门外还有一道锁。
 
-**多加账号 = 共用一个知识库**。服务端是单用户单库的设计（见 `docs/PLAN.md` 的 F12），
-Basic Auth 只决定"能不能进来"，不区分是谁：任何账号打开「知识库」抽屉，都能列出
-别人的材料、并读到每份正文的前 4000 字。只想自己用就别加账号；真要多人共用，
-先想清楚这些材料能不能互相看见。
+**注册是开放的。** 门禁只挡匿名，游客身份谁都能领（每天 3 次免费生成），注册也不需要邀请码。**不想让陌生人进来就在外层限**：安全组只放行自己的 IP、宿主机再架一层 Basic Auth/SSO、或者干脆先不暴露公网。这是"门禁"与"谁能进来"两件事的分工——应用负责前者。
+
+**知识库是共用的**。服务端是单用户单库的设计（见 `docs/PLAN.md` 的 F12）：任何有身份的账号打开「知识库」抽屉，都能列出别人的材料、并读到每份正文的前 4000 字。只想自己用就别开放注册；真要多人共用，先想清楚这些材料能不能互相看见。
+
+**但记忆与偏好是分开的**。上面那条"共用"是**材料库**的口径，别顺手外推：账号体系
+落地之后，`memory_items`（从会话里总结出的"关于这个人的推断"）、`user_prefs`（含
+`note.*` 这段唯一会进提示词的自由文本）、`style_profile`（从历史图里统计出的作图习惯）
+**都按身份隔离**，别人列不到、删不掉，也不会被拼进你的生成提示词。导图仍是读共享、
+写限主（协作要能看别人的图，改只能改自己的）。一张表在 `docs/API.md` 的「数据隔离」
+一节。
+
+**后端不许被直连暴露**。`X-Real-IP` / `X-Forwarded-For` 是请求方自己写的头，免费额度
+按 IP 计数、登录限速按 IP 建桶，两者都只信任"我们自己那一跳写进来的地址"。两份 nginx
+配置都覆盖这两个头，所以默认部署是安全的；但**把 8000 端口直接放出去就等于关掉这道
+限制**（审查实测：换头即可无限刷额度）。同理，`deploy/genai-mindmap.service` 的
+`--host 127.0.0.1` 与 compose 的 `expose`（不 `ports`）不是"顺手写得保守"，是这套
+计数的前提。
 
 **重启会等正在跑的生成**：单元里 `TimeoutStopSec=660`（生成预算是 600 秒），所以有长请求在跑时 `systemctl restart` 可能等到十来分钟。演示前别在有人用的时候重启；确实要立刻停，用
 `sudo systemctl kill -s SIGKILL genai-mindmap && sudo systemctl start genai-mindmap`（代价是那条请求直接断，前端看到断流）。
@@ -478,7 +523,7 @@ gh api -X POST repos/RPeGio/genai-mindmap/actions/runners/registration-token --j
 mkdir -p /root/genai-mindmap-src
 tar -xzf /root/genai-mindmap-vX.Y.Z.tar.gz -C /root/genai-mindmap-src
 cd /root/genai-mindmap-src
-sudo bash deploy/install.sh --domain genai-mindmap.rpegio.top --version vX.Y.Z-deploy
+sudo bash deploy/install.sh --domain genai-mindmap.rpegio.top --version vX.Y.Z
 sudo bash deploy/install-runner.sh --token <上一步拿到的 token>
 ```
 
@@ -505,13 +550,18 @@ gh api repos/RPeGio/genai-mindmap/actions/runners --jq '.runners[] | "\(.name) \
 
 ### 12.3 日常发布
 
+**tag 命名：纯版本号，不带后缀。** 早期几个 tag 叫 `v0.4.9-deploy`（那阵子既有前端发布又有部署，
+想用后缀区分），后来发现后缀没有区分到任何东西——一个 tag 就是一次发布，两种都发。两种都
+能部署（`cd-apply.sh` 只要求 `[A-Za-z0-9._-]`），但**新 tag 一律用纯版本号**，否则
+`git tag --sort=v:refname` 排出来的顺序会是错的（`v0.4.9-deploy` 与 `v0.4.10` 谁新要人算）。
+
 本地是 Windows PowerShell，一行一条，别用 `&&`（PowerShell 5.1 不支持）：
 
 ```powershell
 git switch main
 git pull --ff-only
-git tag -a v0.4.9-deploy -m "v0.4.9: 这次改了什么"
-git push origin v0.4.9-deploy     # ← 这一步触发部署
+git tag -a v0.5.0 -m "release: v0.5.0（这次改了什么）"
+git push origin v0.5.0            # ← 这一步触发部署
 gh run watch                      # 看着它跑完（Ctrl+C 只退出观察，不会取消 job）
 ```
 
@@ -533,7 +583,7 @@ gh run watch                      # 看着它跑完（Ctrl+C 只退出观察，�
 用 `workflow_dispatch` 指定一个旧 tag 重跑即可（tag 必须存在）：
 
 ```bash
-gh workflow run deploy.yml -f version=v0.4.8-deploy
+gh workflow run deploy.yml -f version=v0.5.0
 ```
 
 它走的是同一条路径：解包旧代码 → `install.sh`（快照当前版本）→ 换回旧 dist。前端与后端

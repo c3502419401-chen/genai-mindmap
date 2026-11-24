@@ -636,6 +636,28 @@ class ChatAsyncStreamingTest(unittest.TestCase):
         self.assertEqual(result, {"children": [{"label": "乙"}]})
         self.assertEqual(len(requests), 2)
 
+    def test_a_gateway_timeout_on_the_stream_does_not_cost_a_second_round(self):
+        """524 是"这个模型此刻不可用"，该直接交给候选循环，而不是退回一次性请求。
+
+        退回的代价是整整一个往返：免费档单次请求实测能跑到 180 秒以上，而 524
+        恰恰是它最常撞到的码。所以这里断言的是**只发了一次**——与
+        `test_stream_http_error_falls_back`（500，不在不可用集合里，退回是对的）
+        正好配对。
+        """
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(524, json={"error": "origin timeout"})
+
+        async def on_delta(text: str) -> None:  # pragma: no cover - 不会走到
+            raise AssertionError("失败的流不该产出 delta")
+
+        with self.assertRaises(GenerationError) as caught:
+            self._call(handler, on_delta)
+        self.assertIn("524", str(caught.exception))
+        self.assertEqual(len(requests), 1)   # 没有"流式一次 + 退回一次"
+
     def test_callback_failure_does_not_fail_generation(self):
         """预览回调自己坏了：停掉后续回调，正文照收、结果照出。"""
         calls = {"n": 0}

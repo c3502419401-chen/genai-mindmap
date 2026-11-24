@@ -208,7 +208,8 @@ class RepositoryCompatibilityTest(unittest.TestCase):
         with closing(sqlite3.connect(repository.db_path())) as conn, conn:
             conn.execute("CREATE TABLE IF NOT EXISTS mindmaps (id TEXT PRIMARY KEY, version INTEGER NOT NULL,"
                          " content TEXT NOT NULL, updated_at TEXT NOT NULL)")
-            conn.execute("INSERT INTO mindmaps VALUES (?, 1, ?, '2026-11-01T00:00:00.000Z')",
+            conn.execute("INSERT INTO mindmaps (id, version, content, updated_at) "
+                         "VALUES (?, 1, ?, '2026-11-01T00:00:00.000Z')",
                          (map_id, json.dumps({"title": "旧图", "root": {"id": "r", "label": "根", "children": []}},
                                              ensure_ascii=False)))
 

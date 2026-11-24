@@ -514,7 +514,8 @@ class TestRepositoryRoundTrip:
             conn.execute("CREATE TABLE IF NOT EXISTS mindmaps (id TEXT PRIMARY KEY,"
                          " version INTEGER NOT NULL, content TEXT NOT NULL,"
                          " updated_at TEXT NOT NULL)")
-            conn.execute("INSERT INTO mindmaps VALUES ('legacy', 1, ?,"
+            conn.execute("INSERT INTO mindmaps (id, version, content, updated_at)"
+                         " VALUES ('legacy', 1, ?,"
                          " '2026-11-01T00:00:00.000Z')",
                          (json.dumps({"schema_version": 2, "title": "旧图",
                                       "root": node("r")}, ensure_ascii=False),))

@@ -1,5 +1,5 @@
 /**
- * 「上次的运行结果」：run 身份落到界面上的那一条链路。
+ * 「上次的生成结果」：run 身份落到界面上的那一条链路。
  *
  * 验的是"这张表有没有人读"——`runs` 里的结果若没人捡，那四十秒只是从内存白花
  * 变成写进数据库白花。所以这里从探测一直走到"载入 → 保存 → 上报已保存"。
@@ -99,7 +99,7 @@ function buttonByText(wrapper: VueWrapper, text: string) {
   return found;
 }
 
-const NOTICE = '[aria-label="上次的运行结果"]';
+const NOTICE = '[aria-label="上次的生成结果"]';
 
 beforeEach(() => {
   setActivePinia(createPinia());
@@ -109,7 +109,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe('上次的运行结果', () => {
+describe('上次的生成结果', () => {
   it('有"生成了但没保存"的运行 → 提示一句，不弹窗', async () => {
     stubFetch({ list: [summary()] });
     const wrapper = mountApp();

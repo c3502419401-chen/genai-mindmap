@@ -8,6 +8,7 @@ import ChatDock from './components/ChatDock.vue';
 import HistoryDrawer from './components/HistoryDrawer.vue';
 import MessageFab from './components/MessageFab.vue';
 import NodeToolbar from './components/NodeToolbar.vue';
+import SettingsPanel from './components/SettingsPanel.vue';
 import StructureCheck from './components/StructureCheck.vue';
 import { SOURCE_LABELS } from './sources/input';
 import { ApiError, exportFilename, exportLabel, exportMindMap, getHealth, listLibrary, readLibrarySource, type ExportFormat } from './api/client';
@@ -688,6 +689,12 @@ function onKeydown(event: KeyboardEvent) {
     }
     if (event.key === 'Tab' && trapLibraryFocus(event)) return;
   }
+  // 模型设置是带遮罩的模态浮层：Esc 关它，跟知识库抽屉同一档（它上面不该再压别的东西）。
+  if (settingsOpen.value && event.key === 'Escape') {
+    event.preventDefault();
+    settingsOpen.value = false;
+    return;
+  }
   // 偏好浮层盖在抽屉左上角，Esc 关它是这类浮层的默认预期（它不带遮罩，也没有确定按钮）。
   if (prefsOpen.value && event.key === 'Escape') {
     event.preventDefault();
@@ -818,6 +825,18 @@ const historyOpen = ref(false);
  * 会让它自己也有两份。
  */
 const prefsOpen = ref(false);
+
+/**
+ * 模型设置浮层的开合。
+ *
+ * 它跟偏好浮层不是同一类东西：偏好是"这张图长什么样"，模型设置是"这台后端连哪个
+ * 模型服务"。所以入口在顶栏（`⚙`）而不是抽屉里——换密钥常常是"现在生成失败了，
+ * 我去看一下"，那时候顺手打开抽屉再找一层反而是绕路。
+ *
+ * 面板自己带遮罩并管自己的关闭，这里只留一位状态：`Esc` 与「点遮罩」都要能关，
+ * 而键盘监听整栋房子只有 `App` 这一处（见 `onKeydown`）。
+ */
+const settingsOpen = ref(false);
 
 function toggleSide(): void {
   sideOpen.value = !sideOpen.value;
@@ -1051,6 +1070,27 @@ const agentHasDetail = computed(() => agentDetailVisible(store));
           @blur="store.setTitleDraft(null)"
         />
       </div>
+      <!--
+        模型设置入口：一个齿轮。
+        图标不带文字，顶栏的可见文字仍是"☰ / 图名 / +"——顶栏不能被一格格按钮撑长
+        这个取舍没变，见 `frontend/tests/shell-actions.spec.ts` 里按 `data-test` 数
+        "顶栏有哪些动作"的那条用例。
+      -->
+      <button
+        type="button"
+        data-test="open-settings"
+        class="shrink-0 rounded-md border border-slate-200 px-2 py-1 text-slate-600 hover:bg-slate-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
+        :aria-expanded="settingsOpen"
+        aria-haspopup="dialog"
+        aria-label="模型设置"
+        title="模型设置（服务地址 / 密钥 / 模型名，改完立即生效）"
+        @click="settingsOpen = !settingsOpen"
+      >
+        <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+          <circle cx="12" cy="12" r="3" />
+          <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.11a1.7 1.7 0 0 0-1.11-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.11a1.7 1.7 0 0 0 1.55-1.11 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.11a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.11a1.7 1.7 0 0 0-1.49 1z" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+      </button>
       <button
         type="button"
         data-test="new-run"
@@ -1287,7 +1327,7 @@ const agentHasDetail = computed(() => agentDetailVisible(store));
               选择没生效。说清"下级选默认 = 继承"比让那条下拉自己解释要省事。
             -->
             <p class="text-[11px] leading-relaxed text-slate-400">
-              一级分支定了颜色，它的所有下级都跟着用这个色（在这里改一级分支，整支一起变）；下级节点选「默认」表示继承上级。
+              一级分支定了颜色，整支都跟着用这个色；下级选「默认」表示继承上级。
             </p>
           </section>
 
@@ -1574,7 +1614,7 @@ const agentHasDetail = computed(() => agentDetailVisible(store));
         <template v-else>
           <h2 class="text-sm font-semibold">节点详情</h2>
           <p class="text-xs leading-relaxed text-slate-500">
-            点击画布上的任意节点查看完整内容与它所在的层级路径；双击节点可以直接改文字。
+            点击画布上的任意节点查看完整内容与层级；双击节点可以直接改文字。
           </p>
         </template>
         <!-- 本图来源：整图口径的来源清单，与各节点自己的引用互为对照。
@@ -1591,11 +1631,17 @@ const agentHasDetail = computed(() => agentDetailVisible(store));
               <span v-else class="text-amber-700">· 没有节点引用</span>
             </li>
           </ul>
-          <p class="mt-2 leading-relaxed text-slate-400">生成时用到的来源（整图口径），具体出处见各节点的引用；原文未随导图保存。</p>
+          <p class="mt-2 leading-relaxed text-slate-400">生成时用到的来源；具体出处见各节点引用，原文未随导图保存。</p>
         </details>
         </div>
       </aside>
     </main>
+
+    <!--
+      模型设置浮层（顶栏 `⚙` 打开）。挂在 `<main>` 之外、`fixed` 定位：它不属于画布，
+      也不该被任何 `absolute` 的抽屉层级压住。自己带遮罩，开合不影响主区布局。
+    -->
+    <SettingsPanel v-if="settingsOpen" @close="settingsOpen = false" />
 
     <!-- 导出等一次性操作的结果浮层；错误停 6 秒，成功 3 秒，带撤销的那条 8 秒。 -->
     <div

@@ -3,3 +3,6 @@
 *.jpg binary
 *.jpeg binary
 *.svg text
+# 音频样本（`backend/scripts/asr_poc_sample/`）：`text=auto` 会让 git 试着按文本处理，
+# 而 `eol=lf` 会对二进制做换行归一化。标记成 binary 才是"别碰我"。
+*.wav binary

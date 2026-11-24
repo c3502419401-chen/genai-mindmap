@@ -383,21 +383,26 @@ function withinScope(change: CandidateChange, scope: Set<string>): boolean {
  * 映射只此一份：面板（要带耗时）与状态行（不带）都从这里取。两处各写一份的话，
  * 同一件事迟早出现两种措辞，用户在两个位置读到不同的词。
  */
-const AGENT_TOOL_LABELS: Record<string, { running: string; done: string }> = {
-  mindmap_generate: { running: '正在定框架', done: '已定好框架' },
-  node_expand: { running: '正在展开分支', done: '已展开分支' },
-  rag_query: { running: '正在查资料', done: '已查好资料' },
-  mindmap_edit: { running: '正在改结构', done: '已改好结构' },
+const AGENT_TOOL_LABELS: Record<string, { running: string; done: string; name: string }> = {
+  // `name` 是这个动作的短名（"生成导图"），只在没有进度可言的那一行用——
+  // 工具失败时那行写的是「生成导图 未成功」，不能把 `mindmap_generate` 摆给用户。
+  mindmap_generate: { running: '正在定框架', done: '已定好框架', name: '生成导图' },
+  mindmap_generate_deep: { running: '正在分部生成', done: '已分部生成', name: '生成导图' },
+  node_expand: { running: '正在展开分支', done: '已展开分支', name: '展开节点' },
+  rag_query: { running: '正在查资料', done: '已查好资料', name: '查资料' },
+  mindmap_edit: { running: '正在改结构', done: '已改好结构', name: '修改导图' },
+  mindmap_fill_details: { running: '正在补写说明', done: '已补写说明', name: '补写说明' },
+  audit_tree: { running: '正在检查结构', done: '已检查结构', name: '检查结构' },
   // 四个细粒度工具。`edit` 意图下模型可能连调几次（一次改一处），所以文案要能
   // 让人看出"它在逐个改"，而不是以为同一件事被重复执行了。
-  add_node: { running: '正在加节点', done: '已加节点' },
-  update_node: { running: '正在改节点', done: '已改节点' },
-  remove_node: { running: '正在删节点', done: '已删节点' },
-  move_node: { running: '正在移动节点', done: '已移动节点' },
+  add_node: { running: '正在加节点', done: '已加节点', name: '加节点' },
+  update_node: { running: '正在改节点', done: '已改节点', name: '改节点' },
+  remove_node: { running: '正在删节点', done: '已删节点', name: '删节点' },
+  move_node: { running: '正在移动节点', done: '已移动节点', name: '移动节点' },
   // 两条边工具。文案要让人看出"它在连线"，而不是"它在改结构"——连线不改层级，
   // 用户盯着画布时看到的是"多了一个箭头"，不是"某个节点换了位置"。
-  add_edge: { running: '正在连关系', done: '已连关系' },
-  remove_edge: { running: '正在删关系', done: '已删关系' },
+  add_edge: { running: '正在连关系', done: '已连关系', name: '加连线' },
+  remove_edge: { running: '正在删关系', done: '已删关系', name: '删连线' },
 };
 
 /**
@@ -410,6 +415,16 @@ export function agentToolLabel(name: string, phase: 'running' | 'done'): string 
   const pair = AGENT_TOOL_LABELS[name];
   if (!pair) return name;
   return phase === 'running' ? pair.running : pair.done;
+}
+
+/**
+ * 工具的动作短名（"生成导图"），给「…未成功」这类没有进度可言的行用。
+ *
+ * 与 `agentToolLabel` 同一张表：失败时也不该让 `mindmap_generate` 这种函数名
+ * 出现在用户面前。未知工具名仍原样返回，理由同上——不硬编一个中文词。
+ */
+export function agentToolName(name: string): string {
+  return AGENT_TOOL_LABELS[name]?.name ?? name;
 }
 
 /**
@@ -1119,7 +1134,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
       }
       if (!detail.candidate) {
         resumableRun.value = null;
-        status.value = '那次运行没有留下可用的内容。';
+        status.value = '上次的生成没有留下可用的内容。';
         return false;
       }
       agentEvents.value = [];
@@ -1529,10 +1544,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
     const diagnostics = diagnosticCount(agentWarnings.value);
     const tail = diagnostics > 0 ? `，${diagnosticsHint(diagnostics)}` : '';
     if (agentWarnings.value.some(item => item.kind === 'partial')) {
-      return `${base}（部分分支未完成${tail}），可以直接改，也可以撤销回生成前。`;
+      return `${base}（部分分支未完成${tail}）。可以直接改，或撤销回生成前。`;
     }
     if (diagnostics > 0) {
-      return `${base}（${diagnosticsHint(diagnostics)}），可以直接改，也可以撤销回生成前。`;
+      return `${base}（${diagnosticsHint(diagnostics)}）。可以直接改，或撤销回生成前。`;
     }
     return `${base}，记得保存。`;
   }
@@ -2854,6 +2869,20 @@ export const useMindMapStore = defineStore('mindmap', () => {
         status.value = '这张导图已被别人改过，本地修改还没保存。';
         return 'conflict';
       }
+      // 403 只可能来自一件事：这张图不是你创建的（门禁有身份就能过，所以不是登录问题）。
+      // 后端那句话已经说了下一步（另存为新建一份），这里原样透传——自己再编一句只会
+      // 与后端口径漂移，而"为什么存不了"这件事只有一个正确答案。
+      if (error instanceof ApiError && error.status === 403) {
+        status.value = error.message;
+        return 'failed';
+      }
+      // 401 = 身份过期（会话 30 天到期、换了浏览器、清了 Cookie）。保存是**唯一**
+      // 一个用户会反复点的动作，所以这一档必须说清"刷新页面"而不是"重试"：
+      // 原样重发还是会 401，而刷新一下就会领到新的游客身份。
+      if (error instanceof ApiError && error.status === 401) {
+        status.value = '这一页的身份过期了：刷新页面后重新打开这张图再保存。';
+        return 'failed';
+      }
       status.value = error instanceof ApiError ? error.message : '保存失败，请重试。';
       return 'failed';
     } finally {
@@ -3336,7 +3365,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     agentRunning.value = true;
     busy.value = true;
     stageText.value = '正在连接';
-    status.value = '正在与模型协作…';
+    status.value = '正在生成…';
     waitedMs.value = 0;
     // 上一轮的模型名与思考过程在**这一次开始的那一刻**就作废：它们描述的是另一个
     // 运行。留到这一次的 done 帧才清，中间那段时间面板会挂着一个已经不对的模型名。
@@ -3428,7 +3457,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
           case 'tool_end': {
             stageText.value = event.ok
               ? agentToolLabel(event.name, 'done')
-              : `${event.name} 未成功`;
+              : `${agentToolName(event.name)} 未成功`;
             // 后端分片生成会以 ok=true 报"结果不完整"：partial 与 diagnostics 都在
             // result_summary 里。不在这里接下来，面板与状态行都看不见它。
             const warnings = agentWarningsFrom(event.result_summary);
@@ -3543,7 +3572,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
       }
     } catch (error) {
       if (controller !== ctrl) return;
-      const message = error instanceof ApiError ? error.message : '运行失败，请重试。';
+      const message = error instanceof ApiError ? error.message : '生成失败，请重试。';
       agentError.value = message;
       // 422 这类"请求本身就不合法"不该显示「重试」——原样再发一遍还是同一个 422。
       // 用它自己的错误码，面板据此给出"改输入"而不是"再来一次"。
@@ -3692,7 +3721,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
       draft.value = null;
       resetDraftOps();
       conflictDraft.value = null;
-      status.value = '这次生成是在另一张导图上跑的，结果已丢弃，请重新运行。';
+      status.value = '这次生成是在另一张导图上跑的，结果已丢弃，请重新生成。';
       return 'stale';
     }
     // 生成期间画布被改过（`undo` 或手工编辑）。**不覆盖**：用户那 25 秒里的编辑

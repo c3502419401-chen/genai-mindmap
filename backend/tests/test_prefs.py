@@ -120,6 +120,24 @@ def test_delete_is_real():
     assert all(row.key != service.ICON_KEY for row in service.list_all())
 
 
+def test_one_pref_can_be_read_by_key():
+    """`GET /api/prefs/{key}` 读一条；不存在的键是 404，不是 405。
+
+    这条端点原本没挂 `GET`，于是 `/api/prefs/anything` 会被判成 405「方法不允许」。
+    405 的字面意思与实际情况正好相反（资源存在但不能用这个方法 vs. 根本没这条偏好），
+    排查时会往路由注册的方向翻，而不是往"这个键不存在"的方向。
+    """
+    service.set(service.ICON_KEY, "false")
+    row = client.get(f"/api/prefs/{service.ICON_KEY}")
+    assert row.status_code == 200
+    assert row.json()["key"] == service.ICON_KEY
+    assert row.json()["value"] == "false"
+
+    missing = client.get("/api/prefs/style")
+    assert missing.status_code == 404
+    assert missing.json()["detail"]["code"] == "pref_not_found"
+
+
 # ---------------------------------------------------------------- 值域
 
 
