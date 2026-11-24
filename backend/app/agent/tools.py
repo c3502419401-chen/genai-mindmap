@@ -8619,6 +8619,13 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
          `FULL_TEXT_MATERIAL_CHARS`）：改成把每份材料的全文拼进 user 消息。检索的
          覆盖率上限由"分支标题命中不命中原文"决定，而全文在上下文里时它不再是瓶颈
          ——代价是输入 token，见下面那段成本口径。
+         **库那一节挂在末尾**（`MINDMAP_LIBRARY_IN_GENERATE`，默认关）：`_intake`
+         在"这次没有材料"时查了一次库，过门的父块由 `_library_evidence_section`
+         渲染成 `sections` 的最后一节，并同时拼进骨架那次调用的 user（一级分支是
+         覆盖上限，只给结构那一步看会错位）。它**不进 `sources`**：库来源不参与按支
+         检索——那会让 20 支各自在 26K 字的开发文档上切一遍块，噪声以"按支检索"的
+         形式重新进来。三档实测与门的依据见 `docs/LIBRARY-IN-GENERATE.md`。
+         开关关着时 `intake.library` 是 None，以上每一条与这段文字之前逐字节相同。
       3. 结构：一次 `chat_async`，骨架 + 全部命中一起给，**只写 id / label / 层级**
          ——`SKELETON_TREE_RULES` 明确要求 detail 留空，引用在这一轮按证据写。
          **有材料时每个节点都必须有引用**（`MUST_CITE_EVERY_NODE`）：原来那句
