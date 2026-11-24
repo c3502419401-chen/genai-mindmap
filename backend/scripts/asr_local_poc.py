@@ -284,7 +284,6 @@ class Engine:
 
     def transcribe(self, audio, sample_rate: int = 16000) -> dict:
         """返回 {"text", "sentences", "timings"}；sentences 对齐 AudioSentence。"""
-        import numpy as np
 
         if sample_rate != 16000:
             raise ValueError(f"只支持 16k 输入，拿到 {sample_rate}")
@@ -339,7 +338,6 @@ def read_wav_bytes(raw: bytes) -> tuple[object, int, int]:
 def read_wav_file(path: str) -> tuple[object, int]:
     with wave.open(path, "rb") as fh:
         sr = fh.getframerate()
-        nch = fh.getnchannels()
     import soundfile as sf
 
     audio, sr = sf.read(path, dtype="float32")

@@ -44,7 +44,6 @@ MAP = {
 def request(method: str, path: str, body=None):
     """最小 ASGI 调用器，避免额外依赖。"""
     import json as _json
-    import uuid
 
     payload = b"" if body is None else _json.dumps(body, ensure_ascii=False).encode()
     path_only, _, query = path.partition("?")

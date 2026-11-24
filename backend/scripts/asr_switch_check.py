@@ -24,7 +24,6 @@ from __future__ import annotations
 import argparse
 import ast
 import json
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from contextlib import closing
 
-import pytest
 from fastapi.testclient import TestClient
 
 from app.agent import runs as runs_module
@@ -33,6 +32,21 @@ def _guest() -> TestClient:
     client = TestClient(app)
     assert client.get("/api/auth/me").status_code == 200
     return client
+
+
+def _owner_key(client: TestClient) -> str:
+    """这个已登录客户端的 owner 串（`runs.owner` 那一列的口径）。
+
+    登录之后 `runs.owner` 存的是 `user:<id>`，而 `_seed_run` 要的正是这个串。
+
+    为什么要有这个 helper：这个文件里原来直接写 `_seed_run("x", "user:1")` 之类的
+    假值，于是"这行属于谁"与"谁在发请求"是两件互不相干的事 —— 陌生人拿 404 只能
+    说明"owner 不是他"，证明不了过滤按 owner 走。要断言**主人自己拿得到**（那是
+    404 而不是 403 这条结论的另一半），种行用的必须是发起者真实的 owner 串。
+    """
+    me = client.get("/api/auth/me").json()
+    assert me["kind"] == "user", "先 _register 再取 owner"
+    return f"user:{me['user']['id']}"
 
 
 def _tree(title: str = "共享的图") -> dict:
@@ -161,17 +175,25 @@ def test_a_run_is_only_visible_to_its_owner():
 
     `run_id` 是随机串，"这条记录存在但不属于你"本身就是不该给的信息——
     403 等于确认了这个 id 有效。
+
+    **两侧都要测**：只断言"陌生人 404"证明的是"owner 不是他"，而那与"过滤按
+    owner 走"是两件事——一份完全不按 owner 过滤的实现，只要那行的 owner 恰好
+    不是他，也会返回 404。所以同一行还要断言主人自己拿得到 200。
     """
     owner = _register("run_owner")
     stranger = _register("run_stranger")
-    _seed_run("run-presence-check", "user:999999")
+    mine_key = _owner_key(owner)
+    _seed_run("run-presence-check", mine_key)
     assert stranger.get("/api/agent/runs/run-presence-check").status_code == 404
-    # 同一条路由，主人自己拿得到（用主人真实的 owner 串另起一行）。
+    assert owner.get("/api/agent/runs/run-presence-check").status_code == 200
+    # 同一条路由，主人自己拿得到；而"这次请求用的身份"确实是 `mine_key`——
+    # 库里的行归属与请求身份是同一口径，否则上面两条断言互不相干。
     from app.auth import identity as identity_module  # noqa: PLC0415
 
     with closing(runs_module._connect()) as conn, conn:
-        owner_key = conn.execute("SELECT owner FROM runs WHERE run_id = ?",
-                                 ("run-presence-check",)).fetchone()[0]
+        seeded = conn.execute("SELECT owner FROM runs WHERE run_id = ?",
+                              ("run-presence-check",)).fetchone()[0]
+    assert seeded == mine_key
     mine = identity_module.current_identity()
     assert mine.kind == "anonymous", "测试里不该有残留身份"
     # 直接在 owner 语境下建一行并读回来：`get_for` 的 owner 参数是这条用例的主角。
@@ -209,7 +231,9 @@ def test_streaming_someone_elses_finished_run_is_404():
     猜中的成本比看上去低，而代价是别人的未保存草稿。
     """
     alice, bob = _register("stream_alice"), _register("stream_bob")
-    _seed_run("run-stream-done", "user:1")
+    # 这行必须真的属于 alice：否则 bob 拿 404 只说明"owner 不是他"，
+    # 而那与"流接口按 owner 过滤"是两件事。
+    _seed_run("run-stream-done", _owner_key(alice))
 
     response = bob.post("/api/agent/runs/stream",
                         json={"goal": "偷看一下", "intent": "create",
@@ -228,12 +252,13 @@ def test_streaming_an_abandoned_run_of_someone_else_does_not_steal_it():
     自己的 `GET /runs/{id}` 都是 404——一次"请求被允许"变成了数据归属的静默转移。
     """
     alice, bob = _register("steal_alice"), _register("steal_bob")
+    alice_key = _owner_key(alice)
     with closing(runs_module._connect()) as conn, conn:
         conn.execute(
             "INSERT INTO runs (run_id, status, request, created_at, updated_at, owner) "
             "VALUES ('run-steal', 'failed', '{}', "
             "strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'), "
-            "'user:1')")
+            "?)", (alice_key,))
 
     response = bob.post("/api/agent/runs/stream",
                         json={"goal": "接着跑", "intent": "create",
@@ -246,5 +271,5 @@ def test_streaming_an_abandoned_run_of_someone_else_does_not_steal_it():
             "SELECT owner FROM runs WHERE run_id = 'run-steal'").fetchone()[0]
         status = conn.execute(
             "SELECT status FROM runs WHERE run_id = 'run-steal'").fetchone()[0]
-    assert owner == "user:1", "别人的行不能被重开成自己的"
+    assert owner == alice_key, "别人的行不能被重开成自己的"
     assert status == "failed", "被拒绝的请求也不该把状态改成 running"
