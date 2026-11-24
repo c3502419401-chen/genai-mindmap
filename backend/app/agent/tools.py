@@ -8216,13 +8216,21 @@ def _drop_unverifiable_refs(
 
 
 async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
-    """整树生成：**骨架一次、每支检索一次、结构一次、只写说明一到两次**。
+    """整树生成：**骨架一次、证据一份、结构一次（或按章 N 次）、说明一到两次，
+    超上限折叠、可选再核对一次**。
 
-    接线（前两段与 `_generate_deep` 完全共用，后两段是这条路独有的）：
+    接线（前两段与 `_generate_deep` 完全共用，后几段是这条路独有的）：
 
-      1. 骨架：`_intake` 定材料 → `_skeleton_outline` 给目录（覆盖率 ≥60% 才给）
-         → `_plan_ask` 让模型定一级分支。有材料却没目录时也是这一步定骨架，所以
-         "有材料 / 无材料"两条路在这里合流，差别只有 prompt 里那几句引用规则。
+      1. 骨架：`_intake` 定材料 → **三档并列**定一级分支（`_plan_ask`）：
+           ① 章节骨架：`_skeleton_outline` 抽得出目录且覆盖率 ≥60%；
+           ② 图谱骨架：①不可用且图里这批材料的带边实体 ≥8（`_graph_outline`）；
+           ③ 模型归纳：以上都不行，凭主题 + 材料清单。
+         **混合材料分开处理再合并**（`_mixed_outline`）：有章节的那几份走章节，
+         没有章节的那几份从图里取概念，合并成一套；顺序是章节在前（作者划的结构
+         该当一级分支），同一说法只留章节那条（它有 start/coverage、能回原文）。
+         **一级分支数不再设人工上限**（`NO_BRANCH_CAP_RULE`）：原来那句"最多 N 条"
+         已删，`args.branches` 也不再进提示词 —— 它从来没有被前端传过，见
+         `docs/BRANCH-CAP.md`。
       2. 证据：`_retrieve_branches` 每支各检索一次（第一支先行预热块向量，其余
          并行）。命中按分支分组渲染进 user 消息，**带分支归属**——这是与旧版
          整树生成最大的差别：旧版只做一次主题级 top_k=5 预检索，实测对 14,120 字
@@ -8233,17 +8241,37 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
          ——代价是输入 token，见下面那段成本口径。
       3. 结构：一次 `chat_async`，骨架 + 全部命中一起给，**只写 id / label / 层级**
          ——`SKELETON_TREE_RULES` 明确要求 detail 留空，引用在这一轮按证据写。
-      4. 说明：`_fill_details` 发**两次并发的 `chat_async`**（节点够多时，见
+         **有材料时每个节点都必须有引用**（`MUST_CITE_EVERY_NODE`）：原来那句
+         "只有你自己补充的内容才给空数组"是个逃逸口（实测薄批只有 31% 的节点带
+         引用），现在改成"材料里找不到依据的方面，不要写成一个节点"。于是规模
+         由材料决定而不是由配额决定 —— 可引的段落少，节点就少。
+         按章切开着（`MINDMAP_SECTION_SLICE`）时这一步是 **N 次**（每章一次，
+         各给它那一章的原文），见 `_slice_structure`。
+      4. 折叠：超出可读性上限时**折而不裁**（`_fold_tree`，`FOLD_CAPS=(8,4,2)`
+         四档阶梯）。把某个父节点下面多出来的兄弟收成一个 roll-up：`label` 写
+         「其他 N 项」、`detail` 写「含：A；B；C」（被并的标题一个不落）、引用取
+         被并那些节点**整棵子树**的并集、`expandable="unknown"`（不是到底了，点了
+         能长回来）。三档都折不动才落回 `_clip_tree`。实测厚批折掉 103 个节点、
+         `cut_nodes=0` —— 折的是形状，不是内容。
+      5. 说明：`_fill_details` 发**两次并发的 `chat_async`**（节点够多时，见
          `DETAIL_SPLIT_MIN`），每半的输入是"这半节点（id / label / 层级路径）+
          同一份原文"，输出是 `{"id":"说明"}`，**按 id 对号**（不靠顺序）。这一轮
          不碰结构、不碰引用。
+         **roll-up 节点不进这一轮**（`fold.rollup_ids` 并进 `skip_ids`）：它的
+         detail 是那份标题清单，被改写成散文就等于把折进来的标题全丢了。
+      6. 核对（`MINDMAP_VERIFY_AFTER_GENERATE`，默认关）：用 title + 一级分支拼
+         一个 query 搜一次，逐节点判 supported / unverified / contradicted，三态
+         只进 `data["verify"]`。实测 supported 17.5%、引文逐字 95.2%，代价 +8 秒
+         —— 精度够、召回不够，所以它只能当标注，不能当删节点的依据。
 
     **一级分支太多时先归成两级**（两级骨架，`SKELETON_GROUP_THRESHOLD` 以上）：
     材料有二十节时，扁平骨架就是二十条一级分支——图宽得没法看。所以**第一步**多问
     一句"这些方面该归成哪几组"，那一次调用的产出就变成"分组 → 分支"两层：
 
-      - 触发：`max(args.branches, 目录行数) > SKELETON_GROUP_THRESHOLD`（10）。
-        低于它保持扁平——十支以内一行能扫完，多一层只是多一次点击；
+      - 触发：`max(目录行数 + 图谱补充, 章数) > SKELETON_GROUP_THRESHOLD`（10）。
+        ★ 这个式子原来读 `args.branches`（"预感要几条"），而不设限之后那个预感
+        既不存在也不该由它决定 —— 现在问的是"材料本身有多少宽度可说"。
+        低于阈值保持扁平——十支以内一行能扫完，多一层只是多一次点击；
       - 组数：`_skeleton_group_count`，每组 4 支倒推、夹在 3–6 之间（二十节就请它
         归成 5 组；实测模型有时给 4 组，也算它照做）；
       - **不多花一次调用**：那句要求拼在同一次骨架请求的 system 里（`_group_plan_rules`），
