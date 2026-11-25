@@ -34,6 +34,7 @@ import argparse
 import asyncio
 import json
 import os
+import statistics
 import sys
 import time
 from collections import Counter
@@ -133,35 +134,64 @@ def _fanout(root) -> Counter:
     return out
 
 
-def _count_refs(root) -> tuple[int, int]:
-    """(有引用的节点数, 节点总数)。"""
-    with_refs = total = 0
+def _count_refs(root) -> dict[str, int]:
+    """引用覆盖率，**两个分母**。
+
+    `node_count` 那个分母（全部节点）会把结构层稀释掉：骨架/章节那一层**结构上不写
+    说明、因此不可能有引用**（早前实测过），它们进分母等于给一条与检索无关的常量打折。
+    所以另给一个**可引用**分母：
+
+        可引用节点 = `detail` 非空 的节点
+
+    引用是给"说明"这一段挂的出处（`source_refs` 挂在节点上、`detail` 是它支撑的那段
+    文字），没有说明的节点没有可引用的内容。这与"每个节点都必须有引用"那条规约要分清：
+    规约要求的是"写了说明就要说出处"，它没说"结构层也要写出处"。
+    """
+    total = with_refs = citable = citable_with_refs = 0
     stack = [root]
     while stack:
         node = stack.pop()
         total += 1
-        if node.source_refs:
-            with_refs += 1
+        has_refs = bool(node.source_refs)
+        with_refs += 1 if has_refs else 0
+        if (node.detail or "").strip():
+            citable += 1
+            citable_with_refs += 1 if has_refs else 0
         stack.extend(node.children)
-    return with_refs, total
+    return {
+        "node_count": total,
+        "with_refs": with_refs,
+        "citable": citable,
+        "citable_with_refs": citable_with_refs,
+        "ref_coverage": round(with_refs / max(1, total), 3),
+        "citable_coverage": round(citable_with_refs / max(1, citable), 3),
+    }
 
 
 def _by_depth(root) -> dict[int, dict]:
-    """逐层的 (节点数, 有引用数)。
+    """逐层的 (节点数, 有引用数, 可引用数)。
 
     这一列是"每个节点必须有引用"那条规则**会不会惩罚深度**的唯一证据：深层节点离原文
     更远，逐字引更难。如果第 3 层以下的有引用率断崖，那这条规则实际上在惩罚深度。
+    「可引用」与 `_count_refs` 同口径（`detail` 非空）——两个口径必须同源，否则
+    "总数涨了但覆盖率跌了"会无法归因。
     """
     out: dict[int, dict] = {}
     stack: list[tuple[object, int]] = [(root, 1)]
     while stack:
         node, depth = stack.pop()
-        bucket = out.setdefault(depth, {"nodes": 0, "with_refs": 0})
+        bucket = out.setdefault(depth, {"nodes": 0, "with_refs": 0, "citable": 0,
+                                        "citable_with_refs": 0})
         bucket["nodes"] += 1
         bucket["with_refs"] += 1 if node.source_refs else 0
+        if (node.detail or "").strip():
+            bucket["citable"] += 1
+            bucket["citable_with_refs"] += 1 if node.source_refs else 0
         stack.extend((child, depth + 1) for child in node.children)
     for bucket in out.values():
         bucket["coverage"] = round(bucket["with_refs"] / max(1, bucket["nodes"]), 3)
+        bucket["citable_coverage"] = round(
+            bucket["citable_with_refs"] / max(1, bucket["citable"]), 3)
     return dict(sorted(out.items()))
 
 
@@ -222,14 +252,17 @@ def _run_once(batch: str, index: int) -> dict:
         row["error"] = "工具返回 ok 但没有产出树"
         return row
     root = tree.root
-    with_refs, total = _count_refs(root)
+    stats = _count_refs(root)
     data = result.data or {}
     fanout = _fanout(root)
     row.update({
-        "node_count": total,
+        "node_count": stats["node_count"],
         "branches": len(root.children),
-        "with_refs": with_refs,
-        "ref_coverage": round(with_refs / max(1, total), 3),
+        "with_refs": stats["with_refs"],
+        "ref_coverage": stats["ref_coverage"],
+        "citable": stats["citable"],
+        "citable_with_refs": stats["citable_with_refs"],
+        "citable_coverage": stats["citable_coverage"],
         "refs_total": data.get("source_refs", {}).get("kept"),
         "fanout": dict(sorted(fanout.items())),
         "by_depth": _by_depth(root),
@@ -298,22 +331,54 @@ def main() -> int:
             rows.append(row)
             print(json.dumps({key: row.get(key) for key in (
                 "ok", "seconds", "node_count", "branches", "ref_coverage",
-                "folded_rollups", "cut_nodes")}, ensure_ascii=False), flush=True)
+                "citable", "citable_coverage", "folded_rollups", "cut_nodes")},
+                ensure_ascii=False), flush=True)
 
     out = BACKEND / "data" / f"generation-strategy-keep-{args.keep}.json"
     out.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n明细：{out}")
 
-    print("\n批次    次  节点  分支  有引用/总   覆盖率  折叠节点  裁剪  耗时")
+    print("\n批次    次  节点  分支  有引用/总   覆盖率  可引用  可引用覆盖率  裁剪  耗时")
     for row in rows:
         if not row.get("ok"):
             print(f"{row['batch']:<6} {row['run']:>2}  FAILED  {row.get('error', '')[:60]}")
             continue
         print(f"{row['batch']:<6} {row['run']:>2} {row['node_count']:>5} "
               f"{row['branches']:>5} {row['with_refs']:>4}/{row['node_count']:<4} "
-              f"{row['ref_coverage']:>6.1%} {row['folded_nodes']:>8} "
-              f"{row['cut_nodes']:>5} {row['seconds']:>5}s")
+              f"{row['ref_coverage']:>6.1%} {row['citable']:>6} "
+              f"{row['citable_coverage']:>13.1%} {row['cut_nodes']:>5} "
+              f"{row['seconds']:>5}s")
+
+    _report_aggregate(rows, args.keep)
     return 0
+
+
+def _report_aggregate(rows: list[dict], keep: str) -> None:
+    """多轮汇总：**均值与极差**，不是单次。
+
+    判据要提前定死（`docs/RETRIEVAL-KEEP.md` §4.1）：`repeat=1` 时两臂的差里混着"这次
+    树长得大不大"，`repeat=3` 之后看两件事——
+
+      1. 可引用覆盖率的均值差还在不在（厚批那 +5.9pp）；
+      2. 两臂各自的极差有多大。**极差大于均值差**时，这个差别不该归因于改动。
+    """
+    ok = [row for row in rows if row.get("ok")]
+    if not ok:
+        print("\n没有一次成功，无法汇总")
+        return
+    print(f"\n汇总（keep={keep}，每批 {len(ok)} 轮有效）")
+    print(f"{'批次':<8}{'可引用覆盖率 均值':>18}{'极差':>10}{'全部节点覆盖率 均值':>20}"
+          f"{'极差':>10}{'节点数 均值':>12}{'极差':>8}")
+    batches = sorted({row["batch"] for row in ok})
+    for batch in batches:
+        group = [row for row in ok if row["batch"] == batch]
+        cite = [row.get("citable_coverage", 0.0) for row in group]
+        cover = [row.get("ref_coverage", 0.0) for row in group]
+        nodes = [row.get("node_count", 0) for row in group]
+        print(f"{batch:<8}{statistics.mean(cite):>17.1%}"
+              f"{max(cite) - min(cite):>10.1%}"
+              f"{statistics.mean(cover):>19.1%}{max(cover) - min(cover):>10.1%}"
+              f"{statistics.mean(nodes):>12.0f}{max(nodes) - min(nodes):>8}")
 
 
 if __name__ == "__main__":
