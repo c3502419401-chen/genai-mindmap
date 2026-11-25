@@ -253,8 +253,8 @@ unshown: Map<id, number>     // 这棵子树里**任何一处**有节点没画�
 | ④ 成本 | 6 支：**2.438 秒 / 643 + 106 token**；50 支：3.244 秒 / 2,231 + 550 token。失败降级见 §三末表 |
 | ⑤ 全展开 | **136 个节点 · 0 枚角标**；「收起到上限」回到 **40 个 · 6 枚** |
 
-复跑的三条命令（基线：后端 **3183 passed / 37 skipped**、前端 **71 files / 1140 tests**、
-`ruff` 全过、`type-check` 0 错）：
+复跑的命令（本轮的基线：后端 **3197 passed / 37 skipped**、前端 **72 files / 1177 tests**、
+`ruff` 全过、`type-check` 0 错。前端那 72 个文件里含同期在做的拖动功能，一并跑过）：
 
 ```
 cd D:\genai-mindmap\backend  ; python -m pytest -o addopts="" -q
