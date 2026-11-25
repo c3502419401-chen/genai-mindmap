@@ -4414,6 +4414,50 @@ DETAIL_ONLY_PROMPT = _detail_only_prompt(DETAIL_MIN_CHARS, DETAIL_MAX_CHARS)
 DETAIL_SENTENCES_ENV = "MINDMAP_DETAIL_SENTENCES"
 
 
+# ---------------------------------------------------------------- 字数：放开
+#
+# 上一条（句子数）只拆了"几句"，`min_chars` 一个字没动 —— 因为它当时是**唯一**还在
+# 挡"越写越短"的东西（`docs/DETAIL-SENTENCES.md` 的 C 臂：拆了它，薄批 86/86 段塌成
+# 1 句、均长 −45%、最短 26 字）。
+#
+# 这一条是产品决定要连字数一起放开：**每一段的长短按它在材料里有多少分量决定**，
+# 不设上下限。所以它必须与"节点数"配套读 —— 薄材料上 670 字给 44 个节点，每节点只
+# 分到 15 字材料，此时"写 80 字"就是硬凑 5 倍。放开字数之后那批节点会各自写短，
+# 而**树的形状不变**（这一轮不动节点预算、不动折叠、不动 `initial_nodes`）。
+#
+# 与 C 臂的差别只有一条：C 臂说"按材料分量决定"但没说并列型 label 怎么办，于是
+# 那类节点（「常见变体」「循环与序列网络」）又被列名字糊过去了。这一份把 A 臂那段
+# 并列要求留着 —— 那条与字数无关，是"别只报菜名"。
+DETAIL_LENGTH_ENV = "MINDMAP_DETAIL_LENGTH"
+
+
+def detail_length_free() -> bool:
+    """`MINDMAP_DETAIL_LENGTH=free` → 说明那一轮不设字数上下限。
+
+    用值而不是布尔，是因为这一族已经有两档语义了（原样 / 去句数），再加一档"去字数"
+    之后 "1" 到底指哪一档会变成靠记忆的事实。显式写 `free` 让它与
+    `MINDMAP_DETAIL_SENTENCES=1` 不互相解释。
+    """
+    return os.getenv(DETAIL_LENGTH_ENV, "").strip().lower() == "free"
+
+
+def _detail_only_prompt_free() -> str:
+    """不设字数上下限的那一份。
+
+    没有 `min_chars` / `max_chars` 入参：这一份里那两个数一个都不出现，留着参数只会
+    让调用方以为它们还在起作用。
+    """
+    return (
+        _DETAIL_ONLY_SHAPE_RULES
+        # 并列型 label 那一条与 A 臂逐字相同：它管的是"别只把名字列一遍"，
+        # 与"写多少字"是两件事，放开字数不该把它一起放开。
+        + "\n每一段说明的长短按这个节点在材料里有多少分量决定：材料里讲得多就写长，"
+        "讲得少就写短，一句话能说清就一句话。"
+        "如果这个节点的标题是一串并列的东西（几个算法、几种变体、几类方法、几个阶段），"
+        "要逐个说清它们各自做什么、差别在哪，不要只把名字列一遍就收。\n"
+    )
+
+
 def detail_sentences_open() -> bool:
     """`MINDMAP_DETAIL_SENTENCES=1` → 说明那一轮不再要求"至少 N 句"。
 
@@ -4458,6 +4502,9 @@ def _detail_prompt(min_chars: int, max_chars: int) -> str:
     "区间参数化之后与常量逐字节相同"这条回归钉着（`test_detail_scale`），让它自己读
     环境变量会让那条断言变成"看环境变量行事"。纯函数保持纯，开关只在这一层。
     """
+    if detail_length_free():
+        # 最高优先：它把字数那两条一起放开，比"只去句数"更彻底。
+        return _detail_only_prompt_free()
     if detail_sentences_open():
         return _detail_only_prompt_open(min_chars, max_chars)
     return _detail_only_prompt(min_chars, max_chars)
@@ -5030,6 +5077,12 @@ def _detail_self_check(count: int, span: budget.DetailSpan) -> str:
     计数用的是 `count`（这次点名了几个 id）而不是树规模：模型只需要核对清单，不必再
     数一遍树。
     """
+    if detail_length_free():
+        # 放开字数之后自查句不能再问"是不是都在 80–150 字"——那会把刚放开的那条
+        # 又当成检查项要回来。只留"都写了"与"长短对不对"两件。
+        return (f"\n\n写完后自查一遍：上面 {count} 个 id 是不是都写了？"
+                "每一段的长短是不是跟它在材料里的分量相称？"
+                "讲得多的别写短、讲得少的别硬拉长，然后再返回。")
     if detail_sentences_open():
         return (f"\n\n写完后自查一遍：上面 {count} 个 id 是不是都写了？"
                 f"每一段是不是都在 {span.min_chars}–{span.max_chars} 字？"
