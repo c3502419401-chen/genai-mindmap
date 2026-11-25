@@ -19,6 +19,7 @@ import {
   viewOf,
 } from '../src/mindmap/shape';
 import { useMindMapStore } from '../src/stores/mindmap';
+import { withDirection } from '../src/mindmap/direction';
 
 /**
  * 三种形状的读侧适配与写回（阶段 3a）。
@@ -190,11 +191,13 @@ describe('画布：另外两种形状能画出来', () => {
   });
 
   it('换朝向不会给鱼骨/流程塞一个 `layout` 字段（那会让保存 422）', () => {
-    const store = useMindMapStore();
-    store.preview(fishbone(), 'right');
-    store.setDirection('left');
-    expect('layout' in store.content!).toBe(false);
-    expect(store.content!.theme?.direction).toBe('left');
+    // 判据落在**纯函数**上而不是 `store.setDirection`：第三轮起 `setDirection` 对
+    // 非树型直接拒绝（`direction` 只有树有，见 `tests/drag-round3.spec.ts`），但
+    // `save()` 仍然会调 `withDirection(content, direction.value)` 归一——那一步要是
+    // 给鱼骨补一个 `layout`，下一次保存就是 422，而用户只是点了一下朝向。
+    const content = withDirection(fishbone(), 'left');
+    expect('layout' in content).toBe(false);
+    expect(content.theme?.direction).toBe('left');
   });
 });
 

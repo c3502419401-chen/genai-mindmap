@@ -369,17 +369,22 @@ describe('store.moveNodeTo：一次拖动 = 一次可撤销的内容改动', () 
     expect(store.status).toContain('环');
   });
 
-  it('非树型不接拖动（本轮只做了树）', () => {
+  // 上一轮这里是「非树型不接拖动（本轮只做了树）」。第三轮把它改成**部分支持**：
+  // 流程图与鱼骨图的**容器内**可以重排（同一阶段的步骤、同一根骨上的原因），
+  // **跨容器**明确拒绝。判据与那三条理由在 `mindmap/move-scope.ts`，逐条用例在
+  // `tests/drag-round3.spec.ts`。这一条留在这里钉最外那道门：容器根拖不动。
+  it('鱼骨的骨根拖不动（跨容器 / 换类别不是一次拖动能表达的事）', () => {
     const store = useMindMapStore();
     store.preview({
       title: '鱼骨',
       diagram_type: 'fishbone',
-      bones: [{ id: 'b1', label: '人', root: { id: 'r1', label: '人', children: [] } }],
+      bones: [{ id: 'b1', category: '人', root: { id: 'r1', label: '人', children: [] } }],
     } as unknown as MindMapContent, 'right');
 
     const result = store.moveNodeTo({ draggedId: 'r1', targetId: 'r1', zone: 'child' });
     expect(result.ok).toBe(false);
-    expect(result.code).toBe('not-tree');
+    expect(result.code).toBe('cross-container');
+    expect(store.status).toContain('骨');
   });
 });
 

@@ -111,9 +111,53 @@ describe('两个浮层一起摆', () => {
     expect(plan.toolbar?.placement).toBe('right');
   });
 
-  it('没有任何浮层时两块都是 null', () => {
+  it('没有任何浮层时三块都是 null', () => {
+    // 第三块是就地意图输入框（`canvas/NodeIntentBox.vue`）：它排在最后摆位，
+    // 不传就是"这次没有它"，与另外两块同一个语义。
     expect(planOverlays({ area: AREA, toolbar: null, detail: null }))
-      .toEqual({ toolbar: null, detail: null });
+      .toEqual({ toolbar: null, detail: null, intent: null });
+  });
+});
+
+/**
+ * 第三个浮层：点节点弹出来的就地输入框。
+ *
+ * 它的位置诉求与另外两块不同，所以候选顺序也不同（下方优先）：
+ *  · 详情卡的诉求是"贴着节点、别挡视线"→ 上方优先；
+ *  · 工具条可交互、宁可挪远 → 侧面优先；
+ *  · 意图框是**用户刚点出来要用的东西**，而且它是"接着这个节点往下写一行字"的
+ *    那个位置 → 下方优先，被挪开也必须完整可见（它要接键盘）。
+ */
+describe('就地输入框：下方优先，且躲开已经占位的两样', () => {
+  const BOX = { width: 240, height: 72 };
+
+  it('只有它一个时，贴在节点正下方', () => {
+    const plan = planOverlays({ area: AREA, toolbar: null, detail: null, intent: { anchor: NODE, size: BOX } });
+    expect(plan.intent?.placement).toBe('below');
+    expect(plan.intent?.y).toBe(NODE.bottom + OVERLAY_GAP);
+  });
+
+  it('工具条已经占了右侧、详情卡占了上方：三者零重叠', () => {
+    const plan = planOverlays({
+      area: AREA,
+      toolbar: { anchor: NODE, size: BAR },
+      detail: { anchor: NODE, size: CARD },
+      intent: { anchor: NODE, size: BOX },
+    });
+    expect(plan.intent).toBeTruthy();
+    const box = rectOf(plan.intent!, BOX);
+    expect(overlapArea(box, rectOf(plan.toolbar!, BAR))).toBe(0);
+    expect(overlapArea(box, rectOf(plan.detail!, CARD))).toBe(0);
+    expect(overlapArea(box, NODE)).toBe(0);
+  });
+
+  it('节点贴着画布下沿时翻到上方，不飘到画布外', () => {
+    const LOW: Rect = { left: 500, top: 760, right: 680, bottom: 800 };
+    const plan = planOverlays({ area: AREA, toolbar: null, detail: null, intent: { anchor: LOW, size: BOX } });
+    expect(plan.intent).toBeTruthy();
+    const box = rectOf(plan.intent!, BOX);
+    expect(box.bottom).toBeLessThanOrEqual(AREA.bottom - OVERLAY_MARGIN);
+    expect(box.top).toBeGreaterThanOrEqual(AREA.top + OVERLAY_MARGIN);
   });
 });
 
