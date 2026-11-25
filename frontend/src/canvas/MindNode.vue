@@ -4,6 +4,7 @@ import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue';
 
 import type { ChildSide } from '../canvas/layout/tidy';
 import { NODE_SIZE } from '../canvas/layout/tidy';
+import { focusCanvasShell, focusIsHomeless } from '../canvas/canvas-focus';
 import {
   DETAIL_WIDTH,
   canvasArea,
@@ -364,16 +365,49 @@ async function focusInput() {
 watch(
   () => props.editing,
   async editing => {
-    if (!editing) {
-      settled = false;
-      return;
-    }
+    if (!editing) return;
     draft.value = props.data.fullLabel;
     settled = false;
     await focusInput();
   },
   { immediate: true },
 );
+
+/**
+ * 编辑框**关掉**之后，把掉到 `body` 的焦点还给画布。
+ *
+ * 为什么是"盯 `editing` 变 false"而不是"在提交那一刻还"：焦点丢失不是提交造成的，
+ * 是 `v-if` 卸掉 input 造成的——浏览器（含 jsdom）会把 `activeElement` 扔回 `body`。
+ * 盯着这个 prop 就把所有关闭原因都兜住了：Enter 提交、Esc 取消、点别处失焦、
+ * 父组件因为换图而关掉。
+ *
+ * 不这么做会怎样（第二轮实测表里那一行）：单击节点 → Enter 加兄弟 → 打名字 →
+ * Enter 提交 → **再按 Enter 什么都不发生**。画布的键盘模型要求 `activeElement` 在
+ * 画布外壳里（`MindMapCanvas.ownsStructureKeys`），焦点在 body 上时 Tab / Enter /
+ * Delete / F2 **全部静默失效**，而画面上没有任何东西显示出错了。
+ *
+ * `flush: 'post'`：要等 DOM 更新完（input 真的消失、焦点真的掉到 body）再判。
+ * `focusIsHomeless()` 是"该不该抢"的唯一判据——焦点还在输入框 / 按钮里就放行。
+ */
+watch(
+  () => props.editing,
+  (now, was) => {
+    if (!was || now) return;
+    // Tab（`finishAndNext`）除外：那一下是把编辑接力给**下一个**节点，而它会自己
+    // `focusInput()`。两处都抢的话，最终落在哪儿取决于 rAF 的先后——那种"时灵时不灵"
+    // 比不修更糟。
+    if (handoffToNext) {
+      handoffToNext = false;
+      return;
+    }
+    if (!focusIsHomeless()) return;
+    focusCanvasShell();
+  },
+  { flush: 'post' },
+);
+
+/** 这一次关闭是把编辑接力给下一个节点（Tab），不是"编辑结束"。 */
+let handoffToNext = false;
 
 function finish(commit: boolean) {
   if (settled) return;
@@ -386,6 +420,7 @@ function finish(commit: boolean) {
 function finishAndNext() {
   if (settled) return;
   settled = true;
+  handoffToNext = true;
   emit('next', draft.value);
 }
 

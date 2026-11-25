@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 
 import { useMindMapStore } from '../stores/mindmap';
+import { focusCanvasShell, focusIsHomeless } from './canvas-focus';
 import {
   DETAIL_WIDTH,
   INTENT_WIDTH,
@@ -159,7 +160,11 @@ function close(): void {
   sending.value = false;
   store.closeIntent();
   // 关掉之后焦点还给画布：用户接下来按 Tab / Enter 是在改图，不是在打字。
-  document.getElementById('mind-canvas-shell')?.focus({ preventScroll: true });
+  // 只在这个框真的握着焦点时才有意义——`focusIsHomeless()` 会把"用户已经去了别处"
+  // 那几种情形放行（理由见 `canvas-focus.ts`）。
+  void nextTick(() => {
+    if (focusIsHomeless()) focusCanvasShell();
+  });
 }
 
 async function submit(): Promise<void> {

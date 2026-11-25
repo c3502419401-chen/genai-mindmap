@@ -5,6 +5,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import { useMindMapStore, type MovePreview } from '../stores/mindmap';
 import { boxesOfNodes, chooseViewMode, visibleIds } from './clarity';
+import { CANVAS_SHELL_ID, focusCanvasShell } from './canvas-focus';
 import { INTENT_DELAY_MS, openIntentAllowed } from './intent-gesture';
 import {
   dropHitOf,
@@ -64,7 +65,9 @@ const shell = ref<HTMLElement | null>(null);
 
 function focusCanvas(): void {
   // `preventScroll`：画布可能比视口大，聚焦外壳时页面跳一下会让人以为图动了。
-  shell.value?.focus({ preventScroll: true });
+  // 走共用的入口而不是 `shell.value?.focus()`：`MindNode` 与 `NodeIntentBox` 卸载后
+  // 也要把焦点还到这里，而它们拿不到这个 ref（理由见 `canvas-focus.ts`）。
+  focusCanvasShell();
 }
 
 /**
@@ -935,12 +938,12 @@ onBeforeUnmount(() => {
     这条链成立。焦点环只在键盘走到这里时出现（`focus-visible`），鼠标点画布不长出
     一圈框。
 
-    `id` 只服务一件事：就地输入框关掉之后把焦点还给画布（`NodeIntentBox.vue` 的
-    `close()`）。用户刚在框里打完字、按 Esc 退出，接下来按 Tab 应该是加子节点，
-    而不是落在 body 上。
+    `id` 是**键盘模型的一部分**，不是给测试用的钩子：三个组件（本画布、节点内联
+    编辑、就地输入框）在卸载后都要把焦点还给这里，而它们互相拿不到 ref。id 的常量
+    定义在 `canvas-focus.ts::CANVAS_SHELL_ID`，这里是它唯一的落地点。
   -->
   <div
-    id="mind-canvas-shell"
+    :id="CANVAS_SHELL_ID"
     ref="shell"
     tabindex="0"
     aria-label="导图画布（选中节点后 Tab 加子节点、Enter 加兄弟节点、Delete 删除、F2 改名；双击空白处加节点）"
