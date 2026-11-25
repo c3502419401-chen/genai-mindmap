@@ -3,8 +3,8 @@ import { createPinia, setActivePinia } from 'pinia';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { MindMapContent } from '../src/api/types';
-import App from '../src/App.vue';
 import MindNode from '../src/canvas/MindNode.vue';
+import MindMapCanvas from '../src/canvas/MindMapCanvas.vue';
 import {
   PREVIEW_ID_PREFIX,
   previewNodeId,
@@ -339,7 +339,31 @@ describe('预览清空后画布回到空态', () => {
   });
 });
 
-describe('画布 DOM', () => {
+/**
+ * 画布 DOM：生成过程中节点真的长在画布上。
+ *
+ * ## 判 C：这里只需要画布，不需要整个应用壳
+ *
+ * 断言读的全在 `MindMapCanvas` 里：空态文案「还没有导图」是它模板里的
+ * （`MindMapCanvas.vue` 那一句），`.vue-flow__node` 是它体内的 Vue Flow 渲出来的，
+ * `done` 之后换树也发生在它体内。右侧面板在这条用例里只是名字上的反例——
+ * 一个断言都没读它。
+ *
+ * 从前 `mount(App)` 为了这三样把 `ChatDock` / `SettingsPanel` / `HistoryDrawer` /
+ * `StructureCheck` / `AgentPanel` 一起挂起来。同一进程、同一时刻的对照（三份 3 次取均值，
+ * `docs/TEST-COST-3-CASES.md` §2）：挂 App 壳 869ms，只挂画布 385ms，只挂画布+密轮询
+ * 318ms——`mount` 一项 318ms → 98ms。"App 壳里画布确实被装上了"由 `smoke-canvas.spec`
+ * 与另外 24 个 `mount(App)` 的 spec 守着，不靠这一条。
+ *
+ * ## 剩下的慢是 A（真画布），所以给上限
+ *
+ * C 削掉的是 App 壳那一层；剩下的 3 秒是"真挂 `MindMapCanvas`"——Vue Flow 建图、
+ * `MindNode` 真渲染、四次 `vi.waitFor` 轮询等流帧。那正是这条用例要证明的东西
+ * （"画布上真的长出节点"），不能 stub 掉。数字：本地加压（两份全量 vitest 同时跑）
+ * 最坏 3593ms、CI 估 ≈ ×1.3–2 = 4.7–7.2s，所以给 10 秒（= 本地加压 2.8×、
+ * CI 估的 1.4–2.1×）。
+ */
+describe('画布 DOM', { timeout: 10_000 }, () => {
   /** jsdom 没有 ResizeObserver，真实 Vue Flow 挂载需要一个空壳。 */
   class ResizeObserverStub {
     observe() {}
@@ -362,7 +386,7 @@ describe('画布 DOM', () => {
 
     const pinia = createPinia();
     setActivePinia(pinia);
-    const wrapper = mount(App, { global: { plugins: [pinia] }, attachTo: document.body });
+    const wrapper = mount(MindMapCanvas, { global: { plugins: [pinia] }, attachTo: document.body });
     const store = useMindMapStore();
 
     expect(store.nodes).toHaveLength(0);

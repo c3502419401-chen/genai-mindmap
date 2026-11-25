@@ -1,8 +1,10 @@
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
+import { defineComponent, h } from 'vue';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import App from '../src/App.vue';
+import MindMapCanvas from '../src/canvas/MindMapCanvas.vue';
+import MessageFab from '../src/components/MessageFab.vue';
 import type { MindMapContent } from '../src/api/types';
 import { useMindMapStore } from '../src/stores/mindmap';
 import { isPrefsRequest, prefsReply } from './helpers/prefs-stub';
@@ -16,8 +18,30 @@ import { isPrefsRequest, prefsReply } from './helpers/prefs-stub';
  * `preventDefault` 还把焦点移动本身吞掉了，用户看到的是"Tab 坏了"。
  *
  * 两条用例必须同时在：一条挡"不该动的时候动了图"，一条挡"该动的时候不动图"。
+ *
+ * ## 为什么只挂这两件东西，而不是整个 `App`（判 C：减挂载）
+ *
+ * 判据在 `MindMapCanvas` 身上：`onKeydown` 挂在 `window` 上，`ownsStructureKeys()`
+ * 读 `shell.contains(document.activeElement)` 与 `isControl()`。所以这个 bug 的
+ * 两个必要条件是"画布外壳存在"和"有个画布**外**的真实控件能拿焦点"。
+ *
+ * 从前 `mount(App)` 就为了这两样，把 `ChatDock` / `SettingsPanel` / `HistoryDrawer` /
+ * `StructureCheck` / `NodeToolbar` / `AgentPanel` 一起挂了起来——223 个 DOM 节点、
+ * 首次求值实测 1710ms（冷）/ 318ms（热），而这两样只需要 49 个节点、98ms。
+ * 加压时那个差值就是它裸奔在 5 秒线上的全部原因（`docs/TEST-COST-3-CASES.md` §3）。
+ *
+ * 换掉的是**无关的兄弟组件**，不是断言对象：画布还是 `MindMapCanvas`，
+ * 画布外那个按钮还是 `MessageFab` 真实渲染的 `[data-test="message-fab"]`，
+ * `store.nodeCount` / `defaultPrevented` 一个都没动。
+ *
+ * ## 剩下的 2.4 秒是 A（真画布），所以给上限
+ *
+ * 减挂载之后最坏的一条仍要 2446ms（本地加压、两份全量同时跑）。剩下的钱花在
+ * `MindMapCanvas` 的首次求值上：Vue Flow 建图 + `MindNode` 真渲染 + `window`
+ * 键盘监听的注册。这三样正是被侧的行为本身（判据在组件里），stub 掉就没得测了。
+ * CI 估 ≈ 2446 × 1.3–2 = 3.2–4.9s——压在 5 秒线边上，所以给 8 秒
+ * （= 本地加压 3.3×、CI 估的 1.6–2.5×）。
  */
-
 class ResizeObserverStub {
   observe() {}
   unobserve() {}
@@ -40,10 +64,22 @@ const CONTENT: MindMapContent = {
 const CANVAS = '[aria-label^="导图画布"]';
 const OUTSIDE_BUTTON = '[data-test="message-fab"]';
 
-function mountApp(): VueWrapper {
+/**
+ * 最小壳：画布 + 画布外那个真实按钮。
+ *
+ * `MessageFab` 留在里面而不是用裸 `<button>`：结构键的判据之一是 `isControl()`，
+ * 它读的是真实控件的 `tagName` / `role`。用合成按钮就把"按钮长什么样"这件事从
+ * 被测行为里偷走了。
+ */
+const Shell = defineComponent({
+  components: { MindMapCanvas, MessageFab },
+  setup: () => () => h('div', [h(MindMapCanvas), h(MessageFab)]),
+});
+
+function mountShell(): VueWrapper {
   const pinia = createPinia();
   setActivePinia(pinia);
-  return mount(App, { attachTo: document.body, global: { plugins: [pinia] } });
+  return mount(Shell, { attachTo: document.body, global: { plugins: [pinia] } });
 }
 
 function keydown(target: EventTarget, key: string): KeyboardEvent {
@@ -77,9 +113,9 @@ afterEach(() => {
   document.body.innerHTML = '';
 });
 
-describe('画布的结构键只在画布有焦点时生效', () => {
+describe('画布的结构键只在画布有焦点时生效', { timeout: 8_000 }, () => {
   it('焦点在别的按钮上：Tab / Enter 不改图，也不吞掉默认的焦点移动', async () => {
-    const wrapper = mountApp();
+    const wrapper = mountShell();
     const store = await withSelectedNode(wrapper);
 
     const button = wrapper.get(OUTSIDE_BUTTON).element as HTMLButtonElement;
@@ -103,7 +139,7 @@ describe('画布的结构键只在画布有焦点时生效', () => {
   });
 
   it('焦点在画布上：Tab 加子节点、Enter 加兄弟节点，原来的键盘操作仍在', async () => {
-    const wrapper = mountApp();
+    const wrapper = mountShell();
     const store = await withSelectedNode(wrapper);
 
     const canvas = wrapper.get(CANVAS).element as HTMLElement;
