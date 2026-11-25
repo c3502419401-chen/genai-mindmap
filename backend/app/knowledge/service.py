@@ -1421,6 +1421,195 @@ def _pick_top(hits: list[EvidenceHit], top_k: int) -> list[EvidenceHit]:
     return _pick_ordered(ordered, top_k)
 
 
+# ---------------------------------------------------------------- 按分数取（阈值 + 上下界）
+#
+# 固定 `top_k` 的问题是"第 4 条可能只差 0.01 分却被砍掉"。实测口径在
+# `scripts/measure_topk_threshold.py`（五组真实材料 × 真实小节标题，`top_k=60`
+# 拿全量，23 组），三件事：
+#
+#   1. 分布不是"3 附近有断崖"，而是**首位离群 + 3 之后长尾**：第 1 名常常是第 2
+#      名以外的 2–11 倍（BM25 15.25 vs 4.52、58.7 vs 5.1——整句标题恰好在某一处
+#      原样出现过），第 3 到第 12 名之间则缓慢下降；
+#   2. 第 3→4 条的跌幅**中位 0.026（hybrid）/ 0.047（纯 BM25）**，也就是大半
+#      情况下第 4 条与第 3 条差不到 5%；
+#   3. 被砍掉的第 4–10 条里 **131/140（94%）落在不同的父块**上——多给几条是真的
+#      多给信息，不是同一段换个开头。
+#
+# 所以"分数差不多就都拼"成立。但**"最优分 × 相对系数"这个朴素写法会退化**：
+# 第 1 名是离群点，拿它乘 0.85 实测中位只剩 3.0 条（与现在的 3 条一样，等于没改）。
+# 基准因此取**头部稳健值**——第 `min_k` 名的分，不取第 1 名。
+#
+# 而"分数"在这里必须挑对量纲：三种可得，可比的只有两种半。
+#
+#   - `score`：hybrid 时是 **RRF 分**（两路 `1/(60+名次)` 之和）。实测前 12 名全落在
+#     0.024–0.033（差 27%）、第 20 名还有第 1 名的 38%——它是**名次的函数**，拿它
+#     做阈值等于按名次取，改个说法而已。**不用。**
+#   - `score_vector`：**余弦**。0–1、跨 query 同量纲、有绝对含义。hybrid 时的首选。
+#   - `score_bm25`：BM25 原始分。同一次检索内可比（同 query、同块集合、同 N/df），
+#     跨 query 不可比（实测同一个词在不同 query 下 5.1 与 58.7 差 11 倍），所以只能
+#     配相对系数，绝对下限只能是 0。纯 BM25 降级时用它。
+#   - `rerank_score`：cross-encoder 概率，0–1 且**绝对可分**（`tools.py` 的实测：
+#     无关 0.191–0.294、真相关 0.584–0.890）。有值就用它——它比余弦强的地方正是
+#     "噪声与真相关不重叠"，余弦做不到这一点。
+#
+# 图游走（`origin="graph"`）的证据没有可比分数：它们不参与阈值判定，只跟着"条数"
+# 一起被带出来（`keep_by_score` 截长度而不是逐条筛，理由见该函数）。
+KEEP_SCORE_RERANK: Literal["rerank"] = "rerank"
+KEEP_SCORE_VECTOR: Literal["vector"] = "vector"
+KEEP_SCORE_BM25: Literal["bm25"] = "bm25"
+
+
+@dataclass(frozen=True)
+class KeepPolicy:
+    """一次检索取多少条：绝对阈值 + 相对系数 + 上下界。
+
+    形状是 `取所有 score >= max(绝对阈值, 基准分 × rel)`，再 clamp 到
+    `[min_k, max_k]`。两个坏法都要防，实测各出现过一侧：
+
+      - **都很低时纯相对系数会取到一条**（第 2 条就跌了）→ `min_k` 托底；
+      - **都很高时能取到 30 条**（余弦长尾一路在 0.4 以上）→ `max_k` 封顶。
+
+    **`max_k` 在 hybrid 下才是真正的闸**：实测任何 `rel`（0.6–0.85）取值都不会把
+    余弦长尾截断（r10 ≈ 0.74、r20 ≈ 0.65，没有断点），所以"取几条"由 `max_k`
+    决定，`rel` 只在"这一支整体都低"时防止硬凑。这一条写在类上，是因为读代码的人
+    很容易以为 `rel` 是主要旋钮。
+    """
+
+    min_k: int = 3
+    max_k: int = 6
+    #: 相对系数。基准是第 `min_k` 名的分（不是第 1 名，理由见上面那一段）。
+    rel: float = 0.85
+    #: 余弦下限。只砍"明显无关"：实测噪声余弦能到 0.57、真相关低到 0.56，两个分布
+    #: 重叠（`_ENTRY` 与 `EXTERNAL-RELEVANCE.md` 那轮），所以这里取一个远低于它们
+    #: 的值——真正的判据是相对系数，绝对值只负责把"整批都在 0.4 以下"的检索判死。
+    abs_vector: float = 0.45
+    #: BM25 原始分下限。跨 query 不可比，只能是 0：过门只要求"这条命中过查询词"。
+    abs_bm25: float = 0.0
+    #: 重排概率下限。0.30 是实测噪声上界（无关 0.191–0.294）再留一点余量。
+    abs_rerank: float = 0.30
+
+    def budget(self, top_k: int) -> int:
+        """这一次检索往下游要多少条：`max(max_k, top_k, min_k)`。
+
+        `top_k` 从此是**下界**而不是条数：调用方说"我要 5 条"意味着"至少 5 条"，
+        而不是"最多 5 条"。这一条是整个改动的语义变化，写在这里免得两处理解不同。
+        """
+        return max(self.max_k, top_k, self.min_k)
+
+
+#: 按支检索（`tools.DEEP_BRANCH_TOP_K` 那一族）与 `rag_query` 共用同一份实测口径：
+#: 每支 3–6 条、`rel=0.85`。`max_k=6` 而不是 10 是**成本闸**：20 支 × 6 = 120 条
+#: 父块 ≈ 6 万字，再高就撑爆按支检索那一次 prompt（实测见 docs/RETRIEVAL-KEEP.md）。
+DEFAULT_KEEP = KeepPolicy()
+
+
+def _keep_scale(hits: list[EvidenceHit]) -> Literal["rerank", "vector", "bm25", "score"]:
+    """整批统一选一个标尺：重排 > 余弦 > BM25 > 融合分。
+
+    **必须整批一个**：同一次排序里不同条目用不同量纲，`>= floor` 比出来的就是两个
+    世界（余弦 0.55 与 BM25 4.5 摆在一起比大小）。选的顺序也对应可信度：重排分是
+    专门判相关性的、余弦是语义距离、BM25 是字面匹配、融合分只是名次的函数。
+    """
+    if hits and all(hit.rerank_score is not None for hit in hits):
+        return KEEP_SCORE_RERANK
+    if any(hit.score_vector is not None for hit in hits):
+        return KEEP_SCORE_VECTOR
+    if any(hit.score_bm25 is not None for hit in hits):
+        return KEEP_SCORE_BM25
+    return "score"
+
+
+def _keep_value(hit: EvidenceHit, scale: str) -> float:
+    """一条命中在选定标尺上的分。缺值按 0 处理（"没参与那一路"当作最低）。"""
+    if scale == KEEP_SCORE_RERANK:
+        return hit.rerank_score or 0.0
+    if scale == KEEP_SCORE_VECTOR:
+        return hit.score_vector or 0.0
+    if scale == KEEP_SCORE_BM25:
+        return hit.score_bm25 or 0.0
+    return hit.score
+
+
+def _keep_scored(hit: EvidenceHit, scale: str) -> bool:
+    """这条命中在选定标尺上**有没有真的分**。
+
+    用途只有一个：图游走（`origin="graph"`）的证据三列原始分全是 None——它们不是
+    "得了 0 分"，是"根本没参与文本路打分"。把它们算进"达标条数"会把门槛拉低，
+    算进"不达标"又会让整条图路被阈值判死，所以单独认出来、按条数带着走
+    （见 `keep_by_score` 的 `extra`）。
+    """
+    if scale == KEEP_SCORE_RERANK:
+        return hit.rerank_score is not None
+    if scale == KEEP_SCORE_VECTOR:
+        return hit.score_vector is not None
+    if scale == KEEP_SCORE_BM25:
+        return hit.score_bm25 is not None
+    return True
+
+
+def _keep_abs(policy: KeepPolicy, scale: str) -> float:
+    if scale == KEEP_SCORE_RERANK:
+        return policy.abs_rerank
+    if scale == KEEP_SCORE_VECTOR:
+        return policy.abs_vector
+    if scale == KEEP_SCORE_BM25:
+        return policy.abs_bm25
+    return 0.0
+
+
+def keep_by_score(hits: list[EvidenceHit], policy: KeepPolicy | None, *,
+                  at_least: int = 0) -> list[EvidenceHit]:
+    """"分数差不多就都留着"：按阈值数出条数，再把列表截到那个长度。
+
+    `policy is None` 时**原样返回同一个列表对象**——这是"没启用"的构造保证：所有
+    既有调用点（含 20 个测试文件里的桩）不传 policy，行为必须逐字段不变。
+
+    `at_least` 是**调用方要的条数**（也就是传进来的 `top_k`）。它进上下界两侧：
+    `low = max(min_k, at_least)`、`high = max(max_k, at_least)`。少了这一半会出现
+    一种很隐蔽的退化——`top_k=5` 而 `min_k=3` 时，达标数只有 4 就取 4 条，比改之前
+    的 5 条**更少**（实测在 `rag_query` 那个口径上出现过 0.60x）。
+
+    三条实现约束，各对应一种能静默出错的写法：
+
+      1. **截长度，不逐条筛**。`search_multi` 的顺序是"保底段 + 竞争段"，保底段
+         最后一条的 `score` 可能低于竞争段第一条（那是有意的，见 `search_multi` 的
+         「代价」）。逐条筛会把保底段中间挖空，而保底段正是"用户原话找到的那几条"。
+         图游走的命中同样没有可比分数，逐条筛会把它们全判死。
+      2. **基准取第 `min_k` 名，不取第 1 名**。第 1 名是离群高点：实测拿它当基准
+         乘 0.85，中位只剩 3.0 条（等于没改）；取第 3 名做基准是 4.5–5.4 条。
+         注意是**列表里第 `min_k` 条**，不是"前 `min_k` 名的中位数"——后者在
+         `[58.7, 37.6, 5.1, …]` 这种形状下会取到 37.6，门槛跟着离群点跑，又回到
+         第 1 名那个错上。
+      3. **条数只增不减地 clamp**：`max(min_k, min(max_k, 达标数))`，再与
+         `len(hits)` 取小。`min_k` 托住"都很低"那一侧，`max_k` 封住"都很高"那一侧，
+         而 `len(hits)` 决定"材料本来就不够"（薄批只有 1 个父块）时不能凭空凑。
+      4. **没有可比分的条目（图证据）不进达标数，但也不会被截掉**：它们的
+         `score_*` 三列全是 None，既不该算"低分"也不该算"高分"；`extra` 把它们
+         按原有顺序补回尾部。
+
+    返回值永远是 `hits` 的前缀（顺序不变、对象不变）：调用方已经按相关性排过序
+    （`_pick_ordered` / `_dedupe_exact` / `_fold_to_parents` / `_rerank_top`），
+    这里只决定"给到第几条"。
+    """
+    if policy is None or not hits:
+        return hits
+    scale = _keep_scale(hits)
+    values = [_keep_value(hit, scale) for hit in hits]
+    anchor = values[min(policy.min_k, len(values)) - 1]
+    floor = max(_keep_abs(policy, scale), anchor * policy.rel)
+    passed = sum(1 for hit, value in zip(hits, values)
+                 if _keep_scored(hit, scale) and value >= floor)
+    low, high = max(policy.min_k, at_least), max(policy.max_k, at_least)
+    count = max(low, min(high, passed))
+    # 上图/图路那类"没有可比分"的条目：只把落在截断线之外的那些补回来，
+    # 已经在前缀里的不用动。
+    extra = sum(1 for hit in hits[count:] if not _keep_scored(hit, scale))
+    count = min(len(hits), count + extra)
+    logger.debug("按分数取：标尺 %s、基准 %.4f、门槛 %.4f、达标 %d → 取 %d/%d 条",
+                 scale, anchor, floor, passed, count, len(hits))
+    return hits[:count]
+
+
 def _collect_chunks(sources: list[Source]) -> list[tuple[str, int, int, str]]:
     """切一遍块，返回 `(source_id, start, end, quote)`。
 
@@ -2154,7 +2343,8 @@ def _search_parent_core(
 def search_parent(sources: list[Source], query: str, top_k: int = 5, *,
                   filters: SourceFilter | None = None,
                   library: bool = False,
-                  drop_external: bool = False) -> list[EvidenceHit]:
+                  drop_external: bool = False,
+                  keep: KeepPolicy | None = None) -> list[EvidenceHit]:
     """**用子块匹配、把父块回给调用方**（small-to-big / parent-document retrieval）。
 
     与 `search_sources` 的差别只有粒度，不是另一套检索：
@@ -2246,28 +2436,41 @@ def search_parent(sources: list[Source], query: str, top_k: int = 5, *,
         分数，塞进重排只会让它的 [0,1] 概率与名次混在一起）。要重排图证据是另一轮的事。
       - 融合后 `score` 一律变成 RRF 分（图命中没有可加的原始分），`origin="graph"`
         标出哪几条是图带来的——`method` 不动。
+
+    **按分数取数（`keep`）**：给了 policy 时 `top_k` 变成**下界**——下游按
+    `keep.budget(top_k) = max(max_k, top_k)` 要更多候选（多出来的部分才让阈值有东西
+    可数），出口再交给 `keep_by_score` 截一次。顺序是"先 `_with_graph`、后
+    `keep_by_score`"：图证据没有可比分数，先进来才能跟着"条数"被带出去，反过来
+    先截就会把它们当"0 分"整批判死。`keep=None`（所有既有调用点）时 `want == top_k`、
+    出口原样返回列表，行为逐字段不变。
     """
+    want = top_k if keep is None else keep.budget(top_k)
     if not _parent_retrieval_enabled():
-        hits = search_sources(sources, query, top_k, filters=filters, library=library,
+        hits = search_sources(sources, query, want, filters=filters, library=library,
                               drop_external=drop_external)
-        return _with_graph(hits, sources, query.strip(), top_k, filters, parent=False)
+        return keep_by_score(
+            _with_graph(hits, sources, query.strip(), want, filters, parent=False), keep,
+            at_least=top_k)
 
     question = query.strip()
-    depth = _rerank_depth(top_k)
-    base = _search_parent_core(sources, question, top_k, filters, depth=depth)
+    depth = _rerank_depth(want)
+    base = _search_parent_core(sources, question, want, filters, depth=depth)
     if not library:
         # 单 query 没有"原 query 那一路"可言，池里也没有保底段。
-        hits = _rerank_top(question, base, top_k)
+        hits = _rerank_top(question, base, want)
     else:
         extra = _library_batch(question, depth, filters, exclude=sources, parent=True,
                                drop_external=drop_external)
         merged, reserve = _merge_batches(base, extra, depth, parent=True)
-        hits = _rerank_top(question, merged, top_k,
-                           reserve=min(reserve, _reserve_seats(top_k)))
-    return _with_graph(hits, sources, question, top_k, filters, parent=True)
+        hits = _rerank_top(question, merged, want,
+                           reserve=min(reserve, _reserve_seats(want)))
+    return keep_by_score(
+        _with_graph(hits, sources, question, want, filters, parent=True), keep,
+        at_least=top_k)
 
 
 def search_exact_blocks(sources: list[Source], query: str, top_k: int = 3,
+                        *, keep: KeepPolicy | None = None,
                         ) -> list[EvidenceHit]:
     """**父块粒度、但不重排也不查库**的检索：给"用短语去定位原文"的调用方。
 
@@ -2293,11 +2496,17 @@ def search_exact_blocks(sources: list[Source], query: str, top_k: int = 3,
     同口径；`leaf_*` 记命中的那一小段（父块模式下恒有值，理由见 `search_parent`）。
     `score` 是 RRF 分（两路）或 BM25 分（单路），**只在本次检索内可比**——与所有
     其它入口同一条约定。
+
+    `keep` 与 `search_parent` 的同名参数同一个意思（`top_k` 变成下界、出口按阈值
+    截一次）。本函数**不扩池**，所以阈值数的是"这一章里全量的父块命中"——章内一共
+    只有 3–5 个父块，`max_k` 一般就是那一章的全部。
     """
     question = (query or "").strip()
     if top_k <= 0 or not question:
         return []
-    return _search_parent_core(sources, question, top_k, None)
+    want = top_k if keep is None else keep.budget(top_k)
+    return keep_by_score(_search_parent_core(sources, question, want, None), keep,
+                         at_least=top_k)
 
 
 # ---------------------------------------------------------------- 图游走接线
@@ -2528,6 +2737,7 @@ async def search_multi(
     hyde: str | None = None,
     library: bool = False,
     drop_external: bool = False,
+    keep: KeepPolicy | None = None,
 ) -> list[EvidenceHit]:
     """在**同一批来源**上并行跑 N 个 query，按 RRF 名次把各路**累加**后融合。
 
@@ -2671,31 +2881,41 @@ async def search_multi(
     `rerank_score` 排，被挤出去的按池序补在段尾）。这一条不能省：`_rerank_depth`
     把池子放宽到 `pool_size(top_k)`，保底信息若不带到重排之后，扩池就等于把交付
     口径偷换成池口径——"扩展路最多贡献 `top_k - ceil(top_k/2)` 条"那条承诺失效。
+
+    **按分数取数（`keep`）**：与 `search_parent` 同一条约定——`top_k` 变下界、
+    下游按 `keep.budget(top_k)` 要候选、出口交给 `keep_by_score` 截一次。这里多一条
+    必须写清的边界：**`keep` 数的是"交付口径的分数"，而多路的 `score` 是各路 RRF
+    累加**（名次函数），所以标尺会落到 `score_vector`（hybrid）或 `score_bm25`
+    （纯 BM25 降级）上，见 `_keep_scale`。这与单路的取舍完全一样，不是这里另开一套。
     """
     # 粒度跟着 `search_parent`：同一个开关（`MINDMAP_PARENT_RETRIEVAL`）决定多路
     # 是"子块匹配 → 折父块"还是"单级块匹配"。两处各判一次的话，会出现"本次那批
     # 折父块、库里那批没折"的粒度错位，而那种错只有调用方按 `end - start` 估信息
     # 密度时才会暴露。
+    want = top_k if keep is None else keep.budget(top_k)
     parent = _parent_retrieval_enabled()
-    depth = _rerank_depth(top_k)
-    fused, reserve = await _search_multi_core(sources, queries, top_k, filters, hyde,
+    depth = _rerank_depth(want)
+    fused, reserve = await _search_multi_core(sources, queries, want, filters, hyde,
                                              depth=depth, parent=parent)
     question = next((text.strip() for text in queries
                      if isinstance(text, str) and text.strip()), "")
     if not question:
-        return fused[:top_k]
-    # 交付口径的保底席是 `ceil(top_k/2)`；池子里那一段按 `depth` 算得更宽，这里取
+        return keep_by_score(fused[:want], keep, at_least=top_k)
+    # 交付口径的保底席是 `ceil(want/2)`；池子里那一段按 `depth` 算得更宽，这里取
     # 交集。`reserve` 可能更小（原 query 只命中一两条父块），也可能为 0（单路）。
-    seats = min(reserve, _reserve_seats(top_k))
+    seats = min(reserve, _reserve_seats(want))
     if not library:
-        return _rerank_top(question, fused, top_k, reserve=seats)
+        return keep_by_score(_rerank_top(question, fused, want, reserve=seats), keep,
+                             at_least=top_k)
     # 跨批融合在**折叠之后**做（`parent` 一致时两批都是同一粒度），理由见
     # docstring 的 `library=True` 那一段。
     extra = _library_batch(question, depth, filters, exclude=sources, parent=parent,
                            drop_external=drop_external)
     merged, merged_reserve = _merge_batches(fused, extra, depth, parent=parent)
-    return _rerank_top(question, merged, top_k,
-                       reserve=min(merged_reserve, _reserve_seats(top_k)))
+    return keep_by_score(
+        _rerank_top(question, merged, want,
+                    reserve=min(merged_reserve, _reserve_seats(want))), keep,
+        at_least=top_k)
 
 
 async def _search_multi_core(

@@ -279,7 +279,7 @@ def _run_deep(titles: tuple[str, ...], *, max_model_calls: int = 30):
     ctx = _ctx(sources, max_model_calls=max_model_calls)
     queries: list[str] = []
 
-    def spy(sources_arg, query, top_k=3, *, filters=None):
+    def spy(sources_arg, query, top_k=3, *, filters=None, keep=None):
         queries.append(query)
         return [_hit(sources[0])]
 
@@ -350,7 +350,7 @@ def test_supplementary_retrieval_never_touches_tool_calls():
     sources = [ctx.request.sources[0]]
     calls = {"tool": 0}
 
-    def spy(_sources, _query, top_k=3, *, filters=None):
+    def spy(_sources, _query, top_k=3, *, filters=None, keep=None):
         return [_hit(sources[0])]
 
     async def chat(system, user, *, max_tokens=None, on_delta=None):

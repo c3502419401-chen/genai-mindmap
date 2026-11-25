@@ -142,6 +142,14 @@ SWITCHES = ("MINDMAP_HYBRID_SEARCH", "MINDMAP_QUERY_EXPANSION", "MINDMAP_PARENT_
             # 区间：宿主机上留着 `MINDMAP_DETAIL_SCALE=1` 时，每条生成用例的第三段
             # 提示词都会悄悄换一个区间，而断言里那些"80–150 字"逐字比的就是它。
             "MINDMAP_DETAIL_SCALE",
+            # 一级分支概括（`tools.BRANCH_DIGEST_ENV`）。**置 0**：它默认关，而既有生成
+            # 用例的模型替身全部按"骨架 → 结构 → 说明"三段回放（`test_detail_round._chat`
+            # 就是这样：不认识 system 的一律 `return tree`）——多出一次以
+            # `BRANCH_DIGEST_PROMPT` 开头的调用，那些替身会拿它当"结构那一次"返回一棵树，
+            # 断言会以"节点数不对"的形式失败，而真正的原因是这次多发了一次调用。
+            # 需要它的用例自己 `setenv(..., "1")`；"默认关"由
+            # `tests/test_branch_digest.py` 的第一条用例钉着。
+            "MINDMAP_BRANCH_DIGEST",
             # 节点预算的旧口径（`budget.NODE_POOL_ENV`：总量池 + 前序裁剪）。置 0 =
             # 按支摊（默认）。清空与置 0 效果相同，但置 0 更明确：宿主机上留着
             # `MINDMAP_NODE_POOL=1` 时，`test_branch_budget` 里那两条对照会一起变绿。
@@ -151,7 +159,13 @@ SWITCHES = ("MINDMAP_HYBRID_SEARCH", "MINDMAP_QUERY_EXPANSION", "MINDMAP_PARENT_
             # `reasoning_effort`——既有那几百条断言钉的都是"模型名来自配置"，
             # 在这里清空等于让它们全部走部署方那把钥匙的免费档。
             # 需要它的用例自己 `setenv(..., "1")` 并替换 `free_models` 的缓存。
-            "MINDMAP_FREE_TIER")
+            "MINDMAP_FREE_TIER",
+            # 按分数取数（`tools.KEEP_BY_SCORE_ENV`）。**置 0**：线上默认开，而
+            # 几百条既有生成用例钉的是"每支 3 条"那个条文（它们按 user 里
+            # "第 N 支「标题」的检索结果"分组造引用，条数变了引用位置就变）。
+            # 这里置 0 之后，那些用例的检索行为**逐字节**是改动前的口径；新口径由
+            # `tests/test_keep_by_score.py` 显式传 policy 覆盖（那批不读这个开关）。
+            "MINDMAP_KEEP_BY_SCORE")
 
 # 图存储的连接参数。清空而不是设默认值：URI/USER/DATABASE 有代码默认，PASSWORD
 # 没有——"没配"必须是可见的未配置状态，否则宿主机上跑着的 Neo4j 会被单测连上。

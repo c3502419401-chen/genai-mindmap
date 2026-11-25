@@ -705,7 +705,7 @@ def test_rag_forwards_filters_as_source_filter(monkeypatch):
     captured: dict = {}
 
     def fake_search(sources, query, top_k=5, *, filters=None, library=False,
-                    drop_external=False):
+                    drop_external=False, keep=None):
         captured["filters"] = filters
         captured["drop_external"] = drop_external
         copied = {"sources": list(sources), "query": query, "top_k": top_k}
@@ -731,7 +731,7 @@ def test_rag_without_filters_passes_none(monkeypatch):
     captured: dict = {}
 
     def fake_search(sources, query, top_k=5, *, filters=None, library=False,
-                    drop_external=False):
+                    drop_external=False, keep=None):
         captured["filters"] = filters
         return []
 

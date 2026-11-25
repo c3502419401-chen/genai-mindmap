@@ -125,6 +125,7 @@ from app.knowledge.service import (
     OUTLINE_MAX_ITEMS,
     OUTLINE_MIN_TITLE_CHARS,
     EvidenceHit,
+    KeepPolicy,
     SourceFilter,
     filter_sources,
     heading_outline,
@@ -246,7 +247,55 @@ DEEP_MIN_BREADTH = 2
 # 88 条文本。**不预热**时是 20 × 69 = 1380 条（56 批），17 倍——所以
 # `_generate_deep` 里第一支仍然串行检索（预热闸见 `run_branch`），那不是保守，
 # 是成本闸。`_retrieve_branches` 是同一策略的批量实现。
-DEEP_BRANCH_TOP_K = 3
+#
+# **条数不再是 3，而是"分数差不多的都留着"**（`keep=DEEP_BRANCH_KEEP`）：固定取前
+# 3 条在实测里会砍掉大量同分证据——`scripts/measure_topk_threshold.py`（五组真实
+# 材料 × 真实小节标题，`top_k=60` 拿全量）记了三个数：第 3→4 条的跌幅中位只有
+# 0.026（hybrid）/ 0.047（纯 BM25）；被砍掉的第 4–10 条里 **131/140（94%）落在
+# 不同的父块**上，也就是"多给几条"是真的多给信息，不是同一段换个开头。
+# 于是 3 变成**下界**，上界是 `DEEP_BRANCH_KEEP.max_k = 6`。
+#
+# `max_k=6` 而不是 10 是成本闸，不是口味：20 支 × 6 = 120 条父块 ≈ 6 万字，已是
+# 按支检索那一次 prompt 的极限（`docs/RETRIEVAL-KEEP.md` 有真生成的 token 实测）。
+# **`DEEP_BRANCH_TOP_K` 这个名字留着**：它仍是"一支至少几块"的口径，六个测试文件
+# 与 `measu*` 脚本都拿它当锚，改个名字换不来任何信息。
+DEEP_BRANCH_KEEP = KeepPolicy(min_k=3, max_k=6, rel=0.85)
+DEEP_BRANCH_TOP_K = DEEP_BRANCH_KEEP.min_k
+
+# 按分数取数的总开关（`MINDMAP_KEEP_BY_SCORE`，默认**开**）。
+#
+# 为什么要有它：这一改动改的是**取数口径**——同一批材料、同一个 query，返回条数不再
+# 等于 `top_k`。这类改动必须有回到旧口径的路，否则下一次回归只能靠 revert。它与
+# `MINDMAP_PARENT_RETRIEVAL` 同一个写法（默认开、正列举假值），因为两者改的都是
+# "返回什么粒度/多少条"：
+#
+#   - `0` → 四个调用点都传 `keep=None`，**逐字节回到 "取排序后前 N 条"**；
+#   - `1`（缺省）→ 按 `KeepPolicy` 取，条数落在 `[min_k, max_k]`。
+#
+# 真生成的 A/B（`scripts/measure_generation_strategy.py --keep off`）就是靠它跑的：
+# 两臂唯一差别是这一个环境变量。
+KEEP_BY_SCORE_ENV = "MINDMAP_KEEP_BY_SCORE"
+
+
+def keep_by_score_enabled() -> bool:
+    """按分数取数是否生效。默认**开**；`0/off/false/no/空串` 一律关。"""
+    return os.getenv(KEEP_BY_SCORE_ENV, "1").strip().lower() not in {
+        "0", "off", "false", "no", ""}
+
+
+def branch_keep() -> KeepPolicy | None:
+    """按支检索用的 policy；总开关关着时返回 `None`（= 旧口径）。"""
+    return DEEP_BRANCH_KEEP if keep_by_score_enabled() else None
+
+
+def detail_keep() -> KeepPolicy | None:
+    """章内检索用的 policy；总开关关着时返回 `None`。"""
+    return DETAIL_RETRIEVAL_KEEP if keep_by_score_enabled() else None
+
+
+def rag_keep() -> KeepPolicy | None:
+    """`rag_query` 用的 policy；总开关关着时返回 `None`。"""
+    return RAG_QUERY_KEEP if keep_by_score_enabled() else None
 
 # 一支最多发几路查询：标题 + 2 条同义问法（`query_plan.plan_branches`）。
 #
@@ -923,10 +972,26 @@ class AuditTreeArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+# `rag_query` 的条数口径：**`top_k` 从此是下界**，实际条数由分数定（3–8）。
+#
+# 为什么把它也动态化：这条是模型唯一能自己调的检索入口，而它原来被 `le=5` 钉死、
+# 默认 5。实测（`scripts/measure_topk_threshold.py`）说明这不是"模型要不要更多"的
+# 问题——第 4 名与第 3 名的分差中位只有 0.026，模型说"要 5 条"时第 6 条常常只差
+# 0.03 分，砍掉它没有任何依据。`max_k=8` 与 `LIBRARY_GENERATE_TOP_K=8` 同量级，
+# `le` 从 5 放宽到 10 只是**允许**模型要得更多（它仍可以只要 3 条）。它**不进**
+# `openapi.json`：`RagArgs` 是 `ToolSpec.args_model`，schema 由
+# `contracts/agent.py::ToolSpec.parameters` 在运行时 `model_json_schema()` 生成，
+# FastAPI 的 `/openapi.json` 里没有工具参数（改完跑过 `scripts/export_openapi.py`，
+# 无 diff）。放宽它是为了"下界"这个新语义，不是为了改 HTTP 契约。
+RAG_QUERY_KEEP = KeepPolicy(min_k=3, max_k=8, rel=0.85)
+
+
 class RagArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     question: str = Field(min_length=1, max_length=500)
-    top_k: int = Field(default=5, ge=1, le=5)
+    #: **下界**，不是条数：`_rag` 把它当 `RAG_QUERY_KEEP` 的下界用。给 5 意味着
+    #: "至少 5 条"，最多 8 条（`RAG_QUERY_KEEP.max_k`）。
+    top_k: int = Field(default=5, ge=1, le=10)
     # 检索前置的元数据过滤条件，原样透传给 `search_sources`（形状见
     # `knowledge.service.SourceFilter`）。用 dict 而不是模型字段，是为了让
     # "模型乱填过滤条件"这件事在工具入口被吸收成"不过滤"，而不是变成一次
@@ -4620,9 +4685,12 @@ def _detail_targets(
 # 逐字等于 `原文[start:end]`，与 `SourceRef` 同一口径。
 DETAIL_RETRIEVAL_ENV = "MINDMAP_DETAIL_RETRIEVAL"
 
-# 每个节点取几段：3。一章切出来只有 3–5 个父块（144–2,894 字 / 450–700 字一块），
-# 取 3 段基本就是"这一章里与它最相关的三处"；取 1 段时模型常写不满 3 句。
-DETAIL_RETRIEVAL_TOP_K = 3
+# 每个节点取几段：**至少 3，至多 5**（`DETAIL_RETRIEVAL_KEEP`）。一章切出来只有 3–5
+# 个父块（144–2,894 字 / 450–700 字一块），所以这里的旋钮更像"要不要把这一章看全"：
+# 固定 3 段在 5 个父块的章里会漏掉两块，而那两块常常只是第 3 块差 0.02 分。
+# `max_k=5` 与"一章 3–5 个父块"对齐，`DETAIL_RETRIEVAL_MAX_CHARS=16,000` 仍是总闸。
+DETAIL_RETRIEVAL_KEEP = KeepPolicy(min_k=3, max_k=5, rel=0.85)
+DETAIL_RETRIEVAL_TOP_K = DETAIL_RETRIEVAL_KEEP.min_k
 
 # 检索并发。检索本身是 `asyncio.to_thread` 里的同步函数（BM25 + 向量缓存），61 个
 # 节点串行发完是十几秒。取 6 而不是更大：真正的等待只在每章第一个节点（块向量要
@@ -4816,7 +4884,8 @@ async def _detail_evidence(
                 hits = await asyncio.to_thread(
                     search_exact_blocks,
                     [_chapter_source(source, chapter, source.text or "")],
-                    questions[node_id], DETAIL_RETRIEVAL_TOP_K)
+                    questions[node_id], DETAIL_RETRIEVAL_TOP_K,
+                    keep=detail_keep())
             except Exception as exc:  # noqa: BLE001 — 检索失败只降级，理由见 docstring
                 logger.warning("第三段按节点检索失败（%s）：%s: %s",
                                questions[node_id][:40], type(exc).__name__, str(exc)[:160])
@@ -5976,9 +6045,11 @@ async def _search_branch(
     try:
         if len(queries) <= 1:
             found = await asyncio.to_thread(
-                search_parent, sources, query, DEEP_BRANCH_TOP_K)
+                search_parent, sources, query, DEEP_BRANCH_TOP_K,
+                keep=branch_keep())
         else:
-            found = await search_multi(sources, queries, DEEP_BRANCH_TOP_K)
+            found = await search_multi(sources, queries, DEEP_BRANCH_TOP_K,
+                                       keep=branch_keep())
     except Exception as exc:  # noqa: BLE001 — 检索失败只降级，不该废掉整张图
         logger.warning("分支检索失败（%s / %d 路）：%s: %s",
                        title, len(queries), type(exc).__name__, str(exc)[:160])
@@ -6094,7 +6165,8 @@ async def _search_text(sources: list[Source], query: str) -> list[EvidenceHit] |
     if not text:
         return None
     try:
-        return await asyncio.to_thread(search_parent, sources, text, DEEP_BRANCH_TOP_K)
+        return await asyncio.to_thread(search_parent, sources, text, DEEP_BRANCH_TOP_K,
+                                       keep=branch_keep())
     except Exception as exc:  # noqa: BLE001 — 补查失败只降级
         logger.warning("补查检索失败（%d 字 query）：%s: %s",
                        len(text), type(exc).__name__, str(exc)[:160])
@@ -12936,8 +13008,10 @@ def _expand_reference(ctx: RunContext, chain: Sequence[Node], sources: list[Sour
                       ) -> tuple["_BranchEvidence | None", dict[str, Any]]:
     """为这次展开单独检索一次：**只查选中节点**，不重跑整支。
 
-    `top_k` 用单支口径（`DEEP_BRANCH_TOP_K = 3`）：一条父块 450–700 字，三条足够
-    一次 2–4 个节点的展开，再多只是把同一段材料换个开头。
+    `top_k` 用单支口径（`DEEP_BRANCH_TOP_K = 3` 是**下界**，实际条数由
+    `DEEP_BRANCH_KEEP` 按分数定，3–6 条）：一条父块 450–700 字，三条已经够一次
+    2–4 个节点的展开；多出来的那几条是同分的补充，不是"同一个开头换个说法"
+    （实测第 4–10 条 94% 落在不同父块，见 `DEEP_BRANCH_KEEP` 的注释）。
 
     **不占 `max_tool_calls`**：检索发生在工具内部（与 `_generate_deep` 的按支检索
     同一条规矩），模型看到的仍然只有一次 `node_expand` 调用。这不只是计费口径：
@@ -12954,6 +13028,7 @@ def _expand_reference(ctx: RunContext, chain: Sequence[Node], sources: list[Sour
         return None, {"query": "", "hits": 0, "skipped": "空查询"}
     hits = search_parent(sources, query, DEEP_BRANCH_TOP_K,
                          library=library_search_enabled(),
+                         keep=branch_keep(),
                          drop_external=library_drop_external())
     if not hits:
         return None, {"query": query, "hits": 0, "top_k": DEEP_BRANCH_TOP_K}
@@ -13677,6 +13752,7 @@ async def _rag(args: RagArgs, ctx: RunContext) -> ToolResult:
         queries.extend(plan.subqueries)
         hits = await search_multi(sources, queries, args.top_k, filters=filters,
                                   hyde=plan.hyde, library=library_on,
+                                  keep=rag_keep(),
                                   drop_external=library_drop_external())
     else:
         # 单路走 `search_parent`：**不在这里再判一次开关**。关着时它内部直接返回
@@ -13691,6 +13767,7 @@ async def _rag(args: RagArgs, ctx: RunContext) -> ToolResult:
         # `knowledge.service._merge_batches` 里，不在这一层。
         hits = search_parent(sources, args.question, args.top_k, filters=filters,
                              library=library_on,
+                             keep=rag_keep(),
                              drop_external=library_drop_external())
     if not hits:
         # 四种"什么都没有"必须给四句不同的话——模型据此决定下一步做什么，而它

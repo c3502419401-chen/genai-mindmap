@@ -403,7 +403,8 @@ def test_branch_query_is_the_title_alone():
     """
     seen: list[str] = []
 
-    def spy(sources, query, top_k=DEEP_BRANCH_TOP_K, *, filters=None):
+    def spy(sources, query, top_k=DEEP_BRANCH_TOP_K, *, filters=None,
+            keep=None):
         seen.append(query)
         return [_hit()]
 
@@ -429,7 +430,8 @@ def test_branch_searches_overlap():
     """
     windows: list[tuple[float, float]] = []
 
-    def fake_search(sources, query, top_k=DEEP_BRANCH_TOP_K, *, filters=None):
+    def fake_search(sources, query, top_k=DEEP_BRANCH_TOP_K, *, filters=None,
+                    keep=None):
         started = time.perf_counter()
         time.sleep(0.15)          # 占住线程：串行时第二个分支只能排在后面
         windows.append((started, time.perf_counter()))
@@ -527,7 +529,8 @@ def test_one_failed_branch_keeps_the_others_and_the_tree(monkeypatch):
 
     prompts: dict[str, str] = {}
 
-    def flaky_search(sources, query, top_k=DEEP_BRANCH_TOP_K, *, filters=None):
+    def flaky_search(sources, query, top_k=DEEP_BRANCH_TOP_K, *, filters=None,
+                     keep=None):
         if "绩效考核" in query:
             raise RuntimeError("模拟向量批失败")
         return real_search(sources, query, top_k, filters=filters)
@@ -587,7 +590,8 @@ def test_all_branch_searches_failing_falls_back_to_whole_tree(monkeypatch):
 
     queries: list[tuple[str, int]] = []
 
-    def failing_search(sources, query, top_k=DEEP_BRANCH_TOP_K, *, filters=None):
+    def failing_search(sources, query, top_k=DEEP_BRANCH_TOP_K, *, filters=None,
+                       keep=None):
         queries.append((query, top_k))
         if query == WHOLE_QUERY:       # 兜底：整树一次检索用"主题 + 全部标题"
             return real_search(sources, query, top_k, filters=filters)
@@ -707,7 +711,7 @@ def test_no_material_means_no_retrieval():
     """
     searches: list[str] = []
 
-    def spy_search(sources, query, top_k=5, *, filters=None):
+    def spy_search(sources, query, top_k=5, *, filters=None, keep=None):
         searches.append(query)
         return []
 
@@ -733,7 +737,8 @@ def test_evidence_spans_from_every_branch_are_kept(monkeypatch):
     hits = {"预算审批": _hit(0), "绩效考核": _hit(0, source_id=PERFORMANCE_ID),
             "预算执行分析": _hit(60)}
 
-    def fake_search(sources, query, top_k=DEEP_BRANCH_TOP_K, *, filters=None):
+    def fake_search(sources, query, top_k=DEEP_BRANCH_TOP_K, *, filters=None,
+                    keep=None):
         return [hits[title] for title in hits if title in query] or []
 
     with patch("app.agent.tools.search_parent", new=fake_search):

@@ -104,7 +104,7 @@ def _run_fill(*, chapters, source, monkeypatch, hits=None) -> tuple[MindMapConte
     """跑一次第三段；`hits` 是替身检索的结果（缺省按 query 命中本章第一段）。"""
     seen: list[tuple[list[Source], str]] = []
 
-    def fake_search(sources, query, top_k=3):
+    def fake_search(sources, query, top_k=3, *, keep=None):
         seen.append((sources, query))
         if hits is not None:
             return hits(sources, query, top_k)
@@ -248,7 +248,7 @@ def test_blocks_are_shared_between_nodes_of_the_same_chapter(monkeypatch):
     targets = [(node, path) for node, path in _iter_paths(content.root)
                if node.id in mapping]
 
-    def one_hit(sources, query, top_k):
+    def one_hit(sources, query, top_k, *, keep=None):
         return [EvidenceHit(source_id=sources[0].id, start=0,
                             end=min(len(sources[0].text), 100),
                             quote=sources[0].text[:100], score=1.0)]
@@ -332,7 +332,7 @@ def test_a_failed_search_only_costs_that_one_node(monkeypatch):
     targets = [(node, path) for node, path in _iter_paths(content.root)
                if node.id in mapping]
 
-    def flaky(sources, query, top_k):
+    def flaky(sources, query, top_k, *, keep=None):
         if query.endswith("要点一") and "切块" in query:
             raise RuntimeError("向量服务 500")
         return [EvidenceHit(source_id=sources[0].id, start=0, end=50,
@@ -384,7 +384,7 @@ def test_switch_on_replaces_sections_and_uses_the_new_rules(monkeypatch):
 
     content, chapters = _tree()
     monkeypatch.setattr(tools_module, "search_exact_blocks",
-                        lambda sources, query, top_k: [EvidenceHit(
+                        lambda sources, query, top_k, *, keep=None: [EvidenceHit(
                             source_id=sources[0].id, start=0,
                             end=min(len(sources[0].text), 80),
                             quote=sources[0].text[:80], score=1.0)])

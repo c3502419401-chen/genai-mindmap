@@ -261,6 +261,11 @@ def main() -> int:
     parser.add_argument("--repeat", type=int, default=2)
     parser.add_argument("--topic", default="", help="覆盖纯主题那一批的主题")
     parser.add_argument(
+        "--keep", default="on", choices=("on", "off"),
+        help=("按分数取数（`tools.KEEP_BY_SCORE_ENV`）的 A/B 臂。`off` = 回到"
+              "\"每支取排序后前 3 条\"那个旧口径。两臂唯一的差别就是这一个环境变量，"
+              "所以两行报告可以直接相减（见 `docs/RETRIEVAL-KEEP.md` 第 4 节）"))
+    parser.add_argument(
         "--no-external", action="store_true",
         help=("关掉外部检索（`MINDMAP_EXTERNAL_DEEPSEEK_SEARCH`）。纯主题那一批**必须**"
               "带这个开关才测得到 B：外部检索会先把'没有材料'变成'8 份 / 22,744 字'，"
@@ -268,6 +273,9 @@ def main() -> int:
     args = parser.parse_args()
 
     _prepare()
+    from app.agent.tools import KEEP_BY_SCORE_ENV
+
+    os.environ[KEEP_BY_SCORE_ENV] = "1" if args.keep == "on" else "0"
     if args.no_external:
         os.environ["MINDMAP_EXTERNAL_DEEPSEEK_SEARCH"] = ""
     if not os.environ.get("MINDMAP_LLM_API_KEY"):
@@ -292,7 +300,7 @@ def main() -> int:
                 "ok", "seconds", "node_count", "branches", "ref_coverage",
                 "folded_rollups", "cut_nodes")}, ensure_ascii=False), flush=True)
 
-    out = BACKEND / "data" / "generation-strategy.json"
+    out = BACKEND / "data" / f"generation-strategy-keep-{args.keep}.json"
     out.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n明细：{out}")
 

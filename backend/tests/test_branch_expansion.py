@@ -237,7 +237,8 @@ def test_retrieve_branches_degraded_is_byte_identical(monkeypatch):
     """
     seen: list[tuple[str, int]] = []
 
-    def spy_parent(sources, query, top_k=DEEP_BRANCH_TOP_K, *, filters=None):
+    def spy_parent(sources, query, top_k=DEEP_BRANCH_TOP_K, *, filters=None,
+                   keep=None):
         seen.append((query, top_k))
         return []
 
@@ -277,11 +278,12 @@ def test_each_branch_sends_one_plus_intents(monkeypatch):
     sent: list[list[str]] = []
 
     async def spy_multi(sources, queries, top_k=DEEP_BRANCH_TOP_K, *, filters=None,
-                        hyde=None):
+                        hyde=None, keep=None):
         sent.append(list(queries))
         return []
 
-    def spy_parent(sources, query, top_k=DEEP_BRANCH_TOP_K, *, filters=None):
+    def spy_parent(sources, query, top_k=DEEP_BRANCH_TOP_K, *, filters=None,
+                   keep=None):
         sent.append([query])
         return []
 
@@ -311,12 +313,13 @@ def test_partial_expansion_only_degrades_that_branch(monkeypatch):
     parent: list[str] = []
     multi: list[list[str]] = []
 
-    def spy_parent(sources, query, top_k=DEEP_BRANCH_TOP_K, *, filters=None):
+    def spy_parent(sources, query, top_k=DEEP_BRANCH_TOP_K, *, filters=None,
+                   keep=None):
         parent.append(query)
         return []
 
     async def spy_multi(sources, queries, top_k=DEEP_BRANCH_TOP_K, *, filters=None,
-                        hyde=None):
+                        hyde=None, keep=None):
         multi.append(list(queries))
         return []
 
