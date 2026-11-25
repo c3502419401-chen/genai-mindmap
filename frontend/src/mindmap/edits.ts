@@ -562,6 +562,77 @@ export function subtreeIds(node: MindNode): Set<string> {
   return ids;
 }
 
+/**
+ * 把一个节点（连同它整支）挪到别处：成为 `parentId` 的第 `index` 个孩子。
+ * 返回新的根，原树不动。
+ *
+ * **先摘后插**，顺序不能换：同层移动时，先插会让"自己原来占的那一格"留在兄弟
+ * 数组里参与下标计算，于是落到第 `index + 1` 位——每一次"往上挪一位"都会变成
+ * "原地不动"。摘掉之后剩下的那个数组，才是 `index` 说的坐标系。
+ *
+ * 三个前置条件都抛错而不是静默返回原树：它们全部是**调用方的判据出了洞**才会
+ * 触发的分支（自环、挂进自己的子树、目标不存在），静默返回会让"拖了没反应"
+ * 变成一条查不出来的路径。
+ */
+export function moveNode(
+  root: MindNode,
+  id: string,
+  parentId: string,
+  index: number,
+): MindNode {
+  if (id === root.id) throw new Error('根节点不能移动');
+  const node = findNode(root, id);
+  if (!node) throw new Error('要移动的节点不存在');
+
+  const detached = removeNode(root, id);
+  // 摘完之后还找不到父节点，说明父节点就在**被摘走的那一支**里——那是最直接的
+  // 环（自己挂到自己下面），也是唯一一种摘完就消失的情形。
+  if (!findNode(detached, parentId)) throw new Error('不能把它挂到自己的子树里');
+
+  return replaceChildren(detached, parentId, children => {
+    const at = Math.max(0, Math.min(index, children.length));
+    return [...children.slice(0, at), node, ...children.slice(at)];
+  });
+}
+
+/**
+ * 「我要当 `targetId` 的父」：目标那一支挂到自己的 children 末尾，自己顶替目标
+ * 在它父节点下的位次。返回新的根，原树不动。
+ *
+ * 这个动作看着像"两步移动"，但它与 `moveNode` 是**同一类不可变改写**、不是两次
+ * 独立操作：中间态（目标被摘下、自己还没插进去）永远不会被谁看到，所以撤销栈里
+ * 它只是**一步**，而用户按 Ctrl+Z 退回去的也应该是整件事。
+ *
+ * 位次取「目标原来的那一格」而不是"末尾"：拖到目标的左边时，画面上期望的是
+ * 「我在它刚才的位置，它被我挤到右边一层」。落到末尾会让整支兄弟的顺序莫名变化
+ * ——用户改的是一处父子关系，不该顺带重排它旁边那些不相干的节点。
+ */
+export function reparentAbove(
+  root: MindNode,
+  draggedId: string,
+  targetId: string,
+): MindNode {
+  if (draggedId === root.id) throw new Error('根节点不能移动');
+  if (targetId === root.id) throw new Error('根节点不能成为别人的子节点');
+  const dragged = findNode(root, draggedId);
+  if (!dragged) throw new Error('要移动的节点不存在');
+
+  // 先摘自己，再找目标：目标可能挂在自己的祖先链上（"把父顶下去当自己的子"），
+  // 摘完之后它的父链才是松手之后的样子。
+  const detached = removeNode(root, draggedId);
+  const target = findNode(detached, targetId);
+  if (!target) throw new Error('不能把上级挂到自己的子树里');
+  const parent = findParent(detached, targetId);
+  if (!parent) throw new Error('根节点不能成为别人的子节点');
+
+  const at = parent.children.findIndex(child => child.id === targetId);
+  const withoutTarget = removeNode(detached, targetId);
+  const adopted: MindNode = { ...dragged, children: [...dragged.children, target] };
+  return replaceChildren(withoutTarget, parent.id, children => [
+    ...children.slice(0, at), adopted, ...children.slice(at),
+  ]);
+}
+
 /** 字数按码点算，和 Pydantic 的 len() 以及画布上的截断保持一致。 */
 export function charLength(text: string): number {
   return Array.from(text).length;

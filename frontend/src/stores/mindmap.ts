@@ -5,6 +5,12 @@ import { computed, ref } from 'vue';
 import { ApiError, createMindMap, getMindMap, getRun, listMindMaps, listRuns, markRunSaved, runAgentStream, updateMindMap } from '../api/client';
 import type { AgentEvent, AgentRunRequest, DiagramContent, DiagramTypeChoice, EdgeKind, MapRecord, MindEdge, MindMapContent, MindNode, MindRelation, NodeColor, OpBatch, RunSummary, Source, SourceRef } from '../api/types';
 import { directionOf, withDirection } from '../mindmap/direction';
+import {
+  dropMessage,
+  planDrop,
+  type DropIntent,
+  type DropRejectionCode,
+} from '../mindmap/drop-plan';
 import { diffEdits, EDIT_EVENT_LIMIT, generateEvent, type EditActor, type EditEvent } from '../mindmap/edit-log';
 import { CONNECTION_LOST, guideForFailure, INVALID_SOURCES, NO_CONTENT, type FailureGuide } from '../mindmap/failures';
 import { applyOps } from '../mindmap/ops';
@@ -37,7 +43,7 @@ import {
 } from '../mindmap/shape';
 import { sourceInputError } from '../sources/input';
 import { useSourcesStore } from './sources';
-import { childSide, NODE_SIZE, type ChildSide, type Direction } from '../canvas/layout/tidy';
+import { childSide, layoutTidy, NODE_SIZE, type ChildSide, type Direction } from '../canvas/layout/tidy';
 import { diagramTypeOf, layoutDiagram, type DiagramLayout } from '../canvas/layout';
 import type { NodeSize } from '../canvas/layout/flow';
 import {
@@ -69,6 +75,27 @@ import {
 
 /** 画布节点上最多显示的字数（按码点算，避免把 emoji 切成半个）。 */
 export const TRUNCATE_CHARS = 24;
+
+/**
+ * 拖动落点的预演结果：松手之后它会落在哪儿、这一步合不合法。
+ *
+ * `rect` 是**松手之后的真实位置**（flow 坐标，节点左上角），不是"光标当前位置"。
+ * 两者的区别就是这一轮的全部设计：坐标仍然只有一个来源（布局），拖动表达的是
+ * **结构**；幽灵框把这个结构的结果提前画出来，于是"手拖的位置"从来不需要被保存，
+ * `Node.pos` 也一直不需要被写（见 `docs/NODE-DRAG.md` §1）。
+ */
+export interface MovePreview {
+  ok: boolean;
+  /** 拒绝原因分类。`not-tree` 是这张图型本轮还不支持拖动改结构。 */
+  code?: DropRejectionCode | 'not-tree';
+  /** 直接给用户看的那句话（非法时画布把它画在光标旁）。 */
+  reason?: string;
+  /** 落点父节点 id（"它会挂到谁下面"）。 */
+  parentId?: string;
+  index?: number;
+  /** 落点左上角 + 尺寸，画布据此画那个虚线幽灵框。 */
+  rect?: { x: number; y: number; width: number; height: number };
+}
 
 /** 撤销栈上限。整树快照一步几 KB，50 步封顶，内存与手感都够用。 */
 export const HISTORY_LIMIT = 50;/**
@@ -2852,6 +2879,82 @@ export const useMindMapStore = defineStore('mindmap', () => {
   }
 
   /**
+   * 拖动过程中的**预演**：这一落会改出什么，以及它落在哪个像素上。
+   *
+   * 为什么要有它——这是这一轮最核心的一个决定。布局是**自动算的**（`layoutDiagram`
+   * 从 content 推所有坐标），拖动是**手动的**；两者只能有一个赢。松手之后节点落在
+   * **布局给的位置**（理由见 `docs/NODE-DRAG.md` §1：坐标的唯一来源不能有两个），
+   * 代价是"拖过去、弹回来"的观感。
+   *
+   * 消掉这个代价的办法不是留住手动坐标，而是**在松手之前就把结果画出来**：
+   * 这里算出的 `rect` 就是松手之后的真实位置（同一个 `layoutTidy`、同一棵假设树），
+   * 于是"弹回"变成"吸附"——用户看见幽灵框在哪里，节点就落到哪里。
+   *
+   * 它同时是非法情形的第二道出口：`ok=false` 时画布不画幽灵框、改画一句原因，
+   * 于是**禁止发生在松手之前**，而不是松手之后弹一句"操作失败"。
+   */
+  function previewMove(intent: DropIntent): MovePreview {
+    const current = content.value;
+    if (!current || !isTree(current)) {
+      return { ok: false, code: 'not-tree', reason: '这张图还不能拖动改结构（本轮只做了树型）' };
+    }
+    const plan = planDrop(current.root, intent);
+    if (!plan.ok) return { ok: false, code: plan.code, reason: plan.reason };
+
+    // 落点用**与真正落地时同一个**布局函数算：两处各算一次的话，幽灵框与松手后的
+    // 位置会差一个常量，而那种偏差看起来像"差一点没对准"，用户会反复微调。
+    const geometry = layoutTidy(plan.root, { direction: direction.value });
+    const center = geometry.positions.get(intent.draggedId);
+    if (!center) return { ok: false, code: 'missing', reason: '算不出落点' };
+
+    return {
+      ok: true,
+      parentId: plan.parentId,
+      index: plan.index,
+      rect: {
+        x: center.x - NODE_SIZE.width / 2,
+        y: center.y - NODE_SIZE.height / 2,
+        ...NODE_SIZE,
+      },
+    };
+  }
+
+  /**
+   * 松手：把这次拖动落到 `content` 上。
+   *
+   * 它是一次**内容改动**，所以 `applyContent(patched, true)` 一步就把四件事办全：
+   * 压一步撤销（`user` 名下的 `move` 事件）、置脏、递增 `clientRevision`、
+   * 交给 `diffEdits` 记账。拖动**不是**视图操作——这与收起/展开那条线泾渭分明。
+   *
+   * 非法情形不写 `content`，但**也不静默**：`status` 说清为什么。用户拖了一下
+   * 什么都没发生，与拖了一下弹出一句原因，是两种体验；而这条路径上"什么都没发生"
+   * 的成因有六种。
+   */
+  function moveNodeTo(intent: DropIntent): MovePreview {
+    const current = content.value;
+    if (!current || !isTree(current)) {
+      return { ok: false, code: 'not-tree', reason: '这张图还不能拖动改结构（本轮只做了树型）' };
+    }
+
+    const plan = planDrop(current.root, intent);
+    if (!plan.ok) {
+      status.value = plan.reason;
+      return { ok: false, code: plan.code, reason: plan.reason };
+    }
+
+    if (!applyContent({ ...current, root: plan.root }, true)) {
+      return { ok: false, code: 'missing', reason: '这次没能改动内容' };
+    }
+
+    // 落点可能正藏在某个收起来的折叠点后面（结构变了，可见集合也跟着变）。
+    // 不补这一句，用户会看到"拖完之后节点不见了"。
+    revealInView(intent.draggedId);
+    setPrimary(intent.draggedId);
+    status.value = dropMessage(current.root, intent, plan);
+    return { ok: true, parentId: plan.parentId, index: plan.index };
+  }
+
+  /**
    * 在当前树里连一条**附加关系**（侧栏「连一条关系」的入口）。
    *
    * 三件事与 `addEdge`（`edits.ts` 的纯函数）分工，这里只做"界面语义"那部分：
@@ -4476,6 +4579,11 @@ export const useMindMapStore = defineStore('mindmap', () => {
     addSiblingTo,
     commitAndAddChild,
     deleteNode,
+    // 拖动改结构：`previewMove` 是拖动中的预演（不写内容），`moveNodeTo` 是松手
+    // 那一下（一次可撤销的内容改动）。两者共用 `planDrop`，所以"看见的落点"与
+    // "真正落下的位置"在结构上是同一份推导。
+    previewMove,
+    moveNodeTo,
     undo,
     redo,
     loadMap,
