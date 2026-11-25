@@ -73,12 +73,25 @@ function treeWithRelations(): MindMapContent {
   };
 }
 
+/**
+ * 装载带关系线的示例树并**全展开**。
+ *
+ * 三个端点（`b1a` / `b2a` / `b3a`）都在第 2 层。视图层默认只摊开一层，端点被收起时
+ * `relationEdges` 找不到坐标就跳过那条线——那是收起的正确行为（线不许画在看不见的
+ * 节点上），但这一组用例测的是"relations 这条通道能不能画出来"，所以显式全展开。
+ * 收起的读数在 `tests/view-collapse.spec.ts`。
+ */
+function loadRelations(store: ReturnType<typeof useMindMapStore>): void {
+  store.preview(treeWithRelations(), 'right');
+  store.expandAllInView();
+}
+
 describe('关系线的数据通道', () => {
   it('store 把 relations 转成 mindRelation 类型的边，id 带 relation: 前缀', () => {
     const pinia = createPinia();
     setActivePinia(pinia);
     const store = useMindMapStore();
-    store.preview(treeWithRelations(), 'right');
+    loadRelations(store);
 
     const relationEdges = store.edges.filter(edge => edge.type === 'mindRelation');
     expect(relationEdges).toHaveLength(2);
@@ -94,7 +107,7 @@ describe('关系线的数据通道', () => {
     const pinia = createPinia();
     setActivePinia(pinia);
     const store = useMindMapStore();
-    store.preview(treeWithRelations(), 'right');
+    loadRelations(store);
     store.select('b2a');
 
     expect(store.contentRelations).toHaveLength(2);
@@ -106,7 +119,7 @@ describe('关系线的数据通道', () => {
     const pinia = createPinia();
     setActivePinia(pinia);
     const store = useMindMapStore();
-    store.preview(treeWithRelations(), 'right');
+    loadRelations(store);
     store.select('b1');
 
     expect(store.selectedRelations).toEqual([]);
@@ -116,7 +129,7 @@ describe('关系线的数据通道', () => {
 describe('关系线在画布上真的画出来', () => {
   it('挂载之后出现两个 edge-mindRelation，并带 kind 的中文标签', async () => {
     const wrapper = mountCanvas();
-    useMindMapStore().preview(treeWithRelations(), 'right');
+    loadRelations(useMindMapStore());
     await settle(wrapper);
 
     const groups = wrapper.findAll('g.vue-flow__edge-mindRelation');
@@ -167,7 +180,7 @@ describe('删掉一条关系', () => {
   it('store.deleteRelation 之后画布上那条线消失', async () => {
     const wrapper = mountCanvas();
     const store = useMindMapStore();
-    store.preview(treeWithRelations(), 'right');
+    loadRelations(store);
     await settle(wrapper);
     expect(wrapper.findAll('g.vue-flow__edge-mindRelation')).toHaveLength(2);
 

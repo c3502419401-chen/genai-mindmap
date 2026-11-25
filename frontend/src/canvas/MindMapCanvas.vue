@@ -6,6 +6,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useMindMapStore } from '../stores/mindmap';
 import { boxesOfNodes, chooseViewMode, visibleIds } from './clarity';
 import { NODE_SIZE } from './layout/tidy';
+import { DEFAULT_EXPAND_DEPTH, chooseExpandDepth } from './view-collapse';
 import {
   MAX_ZOOM,
   MIN_ZOOM,
@@ -288,6 +289,33 @@ function setView(next: ViewMode): void {
 }
 
 /**
+ * 「全部展开」/「收起深层」：用户对"这一屏摊开多少"的直接表态。
+ *
+ * 点完立刻重排这一屏，不走 `scheduleFit`：后者被 `viewAdjusted` 挡着（用户平移过
+ * 画布就不再自动适配），而这两个按钮是明确要求换一种看法，必须当场生效。
+ *
+ * 也不能只改 store 就完事：展开/收起会重排**每一个节点**，屏幕上"原来的位置"已经
+ * 不存在了，不重新适配就会停在一片空白或半张图上。
+ */
+function setFolded(all: boolean): void {
+  if (all) store.expandAllInView();
+  else store.collapseViewToDefault();
+  // 等 computed 落地（`store.nodes` 换了新坐标）再摆视图。
+  void nextTick(() => applyView(viewMode.value, true));
+}
+
+/**
+ * 点了一个折叠点上的「+N」：放出它的子节点，并把这一屏重新摆好。
+ *
+ * 与 `setFolded` 同一套理由（重排之后旧的那一屏没意义了），但**不钉住**展开程度：
+ * 这是"这一支我要看"，不是"以后都按这个深度画"。
+ */
+function unfoldNode(id: string): void {
+  store.expandNodeInView(id);
+  void nextTick(() => applyView(viewMode.value, true));
+}
+
+/**
  * 换了一张图，之前存下的那一屏就作废了。
  *
  * 不复位的后果：在全图档下打开另一张图，再切回「适应宽度」，视口会被还回到**上一张
@@ -296,8 +324,30 @@ function setView(next: ViewMode): void {
 watch(() => store.content, () => {
   savedViewport = null;
 });
-
 let fitTimer: ReturnType<typeof setTimeout> | undefined;
+
+/**
+ * 这个视口下最深能展开到几层，写回 store（`canvas/view-collapse.ts::chooseExpandDepth`）。
+ *
+ * 为什么这条判据在画布而不是 store：它要**视口尺寸**，而 store 里没有视口——那是
+ * 画布量出来的（`dimensions`）。反过来把尺寸灌进 store，等于让 store 依赖渲染环境，
+ * 那么同一棵树在测试里与服务端渲染出来就是两个样子。
+ *
+ * 三处都只在"内容/尺寸/换图"这几个时刻跑：用户手动平移之后不再自动适配（`viewAdjusted`），
+ * 用户点过「全部展开」/「收起深层」之后也不再自动（`viewDepthPinned`）——那条判据是
+ * 给"还没表态的人"用的，不是用来覆盖表态的。
+ */
+function applyAutoDepth(): void {
+  if (store.viewDepthPinned) return;
+  const root = store.canvasRoot;
+  const view = dimensions.value;
+  if (!root || !view?.width || !view?.height) return;
+  store.applyAutoExpandDepth(chooseExpandDepth({
+    root,
+    viewport: view,
+    direction: store.direction,
+  }));
+}
 
 /** 图换了：下一次适配先按 `chooseViewMode` 定档，再摆视图。 */
 function requestAutoMode(): void {
@@ -310,6 +360,9 @@ function scheduleFit() {
   clearTimeout(fitTimer);
   // 增量节点到达很密，节流一下，避免每帧都重新适配。
   fitTimer = setTimeout(() => {
+    // 先定"展开到第几层"，再定"摆哪一档"：两件事共用同一条可读性算术，顺序反了会
+    // 按"全展开那棵树"的尺寸去选档位，于是刚收起的画布被塞进一个空档里。
+    applyAutoDepth();
     if (autoModePending) {
       autoModePending = false;
       const choice = chooseViewMode({ boxes: canvasBoxes(), viewport: dimensions.value });
@@ -431,6 +484,7 @@ onBeforeUnmount(() => {
           :editing="store.editingId === nodeProps.id"
           @commit="label => store.commitLabel(nodeProps.id, label)"
           @next="label => store.commitAndAddChild(label)"
+          @unfold="unfoldNode(nodeProps.id)"
           @cancel="store.endEdit()"
         />
       </template>
@@ -508,6 +562,42 @@ onBeforeUnmount(() => {
           title="整张图塞进视口（节点多时字会很小）"
           @click="setView('fit-all')"
         >全图</button>
+      </div>
+      <!--
+        **收起状态**：这一行是这个功能的诚实声明，不是可选装饰。
+
+        默认收起之后，画布上可能只有 7 个节点，而顶栏写着「136 个节点」。两个数都对，
+        但不在画布上说出"显示 7 / 136"，用户扫一眼就会以为树就这么大——那正是折叠退休
+        （`docs/FOLD-RETIRED.md` §1）要躲开的判断失误。所以这行**常驻**（有内容就显示），
+        并且带一个「全部展开」的出口：不是"可点开就行"，是"随时能看见总量 + 一键看全"。
+      -->
+      <div
+        v-if="store.hiddenNodeCount > 0"
+        data-test="view-fold-state"
+        class="flex items-center gap-1 rounded-lg border border-slate-200 bg-white/95 p-0.5 pl-2 text-[11px] shadow-sm"
+      >
+        <span class="text-slate-600">显示 {{ store.nodes.length }} / {{ store.nodeCount }} 个节点</span>
+        <button
+          type="button"
+          data-test="view-expand-all"
+          class="rounded px-2 py-1 text-slate-600 hover:bg-slate-100 hover:text-slate-900"
+          title="一个节点都不收起（重新载入这张图会回到默认的展开程度）"
+          @click="setFolded(true)"
+        >全部展开</button>
+      </div>
+      <div
+        v-else-if="store.expandDepth !== DEFAULT_EXPAND_DEPTH && store.nodeCount > 0"
+        data-test="view-fold-state"
+        class="flex items-center gap-1 rounded-lg border border-slate-200 bg-white/95 p-0.5 pl-2 text-[11px] shadow-sm"
+      >
+        <span class="text-slate-600">显示全部 {{ store.nodeCount }} 个节点</span>
+        <button
+          type="button"
+          data-test="view-fold-default"
+          class="rounded px-2 py-1 text-slate-600 hover:bg-slate-100 hover:text-slate-900"
+          title="只展开根与一级分支，深层显示「还有 N 个」"
+          @click="setFolded(false)"
+        >收起深层</button>
       </div>
       <!-- 装不下时说一句去哪儿看、还剩多少。这一档的代价必须写出来，而不是让用户猜：
            "只显示了一部分"告诉他发生了什么，"还有 N 个节点在视野外"告诉他代价有多大。 -->

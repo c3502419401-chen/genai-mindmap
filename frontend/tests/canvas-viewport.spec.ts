@@ -93,7 +93,13 @@ async function mountWith(content: MindMapContent): Promise<VueWrapper> {
   setActivePinia(pinia);
   const wrapper = mount(MindMapCanvas, { global: { plugins: [pinia] } });
   wrappers.push(wrapper);
-  useMindMapStore().preview(content, 'right');
+  const store = useMindMapStore();
+  store.preview(content, 'right');
+  // **全展开**：这一组用例钉的是视口算术与两档切换——"装不下的时候怎么办"。它的
+  // 前提是画布上画着整张图；视图层默认只摊开一层（`canvas/view-collapse.ts`）会让
+  // 竖长的图变得装得下，于是这组断言测的就不再是它要测的东西。收起的读数在
+  // `tests/view-collapse.spec.ts` 里，两边互不遮蔽。
+  store.expandAllInView();
   // 两拍：`nodeCount` 的 watch 在微任务里跑，它排那一枪 150ms 的节流；
   // 定时器要等它排上之后才推得动。
   await flushPromises();

@@ -41,14 +41,28 @@ function colors(store: ReturnType<typeof useMindMapStore>) {
   return new Map(store.nodes.map(item => [item.id, item.data?.color]));
 }
 
+/**
+ * 装载示例树并**全展开**。
+ *
+ * 这一组用例看的是整棵树上的颜色继承（三级节点、中间层覆盖、整支重绘），与"画布
+ * 默认摊开几层"是两件事。收起是视图层的默认值（`canvas/view-collapse.ts`），在用例里
+ * 显式关掉它，断言的才是继承规则本身——否则三级节点根本不在 `store.nodes` 里，
+ * 用例会以"颜色丢了"的样子失败，而颜色一直是好的。
+ */
+function loadTree(content: MindMapContent = structuredClone(TREE)) {
+  const store = useMindMapStore();
+  store.preview(content, 'right');
+  store.expandAllInView();
+  return store;
+}
+
 beforeEach(() => {
   setActivePinia(createPinia());
 });
 
 describe('渲染时沿父链继承', () => {
   it('三级节点沿父链拿到一级分支的颜色', () => {
-    const store = useMindMapStore();
-    store.preview(structuredClone(TREE), 'right');
+    const store = loadTree();
 
     const byId = colors(store);
     expect(byId.get('a')).toBe('blue');
@@ -61,8 +75,7 @@ describe('渲染时沿父链继承', () => {
   });
 
   it('没有色的一级分支整支无色（继承不是"凭空给一个色"）', () => {
-    const store = useMindMapStore();
-    store.preview(structuredClone(TREE), 'right');
+    const store = loadTree();
 
     const byId = colors(store);
     expect(byId.get('c')).toBeUndefined();
@@ -72,11 +85,10 @@ describe('渲染时沿父链继承', () => {
   });
 
   it('中间层自己有色时，取**最近的**有色祖先', () => {
-    const store = useMindMapStore();
     const tree = structuredClone(TREE);
     // 甲一被单独染成绿色：甲一一 应该跟绿色，而不是继续跟一级分支的蓝
     tree.root.children[0].children[0].color = 'green';
-    store.preview(tree, 'right');
+    const store = loadTree(tree);
 
     const byId = colors(store);
     expect(byId.get('a')).toBe('blue');
@@ -85,8 +97,7 @@ describe('渲染时沿父链继承', () => {
   });
 
   it('侧栏改一级分支的颜色，整支跟着变', () => {
-    const store = useMindMapStore();
-    store.preview(structuredClone(TREE), 'right');
+    const store = loadTree();
     expect(colors(store).get('a2')).toBe('blue');
 
     store.setNodeVisualById('a', { color: 'purple' });
@@ -101,8 +112,7 @@ describe('渲染时沿父链继承', () => {
   });
 
   it('清掉一级分支的颜色，整支回落成无色', () => {
-    const store = useMindMapStore();
-    store.preview(structuredClone(TREE), 'right');
+    const store = loadTree();
 
     store.setNodeVisualById('a', { color: null });
 
@@ -113,8 +123,7 @@ describe('渲染时沿父链继承', () => {
   });
 
   it('撤销之后颜色跟着回到上一版', () => {
-    const store = useMindMapStore();
-    store.preview(structuredClone(TREE), 'right');
+    const store = loadTree();
     store.setNodeVisualById('a', { color: 'teal' });
     expect(colors(store).get('a2')).toBe('teal');
 
@@ -126,8 +135,7 @@ describe('渲染时沿父链继承', () => {
 
 describe('画布节点真的画出继承来的颜色', () => {
   it('三级节点的 data-node-color / data-node-depth 都由继承结果决定', () => {
-    const store = useMindMapStore();
-    store.preview(structuredClone(TREE), 'right');
+    const store = loadTree();
     const data = store.nodes.find(item => item.id === 'a2')!.data as MindNodeData;
 
     // 句柄要 Vue Flow 的节点上下文才画得出来，这一条只验样式属性：把 in/out 清空

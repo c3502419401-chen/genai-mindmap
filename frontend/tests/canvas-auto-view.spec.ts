@@ -90,7 +90,13 @@ async function mountWith(content: MindMapContent): Promise<VueWrapper> {
   setActivePinia(pinia);
   const wrapper = mount(MindMapCanvas, { global: { plugins: [pinia] } });
   wrappers.push(wrapper);
-  useMindMapStore().preview(content, 'right');
+  const store = useMindMapStore();
+  store.preview(content, 'right');
+  // 这一组用例钉的是"自动选哪一档"，而档位判据的输入是**画布上的节点集**。
+  // 视图层默认只摊开一层（`canvas/view-collapse.ts`），42 节点的竖长图收起后只有
+  // 7 个节点、也就装得下了——那会让这组断言在"其实变好了"的情况下变红。所以这里
+  // 显式全展开：测档位选择时，画布上就该是整张图。
+  store.expandAllInView();
   await flushPromises();
   vi.advanceTimersByTime(200);
   await flushPromises();

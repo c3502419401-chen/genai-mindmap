@@ -160,6 +160,10 @@ describe('store：样式改动', () => {
   it('画布数据里带着颜色与图标（只有已应用的那棵树才画）', () => {
     const store = useMindMapStore();
     store.preview(structuredClone(VISUAL_MAP), 'right');
+    // 这条用例读的是**整棵树**在画布数据里的样子（含二级节点继承来的色）。
+    // 视图层默认只摊开一层，显式全展开——收起是视图层的默认值，与"颜色有没有
+    // 传到 data 里"无关（见 `canvas/view-collapse.ts`）。
+    store.expandAllInView();
     const byId = new Map(store.nodes.map(item => [item.id, item.data]));
     expect(byId.get('a')!.color).toBe('blue');
     expect(byId.get('a')!.icon).toBe('🎯');

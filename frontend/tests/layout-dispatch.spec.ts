@@ -126,9 +126,18 @@ describe('分派：换成各自的算法', () => {
 });
 
 describe('store：画布按 content.diagram_type 选布局', () => {
+  /**
+   * 装载一份内容并**全展开**。
+   *
+   * 这个文件钉的是"图型 → 布局函数"的分派：断言的是 `store.nodes` 与某个布局函数的
+   * 坐标逐个相等。培养皿里不能有别的变量——视图层的默认收起会少画几层（见
+   * `canvas/view-collapse.ts`），那与布局分派对错无关，所以这里显式关掉它。
+   * 鱼骨与流程本来就不收起，这一句对它们没有影响。
+   */
   function mount(content: MindMapContent) {
     const store = useMindMapStore();
     store.preview(content, 'right');
+    store.expandAllInView();
     return store;
   }
 

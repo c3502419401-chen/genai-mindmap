@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 import { Handle, Position } from '@vue-flow/core';
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue';
 
@@ -26,6 +26,13 @@ const emit = defineEmits<{
   cancel: [];
   /** Tab：提交当前文字，并请外面在同一个父节点下再加一个子节点。 */
   next: [label: string];
+  /**
+   * 视图层收起：这个节点在画布上只露出自己，点一下把它的子节点放出来。
+   *
+   * 与 `next` / `commit` 分开是一件事两半：那两个**改内容**（进撤销栈、置脏），
+   * 这一个是**改视图**（什么都不算）。合成一个 emit，外面就必须靠参数猜意图。
+   */
+  unfold: [];
 }>();
 
 const POSITIONS: Record<ChildSide, Position> = {
@@ -464,6 +471,31 @@ onBeforeUnmount(() => {
     >
       {{ data.refs ?? 0 }}
     </div>
+
+    <!--
+      视图层收起：「还有 N 个」。
+
+      **常驻，不等 hover**。收起之后屏幕上可能只有 7 个节点，而这个角标是"树其实有
+      136 个节点"的唯一现场证据（另一处在右上角那行「显示 7 / 136」）。做成悬停才
+      淡入，用户扫一眼画布就会得出"这棵树就这么大"——那正是折叠退休时要躲开的那件事
+      （`docs/FOLD-RETIRED.md` §1）。
+
+      数字是**直接子节点数**，不是整支：点一下当场冒出这么多，点完角标就消失。写 18
+      而只冒出 3 个，这个数第二次就没人信了。整支的数字在 title 与 aria-label 里。
+
+      `@click.stop`：不要让这一下冒泡成"点空白处清选区"；`@focusin.stop` 同理，否则
+      键盘聚焦到它会把悬停卡片弹出来，盖住用户正要看的节点。
+    -->
+    <button
+      v-if="data.foldedChildren"
+      type="button"
+      data-test="node-folded"
+      class="absolute -bottom-2 right-0 flex h-5 items-center justify-center rounded-full border border-slate-400 bg-white px-1.5 text-[10px] font-medium leading-none text-slate-700 shadow-sm hover:border-slate-900 hover:bg-slate-900 hover:text-white"
+      :title="`还有 ${data.foldedChildren} 个子节点（整支 ${data.foldedSubtree ?? data.foldedChildren} 个节点）`"
+      :aria-label="`展开：还有 ${data.foldedChildren} 个子节点，整支共 ${data.foldedSubtree ?? data.foldedChildren} 个节点`"
+      @click.stop="emit('unfold')"
+      @focusin.stop
+    >+{{ data.foldedChildren }}</button>
 
     <!--
       悬停卡片：`Teleport` 到 `body`、`position: fixed`。
