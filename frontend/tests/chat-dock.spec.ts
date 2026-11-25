@@ -974,23 +974,32 @@ describe('thinking 全链路：请求体与折叠展示', () => {
 /**
  * 材料面板什么时候挡在画布上。
  *
- * 这三条钉的是**改动之前的行为**，写的都是"今天实际怎样"，不是"应该怎样"：
+ * 判据（改动前只有第 1 条成立）：
  *
- *   1. 上传后           面板展开。
- *   2. 生成中           面板不存在——它是 `compact` 那条 `v-if` 的副作用（整块对话框
- *                       被一条细进度取代），不是材料面板自己有判据。
- *   3. 生成完（成功）   **面板又原样展开**，把刚落地的那棵树挡在里面。这就是缺陷：
- *                       `materialOpen` 是个只会被"点开"的 `ref`，全文件没有任何一处
- *                       在生成开始 / 成功时把它关掉，而 1378 行那句"默认收起"说的是
- *                       **初始值**，不是"每一轮结束都收起"。
- *   4. 收起态入口        缩略图行里的「管理材料」，文案里**没有**份数。
+ *   1. 上传后            展开——他还要粘贴、录音、看解析进度。
+ *   2. 生成中            不在画布上。
+ *   3. 生成成功之后      **收起**，入口留在缩略图行（「管理材料 · N 份」）。
+ *   4. 生成失败 / 部分完成 / 冲突  不收：那几种都在等他改材料重试。
+ *   5. 用户自己点开的    收起一律让路，`materialBusy`（有草稿 / 录音中 / 解析中）同理。
+ *
+ * 第 5 条是这道改动的核心纪律：**自动行为不许覆盖用户刚做的操作**。它有两个真实
+ * 窗口——生成成功后那 2 秒里他点了「管理材料」；以及他正在粘贴框里写的时候，别处
+ * 触发的一轮生成落地了。
  */
-describe('材料面板：什么时候挡在画布上（改动前的行为）', () => {
+describe('材料面板：什么时候挡在画布上', () => {
   /** `v-show` 收面板，所以可见性看内联样式；组件被卸载也算不可见。 */
   function panelVisible(wrapper: VueWrapper): boolean {
     const panel = wrapper.find('[data-test="material-panel"]');
     if (!panel.exists()) return false;
     return !(panel.attributes('style') ?? '').includes('display: none');
+  }
+
+  /** 造一个"成功落地"的终态：画布有树、状态行是 ok。 */
+  async function succeed(wrapper: VueWrapper): Promise<void> {
+    const store = useMindMapStore();
+    store.preview(TREE, 'right');
+    store.generatedSummary = { nodes: 2, changes: null };
+    await wrapper.vm.$nextTick();
   }
 
   it('上传后：面板展开（他还要粘贴、录音、看解析进度）', async () => {
@@ -1012,19 +1021,54 @@ describe('材料面板：什么时候挡在画布上（改动前的行为）', (
     useMindMapStore().busy = true;
     await wrapper.vm.$nextTick();
 
-    // 不是"收起了"，是连 DOM 都没有：`compact` 把整块换成了 `run-status`。
     expect(wrapper.find('[data-test="material-panel"]').exists()).toBe(false);
   });
 
-  it('生成完（成功）：面板仍然展开——那一刻画布上已经有 73 个节点了', async () => {
+  it('生成一开始就收起：跑完回来是收起的样子，不用等成功那一刻', async () => {
+    stubFetch([{ type: 'done', seq: 2, content: TREE, mode: 'model' }]);
+    const wrapper = mountApp();
+    await wrapper.get('[data-test="attach"]').trigger('click');
+    await wrapper.vm.$nextTick();
+
+    // 提交之后面板那一轮就归自动态管（`submitIntent` 交还用户意图）。
+    await wrapper.get('textarea#intent').setValue('按主题生成');
+    await wrapper.get(SUBMIT).trigger('click');
+    await flushPromises();
+
+    // 生成中整块被一条细进度取代，面板连 DOM 都没有；跑完回来时 materialOpen 已经
+    // 是 false——这一条钉的正是"回来那个样子"，它是那个 bug 的直接反面。
+    expect(panelVisible(wrapper)).toBe(false);
+    expect(wrapper.find('[data-test="material-panel"]').exists()).toBe(true);
+  });
+
+  it('生成开始时手里有草稿、没能收起：他把草稿点进来源之后就补收', async () => {
+    stubFetch([{ type: 'done', seq: 2, content: TREE, mode: 'model' }]);
+    const wrapper = mountApp();
+    const sources = useSourcesStore();
+    await wrapper.get('[data-test="attach"]').trigger('click');
+    await wrapper.vm.$nextTick();
+    await wrapper.get('#material-text').setValue('一段还没点添加的正文');
+
+    // 草稿把"生成开始那次收"拦下来了：他显然还要接着处理这段正文。
+    await wrapper.get('textarea#intent').setValue('按主题生成');
+    await wrapper.get(SUBMIT).trigger('click');
+    await flushPromises();
+    expect(panelVisible(wrapper)).toBe(true);
+
+    // 点「添加」进来源 → 闸门松开 → 那次被拦下的收立即补办（不等下一次生成）。
+    sources.addDraft();
+    await wrapper.vm.$nextTick();
+    expect(panelVisible(wrapper)).toBe(false);
+  });
+
+  it('生成失败：不收——他可能要改材料重试', async () => {
     stubFetch();
     const wrapper = mountApp();
     const store = useMindMapStore();
     await wrapper.get('[data-test="attach"]').trigger('click');
     await wrapper.vm.$nextTick();
 
-    store.preview(TREE, 'right');
-    store.generatedSummary = { nodes: 2, changes: null };
+    store.agentError = '上游 502';
     await wrapper.vm.$nextTick();
     vi.advanceTimersByTime(5000);
     await wrapper.vm.$nextTick();
@@ -1032,16 +1076,91 @@ describe('材料面板：什么时候挡在画布上（改动前的行为）', (
     expect(panelVisible(wrapper)).toBe(true);
   });
 
-  it('收起态那个入口：缩略图行里的「管理材料」，文案里没有份数', async () => {
+  it('他亲手点开的：之后一轮生成落地也不自动收起', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    await wrapper.get('[data-test="attach"]').trigger('click');
+    await wrapper.vm.$nextTick();
+
+    // 这一轮是别处起的（画布「展开这一支」/ 悬浮球），不经过 `submitIntent`，
+    // 所以"用户开过"这件事还挂着——自动收起必须让路。
+    store.busy = true;
+    await wrapper.vm.$nextTick();
+    store.busy = false;
+    await succeed(wrapper);
+
+    expect(panelVisible(wrapper)).toBe(true);
+  });
+
+  it('粘贴框里有没点「添加」的正文时，成功也不自动收起', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    await wrapper.get('[data-test="attach"]').trigger('click');
+    await wrapper.vm.$nextTick();
+    await wrapper.get('#material-text').setValue('刚粘进来的一大段正文');
+
+    await succeed(wrapper);
+    vi.advanceTimersByTime(5000);
+    await wrapper.vm.$nextTick();
+
+    expect(panelVisible(wrapper)).toBe(true);
+    expect(useSourcesStore().draftText).toBe('刚粘进来的一大段正文');
+  });
+
+  it('有材料正在解析时，成功也不自动收起（进度正在这里显示）', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    const sources = useSourcesStore();
+    await wrapper.get('[data-test="attach"]').trigger('click');
+    await wrapper.vm.$nextTick();
+
+    sources.items = [{
+      key: 'k1', id: 'k1', label: '长文档.pdf', kind: 'document', state: 'parsing',
+      source: null, error: '', seconds: 3,
+    }];
+    await succeed(wrapper);
+    vi.advanceTimersByTime(5000);
+    await wrapper.vm.$nextTick();
+
+    expect(panelVisible(wrapper)).toBe(true);
+  });
+
+  it('收起态入口：一个按钮，文案带份数，点它还能打开', async () => {
     stubFetch();
     const wrapper = mountApp();
     const sources = useSourcesStore();
     sources.addText('一段材料正文');
     await wrapper.vm.$nextTick();
 
-    const entry = wrapper.get('[data-test="thumbs"]').element.parentElement
-      ?.querySelector('button:not([aria-label])') as HTMLButtonElement | null;
-    expect(entry?.textContent?.trim()).toBe('管理材料');
+    expect(wrapper.get('[data-test="manage-materials"]').text()).toBe('管理材料 · 1 份');
+
+    await wrapper.get('[data-test="manage-materials"]').trigger('click');
+    await wrapper.vm.$nextTick();
+    expect(panelVisible(wrapper)).toBe(true);
+    // 展开时同一个按钮变成"收起"，不再多长一个入口出来。
+    expect(wrapper.get('[data-test="manage-materials"]').text()).toBe('收起材料 · 1 份');
+  });
+
+  it('最常走的那条路：点「+」传材料 → 提交 → 成功后照样收起', async () => {
+    stubFetch([{ type: 'done', seq: 2, content: TREE, mode: 'model' }]);
+    const wrapper = mountApp();
+    const sources = useSourcesStore();
+    sources.items = [{
+      key: 's1', id: 'doc-1', label: '材料.pdf', kind: 'document', state: 'ready',
+      source: { ...textSource('材料正文'), id: 'doc-1', kind: 'document', filename: '材料.pdf' },
+      error: '', seconds: 0,
+    }];
+    await wrapper.get('[data-test="attach"]').trigger('click');
+    await wrapper.vm.$nextTick();
+    expect(panelVisible(wrapper)).toBe(true);
+
+    await wrapper.get('textarea#intent').setValue('按材料生成');
+    await wrapper.get(SUBMIT).trigger('click');
+    await flushPromises();
+    vi.advanceTimersByTime(2100);
+    await wrapper.vm.$nextTick();
+    expect(panelVisible(wrapper)).toBe(false);
   });
 });
 

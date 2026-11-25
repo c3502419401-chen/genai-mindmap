@@ -280,8 +280,42 @@ const showStatus = computed(() => store.status !== INITIAL_STATUS);
  */
 const deepThinking = ref(false);
 
-/** 材料面板（粘贴 / 文件 / 录音 / 来源列表）开着没有。 */
+/**
+ * 材料面板（粘贴 / 文件 / 录音 / 来源列表）开着没有。
+ *
+ * **它是"准备材料"这一步，不是每一轮都要看的东西**：面板挂在对话框最下面、能长到
+ * 视口 60%，展开就把画布底边盖掉半块。而它最不该在的时刻正是"生成完"——刚落地的那
+ * 棵树等着看，面板却还铺在上面（实测 73 个节点被挡掉一半）。
+ *
+ * 可见性由两个输入决定：
+ *
+ *   1. `materialByUser`——他点过「管理材料」/「+」之后，**任何自动收起都不执行**，
+ *      直到他自己点「收起」。这是这个对话框里反复出现的那条纪律的另一半：自动行为
+ *      不许覆盖用户刚做的操作（同 `pinned`、同淡出那三条刹车）。
+ *   2. 自动态——初始收起；生成开始与生成成功各收一次（见 `autoCloseMaterial` 的两个
+ *      调用点）。收起来之后入口不消失：缩略图行里那个按钮变成「管理材料 · N 份」。
+ *
+ * 空状态（没材料、没生成过）**也保持收起**。那是"第一步：准备材料"没错，但画布此刻
+ * 是空的、没有东西可挡，而面板展开会把输入框推到视口上半、并且暗示"必须先传材料"
+ * ——材料是可选的，第一眼要看的是"你要生成什么"。
+ */
 const materialOpen = ref(false);
+/** 这一次是用户自己点开的。为真时自动收起一律让路（见上）。 */
+const materialByUser = ref(false);
+/** 有一次"该收"被 `materialBusy` 拦下了，等他手里那件事做完补办。 */
+const autoClosePending = ref(false);
+
+/**
+ * 面板里正有一件没做完的事：粘贴框里有没点「添加」的正文 / 正在录音 / 有材料在解析。
+ *
+ * 这三种时候**不自动收起**。理由不是"收起来会丢数据"——草稿和解析进度都住在
+ * `stores/sources` 里，收起来一份都不丢——而是"看不见＝以为丢了"：他刚把一份 3.8 万字
+ * 的正文粘进去，标题还没点「添加」，面板自己合上，他下一步就是回去重新粘一遍。
+ */
+const materialBusy = computed(
+  () => !!sources.draftText.trim() || sources.recording || sources.parsing,
+);
+
 const fileInput = ref<HTMLInputElement | null>(null);
 
 async function submitIntent() {
@@ -300,6 +334,10 @@ async function submitIntent() {
   // 这句话发出去之后，"用户要求留着"这件事就结束了：输入框已经空出来，
   // 接下来该按状态判（生成中就收起、成功就淡出）。
   pinned.value = false;
+  // 「管理材料」那个用户意图只对这一轮有效：材料已经随请求发出去了，面板在这一轮
+  // 结束之后该回到收起。不清的话，他最常走的那条路（点「+」传材料 → 生成）会恰好
+  // 把面板留成展开的样子——那正是"生成完一直挡着画布"。
+  materialByUser.value = false;
   // 那句"这段正文已放进材料"的提示随着这一轮发出去就过期了：材料进了请求体，
   // 再摆一个"放回输入框"只会把用户已提交的东西又抄回框里。
   pastedMaterial.value = null;
@@ -909,16 +947,59 @@ function takeDraft(): string {
 }
 
 function closeMaterial(): void {
+  // 他自己收的：意图交还自动态，下一轮该收的时候照收。
+  materialByUser.value = false;
   materialOpen.value = false;
 }
 
 function openMaterial(): void {
+  materialByUser.value = true;
   materialOpen.value = true;
 }
 
+/**
+ * 缩略图行里那个按钮的文案：收起态叫「管理材料」，展开态叫「收起材料」，都带份数。
+ *
+ * 收起之后"这次带了几份"必须还看得见——缩略块本来就在，但一个 132px 宽的块在横向
+ * 滚动区里只能露出一个半，数不出总数；而这个数决定"要不要再补一份"。
+ */
+const materialEntryLabel = computed(
+  () => `${materialOpen.value ? '收起材料' : '管理材料'} · ${sources.items.length} 份`,
+);
+
+function toggleMaterial(): void {
+  if (materialOpen.value) closeMaterial();
+  else openMaterial();
+}
+
+/**
+ * 该收就收：用户手动开的**永远**不动（`materialByUser`），手里还有活的不动（`materialBusy`）。
+ *
+ * 被第二道闸拦下时记一笔 `autoClosePending`：那不是"这次算了"，而是"等他手里那件事做完
+ * 就收"。闸门一松开（草稿点进来源 / 录音停 / 解析完）由下面那个 watch 补办——否则他粘完
+ * 正文、点「添加」、回头看画布，面板会一直在那儿，等到下一次生成才轮得到它。
+ *
+ * `materialByUser` 拦下的**不记**：用户自己开的，没有"等一会儿再收"这回事。
+ */
+function autoCloseMaterial(): void {
+  if (materialByUser.value) return;
+  if (materialBusy.value) {
+    autoClosePending.value = true;
+    return;
+  }
+  autoClosePending.value = false;
+  materialOpen.value = false;
+}
+
+/** 生成开始：收起来。 */
+watch(running, now => { if (now) autoCloseMaterial(); });
+
+/** 闸门松开了：把那次被拦下的收起补办掉。 */
+watch(materialBusy, busy => { if (!busy && autoClosePending.value) autoCloseMaterial(); });
+
 function pickFiles(): void {
   // 「+」既开材料面板又直接弹文件选择框：它是截图里那个加号，用户点它是想传东西。
-  materialOpen.value = true;
+  openMaterial();
   void nextTick(() => fileInput.value?.click());
 }
 
@@ -1060,9 +1141,12 @@ defineExpose({
           </div>
           <button
             type="button"
-            class="shrink-0 rounded-lg border border-dashed border-slate-300 px-2 text-[11px] text-slate-500 hover:bg-slate-50"
-            @click="openMaterial"
-          >管理材料</button>
+            data-test="manage-materials"
+            class="shrink-0 whitespace-nowrap rounded-lg border border-dashed border-slate-300 px-2 text-[11px] text-slate-500 hover:bg-slate-50"
+            :aria-expanded="materialOpen"
+            :title="materialOpen ? '收起材料面板' : '展开材料面板：粘贴正文 / 上传文件 / 录音'"
+            @click="toggleMaterial"
+          >{{ materialEntryLabel }}</button>
         </div>
 
         <!--
@@ -1375,7 +1459,8 @@ defineExpose({
 
           它**在 `intent-box` 之外**：面板里的说明会重复输入框提示里的"写一个主题"，
           混在同一个分组里会让"这个框里有几句话在说同一件事"变成一件要数一数才知道的事。
-          默认收起——它是"准备材料"这一步，不是每一轮都要看的东西。
+          默认收起，而且**生成开始 / 生成成功各收一次**——它是"准备材料"这一步，
+          不是每一轮都要看的东西（判据与两道让路闸都在 `materialOpen` 上）。
 
           `max-h` + `overflow-y-auto`：这份列表是**无上限**的（最多 30 份，每份还可能
           展开正文与引用明细）。不给高度上限时它一路往下长，把画布连同视口一起顶出去
