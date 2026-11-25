@@ -41,10 +41,11 @@ import { childSide, NODE_SIZE, type ChildSide, type Direction } from '../canvas/
 import { diagramTypeOf, layoutDiagram, type DiagramLayout } from '../canvas/layout';
 import type { NodeSize } from '../canvas/layout/flow';
 import {
-  DEFAULT_EXPAND_DEPTH,
-  EXPAND_ALL_DEPTH,
+  MINDMAP_VISIBLE_NODE_LIMIT,
+  foldActionOf,
   viewTree,
   type FoldInfo,
+  type FoldOpenReason,
 } from '../canvas/view-collapse';
 import {
   addChild,
@@ -618,17 +619,33 @@ export interface MindNodeData {
    */
   changed?: boolean;
   /**
-   * 视图层收起：这个节点在画布上只露出自己，**直接子节点有这么多**。
+   * 视图层收起：这一屏**还有几个直接子节点没画出来**。
    *
    * 与 `expandable` 不是一回事，别混：`expandable` 说的是"模型还能不能再长"
-   * （三态，跟着数据走），这个数说的是"这一屏默认摊开多少"（跟着视图走）。
-   * 一个节点可以 `expandable: 'no'`（内容到头了）却仍然有 18 个子节点被收起。
+   * （三态，跟着数据走），这个数说的是"这一屏少画了几个"（跟着视图走）。
+   * 一个节点可以 `expandable: 'no'`（内容到头了）却仍然有 18 个子节点被截在预算外。
    *
-   * `undefined` = 没有收起任何东西（画布上绝大多数节点是这样），渲染层据此不画角标。
+   * `undefined` = 这一屏没藏它的任何直接子节点（画布上绝大多数节点是这样），
+   * 渲染层据此不画 `+N` 角标。
    */
-  foldedChildren?: number;
-  /** 与 `foldedChildren` 同一次收起：整支（含更深层）还有多少节点。给 `title` 与读屏用。 */
-  foldedSubtree?: number;
+  hiddenChildren?: number;
+  /** 与 `hiddenChildren` 同一次截断：整棵子树里还有多少节点没画出来。给 `title` 与读屏用。 */
+  hiddenSubtree?: number;
+  /**
+   * 这个节点的子节点正显示着，而且是**用户要求**显示着的（点开过，或点了「全部展开」）。
+   *
+   * 渲染层据此给一枚「−」角标：那是"再点一下叠回去"的入口。与 `hiddenChildren` 互斥
+   * ——一个节点的子节点要是被截断过，它就不可能"已经全显示"。
+   */
+  foldOpen?: boolean;
+  /**
+   * 这一屏上这个节点**正显示着几个子节点**（视图树里的 `children.length`）。
+   *
+   * 只服务一件小事：渲染层判"有没有东西可以叠回去"——0 就是叶子，`−` 角标不该出现。
+   * 不从 `hiddenChildren` 反推：两者都为空时，"叶子"与"孩子全靠预算显示着"是两种
+   * 不同的状态，反推会把它们混成一种。
+   */
+  visibleChildren?: number;
 }
 
 export interface FlatNode {
@@ -765,17 +782,28 @@ interface RenderSource {
    */
   layoutEdges?: MindEdge[];
   /**
-   * 视图层收起：被收起的节点 id → 它藏了多少。
+   * 视图层收起：被截断的节点 id → 它缺了什么。
    *
    * 只对树型有值（鱼骨与流程本来就是"每根骨 / 每个阶段几个节点"，收起没有收益，
-   * 而且它们的画布树是合成出来的，层号与内容层号不是一回事）。空表 / `undefined`
-   * 都表示"这一屏什么都没收起"，渲染层不画任何角标。
+   * 而且它们的画布树是合成出来的，数量口径会把用户没生成过的东西算进去）。
+   * 空表 / `undefined` 都表示"这一屏一个节点都没截断"，渲染层不画任何角标。
    */
   folded?: ReadonlyMap<string, FoldInfo>;
+  /** 子节点正显示着的节点 id → 为什么显示（渲染层据此决定给不给"叠回去"的角标）。 */
+  foldOpen?: ReadonlyMap<string, FoldOpenReason>;
 }
 
 /** 共用的空表：非预览来源不需要这份映射，别每次重算都新建一个。 */
 const NO_EXPANDABLE = new Map<string, boolean | null>();
+
+/**
+ * 两个共用空表，给"这张图一个节点都没被截断"的那条路用。
+ *
+ * 必须是常量而不是每次 `new Map()`：`nodes` 这个 computed 每次重排都会逐节点跑一遍，
+ * 在循环里新建空表等于让每个节点都产出一份垃圾。
+ */
+const NO_FOLDS: ReadonlyMap<string, FoldInfo> = new Map<string, FoldInfo>();
+const NO_FOLD_OPEN: ReadonlyMap<string, FoldOpenReason> = new Map<string, FoldOpenReason>();
 
 /**
  * 某个阶段**自己**的附加边条数（`stages[i].edges.length`）。
@@ -876,19 +904,20 @@ export const useMindMapStore = defineStore('mindmap', () => {
   const viewAdjusted = ref(false);
 
   /**
-   * 画布默认展开到第几层（根的层号 0，见 `canvas/view-collapse.ts`）。
+   * 画布上**最多画几个节点**（`0` / 负数 = 不限制，见 `canvas/view-collapse.ts`）。
    *
-   * **这是视图状态，不是内容。** 它不进 `content`、不进撤销栈、不进导出文件，
-   * 判定与理由写在 `docs/VIEW-COLLAPSE.md` §三：同一个文件在 13 寸屏与 4K 上正确的
-   * 展开层数不同，那是"这一屏怎么看"，不是作品属性。
+   * **这是视图状态，不是内容。** 它不进 `content`、不进撤销栈、不进导出文件：
+   * 同一个文件在 13 寸屏与 4K 上、在"只想看目录"与"要逐条核对"时，合适的节点数不同，
+   * 那是"这一屏怎么看"，不是作品属性（理由见 `docs/VIEW-COLLAPSE.md` §三）。
    *
-   * 初值取常量而不是 `Infinity`：换图那一瞬间还没有视口尺寸可供判断，先用最保守的
-   * 一档画出来，再由画布按真实视口放宽（`applyAutoExpandDepth`）。
+   * 初值取常量而不是 `Infinity`：换图那一瞬间画布还没量出尺寸，先用产品定的那一档
+   * 画出来。**它不随视口变化**——上限是认知预算，同一张图在任何屏幕上显示同一批节点；
+   * 字号由 `clearity.chooseViewMode` 那两档管，两件事分开。
    */
-  const expandDepth = ref<number>(DEFAULT_EXPAND_DEPTH);
+  const visibleNodeLimit = ref<number>(MINDMAP_VISIBLE_NODE_LIMIT);
 
   /**
-   * 用户**点开过**的节点（无视层数限制，自己的子节点一律显示）。
+   * 用户**点开过**的节点（无视预算，自己的全部子节点一律显示）。
    *
    * 用不可变集合（每次重建一份）而不是就地 `add`：这个集合的读者是 `renderSource`
    * 那个 computed，就地改一个 `Set` 不会触发重算，而画布上的表现就是"点了没反应"。
@@ -896,12 +925,24 @@ export const useMindMapStore = defineStore('mindmap', () => {
   const viewExpandedNodes = ref<ReadonlySet<string>>(new Set<string>());
 
   /**
-   * 展开程度由用户定过（点了「全部展开」或「收起深层」）。
+   * 用户**收起过**的节点（一个子节点都不画，哪怕预算还够）。
    *
-   * 定过之后画布就不再按视口自动放宽：用户刚说"我要么全看、要么看目录"，下一次
-   * 窗口缩放又把他的选择改掉，比一开始不给这个按钮更糟。
+   * 与 `viewExpandedNodes` 分两个集合而不是一个三态 map：两边各自"加一个 / 删一个"，
+   * 合并成一个 map 的话，每次动作都要读旧值再写新值，多一处能写错的地方。
+   * 两条集合由 `expandNodeInView` / `collapseNodeInView` 互相清掉，所以同一个 id
+   * 永远只会出现在一边。
    */
-  const viewDepthPinned = ref(false);
+  const viewCollapsedNodes = ref<ReadonlySet<string>>(new Set<string>());
+
+  /**
+   * 用户点了「全部展开」：这一屏就是整棵树。
+   *
+   * 用**一个布尔**而不是把每个 id 都塞进 `viewExpandedNodes`：那样"全部展开"会变成
+   * 一百多条必须逐个撤销的状态，用户想再点一支收起来时，还得先判断"它是不是被全部
+   * 展开塞进去的"。布尔 + 逐节点的 `collapsed` 让「全部展开之后逐个叠回去」只是
+   * 一次 `collapsed.add`。
+   */
+  const viewExpandAll = ref(false);
 
   /** 正在内联编辑的节点 id；null 表示没有编辑框打开。 */
   const editingId = ref<string | null>(null);
@@ -1637,16 +1678,18 @@ export const useMindMapStore = defineStore('mindmap', () => {
       //
       // 为什么必须在这个位置、而不是渲染层：`nodes`、`edges` 都从 `layout` 这一份
       // 结果里读坐标，而 `layout` 吃的是 `source.root`。只过滤 `flatNodes` 的话，
-      // 被藏起来的节点仍然参与 `layoutTidy` 的占位——它们照样撑开画布、照样把字号
+      // 被截断的节点仍然参与 `layoutTidy` 的占位——它们照样撑开画布、照样把字号
       // 挤到 5px，只是看不见。那样"收起"连一个像素的可读性都没换回来。
       //
       // 只在树型生效：鱼骨与流程的画布树是合成出来的（虚拟根 + 每个容器一个子），
-      // 它们本来就是"一层容器 + 一层节点"的形状，收起没有收益，而层号口径不同会
-      // 让收起语义变得没法解释。
+      // 它们本来就是"一层容器 + 一层节点"的形状，收起没有收益；更要紧的是数量口径
+      // 要数"内容里真实的节点"，而合成根不在内容里，数出来的上限会凭空虚高一个。
       const foldedView = diagramTypeOf(content.value) === 'tree'
         ? viewTree(tree.root, {
-          expandDepth: expandDepth.value,
+          limit: visibleNodeLimit.value,
           expanded: viewExpandedNodes.value,
+          collapsed: viewCollapsedNodes.value,
+          expandAll: viewExpandAll.value,
         })
         : null;
       return {
@@ -1657,7 +1700,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
         // 画布用的边：流程图的阶段跳转在这里换成阶段入口节点的 id（见 `canvasEdgesOf`），
         // 阶段内的边原样追加在后面。侧栏与删除仍然读内容数组，那是内容真相。
         //
-        // 附加边的端点有可能正落在被收起的子树上（边的两端是内容 id，与视图无关）。
+        // 附加边的端点有可能正落在被截断的子树上（边的两端是内容 id，与视图无关）。
         // 那时 `attachEdges` / `relationEdges` 找不到坐标就跳过——已有一条兜底，
         // 不需要在这里过滤：过滤会让"这条线去哪了"变成一个查不出来的问题。
         edges: canvasEdgesOf(content.value),
@@ -1665,6 +1708,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
         // 出边要是进了 dagre，整张流程图的分层就会为了两条"是 / 否"变形。
         layoutEdges: canvasStageEdgesOf(content.value),
         ...(foldedView && foldedView.folded.size ? { folded: foldedView.folded } : {}),
+        ...(foldedView && foldedView.open.size ? { foldOpen: foldedView.open } : {}),
       };
     }
     if (agentPreview.value) {
@@ -1705,14 +1749,14 @@ export const useMindMapStore = defineStore('mindmap', () => {
   });
 
   /**
-   * **未收起**的画布树根（树型时就是 `content.root` 这一个对象）。
+   * **未截断**的画布树根（树型时就是 `content.root` 这一个对象）。
    *
-   * 只服务一件事：画布要算"这个视口下最深能展开几层"（`chooseExpandDepth`），而它
-   * 必须从**完整的树**起算——从已经收起的那棵上算，永远只会得到"收得刚刚好"。
+   * 只服务"测量"这一类读者：读数用例要按**完整的树**算 `fit-all` 字号、重叠与视野外
+   * 节点数，从已经收起的画布上算只会得到"收得刚刚好"的结论。
    *
-   * 与 `renderSource.root` 分成两个出口，而不是让画布去判 `kind`：画布手上没有
-   * content，它拿到的只有渲染结果。让 store 把"完整的那棵树"直接交出去，画布那边
-   * 就不需要知道 `canvasTreeOf` 怎么合成鱼骨与流程的虚拟根。
+   * 与 `renderSource.root` 分成两个出口，而不是让调用方去判 `kind`：画布那边手上没有
+   * content，它拿到的只有渲染结果。让 store 把"完整的那棵树"直接交出去，调用方就不需要
+   * 知道 `canvasTreeOf` 怎么合成鱼骨与流程的虚拟根。
    */
   const canvasRoot = computed<MindNode | null>(() => {
     if (!content.value) return null;
@@ -1874,9 +1918,21 @@ export const useMindMapStore = defineStore('mindmap', () => {
 
     return flatNodes.value.map(({ node, depth }) => {
       const point = current.positions.get(node.id) ?? { x: 0, y: 0 };
-      // 这个节点在画布上是不是一个"折叠点"（它还有子节点，只是这一屏没画）。见
-      // `canvas/view-collapse.ts`：`folded` 只收树型，鱼骨/流程恒为空表。
+      // 这个节点在画布上缺了什么（还有几个直接子节点没画）。见 `canvas/view-collapse.ts`：
+      // `folded` / `foldOpen` 只收树型，鱼骨/流程恒为空表。
       const fold = source.folded?.get(node.id);
+      /**
+       * 这个节点的子节点正显示着、而且是**用户要求**显示着的（点开过 / 全部展开）——
+       * 渲染层据此给一枚常驻的「−」：那是"再点一下叠回去"的入口。
+       *
+       * 判据与单击节点那条路**同源**（`foldActionOf`）：两处各判一次，就会在边界上
+       * 分家（角标说能收起、点节点却只选中），而那种不一致用户一眼就能看见。
+       */
+      const foldAction = foldActionOf(node.id, {
+        folded: source.folded ?? NO_FOLDS,
+        open: source.foldOpen ?? NO_FOLD_OPEN,
+      });
+      const foldOpen = foldAction === 'collapse';
       // 合成根（鱼头 / 流程起点）只画不选：它不在 content 里，选中它会让详情面板、
       // 面包屑、`expand` 请求一起对着一个 `findIn()` 找不到的 id 说话。
       const inContent = node.id !== source.syntheticId;
@@ -1962,10 +2018,14 @@ export const useMindMapStore = defineStore('mindmap', () => {
           role: shape === undefined ? undefined : node.role ?? undefined,
           shape,
           size: shape === undefined ? undefined : size,
-          // 视图层收起：这一屏把它的子节点藏起来了，藏了多少照实说。`undefined`
-          // 表示"没藏任何东西"，渲染层据此连角标都不画（绝大多数节点是这一档）。
-          foldedChildren: fold?.children,
-          foldedSubtree: fold?.subtree,
+          // 视图层收起：这一屏少画了它几个直接子节点，照实说。`undefined` 表示
+          // "一个都没少画"，渲染层据此连角标都不画（绝大多数节点是这一档）。
+          hiddenChildren: fold?.hidden,
+          hiddenSubtree: fold?.closedSubtree,
+          // 画布上这个节点**正显示着几个子节点**。渲染层拿它判"有没有东西可以叠回去"
+          // ——0 就是叶子，「−」角标根本不该出现。
+          visibleChildren: node.children.length,
+          foldOpen,
         },
       } satisfies MindFlowNode;
     });
@@ -3191,71 +3251,120 @@ export const useMindMapStore = defineStore('mindmap', () => {
   }
 
   /**
-   * 画布上点了一个折叠点的「还有 N 个」：把它的子节点放出来。
+   * 画布上点了一个折叠点的「+N」：把它没画出来的子节点放出来。
    *
    * 只动视图（`viewExpandedNodes`），不动 `content`——所以它不进撤销栈、不置脏。
-   * 想退回去要点画布右上角的「收起深层」，而不是 Ctrl+Z：那一条撤销的是内容，
-   * 用内容撤销去退视图，用户会发现"撤销一步"把他刚改的字也吃了。
+   * 想退回去要点画布顶部的「收起到上限」、或者再点一下这个节点，而不是 Ctrl+Z：
+   * 那一条撤销的是内容，用内容撤销去退视图，用户会发现"撤销一步"把他刚改的字也吃了。
    */
   function expandNodeInView(id: string): void {
-    if (viewExpandedNodes.value.has(id)) return;
-    const next = new Set(viewExpandedNodes.value);
-    next.add(id);
-    viewExpandedNodes.value = next;
+    // 两个集合互斥（见 `viewCollapsedNodes`）：展开一个被收起过的节点，它必须真的出现，
+    // 所以两边一起改，而不是只加一边。
+    if (!viewExpandedNodes.value.has(id) || viewCollapsedNodes.value.has(id)) {
+      const next = new Set(viewExpandedNodes.value);
+      next.add(id);
+      viewExpandedNodes.value = next;
+    }
+    if (viewCollapsedNodes.value.has(id)) {
+      const rest = new Set(viewCollapsedNodes.value);
+      rest.delete(id);
+      viewCollapsedNodes.value = rest;
+    }
+  }
+
+  /**
+   * 把某个节点的子节点叠回去（**保持界面清爽**的那一半）。
+   *
+   * 两条完全不同的回程，按"这些子节点当初是被谁放出来的"分：
+   *
+   * - **用户点开的**（`viewExpandedNodes` 里有它）→ 撤销这次展开，回到预算那一档。
+   *   "点开 A 冒出 3 个，再点 A 收回去"必须回到点之前那一屏，而不是比点之前更少
+   *   ——否则用户点两下就丢了本来就看得见的东西。
+   * - **预算给的 / 全部展开给的** → 真的把它藏起来（进 `collapsed`）。这时可见数**会**
+   *   变少，那正是"保持界面清爽"要的效果：收起一支，别的地方不会莫名其妙冒出节点
+   *   （预算是一个固定前缀，不是边走边扣的余额，见 `viewTree` 第一步）。
+   */
+  function collapseNodeInView(id: string): void {
+    const undoExpand = !viewExpandAll.value && viewExpandedNodes.value.has(id);
+    if (undoExpand) {
+      const rest = new Set(viewExpandedNodes.value);
+      rest.delete(id);
+      viewExpandedNodes.value = rest;
+      return;
+    }
+    if (!viewCollapsedNodes.value.has(id)) {
+      const next = new Set(viewCollapsedNodes.value);
+      next.add(id);
+      viewCollapsedNodes.value = next;
+    }
+    if (viewExpandedNodes.value.has(id)) {
+      const rest = new Set(viewExpandedNodes.value);
+      rest.delete(id);
+      viewExpandedNodes.value = rest;
+    }
+  }
+
+  /**
+   * **单击一个节点**：按它此刻的状态决定"展开 / 收起 / 什么都不做"。
+   *
+   * 判据收敛在 `foldActionOf` 一处（与渲染层给不给「−」角标是同一处），所以不会出现
+   * "角标说能收起、点节点却只选中"这种两条路分家。
+   *
+   * `none` 那一档是刻意的：**预算本来就够**的节点看起来没有任何"更多"，用户点它是
+   * 为了看它、选它（右侧详情区块）；让它的子节点突然塌掉是纯粹的伤害。想收这种节点
+   * 有两条明确的路——它头上的「−」（悬停/选中时出现）与顶部的「收起到上限」。
+   */
+  function toggleFoldInView(id: string): void {
+    const current = content.value;
+    if (!current || !isTree(current)) return;
+    const node = findIn(current, id);
+    if (!node || !node.children.length) return;
+    const view = {
+      folded: renderSource.value?.folded ?? NO_FOLDS,
+      open: renderSource.value?.foldOpen ?? NO_FOLD_OPEN,
+    };
+    const action = foldActionOf(id, view);
+    if (action === 'expand') expandNodeInView(id);
+    else if (action === 'collapse') collapseNodeInView(id);
   }
 
   /**
    * 「全部展开」：一个节点都不收起。
    *
-   * 这是收起的**逃生舱**，也是"这棵树到底有多大"的唯一诚实答案。点过之后画布不再
-   * 按视口自动放宽（`viewDepthPinned`）——用户的表态优先于自动判据。
+   * 这是收起的**逃生舱**，也是"这棵树到底有多大"的唯一诚实答案。两个集合一起清空：
+   * 用户说的是"我全都要看"，那他刚才逐支收起的那几处到这个时刻就该作废。
    */
   function expandAllInView(): void {
-    viewDepthPinned.value = true;
-    expandDepth.value = EXPAND_ALL_DEPTH;
+    viewExpandAll.value = true;
     viewExpandedNodes.value = new Set<string>();
+    viewCollapsedNodes.value = new Set<string>();
   }
 
   /**
-   * 「收起深层」：回到默认的一层，并清掉所有手动展开。
+   * 「收起到上限」：回到上限以内，并清掉所有手动点开/收起。
    *
-   * 与 `expandAllInView` 都是"用户定过的展开程度"，同样会钉住自动档。
+   * 这是**回程路**：全展开之后（字小到看不清）必须有一条一次到位的退路，
+   * 否则「全部展开」就是一次性的、不可撤销的破坏。
    */
-  function collapseViewToDefault(): void {
-    viewDepthPinned.value = true;
-    expandDepth.value = DEFAULT_EXPAND_DEPTH;
+  function collapseViewToCap(): void {
+    viewExpandAll.value = false;
     viewExpandedNodes.value = new Set<string>();
-  }
-
-  /**
-   * 画布把这个视口算出来的深度写回来（见 `canvas/view-collapse.ts::chooseExpandDepth`）。
-   *
-   * 双向都接受（可以变深也可以变浅）：判据只有一条——**当前视口下最深但可读的那一档**。
-   * 只放宽不放宽会有一个很别扭的后果：窗口从宽屏缩到窄屏，图早就挤成一团了，而画布
-   * 还按宽屏的深度摊着。
-   *
-   * 变浅不会把用户已经点开的那几支藏起来：`viewExpandedNodes` 里的节点无视层数限制
-   * （见 `viewTree`），窗口一缩就把他刚展开的内容收走才是真的糟糕。
-   *
-   * 用户点过「全部展开」/「收起深层」之后这一步整个跳过（`viewDepthPinned`）。
-   */
-  function applyAutoExpandDepth(next: number): void {
-    if (viewDepthPinned.value) return;
-    if (next === expandDepth.value) return;
-    expandDepth.value = next;
+    viewCollapsedNodes.value = new Set<string>();
   }
 
   /**
    * 换了一张图：展开程度回到出厂设置。
    *
-   * 手动展开的集合必须清——那些 id 属于上一棵树。留着不会立刻出错（新树里没有那些
+   * 三个视图状态必须清——那些 id 属于上一棵树。留着不会立刻出错（新树里没有那些
    * id），但它是每次换图都会长大一点的内存泄漏，而且下一次换到一棵**恰好复用同 id**
-   * 的树时会莫名多露出几层。
+   * 的树时会莫名多露出几处。
+   *
+   * **上限本身不清**：它是"这个人一次想看几个节点"的偏好，与哪棵树无关。
    */
   function resetViewCollapse(): void {
-    expandDepth.value = DEFAULT_EXPAND_DEPTH;
+    viewExpandAll.value = false;
     viewExpandedNodes.value = new Set<string>();
-    viewDepthPinned.value = false;
+    viewCollapsedNodes.value = new Set<string>();
   }
 
   /**
@@ -3266,24 +3375,32 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 详情面板却已经换成了那条内容——用户以为自己点错了。视图不许让"正在编辑一个
    * 看不见的节点"这种状态存在。
    *
-   * 只对树型生效：鱼骨与流程不收起，`expandDepth` 对它们没有意义（往里塞 id 只会
-   * 让换图时的清理多几个条目）。
+   * 判据从"层号"换成了**"它在不在画布上"**（`flatNodes` 就是这一屏画出来的那些）：
+   * 数量口径下没有"层号 ≤ N"这种可算的边界，唯一可靠的问法就是问画布。
+   *
+   * 只对树型生效：鱼骨与流程不收起，往里塞 id 只会让换图时的清理多几个条目。
    */
   function revealInView(id: string): void {
     const current = content.value;
     if (!current || !isTree(current)) return;
+    // 已经在画布上：什么都不用做。少了这一句，每次点一个可见的深层节点都会把它的
+    // 整条祖先链撑成全展开——点一下，画布上突然多出几十个节点。
+    if (flatNodes.value.some(entry => entry.node.id === id)) return;
     const path = pathToIn(current, id);
     if (!path || path.length < 2) return;
     let next: Set<string> | null = null;
-    // `pathToIn` 的第一项是它所在子树的根，下标就是层号（与 `viewTree` 同一口径）。
-    for (let level = 0; level < path.length - 1; level += 1) {
-      const ancestor = path[level];
+    let rest: Set<string> | null = null;
+    for (const ancestor of path.slice(0, -1)) {
       if (!ancestor.children.length) continue;
+      if (viewCollapsedNodes.value.has(ancestor.id)) {
+        if (!rest) rest = new Set(viewCollapsedNodes.value);
+        rest.delete(ancestor.id);
+      }
       if (viewExpandedNodes.value.has(ancestor.id)) continue;
-      if (level + 1 <= expandDepth.value) continue;
       if (!next) next = new Set(viewExpandedNodes.value);
       next.add(ancestor.id);
     }
+    if (rest) viewCollapsedNodes.value = rest;
     if (next) viewExpandedNodes.value = next;
   }
 
@@ -4165,17 +4282,19 @@ export const useMindMapStore = defineStore('mindmap', () => {
     clearSelection,
     direction,
     viewAdjusted,
-    // 视图层收起：画布默认摊开几层、哪些节点被手动点开过、这一屏藏了多少个节点。
-    // 三个都不进 content（见 `docs/VIEW-COLLAPSE.md` §三）。
-    expandDepth,
+    // 视图层收起：这一屏最多画几个节点、哪些被点开/收起过、这一屏少画了多少个节点。
+    // 全都不进 content（见 `docs/VIEW-COLLAPSE.md` §三）。
+    visibleNodeLimit,
     viewExpandedNodes,
-    viewDepthPinned,
+    viewCollapsedNodes,
+    viewExpandAll,
     hiddenNodeCount,
     canvasRoot,
     expandNodeInView,
+    collapseNodeInView,
+    toggleFoldInView,
     expandAllInView,
-    collapseViewToDefault,
-    applyAutoExpandDepth,
+    collapseViewToCap,
     revealInView,
     editingId,
     titleDraft,

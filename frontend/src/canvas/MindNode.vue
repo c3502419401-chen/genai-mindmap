@@ -27,12 +27,22 @@ const emit = defineEmits<{
   /** Tab：提交当前文字，并请外面在同一个父节点下再加一个子节点。 */
   next: [label: string];
   /**
-   * 视图层收起：这个节点在画布上只露出自己，点一下把它的子节点放出来。
+   * 视图层收起：把这一处的"还有 N 个"放出来，或者把已经摊开的子节点叠回去。
+   *
+   * 两个方向**分成两个事件**（而不是一个 `toggle`）：
+   *
+   * - `toggleFold`：`+N` 用的。它只在"还有没显示的"时才存在，所以语义确定是**展开**。
+   * - `collapse`：`−` 用的。它只在"子节点正显示着"时才存在，所以语义确定是**收起**。
+   *
+   * 一个事件管两个方向的话，"这个节点这一刻该展开还是该收起"的判断就得在两个地方
+   * 各写一遍（模板一次、store 一次），而这两处的边界（预算给的一支要不要能收）恰好
+   * 不一样：点节点本体**不该**把预算给的子节点收掉，点 `−` **正是**要收它们。
    *
    * 与 `next` / `commit` 分开是一件事两半：那两个**改内容**（进撤销栈、置脏），
-   * 这一个是**改视图**（什么都不算）。合成一个 emit，外面就必须靠参数猜意图。
+   * 这两个**改视图**（什么都不算）。合成一个 emit，外面就必须靠参数猜意图。
    */
-  unfold: [];
+  toggleFold: [];
+  collapse: [];
 }>();
 
 const POSITIONS: Record<ChildSide, Position> = {
@@ -215,6 +225,23 @@ const colorAttrs = computed(() => {
   return { 'data-node-color': color, 'data-node-depth': String(props.data.depth) };
 });
 
+/**
+ * 「−」角标什么时候**常驻**。
+ *
+ * 只在这个节点的子节点是**用户要求显示**着的时候（他点开过，或点了「全部展开」）：
+ * 那是他自己打开的一处，收回来的预期最强，入口不该藏起来。其余情况（孩子靠预算显示
+ * 着）它只在悬停 / 键盘聚焦 / 选中时出现——平时画布上不该到处挂着减号。
+ */
+const collapsePinned = computed(() => props.data.foldOpen === true);
+
+/**
+ * 这个节点此刻有没有"可以叠回去"的东西。
+ *
+ * 用 `visibleChildren` 判，不从 `hiddenChildren` 反推：两者都为空时，"叶子"和
+ * "孩子全靠预算显示着"是两种不同的状态，反推会把它们混成一种（叶子也长出减号）。
+ */
+const canCollapse = computed(() => (props.data.visibleChildren ?? 0) > 0);
+
 const card = ref(false);
 let showTimer: ReturnType<typeof setTimeout> | undefined;
 let hideTimer: ReturnType<typeof setTimeout> | undefined;
@@ -362,12 +389,16 @@ onBeforeUnmount(() => {
 <template>
   <div
     ref="rootEl"
-    class="relative"
+    class="group relative"
     @mouseenter="scheduleCard"
     @mouseleave="hideCardSoon"
     @focusin="scheduleCard"
     @focusout="hideCard"
   >
+    <!-- `group` 只服务「−」角标的 `group-hover` / `group-focus-within`：它不产生任何
+         样式，所以树与鱼骨的节点仍然是逐像素同一个盒子。注意它必须挂在这个根 div 上，
+         而**注释不能写在根元素外面**——那会让这个组件变成多根（fragment），
+         `$el` 落到注释锚点上，`@mouseenter` 那条悬停卡片的链会静静地断掉。 -->
     <Handle
       v-for="side in data.in"
       :id="`in-${side}`"
@@ -473,29 +504,47 @@ onBeforeUnmount(() => {
     </div>
 
     <!--
-      视图层收起：「还有 N 个」。
+      视图层收起：这一处的两个方向——「+N 还有没显示的」与「− 叠回去」。
 
-      **常驻，不等 hover**。收起之后屏幕上可能只有 7 个节点，而这个角标是"树其实有
-      136 个节点"的唯一现场证据（另一处在右上角那行「显示 7 / 136」）。做成悬停才
-      淡入，用户扫一眼画布就会得出"这棵树就这么大"——那正是折叠退休时要躲开的那件事
-      （`docs/FOLD-RETIRED.md` §1）。
+      **「+N」常驻，不等 hover**。收起之后屏幕上可能只有 40 个节点，而这枚角标是
+      "树其实有 136 个节点"的现场证据（另一处在顶部那行「显示 40 / 136」）。做成悬停
+      才淡入，用户扫一眼画布就会得出"这棵树就这么大"——那正是折叠退休时要躲开的那件事
+      （`docs/FOLD-RETIRED.md` §1）。数量口径下它还多担一件事：**被截断的位置只由它
+      标出来**（层数口径下边界是一整层，数量口径下边界是一串具体的父节点），所以它必须
+      在**不 hover、不点**的情况下就看得见。
 
-      数字是**直接子节点数**，不是整支：点一下当场冒出这么多，点完角标就消失。写 18
-      而只冒出 3 个，这个数第二次就没人信了。整支的数字在 title 与 aria-label 里。
+      数字是**没画出来的直接子节点数**，不是整支：点一下当场冒出这么多，点完角标就
+      消失。写 18 而只冒出 3 个，这个数第二次就没人信了。整支的数字在 title 与
+      aria-label 里。
 
-      `@click.stop`：不要让这一下冒泡成"点空白处清选区"；`@focusin.stop` 同理，否则
-      键盘聚焦到它会把悬停卡片弹出来，盖住用户正要看的节点。
+      「−」只在**用户自己展开的地方**常驻（`collapsePinned`），其余情况随 hover /
+      聚焦 / 选中出现：那是"叠回去、保持界面清爽"的入口，不该在画布上到处挂减号。
+
+      `@click.stop`：不要让这一下冒泡成"点空白处清选区"或"点节点展开/收起"；两次点击
+      是同一个幂等动作，但一次点击只该改一次状态。`@focusin.stop` 同理，否则键盘聚焦
+      到它会把悬停卡片弹出来，盖住用户正要看的节点。
     -->
     <button
-      v-if="data.foldedChildren"
+      v-if="data.hiddenChildren"
       type="button"
       data-test="node-folded"
       class="absolute -bottom-2 right-0 flex h-5 items-center justify-center rounded-full border border-slate-400 bg-white px-1.5 text-[10px] font-medium leading-none text-slate-700 shadow-sm hover:border-slate-900 hover:bg-slate-900 hover:text-white"
-      :title="`还有 ${data.foldedChildren} 个子节点（整支 ${data.foldedSubtree ?? data.foldedChildren} 个节点）`"
-      :aria-label="`展开：还有 ${data.foldedChildren} 个子节点，整支共 ${data.foldedSubtree ?? data.foldedChildren} 个节点`"
-      @click.stop="emit('unfold')"
+      :title="`还有 ${data.hiddenChildren} 个子节点没显示（这一支还有 ${data.hiddenSubtree ?? data.hiddenChildren} 个节点没画）`"
+      :aria-label="`展开：还有 ${data.hiddenChildren} 个子节点没显示，这一支共 ${data.hiddenSubtree ?? data.hiddenChildren} 个节点没画`"
+      @click.stop="emit('toggleFold')"
       @focusin.stop
-    >+{{ data.foldedChildren }}</button>
+    >+{{ data.hiddenChildren }}</button>
+    <button
+      v-else-if="canCollapse"
+      type="button"
+      data-test="node-collapse"
+      class="absolute -bottom-2 right-0 flex h-5 w-5 items-center justify-center rounded-full border border-slate-300 bg-white text-[10px] font-medium leading-none text-slate-500 shadow-sm transition-opacity hover:border-slate-900 hover:bg-slate-900 hover:text-white focus:opacity-100"
+      :class="collapsePinned || selected ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100'"
+      :title="`叠起这 ${data.visibleChildren} 个子节点（数据不动，只是这一屏不画）`"
+      :aria-label="`叠起这 ${data.visibleChildren} 个子节点`"
+      @click.stop="emit('collapse')"
+      @focusin.stop
+    >−</button>
 
     <!--
       悬停卡片：`Teleport` 到 `body`、`position: fixed`。
