@@ -495,19 +495,46 @@ export function setNodeVisual(
   };
 }
 
-/** 加子节点。返回新树与新节点，方便界面立刻选中它并进入编辑。 */
-export function addChild(
+/**
+ * 在 `parentId` 的第 `index` 个位置插一个子节点。返回新树与新节点，方便界面立刻
+ * 选中它并进入编辑。
+ *
+ * `index` 越界时夹到 `[0, children.length]`（与 `moveNode` 同一口径）：越界说明调用方
+ * 的算术出了洞，而"夹一下"与"抛错"之间——前者最坏是插在末尾（一个合法结果），后者会
+ * 让一个按键把整个组件树炸掉。
+ *
+ * 下标不是可选参数：`addChild` 的"追加到末尾"是一条**语义**（"又一个孩子"），而
+ * 空白处双击要的是"插在这个位置"（见 `drop-plan.ts::planInsert`）。两者合成一个
+ * 函数会让调用方每次都猜"我该传什么"，而"末尾"在插入语境里恰好是最不容易出错的那个
+ * 默认值——错的那个方向会被当成对的。
+ */
+export function addChildAt(
   root: MindNode,
   parentId: string,
+  index: number,
   label = '新节点',
 ): { root: MindNode; node: MindNode } {
   if (!findNode(root, parentId)) throw new Error('父节点不存在');
 
   const node: MindNode = { id: newId(), label, children: [] };
   return {
-    root: replaceChildren(root, parentId, children => [...children, node]),
+    root: replaceChildren(root, parentId, children => {
+      const at = Math.max(0, Math.min(index, children.length));
+      return [...children.slice(0, at), node, ...children.slice(at)];
+    }),
     node,
   };
+}
+
+/** 加子节点。返回新树与新节点，方便界面立刻选中它并进入编辑。 */
+export function addChild(
+  root: MindNode,
+  parentId: string,
+  label = '新节点',
+): { root: MindNode; node: MindNode } {
+  const parent = findNode(root, parentId);
+  if (!parent) throw new Error('父节点不存在');
+  return addChildAt(root, parentId, parent.children.length, label);
 }
 
 /**
@@ -631,6 +658,40 @@ export function reparentAbove(
   return replaceChildren(withoutTarget, parent.id, children => [
     ...children.slice(0, at), adopted, ...children.slice(at),
   ]);
+}
+
+/**
+ * 「断开与父节点的关系」：把这一支摘下来，挂到**根的最后**，成为一级分支。
+ *
+ * 为什么"断关系"在树上只能是这一个结果（`docs/NODE-EDIT.md` §一）：content 是一棵树，
+ * 树里没有"无父节点"这个概念——除了根。想让一个节点不再属于原来那一支，唯一的合法
+ * 去处就是根。所以"断成孤儿、单独悬在画布上"要么引入第二个概念（游离节点集合）+ 三套
+ * 形状各写一遍遍历，要么就只能借"根的孩子"这个位置来承载。
+ *
+ * 挂在**末尾**而不是原来父节点的位次上：它在根下面本来就没有"原来的位次"。而末尾是
+ * 最不容易被误读的一格——新出现的一级分支出现在这一串的最下面，与"新加的东西排在后面"
+ * 这条既有直觉一致（`addChild` 也是末尾）。
+ *
+ * 与 `moveNode(root, id, root.id, n)` 的差别只有一处：这里**不重排**兄弟，也不碰
+ * 任何别的节点；它只做"摘下来 + 挂到根末尾"，返回 `formerParentId` 是因为界面要说出
+ * "从「甲」下面断开"这句话，而那句话的输入只有这里知道。
+ */
+export function detachToRoot(
+  root: MindNode,
+  id: string,
+): { root: MindNode; formerParentId: string; index: number } {
+  if (id === root.id) throw new Error('根节点不能断开');
+  const parent = findParent(root, id);
+  const node = findNode(root, id);
+  if (!parent || !node) throw new Error('要断开的节点不存在');
+
+  const detached = removeNode(root, id);
+  const index = detached.children.length;
+  return {
+    root: { ...detached, children: [...detached.children, node] },
+    formerParentId: parent.id,
+    index,
+  };
 }
 
 /** 字数按码点算，和 Pydantic 的 len() 以及画布上的截断保持一致。 */
