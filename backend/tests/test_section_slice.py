@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from unittest.mock import patch
 
 import pytest
@@ -122,8 +123,16 @@ def _skeleton(count: int = len(CHAPTERS)) -> dict:
 
 
 def _chat(*, skeleton: dict | None = None, subtree: dict | None = None,
-          seen: list[tuple[str, str]] | None = None, detail_systems: list[str] | None = None):
-    """模型替身：骨架 / **每章一次的子树** / 第三段，按 system 前缀分流。"""
+          seen: list[tuple[str, str]] | None = None, detail_systems: list[str] | None = None,
+          on_delta_chunks: int = 0, deltas: list[bool] | None = None):
+    """模型替身：骨架 / **每章一次的子树** / 第三段，按 system 前缀分流。
+
+    `on_delta_chunks > 0` 时把这一章的子树 JSON 按这个段数喂给 `on_delta`——
+    预览只有真收到增量才会往外推帧，假流式测不出 `node_grow`。
+
+    `deltas` 收每一次结构调用"有没有拿到 `on_delta`"，用来钉"通道为 None 时
+    连流式请求都不发"那条约定。
+    """
     skeleton = _skeleton() if skeleton is None else skeleton
 
     async def chat(system: str, user: str, *, max_tokens=None, on_delta=None) -> dict:
@@ -132,12 +141,20 @@ def _chat(*, skeleton: dict | None = None, subtree: dict | None = None,
         if system.startswith(PLAN_PROMPT):
             return skeleton
         if system.startswith(SECTION_SLICE_PROMPT):
-            return subtree if subtree is not None else {
+            if deltas is not None:
+                deltas.append(on_delta is not None)
+            body = subtree if subtree is not None else {
                 "children": [
                     {"label": "要点甲", "children": [{"label": "细节一"}]},
                     {"label": "要点乙"},
                 ]
             }
+            if on_delta is not None and on_delta_chunks:
+                text = json.dumps(body, ensure_ascii=False)
+                size = max(1, len(text) // on_delta_chunks)
+                for start in range(0, len(text), size):
+                    await on_delta(text[start:start + size])
+            return body
         if system.startswith(DETAIL_ONLY_PROMPT):
             if detail_systems is not None:
                 detail_systems.append(system)
@@ -158,11 +175,20 @@ def _chat(*, skeleton: dict | None = None, subtree: dict | None = None,
 def _run(chat, *, channels: bool = False, **kwargs):
     source = kwargs.pop("source", None) or _material()
     ctx = _ctx([source] if source is not None else [], **kwargs)
+    frames: list[dict] = []
+
+    async def emit(frame: dict) -> None:
+        frames.append(frame)
+
+    if channels:
+        # 与 `service._run_tool` 给工具挂的那个通道同形：一个 async 函数，收 dict。
+        ctx.emit = emit
     registry = build_registry("create", has_sources=True, has_library=False)
     with patch("app.agent.tools.chat_async", new=chat):
-        return asyncio.run(registry.execute(
+        result = asyncio.run(registry.execute(
             ToolCall(call_id="c-gen", name="mindmap_generate",
                      arguments={"topic": TOPIC, "branches": 5}), ctx))
+    return (result, frames) if channels else result
 
 
 # ---------------------------------------------------------------- 1. 切章
@@ -480,3 +506,113 @@ def test_switch_on_says_so_when_the_outline_is_trimmed(monkeypatch):
 def test_depth_constant_is_two_so_a_chapter_gets_two_levels(depth):
     """`INITIAL_MAX_DEPTH=3`：root → 分支 → 两层。新路不分组，所以这一笔账是干净的。"""
     assert depth == 2
+
+
+# ---------------------------------------------------------------- 5. 节点生长预览
+
+
+def _grows(frames: list[dict]) -> list[dict]:
+    return [frame for frame in frames if frame.get("type") == "node_grow"]
+
+
+def test_growth_frames_exist_on_this_path(monkeypatch):
+    """**这条路上必须真有 `node_grow` 帧**（改之前是 0 帧，这就是用户看到的那件事）。
+
+    为什么以前是 0：`_generate` 把 `on_delta` 接在"结构那一次调用"上
+    （`stream_kwargs`），而按章切那条路与它是 `if slice_chapters: … else: …` 的
+    互斥关系——切了章，那次调用根本不会发生。于是整棵树要等 12 次调用全部
+    `gather` 完、在 `_slice_structure` 的末尾组装好，才一次性落画布。
+
+    实测形态：37,973 字的 PDF（`MINDMAP_SECTION_SLICE=1`）首帧在第 0 秒之后
+    一个都不来，几十秒后一次性出现 73 个节点 = `12 × 6 + 1`，正好是
+    `_slice_budget` 那个公式。
+    """
+    monkeypatch.setenv("MINDMAP_SECTION_SLICE", "1")
+    result, frames = _run(_chat(on_delta_chunks=8), channels=True)
+    assert result.ok, result.content
+    grows = _grows(frames)
+    assert grows, "按章切这条路一帧都没有：整树生成又回到了一次性落画布"
+
+
+def test_growth_frames_start_with_the_root_then_mat_hed_branches_in_order(monkeypatch):
+    """帧序：根（`path=None`）→ 12 条一级分支（`path=[]`，按 `aligned` 顺序）。
+
+    分支帧必须在孩子之前、而且顺序就是最终树里根的孩子顺序——前端拿 `path` 当
+    **父节点的索引链**用（`mindmap.ts:1457`），顺序错了节点会挂到别的分支下面，
+    而且不报错。
+    """
+    monkeypatch.setenv("MINDMAP_SECTION_SLICE", "1")
+    result, frames = _run(_chat(on_delta_chunks=8), channels=True)
+    assert result.ok, result.content
+    grows = _grows(frames)
+
+    assert grows[0]["path"] is None and grows[0]["label"] == TOPIC
+
+    branches = [frame for frame in grows if frame["path"] == []]
+    expected = [f"{index} {title}" for index, title in enumerate(CHAPTERS, start=1)]
+    assert [frame["label"] for frame in branches] == expected
+    # 分支帧整体排在所有带路径的孩子之前：先立骨架，再长内容
+    first_child = next(i for i, frame in enumerate(grows)
+                       if frame["path"] is not None and frame["path"] != [])
+    last_branch = max(i for i, frame in enumerate(grows) if frame["path"] == [])
+    assert last_branch < first_child
+
+
+def test_growth_frames_mount_under_the_right_branch(monkeypatch):
+    """每章的孩子挂在**它自己那条分支**下：`path` 的首位是该章在 `aligned` 里的位置。
+
+    这是"不能漏"的另一半：挂错分支不会漏节点，但会让一整支长到别人身上。
+    """
+    monkeypatch.setenv("MINDMAP_SECTION_SLICE", "1")
+    result, frames = _run(_chat(on_delta_chunks=8), channels=True)
+    assert result.ok, result.content
+    grows = _grows(frames)
+
+    nested = [frame for frame in grows if frame["path"]]
+    assert nested, grows
+    # 12 章 × (要点甲 + 细节一 + 要点乙)
+    assert len(nested) == len(CHAPTERS) * 3
+    tops = [frame for frame in nested if len(frame["path"]) == 1]
+    assert sorted({frame["path"][0] for frame in tops}) == list(range(len(CHAPTERS)))
+    for index in range(len(CHAPTERS)):
+        assert [frame["label"] for frame in tops if frame["path"] == [index]] == [
+            "要点甲", "要点乙"]
+    # 第三层：`细节一` 挂在 `要点甲` 下（`path=[章, 0]`）
+    deep = [frame for frame in nested if len(frame["path"]) == 2]
+    assert {frame["label"] for frame in deep} == {"细节一"}
+    assert {frame["path"][1] for frame in deep} == {0}
+
+
+def test_growth_frames_do_not_exceed_the_final_tree(monkeypatch):
+    """预览与最终树**同形**：帧里的节点数不超过落树之后的节点数。
+
+    "长出来又消失"比"晚出来"更糟——用户会以为那几个节点没了。所以预览按
+    `_slice_nodes` 的两把尺子截：`quota`（这支能写几个）与 `max_level`（分支下
+    最多几层）。
+    """
+    monkeypatch.setenv("MINDMAP_SECTION_SLICE", "1")
+    # 模型多写一层：`_slice_nodes` 会在 level > SECTION_SLICE_DEPTH 处停手
+    subtree = {"children": [
+        {"label": "要点甲", "children": [
+            {"label": "细节一", "children": [{"label": "再深一层"}]}]},
+        {"label": "要点乙"},
+    ]}
+    result, frames = _run(_chat(subtree=subtree, on_delta_chunks=8), channels=True)
+    assert result.ok, result.content
+    grows = _grows(frames)
+    assert "再深一层" not in {frame["label"] for frame in grows}
+    # 与落树之后的节点数对齐：预览多报一个就会"长出来又消失"
+    assert len(grows) <= result.data["node_count"]
+
+
+def test_growth_frames_stay_off_when_the_channel_is_none(monkeypatch):
+    """没有通道时**连 `on_delta` 都不传**：这条路的行为与加预览之前逐字相同。
+
+    这条约定是既有测试有效性的前提（假 provider 的签名里 `on_delta=None`），
+    也是 `_generate` 那次判断的同一条理由。
+    """
+    monkeypatch.setenv("MINDMAP_SECTION_SLICE", "1")
+    deltas: list[bool] = []
+    result = _run(_chat(deltas=deltas), channels=False)
+    assert result.ok, result.content
+    assert deltas and not any(deltas), "通道为 None 时不该发流式请求"
