@@ -971,6 +971,80 @@ describe('thinking 全链路：请求体与折叠展示', () => {
   });
 });
 
+/**
+ * 材料面板什么时候挡在画布上。
+ *
+ * 这三条钉的是**改动之前的行为**，写的都是"今天实际怎样"，不是"应该怎样"：
+ *
+ *   1. 上传后           面板展开。
+ *   2. 生成中           面板不存在——它是 `compact` 那条 `v-if` 的副作用（整块对话框
+ *                       被一条细进度取代），不是材料面板自己有判据。
+ *   3. 生成完（成功）   **面板又原样展开**，把刚落地的那棵树挡在里面。这就是缺陷：
+ *                       `materialOpen` 是个只会被"点开"的 `ref`，全文件没有任何一处
+ *                       在生成开始 / 成功时把它关掉，而 1378 行那句"默认收起"说的是
+ *                       **初始值**，不是"每一轮结束都收起"。
+ *   4. 收起态入口        缩略图行里的「管理材料」，文案里**没有**份数。
+ */
+describe('材料面板：什么时候挡在画布上（改动前的行为）', () => {
+  /** `v-show` 收面板，所以可见性看内联样式；组件被卸载也算不可见。 */
+  function panelVisible(wrapper: VueWrapper): boolean {
+    const panel = wrapper.find('[data-test="material-panel"]');
+    if (!panel.exists()) return false;
+    return !(panel.attributes('style') ?? '').includes('display: none');
+  }
+
+  it('上传后：面板展开（他还要粘贴、录音、看解析进度）', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    expect(panelVisible(wrapper)).toBe(false);
+
+    await wrapper.get('[data-test="attach"]').trigger('click');
+    await wrapper.vm.$nextTick();
+    expect(panelVisible(wrapper)).toBe(true);
+  });
+
+  it('生成中：面板跟着整块对话框一起不在（一条细进度取代它）', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    await wrapper.get('[data-test="attach"]').trigger('click');
+    await wrapper.vm.$nextTick();
+
+    useMindMapStore().busy = true;
+    await wrapper.vm.$nextTick();
+
+    // 不是"收起了"，是连 DOM 都没有：`compact` 把整块换成了 `run-status`。
+    expect(wrapper.find('[data-test="material-panel"]').exists()).toBe(false);
+  });
+
+  it('生成完（成功）：面板仍然展开——那一刻画布上已经有 73 个节点了', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    const store = useMindMapStore();
+    await wrapper.get('[data-test="attach"]').trigger('click');
+    await wrapper.vm.$nextTick();
+
+    store.preview(TREE, 'right');
+    store.generatedSummary = { nodes: 2, changes: null };
+    await wrapper.vm.$nextTick();
+    vi.advanceTimersByTime(5000);
+    await wrapper.vm.$nextTick();
+
+    expect(panelVisible(wrapper)).toBe(true);
+  });
+
+  it('收起态那个入口：缩略图行里的「管理材料」，文案里没有份数', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    const sources = useSourcesStore();
+    sources.addText('一段材料正文');
+    await wrapper.vm.$nextTick();
+
+    const entry = wrapper.get('[data-test="thumbs"]').element.parentElement
+      ?.querySelector('button:not([aria-label])') as HTMLButtonElement | null;
+    expect(entry?.textContent?.trim()).toBe('管理材料');
+  });
+});
+
 describe('材料参与生成', () => {
   it('缩略图里的材料照旧进请求体（材料没有因为换位置而丢）', async () => {
     const fetchMock = stubFetch([{ type: 'done', seq: 2, content: TREE, mode: 'model' }]);
