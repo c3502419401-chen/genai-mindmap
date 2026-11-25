@@ -3013,6 +3013,150 @@ FISHBONE_PLAN_PROMPT = (
     "（problem 写成了原因/结论；六类也只给了两类，六类缺一不可）"
 )
 
+# ---- 鱼骨图的类别可变（`MINDMAP_FISHBONE_FREE_CATEGORIES`，默认关）-------------
+#
+# ## 为什么要放开类别
+#
+# 人机料法环测（5M1E）是**制造业现场管理**的维度表。对着「为什么团队协作效率低」
+# 「为什么转化率上不去」这类主题，那六个维度本来就不合适，而上面的提示词明令"必须
+# 正好是这六个、不许改写成别的话题分类"，模型只能扭曲归类：实证的一张图（主题是
+# 人的管理）六类都在，而「料」下面写着「员工技能不足」——那是「人」里的东西。
+# 那不是模型不会分，是它**没有第二个出口**。
+#
+# ## 放开之后靠什么不退化
+#
+# 真正的风险是"类别变成话题分类"，鱼骨图于是退化成普通树。现行提示词用一句
+# "不要改写成别的话题分类"防它，但**没给判据**——类别名本身判不了（「人」既是
+# 话题也是变量）。这里给的是可判的那条界线：
+#
+#   **原因维度是一个可取高低的变量；话题分类是一个领域或职能。**
+#
+# 三个可操作的测试（都写进提示词，正反例各一条）：
+#
+#   1. 因果槽位：「（这个类别）不足 / 缺失 / 偏高 → 主骨上那个为什么」成立吗？
+#      「工具 → 效率低」成立；「人员管理 → 效率低」不成立（它不是变量，是题目）。
+#   2. 还能不能再分：「工具」下面挂的是具体原因（"审批系统要来回切三个页面"）；
+#      「人员管理」下面挂的是**另一个维度**（"招聘慢""培训少"）——那说明它是领域。
+#   3. 正交性：一个原因只能落进一个类别。「工具」与「系统」两份就是重复。
+#
+# 判据之外还有一条**覆盖面**约束（"第三条路"）：类别名自由，但必须覆盖四个成因面
+# 里的至少三个——谁来做（人）/ 用什么做（物）/ 怎么做（法）/ 在哪做（境）。这四类
+# 是 5M1E 去掉"测"之后剩下的那四类，也是 8P、服务业模板都能归进去的最小公约数。
+# 它保住的正是鱼骨图真正值钱的那件事：**逼你把成因面过一遍**。丢掉的是"永远是那
+# 六个名字"，那件事在非制造主题上本来就没有兑现过。
+#
+# ## 用户点名时以用户为准
+#
+# `FISHBONE_TEMPLATES` 是"用户明说要按某套类别画"的词表。这条路以前**不存在**：
+# 请求层没有类别字段（`AgentRunRequest` 只有 `diagram_type`），`diagram_intent`
+# 只认图型词——用户说「按人机料法环测画」，那五个字会当主题的一部分进 prompt，
+# 然后被"必须正好是这六个类别"覆盖。现在开关打开时它至少能被认出来并压过模型自定。
+#
+# 词表里只有 ≤6 个的模板，因为 `MAX_FISHBONE_BONES` 是契约硬上限 6：8P（8 个）
+# 与服务业的六类模板**这次不进词表**——8P 塞进 6 根骨要靠截断，那是改用户的模板
+# 而不是照它画。见 `docs/FISHBONE-CATEGORIES.md`。
+FISHBONE_FREE_ENV = "MINDMAP_FISHBONE_FREE_CATEGORIES"
+
+
+def fishbone_free_categories_enabled() -> bool:
+    """鱼骨图类别可变开关（`MINDMAP_FISHBONE_FREE_CATEGORIES`，默认**关**）。
+
+    真值写法与 `input_extract_enabled` / `section_slice_enabled` 一致（正列举真值、
+    缺省取空串即关）：这几个改变提示词形状的开关要能用同一行 shell 一起切。
+    """
+    return os.getenv(FISHBONE_FREE_ENV, "").strip().lower() in GRAPH_SKELETON_TRUTHY
+
+
+#: 用户明确点名过的类别模板。键是**正则**（`人机料法环测` 会被写成带空格的、
+#: 写成 `5M1E` 的、写成 `5m1e` 的），值是那套类别的逐字清单。
+#:
+#: 只收 ≤ `MAX_FISHBONE_BONES` 个的模板（见上面那段注释）。
+FISHBONE_TEMPLATES: tuple[tuple[re.Pattern[str], tuple[str, ...]], ...] = (
+    # 5M1E。中文连写是最常见的说法；`人机料法环` 五连写也算（用户常常漏掉"测"）。
+    (re.compile(r"5\s*[Mm]\s*1\s*[Ee]|人\s*机\s*料\s*法\s*环\s*测|人\s*机\s*料\s*法\s*环"),
+     ("人", "机", "料", "法", "环", "测")),
+    # 4M1E：人 / 机 / 料 / 法 / 环。写在 5M1E 之后，两条都命中时先登记的那条赢。
+    (re.compile(r"4\s*[Mm]\s*1\s*[Ee]"), ("人", "机", "料", "法", "环")),
+)
+
+
+def named_fishbone_categories(text: str) -> tuple[str, ...]:
+    """用户在这句话里点名了哪一套类别；没点名返回空元组。
+
+    与 `diagram_intent.infer` 同一条边界：**按词面判，判不出来就什么都不做**——
+    猜一套类别比让模型按主题自己定更糟（模型至少看着 `problem`）。
+    """
+    for pattern, categories in FISHBONE_TEMPLATES:
+        if pattern.search(text or ""):
+            return categories
+    return ()
+
+
+# 自由类别版的骨架提示词。与 `FISHBONE_PLAN_PROMPT` 的差别**只在"一级分支"那一段**
+# （problem 的三条硬规矩逐字相同：它们守的是"鱼头里是不是一个问题"，与类别无关）。
+FISHBONE_FREE_PLAN_PROMPT = (
+    "你在为一张**鱼骨图（因果分析）**只定骨架，不写任何子要点。"
+    "只返回一个 JSON 对象，不要代码围栏，格式为 "
+    '{"problem":"为什么新员工要三个月才独立上岗",'
+    '"branches":[{"label":"技能","color":"blue","icon":"👤"},'
+    '{"label":"手册","color":"teal","icon":"📕"},'
+    '{"label":"带教","color":"amber","icon":"🧑‍🏫"}]}。'
+    "problem 是**主骨上那一句**：一个「为什么 X 会 Y」的疑问句，40 字以内，不带句号。"
+    "它不是主题的重写——主题是这张图叫什么（用于文件名），problem 是这张图要回答的"
+    "那个问题；**不要复读主题**。也不要写成一句结论或原因（「因为审批链太长」是答案，"
+    "不是问题），不要写成名词短语（「报销慢的原因」缺了「为什么」）。"
+    # 顺序：先 problem 再类别。理由写在这里，因为它是这次改动最容易被写反的一处——
+    # 类别是"这个问题的成因面"，是关于 **problem** 的函数，不是关于主题的函数。
+    # 同一个主题换个问法（"为什么转化率上不去" / "为什么留存率上不去"）该长出不同的
+    # 类别；先想类别再套问题，必然长出"这个主题分几块讲"。
+    "**先写 problem，再定一级分支**。一级分支是**这个问题的成因面**，不是这个主题"
+    "分几块讲：写完 problem 回头对一遍，每一个一级分支都要能填进「（这个分支）出了"
+    "偏差 → 主骨上那个为什么」，填不进去的换掉。"
+    "一级分支 3 到 6 个（少于 3 个不成图），每个 1 到 4 个字、名词性、彼此不重叠。"
+    # 判据与正反例：这是整段的核心。现行提示词只写了"不要改写成话题分类"——一句
+    # 没有判据的禁令，模型只能靠猜。这里给的是"变量 vs 领域"这条可判的界线。
+    "判据是**变量还是领域**：原因维度是一个能取高低、有缺无的变量（技能 / 步数 /"
+    "信息 / 工具 / 名额 / 天气），它下面能直接挂具体原因；话题分类是一个领域或职能"
+    "（人员管理 / 设备维护 / 技术架构 / 团队建设），它下面还得再分一层维度。"
+    "四个成因面里**至少覆盖三个**（名字随主题起，不要照抄这四个词）："
+    "① 谁来做（人的技能、认知、意愿、编制）；② 用什么做（设备、材料、技术、数据、"
+    "工具）；③ 怎么做（流程、方法、规则、标准、职责边界）；④ 在哪做（环境、外部"
+    "条件、时间、资源）。主题确实不涉及的那一面可以不出现，但不要放一个填不满的类别"
+    "凑数——填不进原因的类别，画出来是一根空骨。"
+    "**不要输出 edges**：鱼骨图的关系全部由层级表达，多画线只会把图弄乱。"
+    f"color 只能取 {' / '.join(NODE_COLORS)} 之一；"
+    f"icon 是**一个** emoji，不超过 {MAX_NODE_ICON_CHARS} 个字符。"
+    "✅ 正确（主题「团队协作」）："
+    '{"problem":"为什么团队协作效率一直上不去",'
+    '"branches":[{"label":"职责","color":"blue","icon":"🧩"},'
+    '{"label":"沟通","color":"teal","icon":"💬"},'
+    '{"label":"工具","color":"amber","icon":"🛠"},'
+    '{"label":"会议","color":"purple","icon":"🗓"},'
+    '{"label":"激励","color":"green","icon":"🎯"}]}'
+    "（五个都是变量：「职责不清 → 协作慢」成立，每个下面挂得进具体原因）"
+    "❌ 错误："
+    '{"branches":[{"label":"人员管理"},{"label":"设备维护"},{"label":"团队建设"}]}'
+    "（三个都是**领域/职能**，是「这一节讲什么」，填进「（它）出了偏差 → 为什么」里"
+    "不通；它下面挂的还会是别的维度）"
+    "❌ 错误："
+    '{"branches":[{"label":"沟通不畅"},{"label":"工具落后"}]}'
+    "（这两条**已经是一条原因**了：类别是维度，「沟通」下面才挂「沟通不畅」）"
+    "❌ 错误："
+    '{"branches":[{"label":"工具"},{"label":"系统"}]}'
+    "（同义：同一个原因会同时落进两个类别，正交性没了）"
+    "❌ 错误："
+    '{"branches":[{"label":"人"},{"label":"员工"},{"label":"团队"}]}'
+    "（三个都在同一个成因面上：覆盖面约束要的是至少三个不同的面）"
+)
+
+# 自由类别版的**结构规则**（根规则 + 骨下面写什么）放在 `FISHBONE_TREE_RULES` 之后：
+# 它要复用 `_FISHBONE_BODY`，而那个常量在本函数下面才定义。
+
+def fishbone_plan_prompt() -> str:
+    """这一次鱼骨骨架用哪份提示词。**开关关着时返回的就是那个常量本身**。"""
+    return FISHBONE_FREE_PLAN_PROMPT if fishbone_free_categories_enabled() else FISHBONE_PLAN_PROMPT
+
+
 # 骨架提示词里那段"材料自带的章节"的表头。测试用它断言"目录拼进去了没有"，
 # 所以必须是**一个字符串常量**而不是散在 `_skeleton_outline` 里的字面量——
 # 两处各写一遍，改一处忘一处时，用例会绿着而提示词已经不再是那个形状。
@@ -3528,10 +3672,33 @@ def _plan_ask(
             "这次是流程图：一级分支按**执行先后**排列，每条是一个流程阶段；"
             "有判断出口或回退时，用 edges 补上（source/target 只写阶段序号）。")
     elif diagram_type == "fishbone":
-        parts.append(
-            "这次是鱼骨图：一级分支固定为人 / 机 / 料 / 法 / 环 / 测 六条，不要输出 edges；"
-            "同时给出 problem——**主骨上那一句**「为什么 X 会 Y」，40 字以内，"
-            "不要复读主题，也不要写成原因或名词短语。")
+        # 类别可变那一版（`MINDMAP_FISHBONE_FREE_CATEGORIES`）：user 这末尾的一两句是
+        # "这一次的重点"。关着时加的是原来那一句，逐字节不变——它被
+        # `test_edges.py::TestTreeIsByteIdentical` 的兄弟用例与 `test_agent_shapes.py`
+        # 的鱼骨用例读着。
+        if fishbone_free_categories_enabled():
+            parts.append(
+                "这次是鱼骨图：一级分支是**这道题的成因面**，不是固定的六类——"
+                "按 system 里的判据自己定 3 到 6 个（每个 1 到 4 字、名词性、彼此不重叠，"
+                "要能填进「（这个分支）出了偏差 → 主骨上那个为什么」），"
+                "并覆盖四个成因面里的至少三个；不要输出 edges；"
+                "同时给出 problem——**先写它**，再拿它校准一级分支。"
+                "problem 是**主骨上那一句**「为什么 X 会 Y」，40 字以内，"
+                "不要复读主题，也不要写成原因或名词短语。")
+            # 用户点名过一套类别时，**以用户为准**。这条路以前不存在（请求层没有类别
+            # 字段、`diagram_intent` 只认图型词），所以它是"开关打开之后比关着时多出来
+            # 的那一件事"，必须紧跟在那句之后说——位置即权重。
+            named = named_fishbone_categories(topic)
+            if named:
+                parts.append(
+                    "主题里点名了一套类别（" + " / ".join(named) + "）："
+                    "一级分支**逐字就用这一套**，顺序也不改，不要自己另立；"
+                    "problem 仍由你按主题定。")
+        else:
+            parts.append(
+                "这次是鱼骨图：一级分支固定为人 / 机 / 料 / 法 / 环 / 测 六条，不要输出 edges；"
+                "同时给出 problem——**主骨上那一句**「为什么 X 会 Y」，40 字以内，"
+                "不要复读主题，也不要写成原因或名词短语。")
     return "\n".join(parts)
 
 
@@ -3954,6 +4121,23 @@ def _skeleton_block(plan: _SkeletonPlan) -> str:
         for branch_index, branch in enumerate(group.branches, start=1):
             lines.append(f"   {group_index}.{branch_index} {branch.label}")
     return "\n".join(lines)
+
+# 自由类别版（`MINDMAP_FISHBONE_FREE_CATEGORIES`，定义见 `FISHBONE_FREE_PLAN_PROMPT`
+# 上面那段注释）。与固定版的差别只有"六个**类别**"→"几个**原因维度**"——它说的仍是
+# 同一件事（一级分支已定，照抄不增删），换那个词是为了让第二段调用也守住"这是原因
+# 维度"这句话，而不是在那一次悄悄滑回"类别"。
+_FISHBONE_FREE_ROOT_RULE = (
+    "\n这次的一级分支已经定好了，就是 user 消息里列出的那几个**原因维度**："
+    "根节点下必须恰好是这几个，顺序、名称都不改，不增不减。"
+)
+# 骨下面写什么与类别固不固定无关：`_FISHBONE_BODY` 一个字都不用改（它说的是"属于
+# 这一类的原因"，对自定的维度同样成立），所以这里直接复用——两份同样的文字迟早漂。
+FISHBONE_FREE_TREE_RULES = _FISHBONE_FREE_ROOT_RULE + _FISHBONE_BODY
+
+
+def fishbone_tree_rules() -> str:
+    """这一次鱼骨第二段用哪份结构规则。关着时返回 `FISHBONE_TREE_RULES` 本身。"""
+    return FISHBONE_FREE_TREE_RULES if fishbone_free_categories_enabled() else FISHBONE_TREE_RULES
 
 
 # **引用字段的形状**。抽出来是因为它有**三个**消费者：按支分组（`BRANCHED_EVIDENCE_RULES`）、
@@ -6842,8 +7026,26 @@ def _fishbone_shape_diagnostics(
     `FISHBONE_CATEGORIES` 是推荐词表而不是契约白名单（见那个常量的注释）：模型写
     "人员"而不是"人"时硬绑的表现是整张图 422，而用户宁可要一张类别名不太标准但
     内容对的鱼骨图。所以这里只数"少了哪些"，缺的几根在画布上确实是空的。
+
+    类别可变开着时（`MINDMAP_FISHBONE_FREE_CATEGORIES`）这条判据**不成立**：那次
+    的类别就是按主题定的，"少了人/机/料/法/环/测"不是缺内容，而是设计。那种情况
+    下改报一条 info，说清这次有几个类别、它们是什么——用户仍然要知道"这张图没有
+    走 5M1E"这件事，只是它不再是缺陷。
     """
     got = {_skeleton_key(bone.category) for bone in content.bones}
+    if fishbone_free_categories_enabled():
+        if not content.bones:
+            return
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.info, code="FISHBONE_CATEGORIES_UNFIXED",
+            message=(
+                f"这次的一级分支是按主题定的 {len(content.bones)} 个原因维度"
+                f"（{'、'.join(bone.category for bone in content.bones)}），"
+                f"不是 5M1E 的 {'/'.join(FISHBONE_CATEGORIES)}；"
+                "每根骨下面写的是属于那个维度的原因"
+            ),
+        ))
+        return
     missing = [name for name in FISHBONE_CATEGORIES if _skeleton_key(name) not in got]
     if not missing:
         return
@@ -7002,10 +7204,16 @@ def _shape_output(
         problem = _fishbone_problem(raw_plan, content.title, diagnostics)
         shaped, extras = shapes.to_fishbone(content, problem=problem)
         if extras:
+            # 上限那一句只换主语：关着时"比六类多了"是对的（六类就是上限），开着时
+            # 上限仍是 6 但类别不是那六个，说"比六类多了"会让用户以为模型漏了 5M1E。
+            ceiling = (
+                f"一级分支比 {MAX_FISHBONE_BONES} 个多了 {extras} 条"
+                if fishbone_free_categories_enabled()
+                else f"一级分支比六类多了 {extras} 条")
             diagnostics.append(Diagnostic(
                 level=DiagnosticLevel.warn, code="FISHBONE_EXTRA_BRANCH",
                 message=(
-                    f"一级分支比六类多了 {extras} 条，已并入最后一根骨"
+                    f"{ceiling}，已并入最后一根骨"
                     f"（「{shaped.bones[-1].category}」）：鱼骨图最多 "
                     f"{MAX_FISHBONE_BONES} 根骨，多出来的内容不丢，但位置按规则摆"
                 ),
@@ -9288,7 +9496,9 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         base_plan = (
             PLAN_PROMPT if diagram_type == "tree"
             else FLOW_PLAN_PROMPT if diagram_type == "flowchart"
-            else FISHBONE_PLAN_PROMPT
+            # 类别可变的那一版（`MINDMAP_FISHBONE_FREE_CATEGORIES`）：关着时这个调用
+            # 返回的就是 `FISHBONE_PLAN_PROMPT` 本身，逐字节不变。
+            else fishbone_plan_prompt()
         )
         # **两级骨架的判定点**：这一次大概会有多少个方面。**只数材料的宽度**——
         # 目录行数（`_skeleton_outline` 拼进去的那一份，覆盖率不够时是 0 行）、图谱
@@ -9663,7 +9873,7 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             GRAPH_TREE_RULES if graph_mode
             else GROUPED_TREE_RULES if plan.grouped
             else FLOW_TREE_RULES if diagram_type == "flowchart"
-            else FISHBONE_TREE_RULES if diagram_type == "fishbone"
+            else fishbone_tree_rules() if diagram_type == "fishbone"
             else SKELETON_TREE_RULES
         )
         # 树规则那一份里只有「这一次要多大」那一句与常量不同（`DETAIL_PROMPT_OPEN`：把配额
@@ -10757,7 +10967,8 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
     base_plan = (
         PLAN_PROMPT if diagram_type == "tree"
         else FLOW_PLAN_PROMPT if diagram_type == "flowchart"
-        else FISHBONE_PLAN_PROMPT
+        # 与整树那条逐字同一处（`AGENTS.md`：骨架被两条生成路共用）。
+        else fishbone_plan_prompt()
     )
     plan_system = base_plan if slicing else (
         base_plan + "\n" + CONTENT_FREEDOM_CONTRACT + DETAIL_NO_SOURCE_RULES)
