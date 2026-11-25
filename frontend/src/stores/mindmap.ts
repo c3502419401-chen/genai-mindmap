@@ -21,6 +21,7 @@ import {
 } from '../mindmap/drop-plan';
 import { diffEdits, EDIT_EVENT_LIMIT, generateEvent, type EditActor, type EditEvent } from '../mindmap/edit-log';
 import { CONNECTION_LOST, guideForFailure, INVALID_SOURCES, NO_CONTENT, type FailureGuide } from '../mindmap/failures';
+import { evictCount } from '../mindmap/history-limit';
 import { moveScopeProblem } from '../mindmap/move-scope';
 import { applyOps } from '../mindmap/ops';
 import { buildRefIndex } from '../mindmap/refs';
@@ -1076,8 +1077,20 @@ export const useMindMapStore = defineStore('mindmap', () => {
   const savedAt = ref<string | null>(null);
   const dirty = ref(false);
 
+  /**
+   * 撤销栈里的一步：快照原文 + **它自己的字节数**。
+   *
+   * 字节随条目一起存，而不是需要时重新编码：淘汰一份旧快照时要算它占多少，
+   * 从前每次淘汰都 `snapshotBytes(dropped)` 再编码一遍（大图时一份 200KB+，
+   * 淘汰 50 次就是 10MB 的无用编码）。
+   */
+  interface HistoryEntry {
+    snap: string;
+    bytes: number;
+  }
+
   /** 撤销/重做存整树 JSON 快照：比命令模式少一半代码。节点上限 1000、每个节点还带正文，一份快照能到几十到几百 KB，只按 50 步计会涨到十几 MB，所以除了步数还按字节截（10MB）。 */
-  const past = ref<string[]>([]);
+  const past = ref<HistoryEntry[]>([]);
   const future = ref<string[]>([]);
   /** 撤销栈已占的字节数。维护这个数，免得每次压栈都把整栈重新编码一遍。 */
   const pastBytes = ref(0);
@@ -2579,13 +2592,24 @@ export const useMindMapStore = defineStore('mindmap', () => {
    *
    * 至少保留一步：一份快照自身就超过上限时（极端大的树）清空栈会让撤销直接失效，
    * 那比占着这 10MB 更糟。
+   *
+   * **淘汰判据本身在 `mindmap/history-limit.ts::evictCount`**（纯函数，可单测）：
+   * 这里只负责"压栈 + 按它说的份数 shift"。把它抽出去的理由见那个文件头——
+   * 藏在 store 里的时候，这条规则只有一条"造大树、走完整链路"的测法，而在
+   * `LIMITS.nodes = 1000` / `LIMITS.detail = 2000` 的契约下那条链路里步数上限
+   * 先命中，字节上限一次都触发不到（`docs/TEST-COST-3-CASES.md` §6）。
    */
   function recordPast(snap: string) {
-    past.value.push(snap);
-    pastBytes.value += snapshotBytes(snap);
-    while (past.value.length > 1 && (past.value.length > HISTORY_LIMIT || pastBytes.value > HISTORY_BYTES_LIMIT)) {
+    const entry: HistoryEntry = { snap, bytes: snapshotBytes(snap) };
+    past.value.push(entry);
+    pastBytes.value += entry.bytes;
+    const drop = evictCount(past.value.map(item => item.bytes), {
+      count: HISTORY_LIMIT,
+      bytes: HISTORY_BYTES_LIMIT,
+    });
+    for (let i = 0; i < drop; i += 1) {
       const dropped = past.value.shift()!;
-      pastBytes.value -= snapshotBytes(dropped);
+      pastBytes.value -= dropped.bytes;
     }
   }
 
@@ -3391,13 +3415,13 @@ export const useMindMapStore = defineStore('mindmap', () => {
   }
 
   function undo() {
-    const snap = past.value.pop();
-    if (!snap) return;
-    pastBytes.value -= snapshotBytes(snap);
+    const entry = past.value.pop();
+    if (!entry) return;
+    pastBytes.value -= entry.bytes;
     // 当前是空画布时也要压一步 `'null'`，否则「空 → 生成 → 撤销 → 重做 → 撤销」
     // 的最后一步会丢掉：重做那一次不记历史，再撤销就没得可撤，回不到空白。
     future.value.push(snapshot() ?? 'null');
-    restoreSnapshot(snap);
+    restoreSnapshot(entry.snap);
     dirty.value = true;
     // 撤销改的就是画布本身，必须让"这份结果基于哪个版本算出来"的判断看见这一步。
     // 不递增的话，生成期间用户撤销一步、生成结果照样把画布整棵盖掉——那正是
