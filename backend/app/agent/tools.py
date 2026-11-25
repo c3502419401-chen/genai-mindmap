@@ -4348,9 +4348,12 @@ DETAIL_SPLIT_MIN = 12
 # 对 system 末尾与 user 末尾更敏感），并在 user 末尾再加一句自查。
 #
 # **只有两个数字是可变的**（`min_chars` / `max_chars`，由 `budget.detail_span` 给）：
-# 句子数不跟着伸缩。"至少 3 句"是拿 21–46 字的一句半量出来的质量线，句子数一降就
-# 退回那个形态；材料撑不住 3 句时该减的是节点数（`MINDMAP_NODE_SCALE`），见
-# `generation.budget.DETAIL_SENTENCE_FLOOR` 的理由。
+# 句子数不跟着区间伸缩，它由 `MINDMAP_DETAIL_SENTENCES` 单独开关（默认关 = 仍要求
+# "至少 3 句"）。"至少 3 句"是拿 21–46 字的一句半量出来的质量线，但四臂读数
+# （`docs/DETAIL-SENTENCES.md`）显示它更像"每段末尾固定挂一句最短的收尾"——薄批 66%
+# 的段里末句就是全段最短的那一句，而放开之后均长只掉 4.7%、ρ 与 κ 不变。所以它不再
+# 是一条不需要理由的常量：要放开就翻开关，翻之前先看那一节的读数。材料撑不住 3 句时
+# 该减的仍是节点数（`MINDMAP_NODE_SCALE`），见 `generation.budget.DETAIL_SENTENCE_FLOOR`。
 #: 两份「只写说明」prompt 共用的前半段：输出形状、禁占位话、不动引用。
 #
 # 抽成常量是为了让"句子数"成为**唯一**可变的尾段：`_detail_only_prompt` 与
