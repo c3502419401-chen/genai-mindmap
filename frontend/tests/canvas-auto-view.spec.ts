@@ -46,6 +46,15 @@ vi.mock('@vue-flow/core', () => ({
     onPaneClick: vi.fn(),
     onMoveEnd: vi.fn(),
     updateNodeInternals: vi.fn(),
+    // 拖动改结构那一套。这个用例不拖，但组件在 setup 阶段就要注册它们——
+    // 少一个就是 `undefined is not a function`，整块画布挂不掉。
+    onNodeDragStart: vi.fn(),
+    onNodeDrag: vi.fn(),
+    onNodeDragStop: vi.fn(),
+    screenToFlowCoordinate: (point: { x: number; y: number }) => point,
+    flowToScreenCoordinate: (point: { x: number; y: number }) => point,
+    findNode: () => undefined,
+    updateNode: vi.fn(),
   }),
 }));
 

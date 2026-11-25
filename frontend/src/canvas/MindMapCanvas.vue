@@ -3,9 +3,16 @@ import { Background } from '@vue-flow/background';
 import { VueFlow, useVueFlow } from '@vue-flow/core';
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 
-import { useMindMapStore } from '../stores/mindmap';
+import { useMindMapStore, type MovePreview } from '../stores/mindmap';
 import { boxesOfNodes, chooseViewMode, visibleIds } from './clarity';
+import {
+  dropHitOf,
+  dropZoneOf,
+  outwardOf,
+  type DropSide,
+} from './layout/drop-zone';
 import { NODE_SIZE } from './layout/tidy';
+import { dropPendingLabel, type DropZone } from '../mindmap/drop-plan';
 import {
   MAX_ZOOM,
   MIN_ZOOM,
@@ -33,6 +40,8 @@ const store = useMindMapStore();
 const {
   setCenter, setViewport, getViewport, dimensions,
   onNodeClick, onNodeDoubleClick, onPaneClick, onMoveEnd, updateNodeInternals,
+  onNodeDragStart, onNodeDrag, onNodeDragStop,
+  screenToFlowCoordinate, findNode, updateNode,
 } = useVueFlow();
 
 /**
@@ -67,6 +76,10 @@ function focusCanvas(): void {
 // 为什么叶子不受影响：`toggleFoldInView` 对没有子节点的节点是空操作，所以"点一下读
 // 正文"这条最常用的路径上，画布一个像素都不会动。
 onNodeClick(({ node, event }) => {
+  // 松手后紧跟着的那一下 click 是拖动的一部分（拖完手还在节点上），不是"点开这一处"。
+  // 不拦的话，每次拖完都会顺带把落点的折叠状态翻一次——用户看到的是"拖了一下，
+  // 目标节点突然冒出/收起了一批子节点"。
+  if (performance.now() - dragEndedAt < 200) return;
   const additive = event.ctrlKey || event.metaKey || event.shiftKey;
   if (additive) store.toggleSelect(node.id);
   else store.select(node.id);
@@ -406,7 +419,12 @@ watch([() => store.mode, () => store.mapId, () => store.generatedSummary], () =>
 });
 
 // 内容换了：用户没手动选过档位时跟着可读性走。
+// 拖动改结构造成的那一次除外——理由见 `contentChangedByDrag`。
 watch(() => store.content, () => {
+  if (contentChangedByDrag) {
+    contentChangedByDrag = false;
+    return;
+  }
   if (!userPickedMode) requestAutoMode();
 });
 
@@ -463,6 +481,249 @@ watch(
   { flush: 'post' },
 );
 
+/**
+ * 拖动改结构：**手工位置从不落盘，落点是布局给的**。
+ *
+ * 布局是自动算的（`layoutDiagram` 从 content 推所有坐标），拖动是手动的，两者只能
+ * 有一个赢。这一轮选布局，理由三条：
+ *
+ *  1. 坐标的唯一来源不能有两个。`Node.pos` 至今没有渲染层的读者，给它开一个读点
+ *     意味着 `bounds` / `fitView` / 可读性选档 / 收起计数全都要分叉出"手动"这一
+ *     支——而那不是用户要的东西（他要的是改关系，位置只是手势的载体）；
+ *  2. 用户的原话本身就是**结构**语义（"假如要成为一个节点的父或子"）。他用手势
+ *     说的是"我要挂到这儿"，不是"请把这块画布按我的手摆放"；
+ *  3. 在 `tidy` 这套几何下，"拖的方向"与"布局给的落点方向"**同构**：拖到右边是
+ *     子（子本来就排在右边）、拖到左上是父（父本来就排在左边一层）、拖到上下是
+ *     兄弟（兄弟本来就上下排）。于是重排之后节点是**朝手势的方向吸附过去**的，
+ *     而不是弹回原点。这一条是这个决定成立的前提，没有它就只剩"拖了个寂寞"。
+ *
+ * 剩下的观感问题（"松手前不知道会变成什么"）由 `dragOverlay` 那块解决：松手之前
+ * 就画出**松手之后的真实位置**（`store.previewMove` 用同一个 `layoutTidy` 算的），
+ * 于是"弹回"读作"吸附"。
+ */
+interface DragHint {
+  targetId: string;
+  zone: DropZone;
+  side: DropSide;
+  preview: MovePreview;
+  /** 光标位置（页面坐标）。跟随光标的那句标签用它，与落点无关。 */
+  pointer: { x: number; y: number };
+}
+
+const dragHint = ref<DragHint | null>(null);
+
+/**
+ * 这一次内容变化是**拖动**引起的：不重新适配视图。
+ *
+ * 拖动之后必然整支重排，而"重排完就重新适配"会把用户刚调好的视角扔掉一次——他
+ * 刚松手，眼睛还停在原地。落点紧挨着他拖到的那个目标（那是他看得见的东西），
+ * 所以不重排视图也不会跑到视野外。
+ */
+let contentChangedByDrag = false;
+
+/** 拖动刚结束的那一下：抑制紧随其后的 click（否则会顺手开合一次折叠）。 */
+let dragEndedAt = 0;
+
+/** 鼠标 / 触摸事件的页面坐标。Vue Flow 两种都发（`MouseTouchEvent`）。 */
+function pointerOf(event: MouseEvent | TouchEvent): { x: number; y: number } {
+  const touch = 'touches' in event
+    ? (event.touches[0] ?? event.changedTouches[0])
+    : null;
+  if (touch) return { x: touch.clientX, y: touch.clientY };
+  return { x: (event as MouseEvent).clientX, y: (event as MouseEvent).clientY };
+}
+
+/**
+ * 节点在画布上的矩形（flow 坐标）。
+ *
+ * 树与鱼骨没有 `data.size`（`stores/mindmap` 只在流程图里发它），回退到 `NODE_SIZE`
+ * ——与布局共读同一份常量，所以这里算出来的框与画出来的框逐像素相同。
+ */
+function nodeRectOf(node: { position: { x: number; y: number }; data?: { size?: { width: number; height: number } } }): {
+  x: number; y: number; width: number; height: number;
+} {
+  const size = node.data?.size ?? NODE_SIZE;
+  return { x: node.position.x, y: node.position.y, width: size.width, height: size.height };
+}
+
+/**
+ * 指针底下是哪个节点、落在它的哪一侧。
+ *
+ * 遍历全部节点而不是问 Vue Flow 的命中 API：`store.nodes` 里的坐标是**布局坐标**，
+ * 而被拖的那个节点此刻在屏幕上位于手拖的位置——用 Vue Flow 自己的相交判定会把
+ * "指针在它自己身上"也算一次命中，于是它自己成了目标。排除它，是这里唯一需要的
+ * 判断。
+ */
+function findDropTarget(
+  pointer: { x: number; y: number },
+  draggedId: string,
+): { id: string; side: DropSide; nearness: number } | null {
+  let best: { id: string; side: DropSide; nearness: number } | null = null;
+  for (const node of store.nodes) {
+    if (node.id === draggedId) continue;
+    const hit = dropHitOf(pointer, nodeRectOf(node));
+    if (!hit) continue;
+    // 两个命中区重叠时取更贴近中心的那一个（见 `dropHitOf` 的 `nearness`）。
+    if (!best || hit.nearness < best.nearness) {
+      best = { id: node.id, side: hit.side, nearness: hit.nearness };
+    }
+  }
+  return best;
+}
+
+/** 双向布局里目标在中心主题的哪一侧；其余三种朝向不读它（恒为 0）。 */
+function outwardFor(targetId: string): 1 | -1 | 0 {
+  if (store.direction !== 'both') return 0;
+  const root = store.nodes.find(node => node.data?.depth === 0);
+  const target = store.nodes.find(node => node.id === targetId);
+  if (!root || !target) return 0;
+  const rootRect = nodeRectOf(root);
+  const targetRect = nodeRectOf(target);
+  return outwardOf(
+    targetRect.x + targetRect.width / 2,
+    rootRect.x + rootRect.width / 2,
+  );
+}
+
+onNodeDragStart(() => {
+  dragHint.value = null;
+});
+
+onNodeDrag(({ node, event }) => {
+  const pointer = pointerOf(event);
+  const hit = findDropTarget(screenToFlowCoordinate(pointer), node.id);
+
+  if (!hit) {
+    // 拖到空白处：不画任何指示。**这不等于"移动失败"**——是一句"这里没有目标"，
+    // 松手时节点会归位，那正是它本来该在的地方。
+    dragHint.value = null;
+    return;
+  }
+
+  const zone = dropZoneOf(hit.side, {
+    direction: store.direction,
+    outward: outwardFor(hit.id),
+  });
+  const previous = dragHint.value;
+  if (previous && previous.targetId === hit.id && previous.zone === zone) {
+    // 目标与方向都没变：只挪那句跟随标签。**不重算预演**——`previewMove` 要构造
+    // 一棵新树、排一次版，每帧重算是白烧，而结果一个像素都不会变。
+    dragHint.value = { ...previous, pointer };
+    return;
+  }
+  dragHint.value = {
+    targetId: hit.id,
+    zone,
+    side: hit.side,
+    pointer,
+    preview: store.previewMove({ draggedId: node.id, targetId: hit.id, zone }),
+  };
+});
+
+/**
+ * 把被拖节点放回**布局给的位置**。
+ *
+ * 松手的两种结局都要走这里，理由不同：
+ *  - 落点合法：`content` 换了 → `store.nodes` 重算 → Vue Flow 收到新的 `:nodes`
+ *    就该归位。这里写一遍是**兜底**（props 同步与 Vue Flow 内部拖动状态的先后顺序
+ *    不由我们定），而且写的是同一个值，幂等。
+ *  - 落点非法：`content` 没动 → `:nodes` 不变 → Vue Flow 内部那个节点还停在手拖的
+ *    位置上。不写这一遍，用户会看到一个**飘在半空**、连线脱开的节点，而数据里什么
+ *    都没变——看起来就像拖动坏了。
+ */
+function settleDraggedNode(id: string): void {
+  const wanted = store.nodes.find(node => node.id === id);
+  const live = findNode(id);
+  if (!wanted || !live) return;
+  // 亚像素差不算"没归位"：缩放会让同一份坐标在两处带上浮点尾数。
+  if (Math.abs(live.position.x - wanted.position.x) < 0.5
+    && Math.abs(live.position.y - wanted.position.y) < 0.5) return;
+  updateNode(id, { position: { x: wanted.position.x, y: wanted.position.y } });
+}
+
+onNodeDragStop(({ node }) => {
+  const hint = dragHint.value;
+  dragHint.value = null;
+  dragEndedAt = performance.now();
+
+  if (!hint || !hint.preview.ok) {
+    settleDraggedNode(node.id);
+    return;
+  }
+
+  contentChangedByDrag = true;
+  const result = store.moveNodeTo({
+    draggedId: node.id,
+    targetId: hint.targetId,
+    zone: hint.zone,
+  });
+  // `store.nodes` 是 computed，要等下一个 tick 才把新坐标交给 Vue Flow。归位放在
+  // 那之后；此时它已经指向**新结构**给的位置，所以这一步就是"吸附"的最后一帧。
+  void nextTick(() => settleDraggedNode(node.id));
+  // 内容层拒掉了（环、深度）时 `content` 并没变，那个"跳过适配"的标记必须还回去，
+  // 否则下一次真正的内容变化会少适配一次视图。
+  if (!result.ok) contentChangedByDrag = false;
+});
+
+/**
+ * 指示层要的那几个坐标。
+ *
+ * 全部换算到**外层 shell 的坐标系**里。这里刻意不用 Vue Flow 的
+ * `flowToScreenCoordinate`：它的实现是 `(point + 容器偏移) * zoom + translate`，
+ * 把容器偏移也乘了一次 zoom——容器的 y 是 48（顶栏高度），zoom 是 1.2 时它给出的
+ * 位置比真实位置偏 9.7px "少一格"，而这个偏差随 zoom 变化（缩放一次，幽灵框就和
+ * 落点错开一点）。视口变换的定义是 `translate → scale`，所以正确的换算是
+ * `flow * zoom + viewport`，一行写完，没有任何需要猜的地方。
+ *
+ * 幽灵框的位置来自 `previewMove().rect`——那是 `layoutTidy` 在**假设的新树**上算
+ * 出来的真位置，所以它画在哪里，松手之后节点就落在哪里。
+ */
+const dragOverlay = computed(() => {
+  const hint = dragHint.value;
+  const origin = shell.value?.getBoundingClientRect();
+  if (!hint || !origin) return null;
+  const target = store.nodes.find(node => node.id === hint.targetId);
+  if (!target) return null;
+  const view = getViewport();
+
+  const toScreen = (point: { x: number; y: number }) => ({
+    left: `${point.x * view.zoom + view.x}px`,
+    top: `${point.y * view.zoom + view.y}px`,
+  });
+
+  const targetRect = nodeRectOf(target);
+  const ghost = hint.preview.rect;
+
+  return {
+    ok: hint.preview.ok,
+    target: {
+      ...toScreen({ x: targetRect.x, y: targetRect.y }),
+      width: `${targetRect.width * view.zoom}px`,
+      height: `${targetRect.height * view.zoom}px`,
+    },
+    ghost: ghost
+      ? {
+        ...toScreen({ x: ghost.x, y: ghost.y }),
+        width: `${ghost.width * view.zoom}px`,
+        height: `${ghost.height * view.zoom}px`,
+      }
+      : null,
+    label: {
+      left: `${hint.pointer.x - origin.x}px`,
+      top: `${hint.pointer.y - origin.y}px`,
+      // 光标靠右边缘时把标签翻到左边：那句话是这一层唯一能读的文字，被裁掉一半
+      // 就等于没有。用 `transform` 而不是两个 tailwind 类叠加——后者会共用同一个
+      // `--tw-translate-x` 变量，两句话只能活一句。
+      transform: hint.pointer.x - origin.x > origin.width - 220
+        ? 'translate(calc(-100% - 12px), -50%)'
+        : 'translate(12px, -50%)',
+    },
+    text: hint.preview.ok
+      ? dropPendingLabel(target.data?.label ?? '', hint.zone)
+      : hint.preview.reason ?? '这里放不下',
+  };
+});
+
 onBeforeUnmount(() => {
   clearTimeout(fitTimer);
   window.removeEventListener('keydown', onKeydown);
@@ -484,7 +745,7 @@ onBeforeUnmount(() => {
     <VueFlow
       :nodes="store.nodes"
       :edges="store.edges"
-      :nodes-draggable="false"
+      :nodes-draggable="true"
       :nodes-connectable="false"
       :elements-selectable="true"
       :pan-on-drag="true"
@@ -532,6 +793,46 @@ onBeforeUnmount(() => {
         <FishboneEdge v-bind="edgeProps" />
       </template>
     </VueFlow>
+
+    <!--
+      拖动落点指示。**这是"拖动改结构"能被看懂的唯一原因**，不是可选装饰：
+      松手之后节点落在布局给的位置（见 `dragHint` 那段的三条理由），没有这一层，
+      用户看到的就是"拖过去、弹回来"。它画的幽灵框位置取自 `store.previewMove`
+      ——与真正落地时同一个 `layoutTidy`、同一棵假设树，所以"画在哪儿就落在哪儿"。
+
+      三层信息，缺一层都会有一类错解：
+        · 目标节点的光圈   → "这次要动的是**这一条**关系"（画布上同时有上百个节点）
+        · 幽灵框           → "它会落在这里"。位置本身就是答案，用户不需要记住
+                            "左父右子"这条约定
+        · 跟随光标的一句话 → 用**关系**措辞（"成为 A 的子节点"）而不是方向措辞；
+                            非法时这里换成原因，于是"禁止"发生在松手之前，而不是
+                            松手之后弹一句"操作失败"
+    -->
+    <div
+      v-if="dragOverlay"
+      data-test="drag-overlay"
+      class="pointer-events-none absolute inset-0 z-30"
+    >
+      <div
+        data-test="drag-target"
+        class="absolute rounded-lg ring-4"
+        :class="dragOverlay.ok ? 'ring-sky-400/35' : 'ring-rose-400/35'"
+        :style="dragOverlay.target"
+      />
+      <div
+        v-if="dragOverlay.ghost"
+        data-test="drag-ghost"
+        class="absolute rounded-lg border-2 border-dashed"
+        :class="dragOverlay.ok ? 'border-sky-500 bg-sky-400/15' : 'border-rose-400 bg-rose-300/10'"
+        :style="dragOverlay.ghost"
+      />
+      <div
+        data-test="drag-label"
+        class="absolute whitespace-nowrap rounded px-2 py-1 text-[11px] font-medium text-white shadow"
+        :class="dragOverlay.ok ? 'bg-sky-600' : 'bg-rose-600'"
+        :style="dragOverlay.label"
+      >{{ dragOverlay.text }}</div>
+    </div>
 
     <!-- 空态用「画布上一个节点都没有」判断，而不是「content 为空」：生成中预览
          会长出节点，这时再压一条占位文字，正好盖住用户想看的生长过程。

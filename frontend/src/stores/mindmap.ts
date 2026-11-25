@@ -1959,6 +1959,21 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 只有 `content` 可编辑：预览也能画出来，但点不动、改不了。
     const editable = source.kind === 'content';
 
+    /**
+     * 这张图**能不能拖动改结构**。
+     *
+     * 三条判据，每条都对应一种"拖了会出事"的具体情形：
+     *
+     *  1. `editable`：生成中的预览树不在 `content` 里，拖它没有可以写回的地方；
+     *  2. **只认树型**：流程图与鱼骨图的画布树是**合成**出来的（虚拟根 + 每个容器
+     *     一个子，见 `shape.canvasTreeOf`），拖一个节点要改的是"它属于哪个阶段 /
+     *     哪根骨"这件事，语义与树完全不同。第一轮只做树，其余留给后面单独适配
+     *     —— 让它们也能拖、但拖出个说不清的结果，比不让拖更糟；
+     *  3. **根不拖**：`planDrop` 会拒（中心主题不能被挪走），而"让用户先把根拖到
+     *     半空、松手才被告知不行"是没必要的一次失败。
+     */
+    const treeDraggable = editable && diagramTypeOf(content.value) === 'tree';
+
     const parentOf = new Map<string, string | null>();
     for (const { node, parentId } of flatNodes.value) parentOf.set(node.id, parentId);
 
@@ -2072,7 +2087,11 @@ export const useMindMapStore = defineStore('mindmap', () => {
       return {
         id: node.id,
         type: 'mind',
-        draggable: false,
+        // 拖动**只改结构**，不改坐标：松手之后 `content` 换了，`layout` 重算，
+        // 这个节点的 `position` 就落到新结构给的位置上。手拖的那个位置从来不进
+        // `content`（`Node.pos` 至今没有渲染层的读者，这一轮也不给它加）。
+        // 三个 gate 的理由见上面 `treeDraggable` 那一段。
+        draggable: treeDraggable && inContent && depth > 0,
         connectable: false,
         // 预览不可选：选中一个只在"提案"里存在的 id，会让详情面板对着
         // 空内容说话，expand 请求也会把后端不认识的 id 发回去。

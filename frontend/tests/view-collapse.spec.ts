@@ -429,12 +429,38 @@ describe('store：画布上的读数', () => {
     expect(store.nodes.some(node => node.id === added)).toBe(true);
   });
 
-  it('拖不动节点（画布上 `nodes-draggable=false`），所以坐标只有布局一个来源', () => {
+  it('节点可以拖，但坐标仍然只有布局一个来源：拖动只改 content，不写手动坐标', () => {
     const store = load(tree136);
+    // 根不拖（中心主题不能被挪走），其余节点可拖。连线一律不可连。
     for (const node of store.nodes) {
-      expect(node.draggable).toBe(false);
       expect(node.connectable).toBe(false);
+      expect(node.draggable).toBe(node.data?.depth !== 0);
     }
+
+    // 这一条要逐节点比对坐标，所以先关掉视图收起：否则 `store.nodes` 只是被截断的
+    // 那一屏，与"整棵树的布局"本来就不是同一批节点，比出来的差异说明不了任何事。
+    store.visibleNodeLimit = NO_NODE_LIMIT;
+    const [branch] = tree136.root.children;
+    const other = tree136.root.children[1];
+    expect(store.moveNodeTo({ draggedId: branch.id, targetId: other.id, zone: 'child' }).ok).toBe(true);
+
+    // 坐标由布局**重算**：拖动之后的每一格都等于 `layoutDiagram(新树)`。
+    const geometry = layoutDiagram({ root: store.content!.root, direction: 'right' });
+    for (const node of store.nodes) {
+      const center = geometry.positions.get(node.id);
+      expect(center, node.id).toBeTruthy();
+      expect(node.position.x).toBeCloseTo(center!.x - NODE_SIZE.width / 2, 5);
+      expect(node.position.y).toBeCloseTo(center!.y - NODE_SIZE.height / 2, 5);
+    }
+
+    // 而且内容里**一个 `pos` 都没有**：手拖的那个位置从来没有被记下来。
+    const withPos: string[] = [];
+    const walk = (node: MindNode): void => {
+      if (node.pos !== undefined && node.pos !== null) withPos.push(node.id);
+      node.children.forEach(walk);
+    };
+    walk(store.content!.root);
+    expect(withPos).toEqual([]);
   });
 
   it('undo 只回退内容，不改展开状态', () => {
