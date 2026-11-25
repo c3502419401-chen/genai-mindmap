@@ -551,9 +551,10 @@ EXTERNAL_OFF_NOTE = "你在设置里关掉了联网检索"
 DETAIL_STAGE = "detail"
 
 # 「按章切」那条路的结构 `stage` 帧标识。它与 `DETAIL_STAGE` 是**两段不同的等待**：
-# 这条路把结构那一次调用换成了 N 次（实测 12 章 15–25 秒），而界面在这段时间里同样
-# 一个节点都不长（`node_grow` 只服务整树那一次的输出流）。文案由 `detail` 承载，
-# 这个标识只用于前端与日志区分"卡在哪一段"。
+# 这条路把结构那一次调用换成了 N 次（实测 12 章 15–25 秒）。这一段里现在**也有**
+# `node_grow`（每章的结构调用各自边收增量边报，见 `_slice_one`），所以这个标识
+# 不再表示"一个节点都不长"，只用于区分"卡在按章写结构"还是"卡在写说明"。
+# 文案由 `detail` 承载，这个标识只用于前端与日志。
 SECTION_SLICE_STAGE = "section_slice"
 
 # 一条引文的上限。与 `SourceRef.quote` 的 `max_length=300` 同源（那边是硬边界）：
@@ -2586,6 +2587,13 @@ class _GrowStream:
     buffer: str = ""
     reported: int = 0
     accepted: int = 0
+    # 这一路最多报几层（1 = 只报第一层）。None = 不设限。
+    #
+    # 存在的理由与 `quota` 同源：预览必须与最终树同形。按章切那条路（`_slice_one`）
+    # 用 `SECTION_SLICE_DEPTH` 砍层，而 `closed_items` 会把模型写出的**所有**层都
+    # 收进来——模型偶尔多给一层，那些节点在预览里长出来、在最终树里根本不存在。
+    # 深层生成那条路不传它（`None`），行为与加这个字段之前逐字相同。
+    max_level: int | None = None
 
     async def feed(self, delta: str) -> None:
         """收到一段模型输出，把刚写完整的子项报出去。
@@ -2602,6 +2610,7 @@ class _GrowStream:
 
     async def _report(
         self, parent: tuple[int, ...], index: int, item: StreamItem,
+        level: int = 1,
     ) -> None:
         """先报自己，再报模型额外给的下一层。
 
@@ -2614,11 +2623,13 @@ class _GrowStream:
         """
         if self.quota is not None and self.accepted >= self.quota:
             return
+        if self.max_level is not None and level > self.max_level:
+            return
         self.accepted += 1
         await _emit_grow(self.ctx, self.seen, parent, item.label, item.expandable)
         own = (*parent, index)
         for position, child in enumerate(item.children):
-            await self._report(own, position, child)
+            await self._report(own, position, child, level + 1)
 
 
 @dataclass
@@ -8227,6 +8238,8 @@ def _slice_refs(
 async def _slice_one(
     chapter: _Chapter, *, topic: str, budget: int, ctx: RunContext,
     text: str, report: dict[str, Any],
+    parent: tuple[int, ...] | None = None,
+    seen: set[tuple[tuple[int, ...] | None, str]] | None = None,
 ) -> list[dict[str, Any]]:
     """一章一次调用：发出去、解析、把引用落到本章坐标上。失败时返回空列表。
 
@@ -8238,6 +8251,13 @@ async def _slice_one(
     异常（httpx 超时、解析器意外的 TypeError）都会被 `gather` 原样抛出去，把另外
     N-1 次已经付过钱的产出一起丢掉。所以这里兜 `Exception` 并记下类型——与
     `_settle_halves` 在第三段做的同一件事（那里也只兜住非取消的那一半）。
+
+    **这一章的结构也走增量上报**（`on_delta` → `_GrowStream`）。这条路是整树生成
+    唯一不切片的旁路：`_generate` 的"一次写完"那支早在 `stream_kwargs` 里接过
+    通道，切章之后它根本不会被执行，于是通篇一个 `node_grow` 帧都没有——界面在
+    几十秒里一片空白，然后一次性落 73 个节点（实测 12 章 × 每支 6 个 + 根）。
+    `parent` 是**这一支在根下面的索引链**（`(章的位置,)`），由 `_slice_structure`
+    按 `aligned` 的顺序给出：那个顺序就是最终树里根的孩子顺序。
     """
     if not ctx.reserve_model_call():
         report["skipped"] += 1
@@ -8245,8 +8265,21 @@ async def _slice_one(
     ctx.extra_model_calls += 1
     ask = _slice_ask(topic, chapter, budget=budget, depth=SECTION_SLICE_DEPTH)
     system = SECTION_SLICE_PROMPT + SECTION_SLICE_REF_RULES
+    # 通道为 None 时连 `on_delta` 都不传：这条路在加生长事件之前的行为是逐字不变的
+    # （`_GrowStream` 根本不会被创建，与 `_generate` 那次判断同一条约定）。
+    stream_kwargs: dict[str, Any] = {}
+    if ctx.emit is not None and parent is not None:
+        # 预览的上限与 `_slice_nodes` 的裁剪**同一个数**：`budget - 1` 是这支最多
+        # 能写几个后代（`remaining = [budget - 1]`），`SECTION_SLICE_DEPTH` 是分支
+        # 下最多几层（`level > depth` 就停）。两把尺子不一致时，界面会看到节点
+        # "长出来又消失"——而消失的那些从来没有进过树。
+        stream = _GrowStream(
+            ctx, seen if seen is not None else set(), parent,
+            quota=max(0, budget - 1), max_level=SECTION_SLICE_DEPTH,
+        )
+        stream_kwargs["on_delta"] = stream.feed
     try:
-        raw = await _chat(ctx, system, ask, max_tokens=_max_tokens(ctx))
+        raw = await _chat(ctx, system, ask, max_tokens=_max_tokens(ctx), **stream_kwargs)
     except Exception as exc:  # noqa: BLE001 — 失败的原因要回给人看，见 docstring
         report["failed"].append({"chapter": chapter.index, "title": chapter.title,
                                  "reason": _reason_text(exc)})
@@ -8298,6 +8331,11 @@ async def _slice_structure(
 
     返回的形状（`{"title":…, "root":{…}}`）与"一次写完"那条路**完全一样**，所以
     它下面的收尾（校验 / 套色 / 裁剪 / 第三段 / 重复检测）一行都不用改。
+
+    开事件通道时，这一段自己负责"节点一个个长出来"：根与 N 条一级分支先报（顺序
+    就是 `aligned`），随后每章的结构调用边收增量边报孩子（见 `_slice_one`）。这条
+    路的存在恰恰是"整树生成没有流式输出"的成因——它绕开了 `_generate` 里那次带
+    `on_delta` 的结构调用，所以接在这两个地方，而不是在那次调用上。
     """
     aligned = _align_chapters(plan, chapters)
     if len(plan.flat) > len(chapters):
@@ -8340,12 +8378,30 @@ async def _slice_structure(
         f"正在按 {len(chapters)} 章分别写结构（每次只给它这一章的原文）…")
     limit = asyncio.Semaphore(SECTION_SLICE_CONCURRENCY)
 
-    async def run(chapter: _Chapter) -> list[dict[str, Any]]:
+    # ---- 预览的骨架：根与一级分支先立起来 --------------------------------------
+    #
+    # 必须在 `gather` **之前**、而且按 `aligned` 的顺序发：各章的孩子报出来的
+    # `path` 是"父节点的索引链"，父就是这里的一级分支；分支帧没到，那些孩子在前端
+    # 只能进暂存（`mindmap.ts` 的 `queuePreviewNode`），挂不上的永远不显示。
+    #
+    # 根帧 `path=None`、一级分支 `path=()`：两者不能用同一个值，否则前端分不清
+    # 中心主题与第一个分支（`_emit_grow` 的 docstring 记着同一条）。
+    #
+    # 通道为 None 时这一段整体不发生，工具行为与加预览之前逐字相同。
+    grow_seen: set[tuple[tuple[int, ...] | None, str]] = set()
+    if ctx.emit is not None:
+        await _emit_grow(ctx, grow_seen, None, topic, None)
+        for chapter, _ in aligned:
+            await _emit_grow(ctx, grow_seen, (), chapter.title, None)
+
+    async def run(position: int, chapter: _Chapter) -> list[dict[str, Any]]:
         async with limit:
             return await _slice_one(
-                chapter, topic=topic, budget=budget, ctx=ctx, text=text, report=report)
+                chapter, topic=topic, budget=budget, ctx=ctx, text=text, report=report,
+                parent=(position,), seen=grow_seen)
 
-    subtrees = await asyncio.gather(*(run(chapter) for chapter, _ in aligned))
+    subtrees = await asyncio.gather(
+        *(run(position, chapter) for position, (chapter, _) in enumerate(aligned)))
     report["seconds"] = round(time.perf_counter() - started, 3)
     report["calls"] = len(chapters) - report["skipped"]
     # 结束帧与开始帧配对（`_emit_stage` 的既有约定，第三段与外部检索都是这么做的）：
