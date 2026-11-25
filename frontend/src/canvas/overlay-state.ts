@@ -21,4 +21,11 @@ export const overlayState = reactive({
   detailId: null as string | null,
   /** 详情卡的尺寸：宽固定（`DETAIL_WIDTH`），高随正文。 */
   detailSize: { width: 288, height: 0 } as Size,
+  /**
+   * 就地意图输入框自己的尺寸（`canvas/NodeIntentBox.vue` 量出来之后填）。
+   *
+   * 它自己也要躲别人，所以它必须先知道自己多大；而它**不广播**自己在哪儿——
+   * 工具条与详情卡都不躲它（顺序见 `planOverlays`：意图框是最后摆的那个）。
+   */
+  intentSize: { width: 240, height: 0 } as Size,
 });

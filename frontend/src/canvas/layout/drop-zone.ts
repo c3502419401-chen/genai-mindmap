@@ -78,18 +78,39 @@ export interface DropHit {
  * 平局再按符号定左右，于是中心点恒为 `right`（= 子），与"把节点盖在目标身上 = 挂进去"
  * 这条直觉一致。
  */
+/**
+ * 指针相对一个矩形盒的**归一化偏移**。`dx` / `dy` 落在 `[-1, 1]` 之内就是"在命中区
+ * 里"（那就是命中区的定义），`nearness = max(|dx|, |dy|)`。
+ *
+ * 抽出来单独一个函数，是因为命中判定（`dropHitOf`）与"最近的节点"（`nearestHitOf`）
+ * 必须共用同一个度量：前者按椭圆截断，后者专门要用**椭圆之外**的那些点，两者只差最后
+ * 那一句 `return null`。写成两份的话，"拖到边缘判给谁"和"空白处双击算离谁近"会在某
+ * 一天给出互相矛盾的答案，而那种矛盾在界面上表现为"吸附位置与预览不一致"——最难查的
+ * 一类。
+ */
+function normalizedOf(
+  pointer: DropPointer,
+  rect: DropRect,
+  padX: number,
+  padY: number,
+): { dx: number; dy: number; nearness: number } | null {
+  const halfW = rect.width / 2 + padX;
+  const halfH = rect.height / 2 + padY;
+  if (halfW <= 0 || halfH <= 0) return null;
+  const dx = (pointer.x - (rect.x + rect.width / 2)) / halfW;
+  const dy = (pointer.y - (rect.y + rect.height / 2)) / halfH;
+  return { dx, dy, nearness: Math.max(Math.abs(dx), Math.abs(dy)) };
+}
+
 export function dropHitOf(
   pointer: DropPointer,
   rect: DropRect,
   padX: number = DROP_PAD_X,
   padY: number = DROP_PAD_Y,
 ): DropHit | null {
-  const halfW = rect.width / 2 + padX;
-  const halfH = rect.height / 2 + padY;
-  if (halfW <= 0 || halfH <= 0) return null;
-
-  const dx = (pointer.x - (rect.x + rect.width / 2)) / halfW;
-  const dy = (pointer.y - (rect.y + rect.height / 2)) / halfH;
+  const at = normalizedOf(pointer, rect, padX, padY);
+  if (!at) return null;
+  const { dx, dy, nearness } = at;
   // 归一化后落在单位正方形之外 = 不在命中区。注意这里判的是**归一化之后**，
   // 也就是说命中区是一个椭圆，而不是"矩形各边外扩"——那正是上面那段取舍的落点。
   if (Math.abs(dx) > 1 || Math.abs(dy) > 1) return null;
@@ -97,7 +118,7 @@ export function dropHitOf(
   const side: DropSide = Math.abs(dx) >= Math.abs(dy)
     ? (dx < 0 ? 'left' : 'right')
     : (dy < 0 ? 'top' : 'bottom');
-  return { side, nearness: Math.max(Math.abs(dx), Math.abs(dy)) };
+  return { side, nearness };
 }
 
 /** `dropHitOf` 只要方位的那一半。 */
@@ -170,4 +191,51 @@ export function dropZoneOf(side: DropSide, context: ZoneContext): DropZone {
 export function outwardOf(targetCenterX: number, rootCenterX: number, epsilon = 1): 1 | -1 | 0 {
   if (Math.abs(targetCenterX - rootCenterX) < epsilon) return 0;
   return targetCenterX > rootCenterX ? 1 : -1;
+}
+
+/** 一个候选盒子：`id` 只是给调用方回传，几何全在 `rect` 里。 */
+export interface NearCandidate {
+  id: string;
+  rect: DropRect;
+}
+
+export interface NearHit {
+  id: string;
+  /** 与 `DropHit.nearness` 同一把尺子：`0` 正中、`1` 正好在命中区边界上、`>1` 在区外。 */
+  nearness: number;
+}
+
+/**
+ * 空白处落点时**最近的**一个节点——"最近的"必须回答清楚，否则双击空白加节点这件事
+ * 在新节点出现之前是不可预测的。
+ *
+ * 三个候选口径，选第三个：
+ *
+ *  1. **欧氏距离**（到框的边或到中心）：盒子的宽高比是 180:48，同一份"绝对像素"
+ *     在水平方向与垂直方向上的含义差近四倍。欧氏距离于是几乎只听水平分量——竖直
+ *     方向排得再近也算"远"，而兄弟轴恰好是竖直的。实测后果是：右上角双击会挂到
+ *     右边很远的那个节点下面，而不是正上方那个。
+ *  2. **圆心距离**：同上，只差一个把盒子当圆的近似。
+ *  3. **命中区那套归一化度量**（这里）：先除以 `半宽 + PAD_X` / `半高 + PAD_Y`，
+ *     两轴在"几个盒子的尺度上"同权。于是"往上偏一个兄弟间距"与"往右偏一层间距"
+ *     可以比较，而这两个间距正是用户眼睛里真实的那两把尺子。
+ *
+ * 与 `dropHitOf` 只差一条：**不截断**。空白处的定义就是"椭圆之外"，那条 `> 1` 的
+ * 判据在这里必须去掉，否则"最近的节点"在空白处恒为 `null`。
+ */
+export function nearestHitOf(
+  pointer: DropPointer,
+  candidates: readonly NearCandidate[],
+  padX: number = DROP_PAD_X,
+  padY: number = DROP_PAD_Y,
+): NearHit | null {
+  let best: NearHit | null = null;
+  for (const candidate of candidates) {
+    const at = normalizedOf(pointer, candidate.rect, padX, padY);
+    if (!at) continue;
+    if (!best || at.nearness < best.nearness) {
+      best = { id: candidate.id, nearness: at.nearness };
+    }
+  }
+  return best;
 }

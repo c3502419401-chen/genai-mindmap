@@ -5,14 +5,21 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import { useMindMapStore, type MovePreview } from '../stores/mindmap';
 import { boxesOfNodes, chooseViewMode, visibleIds } from './clarity';
+import { INTENT_DELAY_MS, openIntentAllowed } from './intent-gesture';
 import {
   dropHitOf,
   dropZoneOf,
   outwardOf,
   type DropSide,
 } from './layout/drop-zone';
+import { insertIntentAt } from './layout/insert-zone';
 import { NODE_SIZE } from './layout/tidy';
-import { dropPendingLabel, type DropZone } from '../mindmap/drop-plan';
+import {
+  detachPendingLabel,
+  dropPendingLabel,
+  type DropZone,
+  type InsertIntent,
+} from '../mindmap/drop-plan';
 import {
   MAX_ZOOM,
   MIN_ZOOM,
@@ -26,6 +33,7 @@ import FishboneEdge from './FishboneEdge.vue';
 import MindEdge from './MindEdge.vue';
 import MindNode from './MindNode.vue';
 import MindRelation from './MindRelation.vue';
+import NodeIntentBox from './NodeIntentBox.vue';
 
 /**
  * 画布是**纯渲染**：节点坐标、连线句柄、鱼骨的骨线折线都由 store 算好
@@ -59,6 +67,46 @@ function focusCanvas(): void {
   shell.value?.focus({ preventScroll: true });
 }
 
+/**
+ * 拖动的方位换算用**这份布局自己报的朝向**，不是 `theme.direction`。
+ *
+ * 树型下两者恒等（`layoutTidy` 原样返回传进去的 `direction`），所以这一句对树一个
+ * 字节都没改。但流程图与鱼骨图的几何是定死的：`layoutFlow` 报 `down`（dagre TB）、
+ * `layoutFishbone` 报 `right`（主骨横贯）——它们的"上下左右"与用户给树选的那个朝向
+ * 毫无关系。拿 `store.direction` 翻译会得到整张反的表：在鱼骨上把原因拖到左边
+ * （画面上那是**更深**的方向，因为子永远在父左侧），会被判成"我当它的父"。
+ */
+const zoneDirection = computed(() => store.layout?.direction ?? store.direction);
+
+/**
+ * 单击节点之后**晚一点**再把就地输入框亮出来。
+ *
+ * 这个延迟不是手感调优，是手势仲裁：浏览器的一次双击会先发两次 `click` 再发
+ * `dblclick`。用户双击一个节点是要**改它的标题**（`MindNode` 的内联输入框），
+ * 而单击是要**说意图**。判据与理由都在 `intent-gesture.ts`（纯函数，四条竞态各有
+ * 一条用例）；这里只负责那一个定时器与"到点了再问一次"。
+ */
+let intentTimer: ReturnType<typeof setTimeout> | undefined;
+
+function cancelIntentSoon(): void {
+  if (intentTimer) clearTimeout(intentTimer);
+  intentTimer = undefined;
+}
+
+function openIntentSoon(id: string): void {
+  cancelIntentSoon();
+  intentTimer = setTimeout(() => {
+    intentTimer = undefined;
+    const allowed = openIntentAllowed(id, {
+      editingId: store.editingId,
+      selectedId: store.selectedId,
+      exists: store.nodes.some(node => node.id === id),
+      canEdit: store.canEditIntent,
+    });
+    if (allowed) store.openIntentFor(id);
+  }, INTENT_DELAY_MS);
+}
+
 // 预览节点也在同一份 nodes 里，但 store.select 只接受 content 中真实存在的 id：
 // 画布这边不必自己判断来源，点不中就是点不中。
 //
@@ -86,12 +134,68 @@ onNodeClick(({ node, event }) => {
   if (!additive) store.toggleFoldInView(node.id);
   // 点了节点就把焦点交给画布：接下来按 Tab / Enter 是要改图，不是去别处。
   focusCanvas();
+  // 圈选区（Ctrl / Cmd / Shift 点）时不弹意图框：那一下说的是"把它也加进来"，
+  // 而弹出的框会立刻把焦点和视线都抢到"改这一处"上去。
+  if (!additive) openIntentSoon(node.id);
 });
-onNodeDoubleClick(({ node }) => store.beginEdit(node.id));
+onNodeDoubleClick(({ node }) => {
+  // 双击是**改这一行的文字**（`MindNode` 的内联输入框），意图框让位。
+  // 浏览器双击会先发两次 click 再发 dblclick，所以这里必须把那次待开的框掐掉，
+  // 否则用户会看到"双击 → 先弹出一个框、再被编辑框顶掉"的一次闪。
+  cancelIntentSoon();
+  store.closeIntent();
+  store.beginEdit(node.id);
+});
 onPaneClick(() => {
+  cancelIntentSoon();
+  store.closeIntent();
   store.clearSelection();
   focusCanvas();
 });
+
+/**
+ * 双击**空白**：在那个位置加一个节点。
+ *
+ * 为什么这条手势值得做（用户点名要的三种长节点方式里的第二种）：键盘那条（Tab /
+ * Enter）只能沿着"当前选中的那个节点"长，而用户常常是先看到**这一片**还空着、
+ * 想在那儿放一个。位置是手势里唯一有信息量的东西，所以它必须参与落点的推导。
+ *
+ * 位置参与的方式只有一种合法解：**挂到哪个节点下面、排第几**。坐标的唯一来源仍然是
+ * 布局（`docs/NODE-DRAG.md` §一），所以"在那儿"读作"离那儿最近的那个节点下面"。
+ *
+ * 手势分工写在 DOM 上：`.vue-flow__node` 上的双击归 `onNodeDoubleClick`（改名），
+ * 这一层只认**不在节点里的**那些双击。判据不用坐标而用 DOM——用户看到的"节点"就是
+ * 那个元素，用外接框判会在缩放 / 判定节点（菱形更大）上错开。
+ */
+function insertIntentFor(pointer: { x: number; y: number }): InsertIntent | null {
+  // 合成根（鱼头 / 流程起点）不在 `content` 里，选中它、挂到它下面都是非法操作。
+  // `selectableNodes` 已经把它们摘掉了，交叉一下 `nodes`（那里才有坐标）。
+  const real = new Set(store.selectableNodes.map(entry => entry.node.id));
+  const boxes = store.nodes
+    .filter(node => real.has(node.id))
+    .map(node => ({ id: node.id, rect: nodeRectOf(node) }));
+  return insertIntentAt(pointer, boxes, {
+    direction: zoneDirection.value,
+    rootId: store.nodes.find(node => node.data?.depth === 0)?.id ?? null,
+  });
+}
+
+function onShellDoubleClick(event: MouseEvent): void {
+  const target = event.target as HTMLElement | null;
+  // 节点上的双击归节点自己（改名）。
+  if (target?.closest('.vue-flow__node')) return;
+  // 悬浮控件（视图档位、折叠开关）上的双击是用户连点了两下按钮。
+  if (isControl(target)) return;
+  // 空白处双击是**加一个节点**。它同样会让那次待开的意图框作废：双击的第二下
+  // 说明用户要的是"在这里放一个"，不是"改那一处"。
+  cancelIntentSoon();
+  store.closeIntent();
+  const intent = insertIntentFor(screenToFlowCoordinate({ x: event.clientX, y: event.clientY }));
+  if (!intent) return;
+  event.preventDefault();
+  store.addNodeAt(intent);
+  focusCanvas();
+}
 // 用户手动平移或缩放后停止自动适配，否则每长一个节点视图就会被拽回全图。
 onMoveEnd(() => {
   store.viewAdjusted = true;
@@ -505,9 +609,20 @@ watch(
  * 以及自己算 `flow * zoom + viewport` 而不是用 `flowToScreenCoordinate`。
  */
 interface DragHint {
+  /**
+   * 这一拖现在指向哪一种结果。
+   *
+   * `move` = 指针落在某个节点的命中区里（`content` 换掉一个父子关系）；
+   * `detach` = 指针**不在任何命中区里**，也就是"拖到空白处松手"（把节点从父节点下面
+   * 断开）。两者共用同一套预演与同一块指示层，但结论完全不同，所以种类要显式写出来
+   * ——从 `targetId` 是否为空反推会在"目标节点刚好在预览里缺席"那一刻判错。
+   */
+  kind: 'move' | 'detach';
+  /** `move` 时是落点目标；`detach` 时是**被拖的节点自己**。 */
   targetId: string;
-  zone: DropZone;
-  side: DropSide;
+  /** 只有 `move` 有。 */
+  zone?: DropZone;
+  side?: DropSide;
   preview: MovePreview;
   /** 光标位置（页面坐标）。跟随光标的那句标签用它，与落点无关。 */
   pointer: { x: number; y: number };
@@ -576,7 +691,9 @@ function findDropTarget(
 
 /** 双向布局里目标在中心主题的哪一侧；其余三种朝向不读它（恒为 0）。 */
 function outwardFor(targetId: string): 1 | -1 | 0 {
-  if (store.direction !== 'both') return 0;
+  // 与 `zoneDirection` 同一份朝向：`both` 只可能是树自己的朝向，鱼骨（`right`）
+  // 与流程（`down`）永远走不进这一支。
+  if (zoneDirection.value !== 'both') return 0;
   const root = store.nodes.find(node => node.data?.depth === 0);
   const target = store.nodes.find(node => node.id === targetId);
   if (!root || !target) return 0;
@@ -590,31 +707,58 @@ function outwardFor(targetId: string): 1 | -1 | 0 {
 
 onNodeDragStart(() => {
   dragHint.value = null;
+  // 拖着节点走的时候，那个输入框得让开：它贴在节点下方，而拖动会让节点从它底下
+  // 穿过去。更要紧的是它此刻没有意义——用户在做的是结构编辑，不是写一句话。
+  cancelIntentSoon();
+  store.closeIntent();
 });
 
+/**
+ * 指针底下是哪个节点、落在它的哪一侧（或一个都没有 = 空白处）。
+ *
+ * 三档结论，都要在**松手之前**就变成一句看得懂的话，所以这里连"没命中"也是正结果：
+ *
+ *  - 命中区里 → `move`：把这次拖动翻译成父子 / 兄弟关系；
+ *  - 一个都没命中 → `detach`：断开。这是第二轮加的，"拖到空白处"以前是一个什么都不
+ *    发生的死手势（`docs/NODE-DRAG.md` §七 把它划在了这一轮）；
+ *  - `detach` 自己也可能是非法（它已经是一级分支），那时 `preview.ok=false`，指示层
+ *    画红框 + 一句原因，**松手也不改内容**——与 `move` 的非法处理是同一条路。
+ */
 onNodeDrag(({ node, event }) => {
   const pointer = pointerOf(event);
-  const hit = findDropTarget(screenToFlowCoordinate(pointer), node.id);
+  const flow = screenToFlowCoordinate(pointer);
+  const hit = findDropTarget(flow, node.id);
 
   if (!hit) {
-    // 拖到空白处：不画任何指示。**这不等于"移动失败"**——是一句"这里没有目标"，
-    // 松手时节点会归位，那正是它本来该在的地方。
-    dragHint.value = null;
+    const previous = dragHint.value;
+    // 上一次已经是"同一个节点在断开"：只挪那句跟随标签。`previewDetach` 要排一次版，
+    // 每帧重算是白烧（与下面 `move` 那档同一个理由）。
+    if (previous && previous.kind === 'detach' && previous.targetId === node.id) {
+      dragHint.value = { ...previous, pointer };
+      return;
+    }
+    dragHint.value = {
+      kind: 'detach',
+      targetId: node.id,
+      pointer,
+      preview: store.previewDetach(node.id),
+    };
     return;
   }
 
   const zone = dropZoneOf(hit.side, {
-    direction: store.direction,
+    direction: zoneDirection.value,
     outward: outwardFor(hit.id),
   });
   const previous = dragHint.value;
-  if (previous && previous.targetId === hit.id && previous.zone === zone) {
+  if (previous && previous.kind === 'move' && previous.targetId === hit.id && previous.zone === zone) {
     // 目标与方向都没变：只挪那句跟随标签。**不重算预演**——`previewMove` 要构造
     // 一棵新树、排一次版，每帧重算是白烧，而结果一个像素都不会变。
     dragHint.value = { ...previous, pointer };
     return;
   }
   dragHint.value = {
+    kind: 'move',
     targetId: hit.id,
     zone,
     side: hit.side,
@@ -654,11 +798,23 @@ onNodeDragStop(({ node }) => {
     return;
   }
 
+  if (hint.kind === 'detach') {
+    // **不设 `contentChangedByDrag`**，这是与 `move` 唯一一处刻意的不对称。
+    //
+    // 普通拖动的落点紧挨着用户看得见的目标，所以松手之后不重新适配也不会跑出视野。
+    // 断开的落点是**根的最后一位**——它可能在画布另一头，离原位一整屏。那时不重新
+    // 适配，用户看到的就是"拖到空白处，节点不见了"。
+    const result = store.detachNode(node.id);
+    void nextTick(() => settleDraggedNode(node.id));
+    if (!result.ok) return;
+    return;
+  }
+
   contentChangedByDrag = true;
   const result = store.moveNodeTo({
     draggedId: node.id,
     targetId: hint.targetId,
-    zone: hint.zone,
+    zone: hint.zone!,
   });
   // `store.nodes` 是 computed，要等下一个 tick 才把新坐标交给 Vue Flow。归位放在
   // 那之后；此时它已经指向**新结构**给的位置，所以这一步就是"吸附"的最后一帧。
@@ -690,8 +846,22 @@ const dragOverlay = computed(() => {
   if (!hint) return null;
   const origin = shell.value?.getBoundingClientRect();
   if (!origin) return null;
-  const target = store.nodes.find(node => node.id === hint.targetId);
-  if (!target) return null;
+
+  /**
+   * 光圈画在**那条会被动的关系的另一端**上。
+   *
+   *  - `move`：目标节点——"这次要挂到它身上"；
+   *  - `detach`：**原来的父节点**——"要断的是它俩之间那条边"。空白处没有任何视觉
+   *    锚点说明会断哪条边，这一圈就是这个功能的可读性本身：没有它，"拖到空白处"
+   *    与"拖了一下没对准"在松手之前长得一模一样，而两者的结果一个是改结构、一个是
+   *    什么都不发生。
+   *
+   * 父节点可能已经被视图收起（它不在 `store.nodes` 里）——那时不画光圈，只留幽灵框
+   * 与那句话；这是"看不见的关系就不去指它"，而不是画错位置。
+   */
+  const ringId = hint.kind === 'detach' ? hint.preview.detachedFrom : hint.targetId;
+  const ring = ringId ? store.nodes.find(node => node.id === ringId) : undefined;
+
   /**
    * **必须读响应式的 `viewport`，不能读 `getViewport()`。**
    *
@@ -710,16 +880,23 @@ const dragOverlay = computed(() => {
     top: `${point.y * view.zoom + view.y}px`,
   });
 
-  const targetRect = nodeRectOf(target);
+  const ringRect = ring ? nodeRectOf(ring) : null;
   const ghost = hint.preview.rect;
+
+  const labelOf = (id: string | undefined): string => {
+    if (!id) return '节点';
+    return store.nodes.find(node => node.id === id)?.data?.label ?? '节点';
+  };
 
   return {
     ok: hint.preview.ok,
-    target: {
-      ...toScreen({ x: targetRect.x, y: targetRect.y }),
-      width: `${targetRect.width * view.zoom}px`,
-      height: `${targetRect.height * view.zoom}px`,
-    },
+    target: ringRect
+      ? {
+        ...toScreen({ x: ringRect.x, y: ringRect.y }),
+        width: `${ringRect.width * view.zoom}px`,
+        height: `${ringRect.height * view.zoom}px`,
+      }
+      : null,
     ghost: ghost
       ? {
         ...toScreen({ x: ghost.x, y: ghost.y }),
@@ -738,13 +915,16 @@ const dragOverlay = computed(() => {
         : 'translate(12px, -50%)',
     },
     text: hint.preview.ok
-      ? dropPendingLabel(target.data?.label ?? '', hint.zone)
+      ? (hint.kind === 'detach'
+        ? detachPendingLabel(labelOf(hint.targetId), labelOf(hint.preview.detachedFrom))
+        : dropPendingLabel(labelOf(hint.targetId), hint.zone!))
       : hint.preview.reason ?? '这里放不下',
   };
 });
 
 onBeforeUnmount(() => {
   clearTimeout(fitTimer);
+  cancelIntentSoon();
   window.removeEventListener('keydown', onKeydown);
 });
 </script>
@@ -754,12 +934,18 @@ onBeforeUnmount(() => {
     画布要能拿到焦点：`tabindex="0"` 让它进 Tab 序列，也让"点了画布 → 键盘改图"
     这条链成立。焦点环只在键盘走到这里时出现（`focus-visible`），鼠标点画布不长出
     一圈框。
+
+    `id` 只服务一件事：就地输入框关掉之后把焦点还给画布（`NodeIntentBox.vue` 的
+    `close()`）。用户刚在框里打完字、按 Esc 退出，接下来按 Tab 应该是加子节点，
+    而不是落在 body 上。
   -->
   <div
+    id="mind-canvas-shell"
     ref="shell"
     tabindex="0"
-    aria-label="导图画布（选中节点后 Tab 加子节点、Enter 加兄弟节点、Delete 删除、F2 改名）"
+    aria-label="导图画布（选中节点后 Tab 加子节点、Enter 加兄弟节点、Delete 删除、F2 改名；双击空白处加节点）"
     class="relative h-full w-full outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-sky-300"
+    @dblclick="onShellDoubleClick"
   >
     <VueFlow
       :nodes="store.nodes"
@@ -769,6 +955,7 @@ onBeforeUnmount(() => {
       :elements-selectable="true"
       :pan-on-drag="true"
       :zoom-on-scroll="true"
+      :zoom-on-double-click="false"
       :min-zoom="MIN_ZOOM"
       :max-zoom="MAX_ZOOM"
       :fit-view-on-init="false"
@@ -833,6 +1020,7 @@ onBeforeUnmount(() => {
       class="pointer-events-none absolute inset-0 z-30"
     >
       <div
+        v-if="dragOverlay.target"
         data-test="drag-target"
         class="absolute rounded-lg ring-4"
         :class="dragOverlay.ok ? 'ring-sky-400/35' : 'ring-rose-400/35'"
@@ -852,6 +1040,15 @@ onBeforeUnmount(() => {
         :style="dragOverlay.label"
       >{{ dragOverlay.text }}</div>
     </div>
+
+    <!--
+      就地输入框：点节点 → 它出现在节点正下方 → 写一句话按回车 → 模型改这一处。
+      它自己 `Teleport` 到 `body`（不跟着画布缩放，理由见组件头），所以放在模板的
+      哪一层都不影响渲染位置；留在这里是因为**它的生命周期归画布**——点节点/点空白/
+      双击/开始拖动都由本组件的四个回调关掉它，放到 `App.vue` 反而要把这套开关再抄
+      一遍。
+    -->
+    <NodeIntentBox />
 
     <!-- 空态用「画布上一个节点都没有」判断，而不是「content 为空」：生成中预览
          会长出节点，这时再压一条占位文字，正好盖住用户想看的生长过程。

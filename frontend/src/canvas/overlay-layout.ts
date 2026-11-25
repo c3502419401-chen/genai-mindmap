@@ -44,6 +44,14 @@ export const OVERLAY_GAP = 8;
 /** 详情卡的固定宽度：`w-72` 是 288px，与 `MindNode` 的类名同一份口径。 */
 export const DETAIL_WIDTH = 288;
 
+/**
+ * 就地意图输入框的固定宽度（`w-60` = 240px）。
+ *
+ * 比详情卡窄一档：框里只有一行话，宽到能摆下 16 个汉字加一个发送箭头即可。再宽就
+ * 开始挡画布了——它出现的位置**紧贴节点**，而节点旁边的空白正是读图的地方。
+ */
+export const INTENT_WIDTH = 240;
+
 export interface OverlayItem {
   /** 浮层贴着的那个节点（视口坐标）。 */
   anchor: Rect;
@@ -55,6 +63,15 @@ export interface PlanInput {
   area: Rect;
   toolbar: OverlayItem | null;
   detail: OverlayItem | null;
+  /**
+   * 就地意图输入框（`canvas/NodeIntentBox.vue`）。
+   *
+   * 它是**第三个**浮层，而且摆位顺序排在最后——前面两个比它先占位，它躲开它们。
+   * 顺序不是随意的：详情卡是被动的正文块（诉求只有"贴着节点"），工具条是可交互控件
+   * （宁可挪远也不要盖住字），而意图框是**用户刚点出来要用的东西**——它可以被挪到
+   * 稍远一点的候选位置，但它必须完整可见（它要接键盘）。
+   */
+  intent?: OverlayItem | null;
   margin?: number;
   gap?: number;
 }
@@ -62,12 +79,21 @@ export interface PlanInput {
 export interface Plan {
   toolbar: Spot | null;
   detail: Spot | null;
+  intent: Spot | null;
 }
 
 /** 详情卡的候选顺序：先上方（不挡节点、视线连续），放不下再依次让位。 */
 const DETAIL_ORDER: Placement[] = ['above', 'below', 'right', 'left'];
 /** 工具条的候选顺序：侧面优先，其次下方，最后才是上方。 */
 const TOOLBAR_ORDER: Placement[] = ['right', 'left', 'below', 'above'];
+/**
+ * 意图框的候选顺序：**下方优先**。
+ *
+ * "点节点就地出输入框"里那个"就地"只有一种直觉位置——节点正下方，像一行接着写的
+ * 批注。侧面（工具条的偏好）与上方（详情卡的偏好）都已经被别人占着，而且这两处
+ * 在视觉上属于"这个节点旁边还有别的控件"，与"我要在这里写一句话"不是同一件事。
+ */
+const INTENT_ORDER: Placement[] = ['below', 'right', 'left', 'above'];
 
 export function rectOf(spot: Spot, size: Size): Rect {
   return {
@@ -173,8 +199,15 @@ export function planOverlays(input: PlanInput): Plan {
   const toolbar = input.toolbar
     ? place(input.toolbar, input.area, TOOLBAR_ORDER, margin, gap, taken)
     : null;
+  if (toolbar && input.toolbar) taken.push(rectOf(toolbar, input.toolbar.size));
+  // 意图框最后摆：它躲开已经占位的两样，但也只有它知道"我新来的"。反过来让工具条
+  // 躲它是不可能的——工具条由 `App.vue` 挂在一个**它看不见彼此**的组件里，而
+  // `overlayState` 那份共享状态只回答"谁在、多大"，不回答"谁先来"。
+  const intent = input.intent
+    ? place(input.intent, input.area, INTENT_ORDER, margin, gap, taken)
+    : null;
 
-  return { toolbar, detail };
+  return { toolbar, detail, intent };
 }
 
 // ---------------------------------------------------------------- 读 DOM

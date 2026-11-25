@@ -6,13 +6,22 @@ import { ApiError, createMindMap, getMindMap, getRun, listMindMaps, listRuns, ma
 import type { AgentEvent, AgentRunRequest, DiagramContent, DiagramTypeChoice, EdgeKind, MapRecord, MindEdge, MindMapContent, MindNode, MindRelation, NodeColor, OpBatch, RunSummary, Source, SourceRef } from '../api/types';
 import { directionOf, withDirection } from '../mindmap/direction';
 import {
+  detachMessage,
   dropMessage,
+  insertMessage,
+  planDetach,
   planDrop,
+  planInsert,
+  type DetachRejectionCode,
   type DropIntent,
+  type DropPlanOk,
   type DropRejectionCode,
+  type InsertIntent,
+  type InsertRejectionCode,
 } from '../mindmap/drop-plan';
 import { diffEdits, EDIT_EVENT_LIMIT, generateEvent, type EditActor, type EditEvent } from '../mindmap/edit-log';
 import { CONNECTION_LOST, guideForFailure, INVALID_SOURCES, NO_CONTENT, type FailureGuide } from '../mindmap/failures';
+import { moveScopeProblem } from '../mindmap/move-scope';
 import { applyOps } from '../mindmap/ops';
 import { buildRefIndex } from '../mindmap/refs';
 import { diagnosticCount, diagnosticsHint } from '../mindmap/run-status';
@@ -27,10 +36,10 @@ import {
   edgeEndpointLabel,
   findIn,
   findParentIn,
-  iterNodesIn,
   isContainerRoot,
   isFlow,
   isTree,
+  iterNodesIn,
   kindOf,
   nodeShapeOf,
   pathToIn,
@@ -38,6 +47,7 @@ import {
   rootsOf,
   stageInnerEdgesOf,
   stageOfNode,
+  withRoots,
   type NodeRole,
   type NodeShape,
 } from '../mindmap/shape';
@@ -57,6 +67,7 @@ import {
 } from '../canvas/view-collapse';
 import {
   addChild,
+  addChildAt,
   addEdge as addEdgeToContent,
   addSibling,
   charLength,
@@ -87,13 +98,33 @@ export const TRUNCATE_CHARS = 24;
  */
 export interface MovePreview {
   ok: boolean;
-  /** 拒绝原因分类。`not-tree` 是这张图型本轮还不支持拖动改结构。 */
-  code?: DropRejectionCode | 'not-tree';
+  /**
+   * 拒绝原因分类。`not-tree` 是"这条图型上这个动作整类不做"。
+   *
+   * 三种拒绝各有一套 code（移动 / 断开 / 新增）：它们不进同一个判据表，但**读它的人
+   * 是同一个**——`dragOverlay` 与 `status` 只关心"是哪一类原因"，文案本身在各自的
+   * `plan*` 里。合成一套联合编码会让 `planDrop` 的六种与 `planDetach` 的四种共享一张
+   * 命名空间，而它们之间没有任何一种可以互换。
+   *
+   * `'cross-container'` 是第二轮**新加**的那一档，含义与前两类都不同：手势本身合法、
+   * 结构上也能算出来，但它跨过了"这一步属于哪个阶段 / 这条原因属于哪根骨"这条线
+   * （判据与三条理由在 `mindmap/move-scope.ts`）。它属于移动那一套，所以不进
+   * `DropRejectionCode`——那个类型是 `planDrop` 的输出，而 `planDrop` 看不到容器。
+   */
+  code?: DropRejectionCode | DetachRejectionCode | InsertRejectionCode | 'not-tree' | 'cross-container';
   /** 直接给用户看的那句话（非法时画布把它画在光标旁）。 */
   reason?: string;
   /** 落点父节点 id（"它会挂到谁下面"）。 */
   parentId?: string;
   index?: number;
+  /**
+   * 这一次是**断开**：被断掉的那个父节点 id。
+   *
+   * 单独一个字段而不是复用 `parentId`：断开之后 `parentId` 是根（新位置），而"要断的是
+   * 哪条边"说的是**旧树**里的那个父。预览层要拿它画目标光圈——空白处没有任何视觉锚点
+   * 告诉用户会断掉哪条边，那一圈就是这个功能的可读性本身（`docs/NODE-EDIT.md` §一）。
+   */
+  detachedFrom?: string;
   /** 落点左上角 + 尺寸，画布据此画那个虚线幽灵框。 */
   rect?: { x: number; y: number; width: number; height: number };
 }
@@ -1008,6 +1039,27 @@ export const useMindMapStore = defineStore('mindmap', () => {
 
   /** 正在内联编辑的节点 id；null 表示没有编辑框打开。 */
   const editingId = ref<string | null>(null);
+
+  /**
+   * **就地输入框**正对着哪个节点（`canvas/NodeIntentBox.vue`）。
+   *
+   * 与 `editingId` 是两件事，这正是这一轮的核心区分：
+   *
+   * | | `editingId` | `intentTargetId` |
+   * | --- | --- | --- |
+   * | 改的是 | 这一行的**文字**（`label`） | 这张图的**结构 / 内容**（走模型） |
+   * | 谁执行 | 本地 `commitLabel`，一次内容改动 | `runGeneration(intent='edit')` |
+   * | 手势 | 双击 / F2 | **单击节点** |
+   *
+   * 两者**互斥**：同一个节点上不能既开着一个改标题的输入框、又开着一个说意图的
+   * 输入框（两个框都吃回车，用户按一下两处都提交是最坏的）。互斥的落点只有一处
+   * ——`openIntentFor()` 会先 `endEdit()`，而 `beginEdit()` 会先 `closeIntent()`
+   * （见那两个函数）。
+   *
+   * 它是**视图状态**：不进 `content`、不进撤销栈、不置脏。关掉一个输入框凭什么算
+   * 一次内容修改。
+   */
+  const intentTargetId = ref<string | null>(null);
 
   /**
    * 标题输入框里还没提交的文字。
@@ -1987,14 +2039,20 @@ export const useMindMapStore = defineStore('mindmap', () => {
      * 三条判据，每条都对应一种"拖了会出事"的具体情形：
      *
      *  1. `editable`：生成中的预览树不在 `content` 里，拖它没有可以写回的地方；
-     *  2. **只认树型**：流程图与鱼骨图的画布树是**合成**出来的（虚拟根 + 每个容器
-     *     一个子，见 `shape.canvasTreeOf`），拖一个节点要改的是"它属于哪个阶段 /
-     *     哪根骨"这件事，语义与树完全不同。第一轮只做树，其余留给后面单独适配
-     *     —— 让它们也能拖、但拖出个说不清的结果，比不让拖更糟；
+     *  2. **容器根不拖**：树的中心主题、鱼骨的一根骨、流程的一个阶段入口。它由
+     *     `content` 的形状决定（`rootsOf`），不能靠 `depth > 0` 判——合成根让鱼骨与
+     *     流程的容器根落在 `depth === 1` 上，那条判据对它们是**放行**的，而拖走一根骨
+     *     的根就是"换掉一个类别"，`planDrop` 会在合成树上把它变成"挂到虚拟根下面"。
+     *     （第二轮之后流程图 / 鱼骨图**也可以拖**了，所以这里是这道 gate 的新责任：
+     *     上一轮"只认树型"那条判据把这两种情形一起挡在外面，现在它必须以"容器根"
+     *     的身份自己站住。跨容器的落点另由 `moveScopeProblem` 拦，见 `previewMove`。）
      *  3. **根不拖**：`planDrop` 会拒（中心主题不能被挪走），而"让用户先把根拖到
-     *     半空、松手才被告知不行"是没必要的一次失败。
+     *     半空、松手才被告知不行"是没必要的一次失败。树的根 `depth === 0`，与第 2 条
+     *     重合；留着 `depth > 0` 是为了不依赖 `rootsOf` 也能挡住最外那一层。
      */
-    const treeDraggable = editable && diagramTypeOf(content.value) === 'tree';
+    const containerRoots = new Set<string>();
+    if (content.value) for (const root of rootsOf(content.value)) containerRoots.add(root.id);
+    const movable = editable;
 
     const parentOf = new Map<string, string | null>();
     for (const { node, parentId } of flatNodes.value) parentOf.set(node.id, parentId);
@@ -2112,8 +2170,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
         // 拖动**只改结构**，不改坐标：松手之后 `content` 换了，`layout` 重算，
         // 这个节点的 `position` 就落到新结构给的位置上。手拖的那个位置从来不进
         // `content`（`Node.pos` 至今没有渲染层的读者，这一轮也不给它加）。
-        // 三个 gate 的理由见上面 `treeDraggable` 那一段。
-        draggable: treeDraggable && inContent && depth > 0,
+        // 三个 gate 的理由见上面 `movable` / `containerRoots` 那一段。
+        draggable: movable && inContent && depth > 0 && !containerRoots.has(node.id),
         connectable: false,
         // 预览不可选：选中一个只在"提案"里存在的 id，会让详情面板对着
         // 空内容说话，expand 请求也会把后端不认识的 id 发回去。
@@ -2682,6 +2740,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
 
   function beginEdit(id: string) {
     if (!content.value || !findIn(content.value, id)) return;
+    // 改标题与说意图**互斥**（两个框都吃回车）。双击 / F2 走这条，于是就地框让位。
+    closeIntent();
     setPrimary(id);
     // 与 `select` 同一条：编辑框长在一个看不见的节点上是纯粹的 bug。
     revealInView(id);
@@ -2690,6 +2750,85 @@ export const useMindMapStore = defineStore('mindmap', () => {
 
   function endEdit() {
     editingId.value = null;
+  }
+
+  /**
+   * 就地输入框**能开吗**：只有树型、只有不在跑的时候。
+   *
+   * 两条判据各有具体后果：
+   *
+   *  - **只有树型**：`runGeneration` 的 `edit` 意图要把 `snapshot` 发给后端，而后端
+   *    只收树形状（`AgentRunRequest.snapshot` 上 `extra="forbid"` 会把 `bones` /
+   *    `stages` 拒成 422）。鱼骨与流程图在这个位置上弹出的输入框，按回车只会收到
+   *    一句"还不能让模型改"——那比不弹更糟。
+   *  - **不在跑**：`runGeneration` 一进来就被 `busy` 挡住，输入框开着但提交无效，
+   *    用户会以为"我打完字按了回车，什么都没发生"。
+   */
+  const canEditIntent = computed<boolean>(() => (
+    !!content.value && isTree(content.value) && !busy.value && !agentRunning.value
+  ));
+
+  /**
+   * 就地输入框对着的那个节点（找不到时为 `null`：它刚被删掉了）。
+   *
+   * 走 `findIn(content)` 而不是缓一份节点对象：内容一改（改标题、拖结构、撤销），
+   * 输入框上那行"关于「甲」"必须跟着变，否则它会对着一个已经改名的节点说话。
+   */
+  const intentNode = computed<MindNode | null>(() => (
+    content.value && intentTargetId.value ? findIn(content.value, intentTargetId.value) : null
+  ));
+
+  /**
+   * 打开就地输入框。
+   *
+   * **调它的地方只有一处**：`MindMapCanvas` 的单击节点（`onNodeClick`）。代码里改
+   * 选中（引用列表跳转、加节点、删完跳父节点）**不**弹这个框——那些动作说的是
+   * "我要看这个"，不是"我要改这个"。这一条是"点节点出输入框"与"选中即出输入框"
+   * 的分界，也是它不跟单击之外任何手势抢的原因。
+   */
+  function openIntentFor(id: string): void {
+    if (!canEditIntent.value) return;
+    if (!content.value || !findIn(content.value, id)) return;
+    // 与 `beginEdit` 对称的那一半：同一时刻只允许一个输入框。
+    editingId.value = null;
+    setPrimary(id);
+    intentTargetId.value = id;
+  }
+
+  function closeIntent(): void {
+    intentTargetId.value = null;
+  }
+
+  /**
+   * 就地输入框提交的这句话 → 一次 `edit` 运行。
+   *
+   * **选区显式给这一个节点**（`options.selection`），不读 `selectedIds`：就地框的
+   * 语义就是"改我看见的这一处"，而此刻画布上可能还圈着别的节点（用户按住 Ctrl
+   * 圈过一片之后又点了这一支）。读实时选区会把那一串记在提示词里，模型就会去动
+   * 用户没在看的地方。
+   *
+   * 它**不是**第二个发送管线：`runGeneration` 是唯一入口，撤销栈、`clientRevision`、
+   * 改动账本、冲突裁决、告警全部共用同一条。`ChatDock` 那条路只是入口不同（它带
+   * 材料面板、图型、深度思考这些"整张图"级别的开关），落地路径是同一条。
+   */
+  async function runEditOn(nodeId: string, goal: string): Promise<void> {
+    const text = goal.trim();
+    if (!text || !content.value) return;
+    if (!findIn(content.value, nodeId)) {
+      status.value = '这个节点已经不在了。';
+      return;
+    }
+    // 材料那一侧的闸门在这里再判一次：`ChatDock` 的 `canSubmit` 是它自己的入口判据，
+    // 绕过它（这条新入口）时正在解析 / 解析失败的材料会被请求体静默漏掉，而用户看到
+    // 的是"改了，但新材料没算进去"。
+    const problem = sourcesStore.materialProblem;
+    if (problem) {
+      status.value = problem;
+      return;
+    }
+    await runGeneration(text, 'edit', sourcesStore.readySources, 'default', 'auto', {
+      selection: [nodeId],
+    });
   }
 
   function commitLabel(id: string, label: string) {
@@ -2920,6 +3059,43 @@ export const useMindMapStore = defineStore('mindmap', () => {
   }
 
   /**
+   * **拖动落到画布树上的结果**：结构判完、写回成新内容、并在新内容上算一次布局。
+   *
+   * 抽成一处是因为三个读者必须得到**同一份**答案：预演（幽灵框）、真正落地、
+   * 以及用例。三处各算一次的话，幽灵框与落点会差一个常量（第一轮实测 40px），
+   * 看起来像"差一点没对准"。
+   *
+   * ## 为什么从 `current.root` 换成 `canvasTreeOf(current).root`
+   *
+   * 树型下这两个是**同一个对象**（`canvasTreeOf` 对树原样返回），所以这一句对树的
+   * 行为一个字节都没变。鱼骨与流程的画布树是合成的（虚拟根 + 每个容器一个一级子），
+   * 在合成树上跑 `planDrop` 得到的正是"这一步在这一阶段里换个位次"这种结构改动；
+   * 跨容器的那一类已经在 `moveScopeProblem` 里被拒了，走不到这里。
+   *
+   * 写回也必须成对：合成树的新版本里，虚拟根的 `children` **逐个就是各容器的根**，
+   * 所以 `withRoots` 原样按顺序写回。容器个数不变（容器内的移动不会增删容器），
+   * `withRoots` 的长度校验因此恒过——它挡的是"某次改动偷偷换了容器个数"。
+   */
+  function planCanvasMove(
+    current: DiagramContent,
+    intent: DropIntent,
+  ): { ok: true; next: DiagramContent; plan: DropPlanOk } | { ok: false; preview: MovePreview } {
+    const scope = moveScopeProblem(current, intent.draggedId, intent.targetId);
+    if (scope) {
+      return { ok: false, preview: { ok: false, code: 'cross-container', reason: scope } };
+    }
+
+    const canvas = canvasTreeOf(current);
+    const plan = planDrop(canvas.root, intent);
+    if (!plan.ok) return { ok: false, preview: { ok: false, code: plan.code, reason: plan.reason } };
+
+    const next = isTree(current)
+      ? { ...current, root: plan.root }
+      : withRoots(current, plan.root.children);
+    return { ok: true, next, plan };
+  }
+
+  /**
    * 拖动过程中的**预演**：这一落会改出什么，以及它落在哪个像素上。
    *
    * 为什么要有它——这是这一轮最核心的一个决定。布局是**自动算的**（`layoutDiagram`
@@ -2928,38 +3104,50 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 代价是"拖过去、弹回来"的观感。
    *
    * 消掉这个代价的办法不是留住手动坐标，而是**在松手之前就把结果画出来**：
-   * 这里算出的 `rect` 就是松手之后的真实位置（同一个 `layoutTidy`、同一棵假设树），
+   * 这里算出的 `rect` 就是松手之后的真实位置（同一个布局分派、同一棵假设树），
    * 于是"弹回"变成"吸附"——用户看见幽灵框在哪里，节点就落到哪里。
    *
    * 它同时是非法情形的第二道出口：`ok=false` 时画布不画幽灵框、改画一句原因，
    * 于是**禁止发生在松手之前**，而不是松手之后弹一句"操作失败"。
+   *
+   * 落点尺寸取**布局自己报的**外接框（`sizes`）：判定节点的菱形是 220×110，
+   * 按 `NODE_SIZE` 画幽灵框，拖到判定节点旁边时会小一圈——而"幽灵框比落点小"
+   * 正是这一层要避免的那件事。树与鱼骨没有 `sizes`，退回 `NODE_SIZE`，与上一轮
+   * 逐像素相同。
    */
   function previewMove(intent: DropIntent): MovePreview {
     const current = content.value;
-    if (!current || !isTree(current)) {
-      return { ok: false, code: 'not-tree', reason: '这张图还不能拖动改结构（本轮只做了树型）' };
-    }
-    const plan = planDrop(current.root, intent);
-    if (!plan.ok) return { ok: false, code: plan.code, reason: plan.reason };
+    if (!current) return { ok: false, code: 'missing', reason: '画布上还没有导图' };
 
-    // 落点用**与真正落地时同一个**布局函数、同一棵**画布树**算：`canvasTreeOfContent`
+    const planned = planCanvasMove(current, intent);
+    if (!planned.ok) return planned.preview;
+
+    // 落点用**与真正落地时同一个**布局分派、同一棵**画布树**算：`canvasTreeOfContent`
     // 里带着视图层收起，所以"用户点开过某一支"之后预演也不会跑偏。
     //
-    // 两处各算一次的话，幽灵框与松手后的位置会差一个常量（实测 40px）——那种偏差
-    // 看起来像"差一点没对准"，用户会反复微调，也等于这一层视觉白做了。
-    const canvasRoot = canvasTreeOfContent({ ...current, root: plan.root }).root;
-    const geometry = layoutTidy(canvasRoot, { direction: direction.value });
+    // 上一轮这里直接调 `layoutTidy`。换成 `layoutDiagram` 之后树型仍然逐像素等于
+    // 它（那条分派对树原样透传 `direction`），而流程图与鱼骨图第一次有了正确的
+    // 落点几何——用 tidy 去排一张鱼骨，幽灵框会落在主骨上方几十像素的空气里。
+    const next = planned.next;
+    const canvasRoot = canvasTreeOfContent(next).root;
+    const geometry = layoutDiagram({
+      root: canvasRoot,
+      edges: canvasStageEdgesOf(next),
+      diagramType: diagramTypeOf(next),
+      direction: direction.value,
+    });
     const center = geometry.positions.get(intent.draggedId);
     if (!center) return { ok: false, code: 'missing', reason: '算不出落点' };
+    const size = geometry.sizes?.get(intent.draggedId) ?? NODE_SIZE;
 
     return {
       ok: true,
-      parentId: plan.parentId,
-      index: plan.index,
+      parentId: planned.plan.parentId,
+      index: planned.plan.index,
       rect: {
-        x: center.x - NODE_SIZE.width / 2,
-        y: center.y - NODE_SIZE.height / 2,
-        ...NODE_SIZE,
+        x: center.x - size.width / 2,
+        y: center.y - size.height / 2,
+        ...size,
       },
     };
   }
@@ -2973,21 +3161,19 @@ export const useMindMapStore = defineStore('mindmap', () => {
    *
    * 非法情形不写 `content`，但**也不静默**：`status` 说清为什么。用户拖了一下
    * 什么都没发生，与拖了一下弹出一句原因，是两种体验；而这条路径上"什么都没发生"
-   * 的成因有六种。
+   * 的成因现在有八种（六种结构 + 跨容器 + 容器根）。
    */
   function moveNodeTo(intent: DropIntent): MovePreview {
     const current = content.value;
-    if (!current || !isTree(current)) {
-      return { ok: false, code: 'not-tree', reason: '这张图还不能拖动改结构（本轮只做了树型）' };
+    if (!current) return { ok: false, code: 'missing', reason: '画布上还没有导图' };
+
+    const planned = planCanvasMove(current, intent);
+    if (!planned.ok) {
+      status.value = planned.preview.reason ?? '这次没能移动';
+      return planned.preview;
     }
 
-    const plan = planDrop(current.root, intent);
-    if (!plan.ok) {
-      status.value = plan.reason;
-      return { ok: false, code: plan.code, reason: plan.reason };
-    }
-
-    if (!applyContent({ ...current, root: plan.root }, true)) {
+    if (!applyContent(planned.next, true)) {
       return { ok: false, code: 'missing', reason: '这次没能改动内容' };
     }
 
@@ -2995,7 +3181,128 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 不补这一句，用户会看到"拖完之后节点不见了"。
     revealInView(intent.draggedId);
     setPrimary(intent.draggedId);
-    status.value = dropMessage(current.root, intent, plan);
+    // 文案在**画布树**上算（`dropMessage` 要读节点标题与位次）：树型下就是 content
+    // 那棵树，鱼骨/流程下合成树的一级子就是各容器根，标题一致。
+    status.value = dropMessage(canvasTreeOf(current).root, intent, planned.plan);
+    return { ok: true, parentId: planned.plan.parentId, index: planned.plan.index };
+  }
+
+  /**
+   * 拖到**空白处**松手：把节点从它父节点下面断开，挂成一级分支。
+   *
+   * 三档候选（拒绝 / 断开挂根 / 游离节点）选了中间那一档，理由是 `content` 是一棵树
+   * ——树里没有"无父节点"，除了根。所以"它不再属于原来那一支"在这个数据结构里唯一的
+   * 落点就是根的孩子列表。完整论证在 `docs/NODE-EDIT.md` §一。
+   *
+   * 与 `moveNodeTo` 的两处不同，都是刻意的：
+   *
+   *  - **不设"拖动引起的改动"标记**（`contentChangedByDrag` 由画布控制）。普通拖动的
+   *    落点紧挨着用户看得见的目标，所以松手后不重新适配也不会跑出视野；断开的落点在
+   *    **根的最后一位**，可能离原位一整屏——那时不重新适配，用户看到的是"拖到空白处，
+   *    节点不见了"。所以这一档必须让视图跟着走。
+   *  - 仍然 `revealInView`：新位置是根的孩子，但它自己的子孙还在原来的折叠档里。
+   */
+  function previewDetach(nodeId: string): MovePreview {
+    const current = content.value;
+    if (!current || !isTree(current)) {
+      return { ok: false, code: 'not-tree', reason: '这张图还不能断开关系（本轮只做了树型）' };
+    }
+    const plan = planDetach(current.root, nodeId);
+    if (!plan.ok) return { ok: false, code: plan.code, reason: plan.reason };
+
+    // 与 `previewMove` 逐条同一个理由：落点用**真正落地时同一个**布局函数、同一棵画布树。
+    const canvasRoot = canvasTreeOfContent({ ...current, root: plan.root }).root;
+    const geometry = layoutTidy(canvasRoot, { direction: direction.value });
+    const center = geometry.positions.get(nodeId);
+    if (!center) return { ok: false, code: 'missing', reason: '算不出落点' };
+
+    return {
+      ok: true,
+      parentId: plan.root.id,
+      index: plan.index,
+      detachedFrom: plan.formerParentId,
+      rect: {
+        x: center.x - NODE_SIZE.width / 2,
+        y: center.y - NODE_SIZE.height / 2,
+        ...NODE_SIZE,
+      },
+    };
+  }
+
+  function detachNode(nodeId: string): MovePreview {
+    const current = content.value;
+    if (!current || !isTree(current)) {
+      return { ok: false, code: 'not-tree', reason: '这张图还不能断开关系（本轮只做了树型）' };
+    }
+    const plan = planDetach(current.root, nodeId);
+    if (!plan.ok) {
+      status.value = plan.reason;
+      return { ok: false, code: plan.code, reason: plan.reason };
+    }
+    if (!applyContent({ ...current, root: plan.root }, true)) {
+      return { ok: false, code: 'missing', reason: '这次没能改动内容' };
+    }
+
+    revealInView(nodeId);
+    setPrimary(nodeId);
+    status.value = detachMessage(current.root, nodeId, plan.formerParentId, plan);
+    return {
+      ok: true,
+      parentId: plan.root.id,
+      index: plan.index,
+      detachedFrom: plan.formerParentId,
+    };
+  }
+
+  /**
+   * **双击空白**：在那个位置挂一个新节点。
+   *
+   * 几何（离谁近、落在哪一侧）由画布算好交进来——store 不读指针、不读矩形，与
+   * `previewMove` 分工相同。这里只做"落法 + 容量 + 写回 + 视图"。
+   *
+   * 三处与 `addChildTo` 不同的地方：
+   *
+   *  1. **位置不是末尾**：`planInsert` 按落点给了 `index`，用 `addChildAt`；
+   *  2. **可能降级**（"新节点当父"→ 兄弟、"根下加兄弟"→ 子），那半句解释拼在
+   *     `status` 最前面，所以用户不会看到一句与他点的方向无关的话；
+   *  3. 新节点 `label` 是 `'新节点'` 而不是空串：契约 `Node.label` 非空（`validateDraft`
+   *     也拦），空串会在保存时 422。编辑框打开时 `MindNode` 会 `select()` 全选，
+   *     于是"按下去直接打字"就是覆盖它，不需要用户先删三个字。
+   */
+  function addNodeAt(intent: InsertIntent): MovePreview {
+    const current = content.value;
+    if (!current) {
+      return { ok: false, code: 'missing', reason: '画布上还没有导图' };
+    }
+    if (countNodesIn(current) >= LIMITS.nodes) {
+      status.value = `导图最多 ${LIMITS.nodes} 个节点`;
+      return { ok: false, code: 'full', reason: `导图最多 ${LIMITS.nodes} 个节点` };
+    }
+    // 三种形状都走同一条：`planInsert` 吃的是**那棵容器子树**，所以鱼骨的一根骨、
+    // 流程的一个阶段与树的一个节点在这里没有分别（与 `addChildTo` 同一个入口）。
+    const container = containerOfNode(current, intent.targetId);
+    if (!container) {
+      return { ok: false, code: 'missing', reason: '落点附近没有可挂的节点' };
+    }
+
+    const plan = planInsert(container.root, intent);
+    if (!plan.ok) {
+      status.value = plan.reason;
+      return { ok: false, code: plan.code, reason: plan.reason };
+    }
+
+    const { root, node } = addChildAt(container.root, plan.parentId, plan.index);
+    const patched = replaceContainer(current, intent.targetId, () => root);
+    if (!applyContent(patched, true)) {
+      return { ok: false, code: 'missing', reason: '这次没能改动内容' };
+    }
+
+    setPrimary(node.id);
+    // 新节点必须看得见：它可能长在被收起的那一层上（视图是数量口径，不是层数口径）。
+    revealInView(node.id);
+    editingId.value = node.id;
+    const target = findIn(patched, intent.targetId);
+    status.value = insertMessage(target?.label ?? '', plan);
     return { ok: true, parentId: plan.parentId, index: plan.index };
   }
 
@@ -3403,6 +3710,13 @@ export const useMindMapStore = defineStore('mindmap', () => {
   function setPrimary(id: string | null) {
     extraSelectedIds.value = [];
     selectedId.value = id;
+    // 就地输入框跟着主选区走：换选中（点别的节点、从引用列表跳转、删完跳父节点、
+    // 换图）之后，那个框还对着上一个节点说话就是纯粹的错位——里面写着"把这个改成
+    // 那样"，按回车却改到另一处。
+    //
+    // `openIntentFor()` 靠**顺序**避让：它先 `setPrimary(id)` 再回填 `intentTargetId`，
+    // 所以"选中变了"与"框要开在这一个上"不矛盾。
+    intentTargetId.value = null;
   }
 
   /**
@@ -3658,9 +3972,22 @@ export const useMindMapStore = defineStore('mindmap', () => {
   /**
    * 换朝向。朝向写在 content 里，所以这是一次可撤销的内容修改：
    * 换了方向之后按 Ctrl+Z 能退回原布局，和改文字是同一套语义。
+   *
+   * **只有树型有朝向。** 鱼骨的骨是几何定死的（主骨横贯、六根骨按类别固定上下交替），
+   * 流程图的分层永远是上下（dagre TB）——两者都忽略这个字段（`layout/fishbone.ts`
+   * 报 `right`、`layout/flow.ts` 报 `down`，与用户选什么无关）。所以在这里挡下它们：
+   * 不挡的话，用户点「向左」，`withDirection` 会把 `theme.direction` 真的改成 `left`、
+   * `applyContent` 记一步撤销并置脏，而**画布一个像素都不动**——一次"点了没反应，
+   * 但内容被改了"的静默写入。那比按钮不可用更糟：它会让"未保存"标记和撤销栈里出现
+   * 用户没有做过的改动。
    */
   function setDirection(next: Direction) {
     if (!content.value) return;
+    if (!isTree(content.value)) {
+      status.value = `${containerNoun(kindOf(content.value))}的排布是固定的：`
+        + '鱼骨的主骨横贯、流程的阶段自上而下，换朝向只对思维导图有效。';
+      return;
+    }
     if (direction.value === next) return;
     if (!applyContent(withDirection(content.value, next), true)) return;
     // 换方向后整体重排，视图必须重新适配，否则可能停在空白处。
@@ -4629,6 +4956,20 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // "真正落下的位置"在结构上是同一份推导。
     previewMove,
     moveNodeTo,
+    // 就地输入框：点节点出框、写一句话、交给模型改（`canvas/NodeIntentBox.vue` 的
+    // 全部输入）。`canEditIntent` 是"这一处能不能开框"的唯一判据。
+    intentTargetId,
+    intentNode,
+    canEditIntent,
+    openIntentFor,
+    closeIntent,
+    runEditOn,
+    // 断关系（拖到空白处松手）：`previewDetach` 与 `detachNode` 与上面两条是同一对
+    // 分工，共用的是 `planDetach`。
+    previewDetach,
+    detachNode,
+    // 双击空白加节点：几何在画布，落法与写回在这里，共用 `planInsert`。
+    addNodeAt,
     undo,
     redo,
     loadMap,
