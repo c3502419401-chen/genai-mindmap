@@ -66,6 +66,27 @@ function marksOf(store: ReturnType<typeof useMindMapStore>) {
 
 const wrappers: VueWrapper[] = [];
 
+/**
+ * 下面三组用例的每一条都要在**真画布上装 136 节点那棵树**，显式上限就一个数。
+ *
+ * 为什么它就该慢（插桩量出来的，不是推断，见 `docs/TEST-COST-136-NODE.md`）：
+ *
+ *   - 布局只占 0.02%：`layoutTidy(136)` 单次 0.51ms、`viewTree(136)` 0.80ms，一条用例
+ *     全程只调 1–2 次（preview 一次、点「全部展开」再一次）；
+ *   - 成本全在渲染：jsdom 里挂一个 `MindNode` 是 38ms，40 个节点 ≈ 0.3 秒，136 个
+ *     3.4–5.1 秒（≈33ms/节点，线性）。而「136 个节点全摊开时角标说了什么」正是这一组
+ *     要证明的东西，降到 20 个节点就等于把它删了。
+ *
+ * 实测三档负载（同一份代码）：单跑（空闲）88–320ms、全量并行（空闲）384–1873ms、
+ * 机器上同时跑着 dev server 与另一份 vitest 时 344–5725ms。默认 5000ms 在重负载下
+ * 必然过线（加压时"全展开时一枚都没有"实测 5725ms）。
+ *
+ * 20 秒 = 本地加压最坏 5.7 秒的 3.5×、按 CI 慢 1.3–2× 估（7–11 秒）的 1.8–2.9×；
+ * 不给 30 秒，那会让真卡死的用例也判绿。若 CI 比本机加压再慢一倍还会红，那时的正确
+ * 答案是把 136 个节点的渲染成本本身降下来，不是再把超时往上加。
+ */
+const CANVAS_136_TIMEOUT = 20_000;
+
 function mountCanvas(): VueWrapper {
   const pinia = createPinia();
   setActivePinia(pinia);
@@ -95,7 +116,7 @@ afterEach(() => {
   document.body.innerHTML = '';
 });
 
-describe('一级分支的概括角标：数字与文案', () => {
+describe('一级分支的概括角标：数字与文案', { timeout: CANVAS_136_TIMEOUT }, () => {
   it('收起态：136 节点那棵树上有 6 枚，数字等于"整支没画出来的节点数"', async () => {
     const wrapper = mountCanvas();
     const store = useMindMapStore();
@@ -148,7 +169,7 @@ describe('一级分支的概括角标：数字与文案', () => {
   });
 });
 
-describe('点一枚：整支冒出来', () => {
+describe('点一枚：整支冒出来', { timeout: CANVAS_136_TIMEOUT }, () => {
   it('点角标 → 那一支全部出现、角标消失、别的支一个不多', async () => {
     const wrapper = mountCanvas();
     const store = useMindMapStore();
@@ -189,7 +210,7 @@ describe('点一枚：整支冒出来', () => {
   });
 });
 
-describe('没有概括就不画', () => {
+describe('没有概括就不画', { timeout: CANVAS_136_TIMEOUT }, () => {
   it('旧图（内容里没有 branch_digests）：一枚都不出现', async () => {
     const wrapper = mountCanvas();
     const store = useMindMapStore();
