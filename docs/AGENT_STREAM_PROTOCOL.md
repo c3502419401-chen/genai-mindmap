@@ -5,9 +5,30 @@
 `parse_partial` 补括号解析，再用 `collect_new_nodes` 挑出没推过的节点。现在它只服务于 agent 的
 `node_grow` 预览。
 
-agent 路径（`POST /api/agent/runs/stream`）已经接上这一层：深层生成（`mindmap_generate_deep`）在工具内部
-边收模型分片边解析，把已经写完整的节点报成 `node_grow` 帧；整树只在 `snapshot` / `done` 帧里给出。
-没有这一层时，深层生成要发十几次调用，用户看到的是十几秒空屏然后整棵树同时出现。
+agent 路径（`POST /api/agent/runs/stream`）上**两条生成路都接上了这一层**，工具内部
+边收模型分片边解析，把已经写完整的节点报成 `node_grow` 帧；整树只在 `snapshot` /
+`done` 帧里给出。没有这一层时，两条路都要发十几次调用，用户看到的是几十秒空屏
+然后整棵树同时出现。
+
+两条路的接法不同，因为响应形状不同：
+
+- **深层生成**（`mindmap_generate_deep`）：`ask_model` 给每次展开调用带 `on_delta`。
+  响应是 `{"children":[{"label":…}]}`，**没有 id**，父子关系由"这一路在展开哪个
+  slot"决定 → `agent/stream_items.closed_items` + `_GrowStream`。
+- **整树生成**（`mindmap_generate`）：
+  - 结构那一次调用就带 `on_delta`。响应是一棵自带 `id` 的整树（`{"root":{…}}`）
+    → `generation/stream_partial.parse_partial` + `collect_new_nodes`，工具层再把
+    id 换成预览协议的父索引链（`_GenerateGrowStream`）。
+  - **按章切（`MINDMAP_SECTION_SLICE=1`）时结构那一次换成"每章一次"**
+    （`_slice_structure` → `_slice_one`），响应变成 `{"children":[…]}`，于是那 N 次
+    调用各自用 `_GrowStream`（与展开响应同形）；根与 N 条一级分支由
+    `_slice_structure` 在并发**之前**先报，孩子的 `path` 才挂得上。
+
+  ⚠ 第二条以前是断的：`_generate` 里 `if slice_chapters: … else: …` 互斥，而
+  `on_delta` 只接在 `else` 那支上——切了章，那次调用根本不发生，于是整棵树要等 N 次
+  调用全部 `gather` 完、在 `_slice_structure` 末尾组装好才一次性落画布（实测 37,973
+  字的 PDF：0 帧，73 个节点在几十秒后同时出现 = `12 × 6 + 1`，正好是
+  `_slice_budget` 的公式）。2026-11-25 修掉。
 
 本文定义 agent 侧的节点生长事件，粒度对齐普通生成：**节点写完就上屏**。
 

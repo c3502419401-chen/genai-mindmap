@@ -216,4 +216,26 @@ full#2   引用 80 条｜引文均长 59.5 字｜实测 31.8%   天花板 34%
   打开时第三段的证据会换（见 `docs/DETAIL-RETRIEVAL.md`），但那是**另一个开关**，默认关；
 - **图渲染没动**：这条路产出的仍是一棵 `MindMapContent`，出口照旧 `_shape_output`；
 - **限额没动**：`INITIAL_MAX_NODES = 80` / `INITIAL_MAX_DEPTH = 3` 仍是全树的上限，
-  平分只是把 80 分给 N 支。
+  平分只是把 80 分给 N 支；
+- **节点生长预览接在这条路上**：`_slice_structure` 在并发之前先报根与 N 条一级分支，
+  每章的 `_slice_one` 各自带 `on_delta` 边收增量边报孩子。预览的两把尺子与
+  `_slice_nodes` **同一套**（`quota = budget - 1`、`max_level = SECTION_SLICE_DEPTH`），
+  所以帧里的节点数与落树之后的 `node_count` 相等——实测 37,973 字的 PDF：73 帧、
+  落树 73 个节点；首帧 1.09s、最大空档 2.77s、末帧 10.91s（改之前这条路上
+  **一帧都没有**，整棵树在 10.9s 之后一次性落画布）。用例见
+  `tests/test_section_slice.py` 第 5 节（`test_growth_frames_*`）。
+
+## 八、这条路曾经没有流式输出
+
+`_generate` 把 `on_delta` 接在"结构那一次调用"上，而按章切与它是 `if slice_chapters:
+… else: …` 的**互斥**关系——切了章，那次调用根本不会执行。于是整棵树要等 N 次调用
+全部 `gather` 完、在 `_slice_structure` 末尾组装好，才一次性落画布。
+
+复现那次的形态：37,973 字的 PDF（`MINDMAP_SECTION_SLICE=1`）→ `0` 个 `node_grow`
+帧，几十秒空白之后 73 个节点同时出现，而 73 = `_slice_budget(6)` 的
+`6 × 12 + 1`。节点数本身就是"走的哪条路"的指纹。
+
+修法不是"把流接回结构那一次"（那条路上没有它），而是接在这条路自己的两个入口：
+根与分支在 `_slice_structure`、孩子在各章的 `_slice_one`。响应形状也不同——这里是
+`{"children":[…]}`（无 id），所以用 `stream_items.closed_items` 与 `_GrowStream`，
+而不是整树那条的 `parse_partial` + `collect_new_nodes`。
