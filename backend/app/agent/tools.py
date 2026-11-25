@@ -6323,6 +6323,306 @@ async def _intake(topic: str, ctx: RunContext) -> _Intake:
     return out
 
 
+# ---------------------------------------------------------------- 输入：一段话 → 意图 + 主题
+#
+# **这一步解决的是"输入的字面"与"它要表达的东西"分不开**，与本模块另外两条同一族：
+# `INVENTORY_RULES` 的「材料的份数不是分支数」、`NO_BRANCH_CAP_RULE` 的「不要为了
+# 整齐把不同的事合成一支」。用户输入的是**一段话**，而提示词里 `主题：{topic}` 那一行
+# 要的是一个**中心词**——这两者之间的翻译从来没有人做过。
+#
+# 实测（`scripts/measure_input_extract.py`，五条真实长输入、走完整 agent 链路，所以记的
+# 是**模型填出来的** `args.topic`）：外层 agent 确实会压缩（33 字 → 23 字），但它压掉的
+# 是不该压的东西——
+#
+#   ①「我想了解怎么在制造业团队里推行AI工具，公司300人，担心员工抵触」
+#      → topic "制造业300人团队推行AI工具：路径与抵触化解"（23 字，带冒号从句）
+#      → 11 条一级分支、123 个节点（可读性参考值是 80）
+#   ③「下周要给老板讲清楚为什么我们的检索效果差，要有数据支撑，别太技术」
+#      → topic "为什么我们的检索效果差：给老板的数据化说明"（21 字）
+#      → 5 条一级分支是「现状 / 根因 / 指标 / 对比 / 改进」——一个通用分析框架，
+#        而"给老板讲清楚"这件事在树上一处都没有体现，"别太技术"被删掉了
+#
+# 所以缺的不是"再压一次长度"，是**把压缩过程中丢掉的三样东西捞出来**：他要拿这张图做
+# 什么（intent）、他真正问的是哪几件事（questions）、他给了什么限定（constraints）。
+#
+# ## 谁消费它（"意图必须真的影响什么"）
+#
+#   - `topic` 换掉 `主题：` 那一行**与** `_intake` 的检索 query（同一份文本，两处都有用）；
+#   - `intent` / `questions` / `constraints` 拼成 user 里的**一小段**（`_intent_block`），
+#     进骨架与结构这两次调用。
+#
+# **`args.branches` 一个字都不动**：整树这条路上它不进提示词（`NO_BRANCH_CAP_RULE` 与
+# `docs/BRANCH-CAP.md` 那件事），所以"questions 有几条 → 建议几条一级分支"这件事没有
+# 落点；而且实测那条路的方向是反的——真正的问题不是分支太少（②三件事 → 6 支），是
+# ①一条诉求 → 11 支 123 个节点。给一个下界解决不了上界那边的问题。
+#
+# ## 为什么默认关
+#
+# 它多**一次模型调用**（`INPUT_EXTRACT_MAX_TOKENS` 的输出很小，但输入是用户原话）。
+# 这几天所有改变提示词形状的能力都是这个默认值（`MINDMAP_SECTION_SLICE` /
+# `MINDMAP_GRAPH_OUTLINE` / `MINDMAP_LIBRARY_IN_GENERATE`），关着时这一整段只有一次
+# 字符串长度判断，`data` 的键集与改动之前逐字节相同。
+INPUT_EXTRACT_ENV = "MINDMAP_INPUT_EXTRACT"
+
+# 「这段话已经不是一个主题」的阈值。守的不是"用户写了多少字"，而是"进提示词的那个
+# 字符串有多像一个主题"：五条基线里两个真主题是 9 / 11 字，三条"一段话"是 19 / 21 / 23
+# 字，20 落在两簇中间（两臂各留 1 字余量）。
+INPUT_EXTRACT_MIN_CHARS = 20
+
+# 提取出来的主题上限。真主题的实测上界是 23 字（①那条），24 是那一位的余量；超了按这个
+# 数截断而不是判失败——它是画布上的一个标题，不是正文。
+INPUT_EXTRACT_MAX_TOPIC_CHARS = 24
+
+# 这一次提取的输出上限。四个字段合计 200 字上下，400 是余量。刻意**不**跟
+# `_max_tokens(ctx)` 走：那是写整棵树的额度，给这一步 8192 它就开始解释自己。
+INPUT_EXTRACT_MAX_TOKENS = 400
+
+# 「短但碎」的两个形状判据。④那条（`"AI学习 怎么学 路线"`，11 字）是纯长度判据必然
+# 漏掉的反例：它短，但一个"怎么"加一个冒号已经说明它不是名词短语。
+#
+# 括号也算子句标记，来历是一次实测漏网：③那条原话（32 字）被外层 agent 压成了
+# 「检索效果差的原因分析（面向老板汇报）」（**18 字**，两次运行分别落在 18 / 21 字
+# 两侧）。纯长度判据在这一次上会放行——而"面向老板汇报"正是最该被捞出来的那件事
+# （它决定口径与深浅）。括号里的东西天然是"用途/口径的注释"，不是主题的一部分。
+_CLAUSE_MARK = re.compile(r"[，,；;：:、？?！!（）()]")
+_ASKED_MARK = re.compile(
+    r"帮我|帮忙|帮我我们|我想|我想要|我们想|希望|需要|麻烦|请|汇报|讲解|"
+    r"怎么|如何|为什么|为何|哪些|是否|能不能|要不要|该不该|值不值得|有没有")
+
+
+def input_extract_enabled() -> bool:
+    """输入提取开关（`MINDMAP_INPUT_EXTRACT`，默认**关**）。
+
+    真值写法与 `graph_skeleton_enabled` / `section_slice_enabled` 一致（正列举真值、
+    缺省取空串即关）——这四个开关要能用同一行 shell 一起切，口径就必须一样。
+    """
+    return os.getenv(INPUT_EXTRACT_ENV, "").strip().lower() in GRAPH_SKELETON_TRUTHY
+
+
+# 「提取没做成」的四种来路 → 给用户的一句话。`short` / `empty` / `off` 刻意**不在**
+# 这张表里：那三个是设计（短主题不为它多付一次调用），不是失败。
+_INPUT_EXTRACT_FAILURE: dict[str, str] = {
+    "budget": "模型调用额度不够，那一次调用没发出去",
+    "failed": "那一次调用失败了（模型侧报错）",
+    "unshaped": "模型没有返回一个 JSON 对象",
+    "no_topic": "模型返回的主题是空的",
+}
+
+
+@dataclass(frozen=True)
+class _InputShape:
+    """一次「读输入」的结果。**唯一进提示词的字段是 `topic`**，其余三个进
+    `_intent_block`（user 里的一小段），另外全部进 `data["input"]`。
+
+    `source` 两态：`raw` = 原样用（开关关着 / 太短 / 额度不够 / 提取失败），
+    `model` = 提取到了。它与 `skip` 不重复：`source="raw"` 时 `skip` 说明**为什么**，
+    而"提取了但只拿到 topic"这种情况是 `source="model"` + 另外三个字段为空。
+    """
+
+    topic: str
+    original: str
+    intent: str = ""
+    questions: tuple[str, ...] = ()
+    constraints: tuple[str, ...] = ()
+    source: str = "raw"
+    seconds: float = 0.0
+    skip: str = ""
+    # 这一次调用的输入 token 估算（`estimate_input_tokens`，与 `chat_async` 的物理边界
+    # 同一个函数）。它是**这一步的代价**，必须能与"省下来的东西"摆在一起看：一次提取
+    # 约 0.4k token 输入，而它替换掉的是一棵按整句话长的树。
+    prompt_tokens: int = 0
+
+
+# 提取那一次的 system。四条判据各对应一种实测会跑偏的写法：
+#
+#   1) topic 写成"这句话的缩写"（①那条的 23 字就是），于是根节点还是从句；
+#   2) intent 写成一段解释——它要的是从固定几类里挑一个，因为下游拿它决定口气；
+#   3) questions 合成一条（②那条三个问题，模型很爱写成"RAG 召回与选型与成本"）；
+#   4) constraints 收进情绪铺垫（"担心员工抵触"不是限制，是要讨论的内容本身）。
+INPUT_EXTRACT_PROMPT = (
+    "你在把用户的一段话读成一张思维导图**要用到的几件事**。"
+    "只返回一个 JSON 对象，不要代码围栏，不要解释。格式：\n"
+    '{"topic":"10-20 字的主题","intent":"他要拿这张图做什么",'
+    '"questions":["他真正想问的事，一件一条"],"constraints":["他给的条件与限定"]}\n'
+    "四条判据：\n"
+    "1) topic 是**这张图的中心词**，不是这句话的改写：写成 6-20 字的名词短语，"
+    "不要带请求语（帮我 / 我想 / 请）、不要带疑问词（怎么 / 如何 / 为什么），"
+    "不要带冒号后面的解释，也不要带「给老板讲」这类用途；\n"
+    "2) intent 从这几类里挑一个，最多 8 字：想了解 / 想对比 / 想规划 / 想排查原因 / "
+    "想讲解给别人听 / 想做决策 / 想动手做；\n"
+    "3) questions 按**他问的事**拆，一件一条，最多 5 条，每条不超过 30 字；"
+    "他说了三件事就三条，不要把三件事合成一条，也不要替他加他没问的问题；\n"
+    "4) constraints 只收**会影响内容的硬条件**（人群、规模、时间、深浅、口径、"
+    "他明确不要的写法），每条不超过 12 字，没有就给空数组；他担心的事、他想达成的事"
+    "属于 questions，不是限制。\n"
+    "不要把这段话的原句搬进任何字段，也不要评价他问得好不好。"
+)
+
+
+def _too_short_to_extract(topic: str) -> str | None:
+    """这一次要不要提取。`None` = 要；否则返回"为什么不"（进 `data["input"]["skip"]`）。
+
+    两个判据是**或**的关系：长度够长，或者形状已经不像一个主题词。写成一串早退而不是
+    一个布尔表达式，是因为三个原因要能分开报——"太短"与"空"在排查时不是一件事。
+    """
+    text = topic.strip()
+    if not text:
+        return "empty"
+    if len(text) >= INPUT_EXTRACT_MIN_CHARS:
+        return None
+    if _CLAUSE_MARK.search(text) or _ASKED_MARK.search(text):
+        return None
+    return "short"
+
+
+def _extract_ask(topic: str) -> str:
+    """提取那一次的 user。原话**一个字都不改**地整段给它：这一步的全部价值就在于看到
+    原话，先做一次摘要再把摘要给它，等于把要捞回来的东西再丢一遍。"""
+    return f"他的话：\n{topic}"
+
+
+def _clean_line(value: Any, limit: int) -> str:
+    """模型给的短字段：去空白、去首尾引号与标点、截到 `limit` 字。不合法时返回空串。"""
+    if not isinstance(value, str):
+        return ""
+    text = value.strip().strip("\"'“”「」（）() \t\r\n。.，,；;")
+    return text[:limit]
+
+
+def _clean_topic(value: Any) -> str:
+    """主题：比 `_clean_line` 多一步"别把冒号从句带回来"。
+
+    模型偶尔会把原话里的从句连冒号一起抄进 topic（`"检索效果差：给老板的数据化说明"`）。
+    冒号后面那半句通常正是**用途**（该进 `intent`），所以这里从冒号处截断——它是这一步
+    唯一要挡的形状，挡不住的其它歪法交给 `_InputShape.source` 与 A/B 去暴露。
+    """
+    text = _clean_line(value, INPUT_EXTRACT_MAX_TOPIC_CHARS * 2)
+    for mark in ("：", ":"):
+        if mark in text:
+            text = text.split(mark, 1)[0].strip()
+    text = text.strip("\"'“”「」（）() \t\r\n。.，,；;")
+    return text[:INPUT_EXTRACT_MAX_TOPIC_CHARS]
+
+
+def _clean_items(value: Any, *, limit: int, count: int) -> tuple[str, ...]:
+    """列表字段：收 list / 单个字符串（模型有时写成 `"a，b"`），去空、去重、截条数。
+
+    去重按**原样**比（不做归一）：`"成本怎么控"` 与 `"成本控制"` 在这一层是两件事，
+    合并它们是语义判断，而这里没有做语义判断的能力——多说一件的代价是提示词多一行，
+    说少一件的代价是那件事从树上消失。
+    """
+    if isinstance(value, str):
+        raw_items: list[Any] = re.split(r"[，,、；;\n]", value)
+    elif isinstance(value, (list, tuple)):
+        raw_items = list(value)
+    else:
+        return ()
+    out: list[str] = []
+    for item in raw_items:
+        text = _clean_line(item, limit)
+        if text and text not in out:
+            out.append(text)
+        if len(out) >= count:
+            break
+    return tuple(out)
+
+
+def _shape_from(raw: Any, topic: str, *, seconds: float,
+                prompt_tokens: int = 0) -> _InputShape:
+    """把模型那一次的输出收拾成 `_InputShape`。任何一处不合法都退回原 topic。
+
+    退回而不是"照它能给的部分用"：`topic` 是这张图的中心，一个空的或半截的中心比原话
+    更糟——原话至少还是用户自己写的。
+    """
+    elapsed = round(seconds, 3)
+    if not isinstance(raw, dict):
+        return _InputShape(topic=topic, original=topic, seconds=elapsed, skip="unshaped",
+                           prompt_tokens=prompt_tokens)
+    shaped = _clean_topic(raw.get("topic"))
+    if not shaped:
+        return _InputShape(topic=topic, original=topic, seconds=elapsed, skip="no_topic",
+                           prompt_tokens=prompt_tokens)
+    return _InputShape(
+        topic=shaped,
+        original=topic,
+        intent=_clean_line(raw.get("intent"), 16),
+        questions=_clean_items(raw.get("questions"), limit=40, count=5),
+        constraints=_clean_items(raw.get("constraints"), limit=16, count=5),
+        source="model",
+        seconds=elapsed,
+        prompt_tokens=prompt_tokens,
+    )
+
+
+def _intent_block(shape: _InputShape) -> str:
+    """意图那三样在 user 里的落点。空串表示这次没有可加的东西（开关关着 / 没提取到）。
+
+    **为什么不把 constraints 拼进 `主题：` 那一行**：那一行必须短（它的长度直接决定
+    根节点 label 的长度，而根节点是画布中央那一个框）。限定写在主题后面，就是把
+    "中心词"重新变回"一句话"——正是这一步要修的那个毛病。所以它们分成两块：主题行
+    只有一个名词短语，其余三样各占一行，位置紧跟在主题之后（顺序即权重：先定中心，
+    再给对齐用的那几行）。
+
+    **为什么不进 system**：这四样是**这一次**的输入，不是树规则。本仓库已经三次记过
+    同一条教训（`role=decision`、`_detail_ask` 的自查句、全塞模式下的引用规则）——
+    写在 system 里的具体指令会被那段长而稳定的规则稀释，挪到 user 里才生效。
+    """
+    if shape.source != "model":
+        return ""
+    lines: list[str] = []
+    if shape.intent:
+        lines.append(f"· 他要拿这张图做的事：{shape.intent}")
+    if shape.questions:
+        lines.append("· 他真正想问的：" + "；".join(shape.questions))
+    if shape.constraints:
+        lines.append("· 他给的条件与限定（写每一支时都要照顾到）：" + "、".join(shape.constraints))
+    if not lines:
+        return ""
+    return (
+        "\n\n（下面几行是**从他原话里读出来的**，不是新的主题，也不改变上面那个主题："
+        "写完每一支之前对一遍，别写出与它们相悖的内容）\n" + "\n".join(lines)
+    )
+
+
+async def _read_input(topic: str, ctx: RunContext) -> _InputShape:
+    """把工具参数 `topic` 读成「意图 + 主题 + 要覆盖的事」。
+
+    位置在 `_generate` 的开头、`_intake` 之前：**它必须比检索更早**，因为 `_intake`
+    拿去查外部资料与库的那条 query 就是主题（`_external_query(topic, …)`），主题换了
+    那两条 query 跟着换。放在 service 层不行：那会让每一次 agent 循环都多一次调用，
+    而绝大多数轮次（改一个节点、删一条边）根本不需要它。
+
+    三条退化都**不失败**，只是退回原样并记下原因：开关关着（`off`）、太短（`short` /
+    `empty`）、额度不够（`budget`）、调用或解析失败（`failed` / `unshaped` / `no_topic`）。
+    一张图值不值得为"提取没成功"报错？不值得——原话当主题是这一步之前的行为，它是
+    已知可用的，只是不够好。
+    """
+    if not input_extract_enabled():
+        return _InputShape(topic=topic, original=topic, skip="off")
+    reason = _too_short_to_extract(topic)
+    if reason is not None:
+        return _InputShape(topic=topic, original=topic, skip=reason)
+    # 额度在调用之前占，与 `_plan_ask` 那一次同一个约定：请求一旦发出就是一次真实计费。
+    if not ctx.reserve_model_call():
+        return _InputShape(topic=topic, original=topic, skip="budget")
+    ctx.extra_model_calls += 1
+    started = time.perf_counter()
+    try:
+        raw = await _chat(
+            ctx, INPUT_EXTRACT_PROMPT, _extract_ask(topic),
+            max_tokens=INPUT_EXTRACT_MAX_TOKENS,
+        )
+    except Exception as exc:  # noqa: BLE001 — 提取失败就是降级，理由见 docstring 末段
+        logger.warning(
+            "输入提取失败（%s: %s），这一次把原话当主题",
+            type(exc).__name__, _reason_text(exc))
+        return _InputShape(
+            topic=topic, original=topic,
+            seconds=round(time.perf_counter() - started, 3), skip="failed")
+    return _shape_from(raw, topic, seconds=time.perf_counter() - started,
+                       prompt_tokens=estimate_input_tokens(
+                           INPUT_EXTRACT_PROMPT + _extract_ask(topic)))
+
 
 def _apply_skeleton(
     content: MindMapContent, plan: _SkeletonPlan, raw_plan: Any,
@@ -8789,10 +9089,25 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     if ctx.candidate is not None and _has_content_nodes(ctx.candidate):
         return _fail("map_exists", "已经有一张导图了，请用 node_expand 或 mindmap_edit 修改它。")
 
+    # ---- 第 0 步：把这段输入读成「意图 + 主题」（`MINDMAP_INPUT_EXTRACT`，默认关）----
+    #
+    # **必须在 `_intake` 之前**：材料入口拿去查外部资料与库的那条 query 就是主题
+    # （`_external_sources(_external_query(topic, …))` / `_library_supplement(topic, …)`）。
+    # 提取放在后面，等于检索查的是一段话、树讲的是另一句，两条路的主题不是同一个。
+    #
+    # 下面所有消费点都写 `topic`，**`args.topic` 在这条路上一个都不留**：开关关着时
+    # `_read_input` 只做一次字符串判断并原样返回 `args.topic`（`skip="off"`），于是整棵
+    # 树的输入与改动之前逐字节相同。
+    shape = await _read_input(args.topic, ctx)
+    topic = shape.topic
+    # 意图 / 要覆盖的事 / 限定在 user 里的那一小段（`_intent_block`）。开关关着时恒为
+    # 空串，下面两处 `+=` 等于没写。
+    intent_block = _intent_block(shape)
+
     # ---- 材料入口（与 `_generate_deep` 同一份实现）------------------------------
     if ctx.model_calls_used >= ctx.request.budget.max_model_calls:
         return _fail("budget_exhausted", "本次运行的模型调用额度已用完，连骨架都出不了，无法生成。")
-    intake = await _intake(args.topic, ctx)
+    intake = await _intake(topic, ctx)
     sources = intake.sources
     short_material = intake.short_material
     material_chars = intake.material_chars
@@ -8810,6 +9125,16 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     library = intake.library
 
     diagnostics: list[Diagnostic] = []
+    # 提取没做成时**必须说出来**：开关打开了、树却还是按原话长的，用户唯一的线索就是
+    # 这一条。四种来路四句话（"开关开了却没生效"这件事在 `SECTION_SLICE_UNAVAILABLE`
+    # 那里已经记过一遍）。`short` / `empty` / `off` 不报：那三个是**设计**——短主题本来
+    # 就不该为它多付一次调用，不是失败。
+    if shape.skip in _INPUT_EXTRACT_FAILURE:
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.warn, code="INPUT_EXTRACT_UNAVAILABLE",
+            message=f"输入提取没做成（{_INPUT_EXTRACT_FAILURE[shape.skip]}），"
+                    "这一次把原话当主题生成；画出来的可能是一棵讲这句话的树。",
+        ))
     # 入图那一步的账（开关关着时恒为 None，什么都不加——键集与加它之前逐字节相同）。
     if intake.ingested is not None:
         diagnostics.append(_graph_ingest_diagnostic(intake.ingested))
@@ -9035,7 +9360,7 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
                 plan_system += DETAIL_NO_SOURCE_RULES
         plan_started = time.perf_counter()
         ask = _plan_ask(
-            args.topic,
+            topic,
             outline=outline,
             # 清单紧跟在 `outline` 之后进 prompt：三个条件（有材料、没材料、按章切）
             # 共用同一个渲染器，`sources` 为空时它是空串，`_plan_ask` 一字不加。
@@ -9048,6 +9373,12 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         # 的话，分支仍会按模型的先验（政策背景/技术路径/案例分析）铺开，而库里那几段
         # 只能挂在其中一两支上——树与证据错位。开关关着时 `library_block` 恒空。
         ask += library_block
+        # 意图那几行拼在骨架的 user **末尾**（`_plan_ask` 的返回值之后、按章那句之前
+        # 或之后都行——它不与任何一条规则冲突，它们是内容，不是格式）：
+        #
+        # 一级分支决定整棵树的覆盖，所以"他真正想问的是哪几件事"最该先给这一步看。
+        # 空串时（开关关着 / 太短 / 提取失败）这里一字不加。
+        ask += intent_block
         if slice_chapters:
             # 拼在 `_plan_ask` 的返回值**之后**，不改进那个函数：它与
             # `PLAN_PROMPT` 一起被逐字节回归用例钉着（`test_outline.py`）。
@@ -9225,7 +9556,7 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     )
     if slice_chapters:
         raw, slice_report = await _slice_structure(
-            topic=args.topic, chapters=slice_chapters,
+            topic=topic, chapters=slice_chapters,
             plan=plan if plan is not None else _SkeletonPlan(flat=()),
             ctx=ctx, text=(sources[0].text or ""), diagnostics=diagnostics,
         )
@@ -9248,7 +9579,7 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
                 if plan.grouped else
                 "\n\n这次的一级分支（已定好，按此顺序，不要增删改名）：\n"
             )
-        user = f"主题：{args.topic}" + hint_block + skeleton_intro + skeleton_block
+        user = f"主题：{topic}" + intent_block + hint_block + skeleton_intro + skeleton_block
         # 流程图的 `role` 必须**在 user 末尾**再说一遍（system 里已有 `FLOW_TREE_RULES`，
         # 但实测第一版把它只写在 system 里时，两次采样一个 `decision` 都没标出来，
         # 而那份流程里明明有「校验信息完整性」「验证账号唯一性」这种判定步骤）。
@@ -9603,7 +9934,7 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     # 没有章就退回"整支/整份"那份证据（`MINDMAP_DETAIL_RETRIEVAL` 的两条前置条件）。
     # 传的是**单份材料本身**：`_chapter_slices` 只在恰好一份材料时才产出章，两者同源。
     content, detail_report = await _fill_details(
-        content, ctx=ctx, topic=args.topic, sections=sections,
+        content, ctx=ctx, topic=topic, sections=sections,
         external_rules=external_rules, diagnostics=diagnostics,
         # 两级骨架的分组节点不进这份清单：它是分类名，写出来只有一句"这一组在讲什么"
         # 的空话，而它占掉的正是那二十节里某一节的输出预算。
@@ -9743,7 +10074,7 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         diagnostics.append(Diagnostic(
             level=DiagnosticLevel.warn, code="GENERATION_WITHOUT_EVIDENCE",
             message=(
-                f"{reason}：这张图只基于主题「{args.topic}」生成，"
+                f"{reason}：这张图只基于主题「{topic}」生成，"
                 "没有任何材料依据，节点上也不会有引用"
             ),
         ))
@@ -9814,7 +10145,7 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         diagnostics.append(Diagnostic(
             level=DiagnosticLevel.info, code="GENERATION_EXTERNAL_DISABLED",
             message=(
-                f"{EXTERNAL_DISABLED_NOTE}（主题「{args.topic}」）"
+                f"{EXTERNAL_DISABLED_NOTE}（主题「{topic}」）"
                 "打开联网检索再生成，引用就能逐字校验、点回原文"
             ),
         ))
@@ -9824,7 +10155,7 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         diagnostics.append(Diagnostic(
             level=DiagnosticLevel.warn, code="GENERATION_WITHOUT_EXTERNAL",
             message=(
-                f"{external_note}：这张图只基于主题「{args.topic}」生成，"
+                f"{external_note}：这张图只基于主题「{topic}」生成，"
                 "没有外部资料依据，节点上也不会有指向原文的引用"
             ),
         ))
@@ -9853,7 +10184,7 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             summary += EXTERNAL_DISABLED_NOTE
         else:
             summary += (
-                f"{external_note}，这张图只基于主题「{args.topic}」生成，"
+                f"{external_note}，这张图只基于主题「{topic}」生成，"
                 "节点上不会有引用；要引用真实出处，请换一个更常见的主题词后重试。"
             )
     if external_used_note:
@@ -9960,6 +10291,29 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         },
         "diagnostics": [item.model_dump() for item in diagnostics],
     }
+    if shape.skip != "off":
+        # 开关开着才有这个键（关着时 `data` 的键集与改动之前逐字节相同——回归用例比的
+        # 是键集，不只是值）。放进 `data` 而不是给 `Node` / 契约加字段：`data` 是
+        # `dict[str, Any]`，而"这一次从输入里读到了什么"本来就是一次运行的读数，
+        # 不是这张图的一部分。诊断只留失败那一档，成功的读数在这里（一次运行一条 info
+        # 诊断是噪声——`data` 才是给脚本与界面看的地方）。
+        data["input"] = {
+            "original": shape.original,
+            "topic": shape.topic,
+            "chars": {"original": len(shape.original), "topic": len(shape.topic)},
+            "source": shape.source,
+            "intent": shape.intent,
+            "questions": list(shape.questions),
+            "constraints": list(shape.constraints),
+            "seconds": shape.seconds,
+            # 这一步的代价：一次提取的输入 token 估算。它能与"这一次少走的那条路"
+            # 直接比较——关着时那一行主题是一整句话，开着时它是一个名词短语。
+            "prompt_tokens": shape.prompt_tokens,
+            # 没提取的四个原因（`off` 不会到这里）：`short` / `empty` / `budget` /
+            # `failed` / `unshaped` / `no_topic`。前两个是设计，后四个在上面有诊断。
+            "skip": shape.skip,
+            "threshold": INPUT_EXTRACT_MIN_CHARS,
+        }
     if verify_data is not None:
         # 只有真的开了核对才有这个键（开关关着时 `data` 的键集与加这段之前逐字节
         # 相同——回归用例比的是键集，不只是值）。
