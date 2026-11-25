@@ -1,6 +1,7 @@
 import { createPinia, setActivePinia } from 'pinia';
 import { beforeEach, describe, expect, it } from 'vitest';
 
+import { REAL_TREES } from './fixtures/real-trees';
 import type { MindMapContent, MindNode } from '../src/api/types';
 import {
   DROP_PAD_X,
@@ -434,7 +435,40 @@ describe('子节点跟随：拖完落点是"新树重排的结果"，不是"旧�
   });
 });
 
-// ---------------------------------------------------------------- 六、文案
+// ---------------------------------------------------------------- 六、与视图收起对齐
+
+describe('拖动与视图收起：结构变了，可见集合跟着重算', () => {
+  it('被拖进一个深分支之后，它仍然在画布上（不能被折叠藏起来）', () => {
+    // 136 节点 + 预算 3：这一屏只画「根 + 两个一级分支」，别的全在折叠点后面。
+    const store = useMindMapStore();
+    store.preview(REAL_TREES.tree136 as MindMapContent, 'right');
+    store.visibleNodeLimit = 3;
+
+    const visible = store.nodes.map(node => node.id);
+    expect(visible.length).toBe(3);
+    const dragged = store.nodes.find(node => (node.data?.depth ?? 0) === 1);
+    expect(dragged, '一级分支应当可见').toBeTruthy();
+
+    // 找一个能接住它的可见节点（撞到 8 层上限的那些跳过，那是另一条用例的事）。
+    let movedTo: string | null = null;
+    for (const node of store.nodes) {
+      if (node.id === dragged!.id || (node.data?.depth ?? 0) < 1) continue;
+      if (store.moveNodeTo({ draggedId: dragged!.id, targetId: node.id, zone: 'child' }).ok) {
+        movedTo = node.id;
+        break;
+      }
+    }
+    expect(movedTo, '至少要有一个可见节点能接住它').not.toBeNull();
+
+    // 结构变了、可见集合跟着变。但"刚拖完的那个节点不见了"是纯粹的 bug——
+    // `moveNodeTo` 里的 `revealInView` 就是为了这一条：它把被拖节点的祖先链撑开。
+    expect(store.nodes.some(node => node.id === dragged!.id)).toBe(true);
+    // 而且内容里它确实换了父（不是"视图变了、内容没变"）。
+    expect(store.content?.root.children.some(child => child.id === dragged!.id)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------- 七、文案
 
 describe('落点文案：拖的时候和松手之后说的是同一件事', () => {
   it('四档的将来式互不相同', () => {
