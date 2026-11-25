@@ -38,7 +38,7 @@ import MindRelation from './MindRelation.vue';
  */
 const store = useMindMapStore();
 const {
-  setCenter, setViewport, getViewport, dimensions,
+  setCenter, setViewport, getViewport, dimensions, viewport,
   onNodeClick, onNodeDoubleClick, onPaneClick, onMoveEnd, updateNodeInternals,
   onNodeDragStart, onNodeDrag, onNodeDragStop,
   screenToFlowCoordinate, findNode, updateNode,
@@ -483,7 +483,6 @@ watch(
 
 /**
  * 拖动改结构：**手工位置从不落盘，落点是布局给的**。
- *
  * 布局是自动算的（`layoutDiagram` 从 content 推所有坐标），拖动是手动的，两者只能
  * 有一个赢。这一轮选布局，理由三条：
  *
@@ -498,8 +497,12 @@ watch(
  *     而不是弹回原点。这一条是这个决定成立的前提，没有它就只剩"拖了个寂寞"。
  *
  * 剩下的观感问题（"松手前不知道会变成什么"）由 `dragOverlay` 那块解决：松手之前
- * 就画出**松手之后的真实位置**（`store.previewMove` 用同一个 `layoutTidy` 算的），
- * 于是"弹回"读作"吸附"。
+ * 就画出**松手之后的真实位置**（`store.previewMove` 用同一个 `layoutTidy`、同一棵
+ * **画布树**算的），于是"弹回"读作"吸附"。
+ *
+ * 幽灵框能不能守住这个承诺，取决于 `dragOverlay` 里那两个细节（都在那个 computed
+ * 的注释里）：用 `viewport` 而不是 `getViewport()`（拖动时 autoPan 会推着视口走），
+ * 以及自己算 `flow * zoom + viewport` 而不是用 `flowToScreenCoordinate`。
  */
 interface DragHint {
   targetId: string;
@@ -680,11 +683,27 @@ onNodeDragStop(({ node }) => {
  */
 const dragOverlay = computed(() => {
   const hint = dragHint.value;
+  // **先判 `hint` 再读 DOM**：`getBoundingClientRect()` 会强制一次 layout，而这个
+  // computed 挂在模板的 `v-if` 上，每次重渲染都会求值。不拖动时它必须**零开销**
+  // ——顺序颠倒的那一版会让"136 个节点、点几次折叠"这段路多出上百次强制重排，
+  // 实测把一条 3 秒的画布用例推过了 5 秒超时。
+  if (!hint) return null;
   const origin = shell.value?.getBoundingClientRect();
-  if (!hint || !origin) return null;
+  if (!origin) return null;
   const target = store.nodes.find(node => node.id === hint.targetId);
   if (!target) return null;
-  const view = getViewport();
+  /**
+   * **必须读响应式的 `viewport`，不能读 `getViewport()`。**
+   *
+   * `getViewport()` 是一次性的取值，不会让这个 computed 与视口建立依赖。而拖动时
+   * `autoPanOnNodeDrag` 会把画布慢慢推着走（拖到画布边缘就会发生），视口一变，
+   * 同一个 flow 坐标对应的屏幕位置就变了——但 `dragHint` 只在目标/方向变化时才换
+   * 对象，于是 computed 不重算，幽灵框停在**旧视口**算出来的位置上。
+   *
+   * 实测表现：拖到画布上方边缘时 autoPan 让内容下移 48px，幽灵框比真实落点高 48px。
+   * 幽灵框与落点错开，恰恰是这一层要避免的那件事。
+   */
+  const view = viewport.value;
 
   const toScreen = (point: { x: number; y: number }) => ({
     left: `${point.x * view.zoom + view.x}px`,

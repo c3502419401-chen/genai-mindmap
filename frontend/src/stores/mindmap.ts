@@ -53,6 +53,7 @@ import {
   viewTree,
   type FoldInfo,
   type FoldOpenReason,
+  type ViewTreeResult,
 } from '../canvas/view-collapse';
 import {
   addChild,
@@ -1729,32 +1730,53 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * **没有"候选"这一级了。** 从前 `candidate` 排在中间，让用户在点「应用」之前
    * 先看见结果；现在生成完成即落地（`commitGenerated`），看得见的就是他的。
    */
+  /**
+   * 一份内容 →**画布上真正排出来的那棵树**（含视图层收起）。
+   *
+   * 抽成函数而不是写在 `renderSource` 里，是因为有两个读者，而两者必须得到**同一个**
+   * 结果：`renderSource`（画布）和 `previewMove`（拖动时的幽灵框）。
+   *
+   * 分开写一次的代价是实测出来的：预演用完整树排、画布用收起后的树排，两者在
+   * "用户点开过某一支"之后不再相等——幽灵框比真实落点高 40px，而用户读到的是
+   * "画在这儿、落在别处"。
+   *
+   * **视图层收起在这里落地**（见 `canvas/view-collapse.ts`）。
+   *
+   * 为什么必须在这个位置、而不是渲染层：`nodes`、`edges` 都从 `layout` 这一份结果里
+   * 读坐标，而 `layout` 吃的就是这棵树的根。只过滤 `flatNodes` 的话，被截断的节点
+   * 仍然参与 `layoutTidy` 的占位——它们照样撑开画布、照样把字号挤到 5px，只是看不见。
+   * 那样"收起"连一个像素的可读性都没换回来。
+   *
+   * 只在树型生效：鱼骨与流程的画布树是合成出来的（虚拟根 + 每个容器一个子），它们
+   * 本来就是"一层容器 + 一层节点"的形状，收起没有收益；更要紧的是数量口径要数
+   * "内容里真实的节点"，而合成根不在内容里，数出来的上限会凭空虚高一个。
+   */
+  function canvasTreeOfContent(current: DiagramContent): {
+    root: MindNode;
+    /** 只有树型才有一份真的折叠表；鱼骨与流程恒为 null（它们不收起）。 */
+    folded: ViewTreeResult | null;
+  } {
+    const tree = canvasTreeOf(current);
+    if (diagramTypeOf(current) !== 'tree') return { root: tree.root, folded: null };
+    const folded = viewTree(tree.root, {
+      limit: visibleNodeLimit.value,
+      expanded: viewExpandedNodes.value,
+      collapsed: viewCollapsedNodes.value,
+      expandAll: viewExpandAll.value,
+    });
+    return { root: folded.root, folded };
+  }
+
   const renderSource = computed<RenderSource | null>(() => {
     if (content.value) {
       // 树型拿到的是 `content.value.root` **这一个对象**（`canvasTreeOf` 里原样透传），
       // 所以树布局的入参与返回值一个字节都没变；鱼骨/流程拿到的是一棵合成树
       // （虚拟根 + 每个容器作为一级子节点），布局函数那边一行都不用改。
       const tree = canvasTreeOf(content.value);
-      // **视图层收起在这里落地**（见 `canvas/view-collapse.ts`）。
-      //
-      // 为什么必须在这个位置、而不是渲染层：`nodes`、`edges` 都从 `layout` 这一份
-      // 结果里读坐标，而 `layout` 吃的是 `source.root`。只过滤 `flatNodes` 的话，
-      // 被截断的节点仍然参与 `layoutTidy` 的占位——它们照样撑开画布、照样把字号
-      // 挤到 5px，只是看不见。那样"收起"连一个像素的可读性都没换回来。
-      //
-      // 只在树型生效：鱼骨与流程的画布树是合成出来的（虚拟根 + 每个容器一个子），
-      // 它们本来就是"一层容器 + 一层节点"的形状，收起没有收益；更要紧的是数量口径
-      // 要数"内容里真实的节点"，而合成根不在内容里，数出来的上限会凭空虚高一个。
-      const foldedView = diagramTypeOf(content.value) === 'tree'
-        ? viewTree(tree.root, {
-          limit: visibleNodeLimit.value,
-          expanded: viewExpandedNodes.value,
-          collapsed: viewCollapsedNodes.value,
-          expandAll: viewExpandAll.value,
-        })
-        : null;
+      const view = canvasTreeOfContent(content.value);
+      const foldedView = view.folded;
       return {
-        root: foldedView ? foldedView.root : tree.root,
+        root: view.root,
         syntheticId: tree.synthetic ? tree.root.id : null,
         kind: 'content',
         expandable: NO_EXPANDABLE,
@@ -2920,9 +2942,13 @@ export const useMindMapStore = defineStore('mindmap', () => {
     const plan = planDrop(current.root, intent);
     if (!plan.ok) return { ok: false, code: plan.code, reason: plan.reason };
 
-    // 落点用**与真正落地时同一个**布局函数算：两处各算一次的话，幽灵框与松手后的
-    // 位置会差一个常量，而那种偏差看起来像"差一点没对准"，用户会反复微调。
-    const geometry = layoutTidy(plan.root, { direction: direction.value });
+    // 落点用**与真正落地时同一个**布局函数、同一棵**画布树**算：`canvasTreeOfContent`
+    // 里带着视图层收起，所以"用户点开过某一支"之后预演也不会跑偏。
+    //
+    // 两处各算一次的话，幽灵框与松手后的位置会差一个常量（实测 40px）——那种偏差
+    // 看起来像"差一点没对准"，用户会反复微调，也等于这一层视觉白做了。
+    const canvasRoot = canvasTreeOfContent({ ...current, root: plan.root }).root;
+    const geometry = layoutTidy(canvasRoot, { direction: direction.value });
     const center = geometry.positions.get(intent.draggedId);
     if (!center) return { ok: false, code: 'missing', reason: '算不出落点' };
 

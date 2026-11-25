@@ -218,7 +218,27 @@
 | 任何节点 → 空白 | — | 没有任何指示；松手后归位 ✓ |
 | Ctrl+Z | — | 一步退回原结构（含整支坐标） ✓ |
 
-### 踩到的坑：别用 `flowToScreenCoordinate`
+### 三个"画在哪儿就落在哪儿"的坑
+
+幽灵框是这个功能的承诺，而它成立需要三件事同时成立。三件都踩过一次，每一条的表现
+都是"差几十像素"——看起来像"差一点没对准"，用户会反复微调。
+
+**一、预演必须走同一条画布树。** `renderSource.root` 不是 `content.root`：它带着视图层
+收起（`canvasTreeOfContent`）。预演如果直接拿 `content.root` 排，两者在"用户点开过某
+一支"之后**就不再相等**——实测幽灵框比真实落点高 40px。所以那一段被抽成
+`canvasTreeOfContent` 一个函数，画布与预演共用；`tests/node-drag.spec.ts`「视图收起
+生效时也一样」用预算 20 + 136 节点的真图钉住它（去掉这次抽取，那条用例偏 2176px）。
+
+**二、读响应式的 `viewport`，不要 `getViewport()`。** 后者是一次性取值，不会让 computed
+与视口建立依赖；而拖动时 `autoPanOnNodeDrag` 会推着视口走（拖到画布边缘就发生），
+视口一变、`dragHint` 却没变 → computed 不重算 → 幽灵框停在**旧视口**算出来的位置。
+
+**三、`dragOverlay` 先判 `hint` 再读 DOM。** `getBoundingClientRect()` 会强制一次
+layout，而这个 computed 挂在模板的 `v-if` 上、每次重渲染都求值。顺序颠倒的那一版让
+"136 个节点 + 点几次折叠"这条画布用例多出上百次强制重排，实测从 3 秒推过了 5 秒超时
+（`tests/view-collapse-canvas.spec.ts`）。不拖动时它必须零开销。
+
+### 还有一个坐标换算的坑：别用 `flowToScreenCoordinate`
 
 Vue Flow 1.48 的实现是 `(point + 容器偏移) * zoom + translate`——它把容器偏移也乘了一次
 zoom。容器 y = 48（顶栏）、zoom = 1.2 时，它给出的位置比真实位置少 9.7px，而这个偏差**随

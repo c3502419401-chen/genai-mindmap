@@ -31,6 +31,8 @@ const setViewport = vi.fn(
 );
 const getViewport = vi.fn(() => currentViewport);
 const dimensions = ref({ width: 1600, height: 852 });
+/** 拖动指示层读的是**响应式**的 `viewport`（不读 `getViewport()`，见画布那边的注释）。 */
+const viewport = ref({ x: 0, y: 0, zoom: 1 });
 
 vi.mock('@vue-flow/core', () => ({
   VueFlow: { name: 'VueFlowStub', template: '<div class="vue-flow-stub" />' },
@@ -38,6 +40,7 @@ vi.mock('@vue-flow/core', () => ({
   Position: { Left: 'left', Right: 'right', Top: 'top', Bottom: 'bottom' },
   useVueFlow: () => ({
     dimensions,
+    viewport,
     setViewport,
     getViewport,
     setCenter: vi.fn(),

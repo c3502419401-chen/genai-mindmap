@@ -435,7 +435,77 @@ describe('子节点跟随：拖完落点是"新树重排的结果"，不是"旧�
   });
 });
 
-// ---------------------------------------------------------------- 六、与视图收起对齐
+// ---------------------------------------------------------------- 六、预演 = 落地
+
+describe('预演落点 === 松手之后的真实位置', () => {
+  /**
+   * 幽灵框是这个功能的**承诺**：它画在哪儿，松手之后就落在哪儿。
+   * 两处必须用同一个 `layoutTidy`、同一棵假设树——这里逐像素比对，钉住那句承诺。
+   */
+  const cases = [
+    { zone: 'child' as const, draggedId: 'c', targetId: 'a' },
+    { zone: 'parent' as const, draggedId: 'c', targetId: 'a' },
+    { zone: 'sibling-before' as const, draggedId: 'c', targetId: 'b' },
+    { zone: 'sibling-after' as const, draggedId: 'a', targetId: 'b' },
+  ];
+
+  for (const intent of cases) {
+    it(`${intent.zone}：预演位置与落地位置逐像素相等`, () => {
+      const store = useMindMapStore();
+      store.preview(content(), 'right');
+
+      const preview = store.previewMove(intent);
+      expect(preview.ok).toBe(true);
+      expect(preview.rect).toBeTruthy();
+
+      const result = store.moveNodeTo(intent);
+      expect(result.ok).toBe(true);
+
+      const landed = store.nodes.find(node => node.id === intent.draggedId);
+      expect(landed).toBeTruthy();
+      expect(landed!.position.x).toBeCloseTo(preview.rect!.x, 5);
+      expect(landed!.position.y).toBeCloseTo(preview.rect!.y, 5);
+    });
+  }
+
+  it('视图收起生效时也一样（预演与画布必须走同一条画布树）', () => {
+    // 预算 20、树有 136 个节点 → `renderSource.root` 已经是**截断后**的那棵树，
+    // 与 `content.root` 不再相等。预演如果拿完整树去排，幽灵框就会比真实落点偏
+    // 一个常量（实测 40px），而用户读到的正是"画在这儿、落在别处"。
+    const store = useMindMapStore();
+    store.preview(REAL_TREES.tree136 as MindMapContent, 'right');
+    store.visibleNodeLimit = 20;
+
+    // 从一级分支里挑一个（根不能拖），按顺序试到第一对能落在一起的。
+    // 不写"两重循环穷举"：`previewMove` 每次要在一棵 136 节点的树上排一次版，
+    // 穷举会让这条用例自己变成整个测试集的瓶颈，而"找到任意一对"就够它钉住的事。
+    const ids = store.nodes.map(node => node.id);
+    let intent: { draggedId: string; targetId: string; zone: 'child' } | null = null;
+    outer: for (const dragged of store.nodes) {
+      if ((dragged.data?.depth ?? 0) < 1) continue;
+      for (const targetId of ids) {
+        if (targetId === dragged.id) continue;
+        const probe = { draggedId: dragged.id, targetId, zone: 'child' as const };
+        if (store.previewMove(probe).ok) {
+          intent = probe;
+          break outer;
+        }
+      }
+    }
+    expect(intent, '这一屏里要有一对能落在一起的节点').not.toBeNull();
+
+    const preview = store.previewMove(intent!);
+    expect(preview.ok).toBe(true);
+    expect(store.moveNodeTo(intent!).ok).toBe(true);
+
+    const landed = store.nodes.find(node => node.id === intent!.draggedId);
+    expect(landed, '拖完它必须还在画布上').toBeTruthy();
+    expect(landed!.position.x).toBeCloseTo(preview.rect!.x, 5);
+    expect(landed!.position.y).toBeCloseTo(preview.rect!.y, 5);
+  });
+});
+
+// ---------------------------------------------------------------- 七、与视图收起对齐
 
 describe('拖动与视图收起：结构变了，可见集合跟着重算', () => {
   it('被拖进一个深分支之后，它仍然在画布上（不能被折叠藏起来）', () => {
