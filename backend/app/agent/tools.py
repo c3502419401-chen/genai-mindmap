@@ -6629,9 +6629,14 @@ INPUT_EXTRACT_MIN_CHARS = 20
 # 数截断而不是判失败——它是画布上的一个标题，不是正文。
 INPUT_EXTRACT_MAX_TOPIC_CHARS = 24
 
-# 这一次提取的输出上限。四个字段合计 200 字上下，400 是余量。刻意**不**跟
-# `_max_tokens(ctx)` 走：那是写整棵树的额度，给这一步 8192 它就开始解释自己。
-INPUT_EXTRACT_MAX_TOKENS = 400
+# 这一次提取的输出上限。四个字段合计 150–250 字，800 token（约 500 字）是余量。
+#
+# 上一版是 400，实测**贴边**：③ 那条原话一次跑出 `GenerationError`（返回内容不是合规
+# JSON）——四个字段稍写长一点就撞上限，被截断的 JSON 在 `parse_model_json` 那里就是
+# "不合规"。输出上限只影响"最多能写多少"，不动平时那 200 字的成本，所以放宽是免费
+# 买到的可靠性。刻意**不**跟 `_max_tokens(ctx)` 走：那是写整棵树的额度，给这一步 8192
+# 它就开始解释自己了。
+INPUT_EXTRACT_MAX_TOKENS = 800
 
 # 「短但碎」的两个形状判据。④那条（`"AI学习 怎么学 路线"`，11 字）是纯长度判据必然
 # 漏掉的反例：它短，但一个"怎么"加一个冒号已经说明它不是名词短语。
@@ -6644,6 +6649,164 @@ _CLAUSE_MARK = re.compile(r"[，,；;：:、？?！!（）()]")
 _ASKED_MARK = re.compile(
     r"帮我|帮忙|帮我我们|我想|我想要|我们想|希望|需要|麻烦|请|汇报|讲解|"
     r"怎么|如何|为什么|为何|哪些|是否|能不能|要不要|该不该|值不值得|有没有")
+
+# ---------------------------------------------------------------- 自检：线索有没有被接住
+#
+# 上一次的 A/B 里 ③ 两次提取都**没有**把"别太技术"收进 `constraints`，当时记的归因是
+# "模型判定它不是硬条件"。一验就翻：那是**看错了输入**，不是判断失误——
+#
+#     提取看**原话**（`ctx.request.goal`）：constraints = ["下周汇报", "面向老板", "别太技术"]
+#     提取看**压缩后的 topic**：            constraints = ["面向老板汇报"]
+#
+# 工具层的 `args.topic` 是外层 agent 压过一遍的（32 字 → 18 字），"别太技术"在这一步
+# 就已经不在输入里了。所以这一轮的主修是**输入源**（`_extract_source`：原话优先），
+# 自检只是第二道——
+#
+# **自检是纯规则，不新增调用**：提取那一次的输入与输出都不变，只在拿到结果之后拿原话
+# 对一遍四类线索。漏的那些**按原文片段追加**进 `constraints`，不改写：那一类词的价值
+# 恰恰在"原样保留"（"别太技术"改写成"通俗表达"就已经不是他要的了）。
+INPUT_EXTRACT_SELFCHECK_ENV = "MINDMAP_INPUT_SELFCHECK"
+
+# 原话进提取调用的长度上限。2,000 字 ≈ 1.3k token。
+#
+# 现在**撞不到**：`AgentRunRequest.goal` 的契约上限是 1,000 字、`GenerateArgs.topic` 也是
+# 1,000，两个来源都到不了这里。留着它是给"哪天把上限放宽"的防御——但这个数一旦变成了
+# 实际生效的截断，就意味着一整段话的后半截（而约束常常写在末尾："…另外，别太技术"）
+# 会在提取之前被切掉，那与这一步的目的正相反。放宽那两层之前先回来看这一段。
+INPUT_EXTRACT_MAX_SOURCE_CHARS = 2_000
+
+# 自检最多追加几条：多了就是把原话抄进 constraints，反而稀释真正的那两三条。
+_SELFCHECK_MAX_ADDED = 3
+
+# 四类线索，判据写在正则里（每一条都能从表上读出会怎么判错）：
+#
+#   amount   数字 + 量词：300 人 / 两周 / 三个 / 十万。**必须带量词**：光秃秃的数字
+#            在主题里通常是型号（RAG 2.0 / GPT 4），补进 constraints 只添噪声；
+#   audience 受众/场景：给老板 / 向客户 / 新员工 / 内部。这一半是"讲给谁听"，
+#            它决定口径与深浅，是提取最该捞的那一类；
+#   tone     口吻/约束：别太技术 / 要有数据支撑 / 尽量简单 / 量化。原话里几乎全是
+#            "别/要/尽量"开头的祈使句，而模型最爱把它们算成"不是硬条件"；
+#   deadline 时间压力：下周 / 明天 / 这个月。
+_SELFCHECK_CUES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("amount", re.compile(r"\d+\s*(?:人|个|万|千|百|条|天|周|月|年|分钟|小时|次|倍|%|％)")),
+    ("audience", re.compile(
+        r"(?:给|向|面向|讲给|说给|对)[^，,。；;：:\s]{0,6}(?:看|听|讲|汇报|说明|解释)"
+        r"|老板|领导|客户|员工|新人|同事|高管|董事会|面试官")),
+    ("tone", re.compile(
+        r"别太[^\s，,。；;]{0,6}|不要太[^\s，,。；;]{0,6}|不要写[^\s，,。；;]{0,6}"
+        r"|不要用[^\s，,。；;]{0,6}|要有[^\s，,。；;]{0,6}|尽量[^\s，,。；;]{0,6}"
+        r"|务必[^\s，,。；;]{0,6}|最好[^\s，,。；;]{0,6}|通俗|深入浅出|量化|举例")),
+    ("deadline", re.compile(r"下周|本周|明天|后天|这个月|月底|季度|三天|一周|两周|马上|尽快|下班前")),
+)
+
+# 子句边界：摘片段时的左右界（与 `_CLAUSE_MARK` 分开写，因为这里要的是"切开的边界"，
+# 不含问号叹号——它们通常是子句的结尾而不是分隔）。
+_SNIPPET_EDGE = "，,。；;：:\n！!？?"
+
+
+def input_selfcheck_enabled() -> bool:
+    """自检开关（`MINDMAP_INPUT_SELFCHECK`，默认**开**，只在提取真的跑过时生效）。
+
+    默认开的理由与其它开关相反，但同一条标准——**它有没有成本**：这一步是一次正则扫描
+    （原话 ≤2,000 字、四条正则），零模型调用、零网络。主开关 `MINDMAP_INPUT_EXTRACT`
+    默认关，所以"开着"并不意味着一上线就生效。写成 `=0` 可单臂关掉，A/B 要的就是这一臂。
+    """
+    return os.getenv(INPUT_EXTRACT_SELFCHECK_ENV, "1").strip().lower() not in {
+        "0", "off", "false", "no"}
+
+
+def _cue_snippet(match: re.Match[str], limit: int = 12) -> str:
+    """把一处线索摘成**原文片段**：直接用正则匹配到的那一段，不改写、不补上下文。
+
+    接过一版"以匹配为中心取 16 字窗口"的写法，实测补出来的是
+    `"下周要给老板讲清楚为什么我们的检"`——半句、还被截在词中间。而这条线索要说的
+    只是"有下周这个时间压力"，`"下周"` 两个字已经说完了。**短而准 > 长而像文章。**
+    """
+    return match.group().strip(" ，,。；;：:、\n\t")[:limit]
+
+
+def _overlaps(left: str, right: str, floor: int = 6) -> bool:
+    """两段片段是不是"同一句话的两刀"（包含关系，或首/尾共 ≥ `floor` 字）。
+
+    要它是因为同一条线索常被两条正则同时扫到：`"下周要给老板讲清楚…"` 里 `下周`（deadline）
+    与 `给老板讲`（audience）摘出来的是几乎一样的一段。两段都补进 `constraints` 就是同一件
+    事写两遍——而 `constraints` 总共只放得下五条。
+    """
+    if left in right or right in left:
+        return True
+    for size in range(min(floor, len(left), len(right)), 0, -1):
+        if left[:size] == right[:size] or left[-size:] == right[-size:]:
+            return True
+    return False
+
+
+# audience 那一条的引导/收尾词：判"接住"时要剥掉它。`"给老板讲"` 的核心是 `"老板"`，
+# 而 `constraints` 里可能已经躺着 `"面向老板"`——不剥就会把同一个受众补第二遍（实测就
+# 这么补出过 `["面向老板", "给老板讲"]` 这种一对同义词）。
+_AUDIENCE_LEAD = re.compile(r"^(?:给|向|面向|讲给|说给|对)")
+_AUDIENCE_TAIL = re.compile(r"(?:看|听|讲|汇报|说明|解释)$")
+
+
+def _cue_core(hit: str, kind: str) -> str:
+    """线索的核心词。只对 `audience` 剥引导词——`tone` 剥了会出事：
+    `"别太技术"` 剥成 `"技术"` 之后，只要主题里出现"技术"就被判成已接住。"""
+    if kind != "audience":
+        return hit
+    core = _AUDIENCE_TAIL.sub("", _AUDIENCE_LEAD.sub("", hit))
+    return core.strip(" ，,。；;：:、")
+
+
+def _selfcheck(text: str, shape: _InputShape) -> _InputShape:
+    """拿**原话**对一遍那四类线索，漏的按原文片段追加进 `constraints`。
+
+    判"漏"用的是**字面包含**：线索的匹配文本（或它所在的片段）只要在 topic / intent /
+    questions / constraints 任一处出现过就算接住了。这是死板的判据，但死板在这里是对的
+    ——自检要做的是"别把找到的东西丢掉"，不是"再判断一次模型判得对不对"（那需要语义，
+    而语义那一步已经花过了）。
+
+    不改写、不重排、不调模型：新增的几条一律追加在 `constraints` 末尾，原来的顺序一个
+    不动（顺序是模型给的，动了就等于替它重排优先级）。
+    """
+    if not input_selfcheck_enabled() or shape.source != "model":
+        return shape
+    known = " ".join((shape.topic, shape.intent, *shape.questions, *shape.constraints))
+    added: list[str] = []
+    missed: list[str] = []
+    cues = caught = 0
+    for name, pattern in _SELFCHECK_CUES:
+        for match in pattern.finditer(text):
+            cues += 1
+            hit = match.group().strip()
+            core = _cue_core(hit, name) if hit else ""
+            if not hit or hit in known or (len(core) >= 2 and core in known):
+                caught += 1
+                continue
+            snippet = _cue_snippet(match)
+            if not snippet or snippet in known or snippet in added:
+                caught += 1
+                continue
+            if any(_overlaps(snippet, item) for item in added):
+                # 同一段话已经被补过（两条正则抓的是同一句）：算接住，不重复补
+                caught += 1
+                continue
+            missed.append(f"{name}:{hit}")
+            if len(added) < _SELFCHECK_MAX_ADDED:
+                added.append(snippet)
+    report = {
+        "cues": cues,
+        "caught": caught,
+        "added": list(added),
+        "missed": missed,
+        "skipped": missed[len(added):] if len(missed) > len(added) else [],
+    }
+    if not added:
+        return replace(shape, selfcheck=report)
+    return replace(
+        shape,
+        constraints=(*shape.constraints, *added)[:5],
+        selfcheck=report,
+    )
+
 
 
 def input_extract_enabled() -> bool:
@@ -6687,6 +6850,14 @@ class _InputShape:
     # 同一个函数）。它是**这一步的代价**，必须能与"省下来的东西"摆在一起看：一次提取
     # 约 0.4k token 输入，而它替换掉的是一棵按整句话长的树。
     prompt_tokens: int = 0
+    # 这一次提取看的是哪一段文本：`goal`（用户原话，首选）/ `topic`（工具的 topic 参数，
+    # 只在没有 goal 或原话过长时用）。分两态上报不是洁癖——实测同一句原话，看 goal 与看
+    # 压缩后的 topic 给出的 `constraints` 是 ["下周汇报","面向老板","别太技术"] 与
+    # ["面向老板汇报"]，差的那两条正是"提取不全"的全部内容。
+    read_from: str = "topic"
+    # 自检的账（`_selfcheck`）：四类线索各扫到几处、接住几处、补了哪几条。`None` 表示
+    # 自检没跑（开关关着 / 没提取到）。
+    selfcheck: dict[str, Any] | None = None
 
 
 # 提取那一次的 system。四条判据各对应一种实测会跑偏的写法：
@@ -6729,6 +6900,28 @@ def _too_short_to_extract(topic: str) -> str | None:
     if _CLAUSE_MARK.search(text) or _ASKED_MARK.search(text):
         return None
     return "short"
+
+
+def _extract_source(topic: str, ctx: RunContext) -> tuple[str, str]:
+    """这一次提取看哪段文本。返回 `(文本, 来源标记)`，标记进 `data["input"]["from"]`。
+
+    取**更长的那一个**（原话 / `topic`），不是无条件取原话：原话通常更长也更保真
+    （③ 的"别太技术"只存在于原话里），但 `goal` 也可能比 `topic` 短（用户只打了
+    「AI」而模型把它补成了「AI 学习路线」），那时拿原话等于把模型补的信息又丢掉一次。
+    信息量大的那个更接近"他到底说了什么"，而这一步的判据只有这一条。
+
+    超过 `INPUT_EXTRACT_MAX_SOURCE_CHARS` 时截断并记 `*_truncated`：那种输入是"用户贴了
+    一整篇文章"，材料入口会接手；提取只需要他要什么，前 2,000 字已经够判断。
+    """
+    goal = (ctx.request.goal or "").strip()
+    candidates = [(name, text) for name, text in (("goal", goal), ("topic", topic.strip()))
+                  if text]
+    if not candidates:
+        return topic, "topic"
+    read_from, text = max(candidates, key=lambda item: len(item[1]))
+    if len(text) > INPUT_EXTRACT_MAX_SOURCE_CHARS:
+        return text[:INPUT_EXTRACT_MAX_SOURCE_CHARS], f"{read_from}_truncated"
+    return text, read_from
 
 
 def _extract_ask(topic: str) -> str:
@@ -6784,7 +6977,7 @@ def _clean_items(value: Any, *, limit: int, count: int) -> tuple[str, ...]:
 
 
 def _shape_from(raw: Any, topic: str, *, seconds: float,
-                prompt_tokens: int = 0) -> _InputShape:
+                prompt_tokens: int = 0, read_from: str = "topic") -> _InputShape:
     """把模型那一次的输出收拾成 `_InputShape`。任何一处不合法都退回原 topic。
 
     退回而不是"照它能给的部分用"：`topic` 是这张图的中心，一个空的或半截的中心比原话
@@ -6793,11 +6986,11 @@ def _shape_from(raw: Any, topic: str, *, seconds: float,
     elapsed = round(seconds, 3)
     if not isinstance(raw, dict):
         return _InputShape(topic=topic, original=topic, seconds=elapsed, skip="unshaped",
-                           prompt_tokens=prompt_tokens)
+                           prompt_tokens=prompt_tokens, read_from=read_from)
     shaped = _clean_topic(raw.get("topic"))
     if not shaped:
         return _InputShape(topic=topic, original=topic, seconds=elapsed, skip="no_topic",
-                           prompt_tokens=prompt_tokens)
+                           prompt_tokens=prompt_tokens, read_from=read_from)
     return _InputShape(
         topic=shaped,
         original=topic,
@@ -6807,6 +7000,7 @@ def _shape_from(raw: Any, topic: str, *, seconds: float,
         source="model",
         seconds=elapsed,
         prompt_tokens=prompt_tokens,
+        read_from=read_from,
     )
 
 
@@ -6841,7 +7035,13 @@ def _intent_block(shape: _InputShape) -> str:
 
 
 async def _read_input(topic: str, ctx: RunContext) -> _InputShape:
-    """把工具参数 `topic` 读成「意图 + 主题 + 要覆盖的事」。
+    """把这次输入读成「意图 + 主题 + 要覆盖的事」。
+
+    **读的是用户原话（`ctx.request.goal`），不是 `topic` 参数**。这一条是实测逼出来的：
+    同一句原话（③，32 字），看原话给出的 `constraints` 是
+    `["下周汇报", "面向老板", "别太技术"]`，看外层 agent 压缩后的 `topic`
+    （"检索效果差的原因分析（面向老板汇报）"，18 字）只有 `["面向老板汇报"]`。
+    差的那两条不是模型判错，是**输入里本来就没有**——压缩发生在工具被调用之前。
 
     位置在 `_generate` 的开头、`_intake` 之前：**它必须比检索更早**，因为 `_intake`
     拿去查外部资料与库的那条 query 就是主题（`_external_query(topic, …)`），主题换了
@@ -6852,6 +7052,10 @@ async def _read_input(topic: str, ctx: RunContext) -> _InputShape:
     `empty`）、额度不够（`budget`）、调用或解析失败（`failed` / `unshaped` / `no_topic`）。
     一张图值不值得为"提取没成功"报错？不值得——原话当主题是这一步之前的行为，它是
     已知可用的，只是不够好。
+
+    判据（`_too_short_to_extract`）仍然只看 `topic`：它是"外层 agent 把这段输入压成了
+    什么"，是判"要不要多花一次调用"最省事的信号；真要看的是原话，那是**输入源**，两件
+    事分开。
     """
     if not input_extract_enabled():
         return _InputShape(topic=topic, original=topic, skip="off")
@@ -6862,10 +7066,14 @@ async def _read_input(topic: str, ctx: RunContext) -> _InputShape:
     if not ctx.reserve_model_call():
         return _InputShape(topic=topic, original=topic, skip="budget")
     ctx.extra_model_calls += 1
+    source, read_from = _extract_source(topic, ctx)
     started = time.perf_counter()
+    # 输入 token 与成败无关（它由 system + 这一次的文本决定），所以先算出来：失败那次
+    # 也照样花了这些 token，账不能只在成功时记。
+    prompt_tokens = estimate_input_tokens(INPUT_EXTRACT_PROMPT + _extract_ask(source))
     try:
         raw = await _chat(
-            ctx, INPUT_EXTRACT_PROMPT, _extract_ask(topic),
+            ctx, INPUT_EXTRACT_PROMPT, _extract_ask(source),
             max_tokens=INPUT_EXTRACT_MAX_TOKENS,
         )
     except Exception as exc:  # noqa: BLE001 — 提取失败就是降级，理由见 docstring 末段
@@ -6873,11 +7081,13 @@ async def _read_input(topic: str, ctx: RunContext) -> _InputShape:
             "输入提取失败（%s: %s），这一次把原话当主题",
             type(exc).__name__, _reason_text(exc))
         return _InputShape(
-            topic=topic, original=topic,
-            seconds=round(time.perf_counter() - started, 3), skip="failed")
-    return _shape_from(raw, topic, seconds=time.perf_counter() - started,
-                       prompt_tokens=estimate_input_tokens(
-                           INPUT_EXTRACT_PROMPT + _extract_ask(topic)))
+            topic=topic, original=topic, read_from=read_from,
+            seconds=round(time.perf_counter() - started, 3), skip="failed",
+            prompt_tokens=prompt_tokens)
+    shape = _shape_from(raw, topic, seconds=time.perf_counter() - started,
+                        prompt_tokens=prompt_tokens, read_from=read_from)
+    # 自检：拿**原话**对一遍（`source`，不是 topic）。纯规则、不新增调用。
+    return _selfcheck(source, shape)
 
 
 def _apply_skeleton(
@@ -10588,6 +10798,13 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             "questions": list(shape.questions),
             "constraints": list(shape.constraints),
             "seconds": shape.seconds,
+            # 这一次看的是哪段文本（`goal` = 用户原话 / `topic` = 工具参数）。这一位
+            # 之所以必须报：同一句原话两种输入给出的 constraints 差两条，而"提取不全"
+            # 与"提取不准"在读数上长得一模一样，只有这一位能分开。
+            "from": shape.read_from,
+            # 自检的账：四类线索扫到几处、接住几处、补了哪几条、哪几条因为超上限没补。
+            # 它证明"补进 constraints 的那几条是原文片段"，不是模型改写。
+            "selfcheck": shape.selfcheck,
             # 这一步的代价：一次提取的输入 token 估算。它能与"这一次少走的那条路"
             # 直接比较——关着时那一行主题是一整句话，开着时它是一个名词短语。
             "prompt_tokens": shape.prompt_tokens,

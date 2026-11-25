@@ -173,8 +173,14 @@ class TestExtract:
         assert ctx.candidate.root.label == EXTRACT_REPLY["topic"]
 
     def test_intent_questions_and_constraints_reach_the_prompts(self, monkeypatch):
-        """三样都进 user 的**一小段**（骨架与结构两次调用都有），且不进主题那一行。"""
+        """三样都进 user 的**一小段**（骨架与结构两次调用都有），且不进主题那一行。
+
+        自检在这一条里**关掉**（`MINDMAP_INPUT_SELFCHECK=0`）：它测的是"提取的三样有没有
+        到 prompt"，而自检会按原话再补几条（那几条有自己的一组用例）。两件事分开测，
+        失败时才知道是哪一层坏了。
+        """
         self._on(monkeypatch)
+        monkeypatch.setenv("MINDMAP_INPUT_SELFCHECK", "0")
         result, record = _generate(LONG_INPUTS[0][1], _ctx(), _stub)
 
         for call in (_calls(record, _PLAN_MARK)[0], _calls(record, "root")[0]):
@@ -185,12 +191,14 @@ class TestExtract:
             assert _topic_line(call["user"]) == EXTRACT_REPLY["topic"]
 
         assert result.data["input"]["source"] == "model"
+        assert result.data["input"]["from"] == "goal"
         assert result.data["input"]["intent"] == "想规划"
         assert result.data["input"]["questions"] == EXTRACT_REPLY["questions"]
         assert result.data["input"]["constraints"] == EXTRACT_REPLY["constraints"]
         assert result.data["input"]["chars"]["original"] == len(LONG_INPUTS[0][1])
         assert result.data["input"]["skip"] == ""
         assert result.data["input"]["seconds"] >= 0
+        assert result.data["input"]["selfcheck"] is None
 
     def test_short_clean_topic_skips_the_call(self, monkeypatch):
         """真主题（9 字）不提取，也不多付一次调用——那是最常见的用法。"""
@@ -292,3 +300,126 @@ class TestShape:
         """没有提取就没有那一段（开关关着时 user 逐字节不变的另一半保证）。"""
         shape = tools_module._InputShape(topic="甲", original="甲", skip="short")
         assert tools_module._intent_block(shape) == ""
+
+
+# ---------------------------------------------------------------- 输入源：原话优先
+
+
+class TestSource:
+    """提取看**哪段文本**。这一条比自检重要：同一句原话，看 goal 与看压缩后的 topic
+    给出的 `constraints` 差两条（`docs/INPUT-EXTRACT.md` 第 5 节）。"""
+
+    def _ctx(self, goal: str, topic: str) -> tuple[RunContext, str]:
+        request = AgentRunRequest(
+            goal=goal, intent="create",
+            budget=RunBudget(max_model_calls=12, max_output_tokens=32768),
+        )
+        return RunContext(request=request), topic
+
+    def test_longer_side_wins(self):
+        """原话 32 字、topic 18 字 → 看原话。"""
+        goal = LONG_INPUTS[2][1]
+        ctx, topic = self._ctx(goal, "检索效果差的原因分析（面向老板汇报）")
+        text, read_from = tools_module._extract_source(topic, ctx)
+        assert text == goal
+        assert read_from == "goal"
+
+    def test_topic_wins_when_it_is_richer(self):
+        """`goal` 只打了两个字、模型补出了主题时，用 topic——不然模型补的信息又丢一次。"""
+        ctx, topic = self._ctx("AI", "AI 学习路线与阶段划分")
+        text, read_from = tools_module._extract_source(topic, ctx)
+        assert text == topic
+        assert read_from == "topic"
+
+    def test_over_long_goal_is_truncated(self):
+        """超过上限就截断（当前契约撞不到，见常量注释——这条钉的是`防御本身`）。"""
+        # 鸭子类型替身：`_extract_source` 只读 `ctx.request.goal`，而用真请求构造会先被
+        # pydantic 的 1,000 字上限拦下，测不到这条分支。
+        class _Request:
+            goal = "长" * (tools_module.INPUT_EXTRACT_MAX_SOURCE_CHARS + 50)
+
+        class _Ctx:
+            request = _Request()
+
+        text, read_from = tools_module._extract_source("某个主题", _Ctx())
+        assert len(text) == tools_module.INPUT_EXTRACT_MAX_SOURCE_CHARS
+        assert read_from == "goal_truncated"
+
+
+# ---------------------------------------------------------------- 自检
+
+
+class TestSelfcheck:
+    """纯规则自检：原话里那四类线索有没有被接住。**不新增调用**是它的硬边界。"""
+
+    def _shape(self, **overrides):
+        payload = {
+            "topic": "检索效果差的原因分析",
+            "intent": "想讲解给别人听",
+            "questions": ["检索效果差的原因是什么"],
+            "constraints": ["面向老板"],
+        }
+        payload.update(overrides)
+        return tools_module._shape_from(payload, "x", seconds=1.0, read_from="goal")
+
+    def test_missed_cue_is_appended_verbatim(self):
+        """原话里的四类线索一条都没接住 → 按原文片段补进 constraints，一个字不改写。"""
+        shape = tools_module._selfcheck(LONG_INPUTS[2][1], self._shape())
+        # "面向老板" 接住了受众（"给老板讲"的核心"老板"在），其余三条都补
+        assert shape.constraints == ("面向老板", "要有数据支撑", "别太技术", "下周")
+        report = shape.selfcheck
+        assert report["cues"] == 4
+        assert report["caught"] == 1
+        assert report["added"] == ["要有数据支撑", "别太技术", "下周"]
+        assert "tone:别太技术" in report["missed"]
+
+    def test_caught_cue_is_not_added(self):
+        """已经写进字段的那条不再补（`"下周汇报"` 覆盖了 `"下周"`）。"""
+        shape = tools_module._selfcheck(LONG_INPUTS[2][1],
+                                       self._shape(constraints=["下周汇报"]))
+        assert "下周" not in shape.constraints
+
+    def test_audience_is_deduped_by_core_word(self):
+        """`"给老板讲"` 的核心是 `"老板"`：`constraints` 里已有 `"面向老板"` 就不重复补。"""
+        shape = tools_module._selfcheck(
+            LONG_INPUTS[2][1], self._shape(constraints=["面向老板", "别太技术", "下周"]))
+        assert shape.constraints == ("面向老板", "别太技术", "下周", "要有数据支撑")
+
+    def test_no_cue_means_no_change(self):
+        """②那条原话里确实没有硬条件：一条都不补（自检不能凭正则造约束）。"""
+        shape = tools_module._selfcheck(LONG_INPUTS[1][1], self._shape(constraints=[]))
+        assert shape.constraints == ()
+        assert shape.selfcheck["cues"] == 0
+        assert shape.selfcheck["added"] == []
+
+    def test_amount_needs_a_quantifier(self):
+        """`"RAG 2.0"` 这种型号不算量词线索；`"300人"` 算。"""
+        assert tools_module._SELFCHECK_CUES[0][1].search("RAG 2.0 的召回") is None
+        assert tools_module._SELFCHECK_CUES[0][1].search("公司300人") is not None
+
+    def test_added_is_capped(self):
+        """最多补 3 条：多了就是把原话抄进 constraints。"""
+        text = "300人，下周，给老板讲，别太技术，要简单"
+        shape = tools_module._selfcheck(text, self._shape(constraints=[]))
+        assert len(shape.selfcheck["added"]) == tools_module._SELFCHECK_MAX_ADDED
+
+    def test_off_by_switch(self, monkeypatch):
+        """`MINDMAP_INPUT_SELFCHECK=0` 时自检不跑（A/B 的那一臂）。"""
+        monkeypatch.setenv("MINDMAP_INPUT_SELFCHECK", "0")
+        shape = self._shape()
+        assert tools_module._selfcheck(LONG_INPUTS[2][1], shape) is shape
+        assert shape.selfcheck is None
+
+    def test_selfcheck_is_free(self, monkeypatch):
+        """自检不碰模型：开了自检，`_read_input` 的调用次数与关着时相同。"""
+        monkeypatch.setenv("MINDMAP_INPUT_EXTRACT", "1")
+        goal = LONG_INPUTS[2][1]
+        counts = []
+        for arm in ("0", "1"):
+            monkeypatch.setenv("MINDMAP_INPUT_SELFCHECK", arm)
+            record: list[dict] = []
+            with patch("app.agent.tools.chat_async", new=_stub(record)):
+                ctx = _ctx()
+                asyncio.run(tools_module._read_input(goal, ctx))
+            counts.append(len(record))
+        assert counts[0] == counts[1] == 1
