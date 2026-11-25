@@ -3727,6 +3727,13 @@
             ],
             "title": "Diagram Type",
             "default": "tree"
+          },
+          "branch_digests": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Branch Digests"
           }
         },
         "additionalProperties": false,
@@ -3793,6 +3800,13 @@
             ],
             "title": "Diagram Type",
             "default": "tree"
+          },
+          "branch_digests": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Branch Digests"
           }
         },
         "additionalProperties": false,

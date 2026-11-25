@@ -611,6 +611,46 @@ SECTION_SLICE_STAGE = "section_slice"
 # 丢掉留下的是零引用。提示词里写的也是这个数（`SECTION_SLICE_REF_RULES`）。
 SECTION_SLICE_QUOTE_CHARS = 300
 
+# ---------------------------------------------------------------- 一级分支概括
+#
+# 画布默认只画 40 个节点（`canvas/view-collapse.ts`），被截断的父节点上有一枚 `+N`
+# ——它证明"这里还有 N 个直接孩子"，证明不了"这一支一共还有多少、讲的是什么"。
+# 后者只有在一级分支上才答得出来，而一级分支只有几条、位置固定。
+#
+# 数字是免费的（前端 `countSubtree` 自己数），**文案要调模型**：这是本轮唯一新增的
+# 一次调用，所以它有独立开关，且默认关。
+BRANCH_DIGEST_ENV = "MINDMAP_BRANCH_DIGEST"
+
+# 一次调用要概括几条一级分支的上限与输出预算。
+#
+# 上限与 `MAX_NODE_CHILDREN`（50，`Node.children` 的契约上限）**同一个数**：超过它的
+# 一级分支根本存不进契约，所以 50 就是"所有合法树都能一次覆盖"的那个界。取 20 会让
+# 库里那棵 50 支的探针树有 30 支永远没有概括——而"为什么这 30 支没有角标"在界面上
+# 查不出来（`docs/VIEW-COLLAPSE.md` §九 记着那棵树）。
+#
+# 一条概括 8–12 字，50 条约 600 字 ≈ 900 token；给 2000 是给 JSON 骨架与模型偶尔
+# 多写一句留的余量。**不给 `_max_tokens(ctx)`**：那条口径是"这一次要写多少个节点的
+# 正文"，与"写几十句短标题"差两个数量级，照它发包只会让模型以为自己该长篇大论。
+BRANCH_DIGEST_MAX_BRANCHES = 50
+BRANCH_DIGEST_MAX_TOKENS = 2_000
+
+# 每条一级分支往下看几个子节点的 label。3 个足够定性（"训练与并行"这种概括来自
+# 下面那三个子节点叫什么），而**不塞 `detail`**：一段 80–150 字的说明 ×6 支会把
+# 这一节的输入从两百字撑到一千字，而概括恰恰是"只看目录"比"读完正文"更准的任务。
+BRANCH_DIGEST_CHILD_SAMPLES = 3
+
+
+def branch_digest_enabled() -> bool:
+    """是否在一级分支上写概括。默认**关**，显式写 `1/on/true/yes` 才算开。
+
+    判定与 `library_in_generate_enabled` / `external_knowledge_enabled` 同一套。
+    默认关的理由与这几天所有新功能一致：它多一次模型调用（实测 1.87 秒 / 5 组），
+    而"这一支还有多少节点"这条信息在没有概括的情况下由 `+N` 与顶部「显示 N / M」
+    已经说了一部分——要不要为剩下的那一半付这笔钱，由数字决定，不由默认值决定。
+    """
+    return (os.getenv(BRANCH_DIGEST_ENV, "0").strip().lower()
+            in LIBRARY_SEARCH_TRUTHY)
+
 # 用户**自己把联网检索关掉**时的那句话。单独提成常量有两个理由：
 #
 #   - 它与"搜了但没搜到"是两件事（那条说"联网检索没有找到相关资料"），而两条路
@@ -5678,6 +5718,228 @@ async def _fill_details(
     return content, report
 
 
+# ---------------------------------------------------------------- 一级分支概括
+
+
+BRANCH_DIGEST_PROMPT = (
+    "你在给一张已经写好的思维导图做目录批注。它的一级分支已经定下来，每一条下面"
+    "挂着若干具体节点。\n\n"
+    "任务：给**每一条一级分支**写一句概括，让没读过这张图的人一眼看出这一支讲什么。\n\n"
+    "硬要求：\n"
+    "1. 8–12 个汉字，写成名词短语；不要写成一整句话，也不要以动词开头。\n"
+    "2. **不许复用分支标题里的词**：标题里出现过的两字以上的实词，一个都不要写进概括。"
+    "标题就印在节点上，概括如果只是把它换一种说法（「相似度打分与权重分配」→"
+    "「相似度打分与归一化权重」），那个位置就白占了。\n"
+    "3. 从这一支**下位节点的词**里取词。它们比标题具体得多，而这就是这条概括唯一的"
+    "信息来源——概括要说的是「这一支的下位节点在讲什么」，不是「这一支叫什么」。\n"
+    "4. 几条之间不许同义重复：两条概括说得像同一件事，说明至少有一条没读下位节点。\n"
+    "5. 不要出现「这一支」「本部分」「相关内容」「核心要点」「介绍」这类空词。\n"
+    "6. 不要编号、不要书名号、结尾不要标点。\n\n"
+    "返回一个 JSON 对象：键是每条一级分支的 id（原样照抄），值是那句概括。"
+    "不要解释，不要多余的话。"
+)
+
+# 一句概括的字数上限。提示词要 8–12，这里卡 14 是**容错而不是目标**：模型偶尔多写
+# 两三个字，截掉比整条丢掉好（截掉的仍是这一支的真实概括，丢掉就只剩数字）。
+# 上限比提示词宽 2 个字，是为了让"12 个字 + 一个没数进去的标点"不至于被腰斩。
+BRANCH_DIGEST_MAX_CHARS = 14
+
+# 概括要剥掉的首尾字符。**只剥标点与引号，不剥字**：`「训练与并行」`与
+# `训练与并行。` 都是模型常给的形状，留着它们在角标上就是一层多余的框。
+_DIGEST_TRAILING = " \t　。．.，,、；;：:！!？?…·「」『』\"'“”‘’（）()《》"
+
+
+@dataclass
+class _BranchDigestReport:
+    """这一次概括调用的账（进 `data["branch_digest"]`）。与 `_DetailHalf` 同一条规矩：
+    一个会花掉秒级时间、会多一次模型调用的步骤，必须留下决定。
+    """
+
+    branches: int = 0
+    written: int = 0
+    # 少了哪几支（模型没写回 / 写回来的是空串）。角标对这几支**不画**——它退化成
+    # "这一支还有 N 个"，而那件事 `+N` 与顶部「显示 N / M」已经说过一遍了。
+    missing: list[str] = field(default_factory=list)
+    # 模型给了 id 但对不上号（它把自己编的分支名当成了键）。非致命，但必须能看见：
+    # "模型写了 6 段话" 与 "一段都没对上" 在产出上长得一模一样。
+    unknown: list[str] = field(default_factory=list)
+    seconds: float = 0.0
+    # None = 真的调了；"few_branches" / "budget" / "error" = 没调成或没调。
+    skipped: str | None = None
+    failure: str = ""
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+    def account(self) -> dict[str, Any]:
+        return {
+            "branches": self.branches,
+            "written": self.written,
+            "missing": list(self.missing),
+            "unknown": list(self.unknown),
+            "skipped": self.skipped,
+            "failure": self.failure,
+            "seconds": self.seconds,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+        }
+
+
+def _branch_digest_ask(rows: Sequence[tuple[Node, Sequence[str]]], topic: str) -> str:
+    """这一次调用的 user：主题 + 每条一级分支一行（id / 标题 / 下位节点的标题）。
+
+    **给 id 而不是靠顺序**，理由与 `_detail_ask` 同一条：顺序错一位，六条概括就会
+    整体串行错位，而从产出上看不出来（每条本身都通顺）。
+
+    **只给下位节点的 label，不给 `detail`**：一段 80–150 字的说明 ×6 支会把这一节
+    从两百字撑到一千字，而"只看目录"恰恰比"读完正文"更容易写出准确的概括——正文
+    里的细节会把概括拽向其中某一句，得到的是一段摘要而不是这一支的边界。
+
+    主题那一行是**锚**：同一批标题在"注意力机制"与"报销流程"两张图里该概括成
+    不同的词，没有它，模型只能按标签的字面去猜。
+    """
+    lines = []
+    for index, (node, children) in enumerate(rows, start=1):
+        tail = f"｜下位：{'、'.join(children)}" if children else ""
+        lines.append(f"{index}. id={node.id}｜{node.label}{tail}")
+    return (
+        f"主题：{topic}\n\n"
+        f"这张图的一级分支共 {len(rows)} 条：\n\n" + "\n".join(lines)
+        + f"\n\n请给这 {len(rows)} 条各写一句概括，用上面给出的 id 做键。"
+    )
+
+
+def _digest_text(raw: Any) -> str | None:
+    """模型给的一句概括 → 能放上画布的字符串（或 `None`）。
+
+    四件事：非字符串当没给、折掉换行（角标只有一行高）、剥掉首尾标点与引号、超过
+    `BRANCH_DIGEST_MAX_CHARS` 截断。**不判空之外的语义**——不改写、不补全。概括写得
+    不如标题，是这一支该不该显示角标的问题（前端那条判据），不是这里能修的事。
+    """
+    if not isinstance(raw, str):
+        return None
+    text = " ".join(raw.split())
+    for prefix in ("一句概括：", "一句话概括：", "概括：", "概括:", "概括——"):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    text = text.strip(_DIGEST_TRAILING)
+    if not text:
+        return None
+    return text[:BRANCH_DIGEST_MAX_CHARS]
+
+
+def _digest_map(
+    raw: Any, known: Sequence[str],
+) -> tuple[dict[str, str], list[str], list[str]]:
+    """模型返回 → `(id → 概括, 缺的 id, 对不上的键)`。
+
+    三种形状都认（与 `_detail_map` 同样宽容，理由是同一个：三种都真的出现过）：
+    `{"d1": "…"}`、`{"digests": {...}}`、`[{"id": "d1", "summary": "…"}]`。
+
+    **不复用 `_detail_map`**：值的清洗规则不同（那是 2000 字允许换行的一段说明，
+    这是 14 字不许换行的一句标题），列表形状的取值键也不同（`summary` / `digest` /
+    `detail` 三选一）。把差别塞成参数，两个调用点就会各带一半参数、而"哪个参数
+    决定行为"再也读不出来——这一处只有 20 行，分开写更清楚。
+    """
+    if isinstance(raw, dict) and len(raw) == 1:
+        key = next(iter(raw))
+        inner = raw[key]
+        if key in ("digests", "digest", "branches", "summary", "data", "map") \
+                and isinstance(inner, (dict, list)):
+            raw = inner
+    pairs: list[tuple[str, Any]] = []
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            if isinstance(value, dict):
+                value = value.get("summary") or value.get("digest") or value.get("detail")
+            pairs.append((str(key), value))
+    elif isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            node_id = item.get("id") or item.get("node_id")
+            value = item.get("summary") or item.get("digest") or item.get("detail")
+            pairs.append((str(node_id or ""), value))
+    allowed = set(known)
+    applied: dict[str, str] = {}
+    unknown: list[str] = []
+    for node_id, value in pairs:
+        key = node_id.strip()
+        if not key:
+            continue
+        if key not in allowed:
+            unknown.append(key)
+            continue
+        text = _digest_text(value)
+        if text:
+            applied[key] = text
+    missing = [node_id for node_id in known if node_id not in applied]
+    return applied, missing, unknown
+
+
+async def _fill_branch_digests(
+    content: MindMapContent, ctx: RunContext, *, topic: str,
+) -> tuple[MindMapContent, _BranchDigestReport]:
+    """一次批量调用，给每条一级分支写一句概括（`MINDMAP_BRANCH_DIGEST`）。
+
+    **时机是"说明那一次之后"**：那时每个节点的 `detail` 都写完了，一级分支也已经是
+    最终形态（骨架分组、裁剪、配色全部落定）。放在结构那一次之后也调得通，但那时
+    一级分支的标题还是骨架的原话、下属节点还没定稿——用它写出来的概括会在二十秒后
+    过期。
+
+    **失败一律降级**：调用抛错、额度用完、模型一条都没写回，都只是让
+    `content.branch_digests` 保持空表，角标退回"只显示数字"（前端那条判据）。为一句
+    概括把一棵已经成型的树判成失败，是拿确定的好换不确定的好——与 `_fill_details`
+    同一条方向。
+
+    **只对树**：鱼骨的一级是固定六类（人机料法环测，概括就是这六个字），流程的一级
+    是阶段（标题本身就是它的定义）。两者都调不出新信息，而那两条路的产物根本没有
+    `branch_digests` 字段。
+    """
+    report = _BranchDigestReport()
+    branches = list(content.root.children)
+    report.branches = len(branches)
+    # 少于两条分支时不调：一条分支的概括只能是它的标题，而单支的树在画布上也不会
+    # 被截成"这一支还有 N 个"（根 + 那一支就在预算里）。
+    if len(branches) < 2:
+        report.skipped = "few_branches"
+        return content, report
+    rows = [
+        (node, [child.label for child in node.children[:BRANCH_DIGEST_CHILD_SAMPLES]])
+        for node in branches[:BRANCH_DIGEST_MAX_BRANCHES]
+    ]
+    user = _branch_digest_ask(rows, topic)
+    # 额度在**发请求之前**占：与骨架那一步同一规矩（请求一旦发出就是一次真实计费）。
+    if not ctx.reserve_model_call():
+        report.skipped = "budget"
+        return content, report
+    ctx.extra_model_calls += 1
+    report.prompt_tokens = estimate_input_tokens(BRANCH_DIGEST_PROMPT) + \
+        estimate_input_tokens(user)
+    started = time.perf_counter()
+    try:
+        raw = await _chat(
+            ctx, BRANCH_DIGEST_PROMPT, user,
+            max_tokens=min(BRANCH_DIGEST_MAX_TOKENS, _max_tokens(ctx)))
+    except GenerationError as exc:
+        report.skipped = "error"
+        report.failure = _reason_text(exc)
+        report.seconds = round(time.perf_counter() - started, 3)
+        return content, report
+    report.seconds = round(time.perf_counter() - started, 3)
+    applied, missing, unknown = _digest_map(raw, [node.id for node in branches])
+    report.written = len(applied)
+    report.missing = missing
+    report.unknown = unknown
+    if not applied:
+        report.skipped = "error"
+        report.failure = "模型没有给出任何可用的概括"
+        return content, report
+    report.completion_tokens = estimate_input_tokens(
+        json.dumps(applied, ensure_ascii=False))
+    return content.model_copy(update={"branch_digests": applied}), report
+
+
 @dataclass(frozen=True)
 class _ExternalFetch:
     """一次外部检索的产物。
@@ -10442,6 +10704,49 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     # 除了契约的 8 层算"到底了"，其余一律 `yes`——它们本来就能再展开。
     _stamp_expandable(content, {}, max_depth=mindmap_contract.MAX_TREE_DEPTH)
 
+    # ---- 一级分支的概括（`MINDMAP_BRANCH_DIGEST`，默认关）---------------------
+    #
+    # 位置就在说明之后：一级分支已经是最终形态（分组 / 裁剪 / 配色全部落定），下位
+    # 节点的标题也定稿了，而 `check()` 还没跑（它是复核，该读最终内容）。往前挪到
+    # 结构那一步之后也调得通，但那时分支标题还是骨架原话，写出来的概括会在二十秒
+    # 后过期。
+    #
+    # 产物进 `content.branch_digests`（契约字段，**会落库**——"这一支讲什么"是这
+    # 张图的属性，刷新一次就没了的东西不该占契约位置，而每次重开都再调一次模型是
+    # 拿钱买一个本来就在手里的答案）。**不进 `data`**：`data` 是一次运行的读数。
+    #
+    # 关着时这一段一行都不执行：`content` 一个字节不动、`data` 的键集不变、模型
+    # 调用次数不变——`test_edges` 那批逐字节回归用例钉的就是这条。
+    digest_report: _BranchDigestReport | None = None
+    if diagram_type == "tree" and branch_digest_enabled():
+        content, digest_report = await _fill_branch_digests(content, ctx, topic=topic)
+        if digest_report.skipped in ("error", "budget"):
+            # 一句概括没写成不该让整棵树失败，但也不能沉默：用户开了开关、界面上却
+            # 只有数字，唯一的线索就是这一条。
+            reason = (
+                "本次运行的模型调用额度已用完" if digest_report.skipped == "budget"
+                else f"调用{('失败：' + digest_report.failure) if digest_report.failure else '出错'}"
+            )
+            diagnostics.append(Diagnostic(
+                level=DiagnosticLevel.warn, code="BRANCH_DIGEST_SKIPPED",
+                message=(
+                    f"一级分支的概括没写成（{reason}）；"
+                    "画布上的角标只显示「还有 N 个」，没有那句概括。"
+                ),
+            ))
+        elif digest_report.missing:
+            labels = {node.id: node.label for node in content.root.children}
+            head = "、".join(
+                f"「{labels.get(node_id, node_id)}」" for node_id in digest_report.missing[:5])
+            diagnostics.append(Diagnostic(
+                level=DiagnosticLevel.info, code="BRANCH_DIGEST_INCOMPLETE",
+                message=(
+                    f"{len(digest_report.missing)}/{digest_report.branches} 条一级分支没写出"
+                    f"概括（{head}{'…' if len(digest_report.missing) > 5 else ''}）；"
+                    "这几支的角标只显示「还有 N 个」。"
+                ),
+            ))
+
     # 结构与语义两层复核（与 `_generate_deep` 的收尾同一份）：诊断只是提示，
     # 不影响这棵树能不能用——契约校验在上一步就决定过了。
     diagnostics.extend(check(content))
@@ -10783,6 +11088,14 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         },
         "diagnostics": [item.model_dump() for item in diagnostics],
     }
+    if digest_report is not None:
+        # 只有开关开着、且真的走到了那一步才有这个键（关着时 `data` 的键集与改动
+        # 之前逐字节相同——回归用例比的是键集，不只是值）。与 `data["input"]` /
+        # `data["verify"]` 同一条规矩。
+        #
+        # 账放这里、产物放契约：`branch_digests` 是这张图的属性（要落库），而"这次
+        # 调了几秒、输入输出多少 token、哪几支没写出来"是一次运行的读数。
+        data["branch_digest"] = digest_report.account()
     if shape.skip != "off":
         # 开关开着才有这个键（关着时 `data` 的键集与改动之前逐字节相同——回归用例比的
         # 是键集，不只是值）。放进 `data` 而不是给 `Node` / 契约加字段：`data` 是

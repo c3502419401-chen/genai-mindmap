@@ -1829,6 +1829,10 @@ export interface components {
              * @enum {string}
              */
             diagram_type: "tree" | "flowchart" | "fishbone";
+            /** Branch Digests */
+            branch_digests?: {
+                [key: string]: string;
+            };
         };
         /** MindMapContent */
         "MindMapContent-Output": {
@@ -1856,6 +1860,10 @@ export interface components {
              * @enum {string}
              */
             diagram_type: "tree" | "flowchart" | "fishbone";
+            /** Branch Digests */
+            branch_digests?: {
+                [key: string]: string;
+            };
         };
         /**
          * ModelSettings
