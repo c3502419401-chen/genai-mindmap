@@ -287,7 +287,10 @@ function median(values: number[]): number {
 }
 
 describe('真图实测', () => {
-  it('把三套几何的分布写成表（含每档的"有问题"比例）', ctx => {
+  // 这一条把库里 58 张图 × 三套几何（tidy / fishbone / dagre）全部排一遍再统计，
+  // 单跑约 0.7 秒，与另外 69 个文件并行时实测到过 6.3 秒——vitest 默认 5 秒会把它判成
+  // 超时失败（是负载，不是断言）。所以给它一个显式上限：它是一条测量，不是速度测试。
+  it('把三套几何的分布写成表（含每档的"有问题"比例）', { timeout: 30_000 }, ctx => {
     if (!samples.length) {
       ctx.skip();
       return;
