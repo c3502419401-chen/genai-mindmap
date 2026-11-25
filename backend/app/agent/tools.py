@@ -4351,28 +4351,39 @@ DETAIL_SPLIT_MIN = 12
 # 句子数不跟着伸缩。"至少 3 句"是拿 21–46 字的一句半量出来的质量线，句子数一降就
 # 退回那个形态；材料撑不住 3 句时该减的是节点数（`MINDMAP_NODE_SCALE`），见
 # `generation.budget.DETAIL_SENTENCE_FLOOR` 的理由。
+#: 两份「只写说明」prompt 共用的前半段：输出形状、禁占位话、不动引用。
+#
+# 抽成常量是为了让"句子数"成为**唯一**可变的尾段：`_detail_only_prompt` 与
+# `_detail_only_prompt_open` 的差别只在最后一段，读 diff 的人不必逐行比对四段没变的
+# 规则。抽取本身不改字节——拼接结果与抽取之前逐字相同（`test_detail_sentences` 用
+# sha256 钉着 `DETAIL_ONLY_PROMPT`，那条断言在抽取前后都必须过）。
+_DETAIL_ONLY_SHAPE_RULES = (
+    "这一次只写思维导图节点的「说明」，不写结构。"
+    "节点已经定好了：id、label、它在一级分支下的位置都在 user 消息里，"
+    "一个都不许增删改名，也不许改动父子关系。\n"
+    "只返回一个 JSON 对象，不要代码围栏：键是节点 id（原样照抄），值是说明正文，"
+    '例如 {"d1a":"…","d1b":"…"}。'
+    "每一个 id 都必须出现，一个都不能漏。\n"
+    "不要写「简要说明」「详见教材」「同上」「可参考」这类占位话；"
+    "也不要把 label 换个说法重复一遍——画布上已经有 label 了，"
+    "detail 是点开之后才能看到的正文。\n"
+    "**这一轮不要写 source_refs**：引用已经在结构那一轮按证据定好了，"
+    "这里再写会与那些引用对不上。\n"
+)
+
+
 def _detail_only_prompt(min_chars: int, max_chars: int) -> str:
     """第三段的 system，长度区间参数化。`(80, 150)` 下与加伸缩之前逐字节相同。"""
     sentences = budget.DETAIL_MIN_SENTENCES
     return (
-        "这一次只写思维导图节点的「说明」，不写结构。"
-        "节点已经定好了：id、label、它在一级分支下的位置都在 user 消息里，"
-        "一个都不许增删改名，也不许改动父子关系。\n"
-        "只返回一个 JSON 对象，不要代码围栏：键是节点 id（原样照抄），值是说明正文，"
-        '例如 {"d1a":"…","d1b":"…"}。'
-        "每一个 id 都必须出现，一个都不能漏。\n"
-        "不要写「简要说明」「详见教材」「同上」「可参考」这类占位话；"
-        "也不要把 label 换个说法重复一遍——画布上已经有 label 了，"
-        "detail 是点开之后才能看到的正文。\n"
-        "**这一轮不要写 source_refs**：引用已经在结构那一轮按证据定好了，"
-        "这里再写会与那些引用对不上。\n"
+        _DETAIL_ONLY_SHAPE_RULES
         # 下面是**最后**一段，两条都是拿真实采样改出来的：
         #   - 偏短的都是**并列型 label**（「常见变体」「循环与序列网络」「K-means 与层次
         #     聚类」）：模型只把名字列一遍就收（21–46 字，低于 60 的下限）。所以点名要求
         #     逐个说清，并给出"至少 3 句"这个比字数更难自我通融的下限；
         #   - 不压上限会写出 165/170 字（超过 150 的目标），多出来的字既读不完，也拖慢
         #     这一次调用（说明那一次是总耗时的大头）。
-        f"\n每一段说明写 {min_chars}–{max_chars} 字、**至少 {sentences} 句完整的话**"
+        + f"\n每一段说明写 {min_chars}–{max_chars} 字、**至少 {sentences} 句完整的话**"
         f"（不是 {sentences} 个短语），少于 {sentences} 句就是没写完。"
         "如果这个节点的标题是一串并列的东西（几个算法、几种变体、几类方法、几个阶段），"
         "要逐个说清它们各自做什么、差别在哪，不要只把名字列一遍就收。"
@@ -4382,6 +4393,86 @@ def _detail_only_prompt(min_chars: int, max_chars: int) -> str:
 
 #: 现状区间的那一份（`MINDMAP_DETAIL_SCALE` 关着、或没有材料时用它，逐字节不变）。
 DETAIL_ONLY_PROMPT = _detail_only_prompt(DETAIL_MIN_CHARS, DETAIL_MAX_CHARS)
+
+
+# ---------------------------------------------------------------- 句子数：放开
+#
+# "至少 3 句完整的话"是**第二道**防"越写越短"的加固（第一道就是 80 字下限）。它的
+# 来历写在上面第三段那段注释里：把「结构 + 说明」压在同一次输出时，五采样 detail 是
+# 45.3 / 28.0 / 28.5 / 26.2 / 27.4 字，越写越短；而在 system 里加"不少于 60 字"反而
+# 更短（28.5 → 26.2）。所以真正救它的是"单独一段只写说明"，句子数只是加固。
+#
+# 加固的另一面是"凑句子"：句数下限会把"这一段没那么多可说"的节点逼成三句**结构上
+# 合格、信息上重复**的话，而 80 字下限已经独立地挡住了"塌到 40 字以下"。这条是不是
+# 在制造噪声，用三批读数回答（`docs/DETAIL-SENTENCES.md`：三臂 × 两批 × 每批 2 次）。
+#
+# 开关默认**关**：关着时 `_detail_prompt` 直接返回 `_detail_only_prompt` 的输出，
+# system 与加这个开关之前逐字节相同（`tests/test_detail_sentences.py` 用 sha256 钉着）。
+DETAIL_SENTENCES_ENV = "MINDMAP_DETAIL_SENTENCES"
+
+
+def detail_sentences_open() -> bool:
+    """`MINDMAP_DETAIL_SENTENCES=1` → 说明那一轮不再要求"至少 N 句"。
+
+    与 `MINDMAP_DETAIL_SCALE` / `MINDMAP_NODE_SCALE` 同一个约定：改的是模型的写法，
+    翻它之前得先有一组读数，而且要能单独回滚。
+    """
+    return os.getenv(DETAIL_SENTENCES_ENV, "").strip().lower() in (
+        "1", "on", "true", "yes")
+
+
+def _detail_only_prompt_open(min_chars: int, max_chars: int) -> str:
+    """开着时的那一份：**去句数，留字数下限**。
+
+    为什么一个字都不动 `min_chars`：句子数管的是"怎么分段"，字数管的是"写多少"，
+    两件事不是同一条约束的两种写法。放开句子数之后**唯一**还在挡"越写越短"的就是
+    这个下限；把它一起拆掉（把长度交给"材料分量"）那一臂的读数在
+    `docs/DETAIL-SENTENCES.md`，结论是拆不得。
+
+    为什么补一句"不要把一句话硬拉长到 {min} 字"：去掉句数之后最差的形态不是"写短"，
+    而是"一句话硬撑到下限"——一条 80 字的句子既不好读，也说明模型在拿字数下限当
+    配额填。这一句只禁"硬撑"，不给句数配额（"几句都行"正是这次要放开的东西）。
+    不补"一句话就能说清也够"这类话：它与 `min_chars` 直接矛盾，模型会拿它当逃生口，
+    退回 21–46 字那个已经被量过的失效形态。
+    """
+    return (
+        _DETAIL_ONLY_SHAPE_RULES
+        # 最后一段的前两条与 A 那一份同源（并列型 label 逐个说清、上限压住），换掉的
+        # 只有句子数那半句：句数配额 → 按意思分句 + 不许硬撑。
+        + f"\n每一段说明写 {min_chars}–{max_chars} 字，少于 {min_chars} 字就是没写完。"
+        "分几句按意思走，几句都行，但不要把一句话硬拉长到"
+        f" {min_chars} 字——那样的说明读不下去。"
+        "如果这个节点的标题是一串并列的东西（几个算法、几种变体、几类方法、几个阶段），"
+        "要逐个说清它们各自做什么、差别在哪，不要只把名字列一遍就收。"
+        f"超过 {max_chars} 字就挑最关键的两三点，长文留给节点下面的子节点。\n"
+    )
+
+
+def _detail_prompt(min_chars: int, max_chars: int) -> str:
+    """第三段 system 的**唯一入口**：开关关着时逐字节等于 `DETAIL_ONLY_PROMPT`。
+
+    单独一个分发函数而不是在 `_fill_details_half` 里写 if：`_detail_only_prompt` 被
+    "区间参数化之后与常量逐字节相同"这条回归钉着（`test_detail_scale`），让它自己读
+    环境变量会让那条断言变成"看环境变量行事"。纯函数保持纯，开关只在这一层。
+    """
+    if detail_sentences_open():
+        return _detail_only_prompt_open(min_chars, max_chars)
+    return _detail_only_prompt(min_chars, max_chars)
+
+
+def is_detail_only_prompt(system: str) -> bool:
+    """这一段 system 是不是「只写说明」那一轮。**判据是共用前半段，不是整份常量**。
+
+    为什么需要它：开关一开，system 就不再以 `DETAIL_ONLY_PROMPT` 那 467 个字符开头
+    （尾段换了措辞），而"按 system 前缀分类哪一轮"这件事散在测试与测量脚本里
+    （`measure_section_slice` / `measure_two_tier` / 十几个 `startswith(...)`）。那些
+    断言在**默认关**的前提下仍然成立，但只要有人打开开关跑一遍，第三段就会被误判成
+    结构轮——返回一个没有 `detail` 的树，看上去像"模型没听话"。
+
+    两份 prompt 的前半段是同一份 `_DETAIL_ONLY_SHAPE_RULES`（输出形状 / 禁占位话 /
+    不动引用），句子数只动尾段。所以这一个判据同时认两种写法。
+    """
+    return system.startswith(_DETAIL_ONLY_SHAPE_RULES)
 
 
 def _default_detail_span() -> budget.DetailSpan:
@@ -4917,11 +5008,33 @@ def _detail_ask(
     # 自查句放在**最末尾**：它紧挨着模型开始输出的位置。上面每一条规则都在 system 里，
     # 而实测"每段至少 3 句"这一条只有写在最后才会被逐条执行（见 `DETAIL_ONLY_PROMPT`
     # 的注释——前两轮有 1–3 个节点只写了一句）。
-    user += (f"\n\n写完后自查一遍：上面 {len(targets)} 个 id 是不是都写了？"
-             f"每一段是不是都有 {span.sentences} 句以上、{span.min_chars}–"
-             f"{span.max_chars} 字？"
-             "不够的补写，然后再返回。")
+    #
+    # 自查句必须跟着 system 走（`MINDMAP_DETAIL_SENTENCES`）：system 里已经放开句子数，
+    # 这一行还在问"是不是都有 3 句以上"，等于把那条约束从末尾又装回去——而它恰是模型
+    # 读到的最后一行。关着时这两句与加开关之前逐字节相同。
+    user += _detail_self_check(len(targets), span)
     return user
+
+
+def _detail_self_check(count: int, span: budget.DetailSpan) -> str:
+    """user 末尾那句自查（`"\\n\\n"` 开头，直接拼在清单/证据之后）。
+
+    单独一个函数而不是内联：它是**检查项**，不是要求——模型不会把它当成新规则，只会
+    照着逐条过一遍。所以它的三项必须与 system 里的要求一模一样，而 system 那一份现在
+    有开关（句子数）。两处各写一遍会漂开：改了一处、另一处还在查旧的那条，模型于是
+    被"自查一遍"这四个字领着回去补齐一条已经放开的约束。
+
+    计数用的是 `count`（这次点名了几个 id）而不是树规模：模型只需要核对清单，不必再
+    数一遍树。
+    """
+    if detail_sentences_open():
+        return (f"\n\n写完后自查一遍：上面 {count} 个 id 是不是都写了？"
+                f"每一段是不是都在 {span.min_chars}–{span.max_chars} 字？"
+                "不够的补写，然后再返回。")
+    return (f"\n\n写完后自查一遍：上面 {count} 个 id 是不是都写了？"
+            f"每一段是不是都有 {span.sentences} 句以上、{span.min_chars}–"
+            f"{span.max_chars} 字？"
+            "不够的补写，然后再返回。")
 
 
 _DETAIL_WRAPPERS = ("details", "detail", "nodes", "data", "map")
@@ -5061,9 +5174,10 @@ async def _fill_details_half(
                        target_ids=[node.id for node, _ in targets])
     span = span or _default_detail_span()
     section = _detail_evidence_section(targets, evidence) if evidence is not None else ""
-    # 区间参数化只换两个数字：`span` 是默认区间时 `_detail_only_prompt` 的输出与
-    # `DETAIL_ONLY_PROMPT` 逐字节相同（同一个构造函数，同一组数）。
-    system = _detail_only_prompt(span.min_chars, span.max_chars)
+    # 区间参数化只换两个数字：`span` 是默认区间时 `_detail_prompt` 的输出与
+    # `DETAIL_ONLY_PROMPT` 逐字节相同（同一个构造函数，同一组数；句子数开关关着时
+    # 它就是 `_detail_only_prompt`）。
+    system = _detail_prompt(span.min_chars, span.max_chars)
     if section:
         system += DETAIL_ONLY_RETRIEVED_RULES + external_rules
     elif sections and full_text:
@@ -5245,6 +5359,10 @@ async def _fill_details(
     if span.scaled:
         # 只在真接管时多一个键：默认路径的 `data["detail"]` 键集必须与改动前相同。
         report["chars"] = span.as_dict()
+        # 句子数放开时把 `sentences` 报成 0（"这次不设句数下限"）：留在 3 会让 `data`
+        # 说一句与 prompt 相反的话，而这一格正是事后判"模型听没听话"的依据。
+        if detail_sentences_open():
+            report["chars"]["sentences"] = 0
         diagnostics.append(Diagnostic(
             level=DiagnosticLevel.info, code="DETAIL_SCALE_APPLIED",
             message=(
@@ -5253,6 +5371,20 @@ async def _fill_details(
                 f" {span.support:.1f} 字支撑，目标压缩比 {span.kappa:g}；"
                 f"开关 `{budget.DETAIL_SCALE_ENV}`）；不设该开关时恒为 "
                 f"{DETAIL_MIN_CHARS}–{DETAIL_MAX_CHARS} 字"
+            ),
+        ))
+
+    # 句子数放开（`MINDMAP_DETAIL_SENTENCES`）：只在真接管时多一个键 + 一条 info。
+    # 不加这条诊断的话，"这次没有句数下限"只存在于 prompt 里，事后看 `data` 分辨不出
+    # 一段说明偏短是模型没听话，还是这一次本来就没要求它写满三句。
+    if detail_sentences_open():
+        report["sentences_open"] = True
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.info, code="DETAIL_SENTENCES_OPEN",
+            message=(
+                f"这次每段说明不设句数下限，只要求 {span.min_chars}–{span.max_chars} 字"
+                f"（开关 `{DETAIL_SENTENCES_ENV}`）；不设该开关时会要求至少 "
+                f"{span.sentences} 句完整的话"
             ),
         ))
 
