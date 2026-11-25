@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 
 from app.agent import tools
+from app.contracts import mindmap as mindmap_contract
 
 BASE = tools.DETAIL_ONLY_PROMPT
 #: `ad61003` 那一版的 sha256。三档全关时必须回到它，一个字都不能动
@@ -89,9 +90,12 @@ def test_free_mode_keeps_the_parallel_label_rule():
 
 
 def test_free_mode_does_not_touch_node_budget():
-    """这一档只改措辞：节点预算、折叠阶梯、裁剪上限一个数都不动。"""
+    """这一档只改措辞：节点规模那一组数（参考值 / 下限 / 契约上限）一个都不动。"""
     from app.generation import budget
 
     assert budget.INITIAL_MAX_NODES == 80
     assert budget.MIN_INITIAL_NODES == 10
-    assert tools.FOLD_CAPS == (8, 4, 2)
+    # 可读性参考值之上不折也不裁，唯一会动手的是契约上限（见 `tools._generate` 的
+    # 「超出可读性上限：不折、不裁，只报数」那段）。它也不该被这一档带着走。
+    assert mindmap_contract.MAX_TREE_NODES == 1000
+

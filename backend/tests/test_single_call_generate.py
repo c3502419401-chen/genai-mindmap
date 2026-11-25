@@ -447,19 +447,21 @@ def test_initial_limits_are_unchanged():
     assert result.data["partial"] is False
 
 
-def test_over_the_readability_limit_is_folded_not_clipped():
-    """超过 80 → **折叠**，不是裁：一级分支一条不少，被并的那些标题留在聚合节点里。
+def test_over_the_readability_limit_keeps_every_node():
+    """超过 80 → **一个节点都不动**：不折也不裁，只记一条 info。
 
-    这条用例以前钉的是"裁到 80、记 `TREE_CLIPPED_TO_INITIAL`、标 `partial`"。裁那条路
-    现在只剩"四档折叠都折不动"之后的兜底（`tools._fold_tree`），正常形态是：
+    这条用例钉过三代行为，每一代都是被真实材料推翻的：
 
-        20 条一级分支 × 每支 6 个要点 = 141 个节点
-        → 根下超过 8 个的那 12 支并成一个「其他 12 项」
-        → 58 个节点、`cut_nodes=0`、落树 9 个一级节点（8 支 + 1 个聚合）
+        裁（`_clip_tree(content, 80)`）      后 12 支整条消失，`TREE_CLIPPED_TO_INITIAL`
+        折（`_fold_tree`）                   12 支并成一个「其他 12 项」，`partial=True`
+        不折、不裁（现在）                   141 个节点原样落树
 
-    为什么这条比原先那条重要：裁丢掉的是后 12 支**整条**（用户看到 8 支的一张图，不知道
-    少了什么），折叠之后根下第 9 个节点明说"这里原本还有 12 项"，而且它带着那 12 支的
-    标题——这是"丢层级"与"丢内容"的差别。
+    为什么最后一条才是对的：141 个节点对契约（1000）是小事，对画布只是"要缩一档看"；
+    而折/裁拿走的都是**用户要的东西**，且不可逆——被折掉的子树不在树里，`node_expand`
+    是让模型重新生成，拿不回原来那几个（`docs/FOLD-RETIRED.md` 有三组真实对照：
+    85/8 支 → 47/5 支、88/7 → 54/5、98/9 → 49/5）。
+
+    可读性只在诊断里说一句，让用户自己决定要不要删几支。
     """
     wide = _tree([
         _branch(index, f"分支{index}", [
@@ -471,30 +473,51 @@ def test_over_the_readability_limit_is_folded_not_clipped():
     result = _run(ctx, _chat(wide))
 
     assert result.ok, result.content
-    assert result.data["node_count"] < INITIAL_MAX_NODES
-    assert result.data["cut_nodes"] == 0           # 一个节点都没被裁
-    assert result.data["folded_rollups"] == 1
-    assert result.data["partial"] is True
-    assert "TREE_FOLDED_TO_READABILITY" in _codes(result)
-    assert "TREE_CLIPPED_TO_INITIAL" not in _codes(result)
+    assert result.data["node_count"] == 141       # 一个都没少
+    assert result.data["cut_nodes"] == 0
+    assert result.data["partial"] is False        # 什么都没丢，就不是"半棵树"
+    assert "TREE_OVER_READABILITY" in _codes(result)
+    assert "TREE_CLIPPED_TO_CONTRACT" not in _codes(result)
 
     top = ctx.candidate.root.children
-    assert len(top) == 9                            # 8 支 + 1 个聚合，比裁到 8 支多活一条
-    assert top[0].label == "分支0" and len(top[0].children) == 6   # 前面几支原样
-    rollup = top[-1]
-    assert rollup.label == "其他 12 项"
-    # 被并的 12 支的标题一个不落地在 detail 里（读图的人据此知道少了什么）
-    for index in range(8, 20):
-        assert f"分支{index}" in rollup.detail
-    # 而这份清单**不能被第三段重写**：它是这个节点唯一的说明（`skip_ids` 里那一格）。
-    # 实测厚批就是这样丢的——聚合节点还在、`含：…` 没了，用户再也说不清"其他 3 项"是哪三项。
-    assert rollup.detail.startswith("含：")
-    # 不是"到底了"：这一支还能从这里长回来（`NODE_EXPANDABLE` 的三态）
-    assert rollup.expandable == "unknown"
+    assert len(top) == 20                          # 20 条一级分支一条不少
+    assert [child.label for child in top] == [f"分支{index}" for index in range(20)]
+    assert all(len(child.children) == 6 for child in top)
+    # 树上没有任何聚合节点：label 里不会凭空出现「其他 N 项」
+    labels, stack = [], [ctx.candidate.root]
+    while stack:
+        node = stack.pop()
+        labels.append(node.label)
+        stack.extend(node.children)
+    assert not [label for label in labels if label.startswith("其他 ")]
+
+
+def test_a_tree_over_the_contract_ceiling_is_rejected_not_trimmed():
+    """越过**契约上限**（1000）时整棵树被拒，不会被偷偷裁成一个"合法"的残树。
+
+    这条以前钉"裁到 80"。裁剪撤掉之后有人会问"那超过 1000 呢"——答案是：那一步不属于
+    生成链路，契约在校验那一刻就把它拒了（`invalid_map`）。这也说明 `INITIAL_MAX_NODES`
+    从头到尾只是可读性口味，从来不是承载能力。
+
+    钉住"拒"而不是"裁"很重要：偷偷裁出来的树**看起来是完整成功的**（`ok=true`、
+    节点数合规），而用户失去的是最后几十个节点且毫无提示——那正是 `_clip_tree` 的老毛病。
+    """
+    wide = _tree([
+        _branch(index, f"分支{index}", [
+            (f"要点{index}-{position}", "一句具体的说明。") for position in range(50)
+        ])
+        for index in range(20)
+    ])  # 1 + 20 + 20×50 = 1021 个节点
+    result = _run(_ctx(), _chat(wide))
+
+    assert result.ok is False
+    assert result.data["code"] == "invalid_map"
+    assert "不合法" in result.content
 
 
 @pytest.mark.parametrize("branches", [3, 6])
 def test_branch_count_only_changes_the_skeleton_size(branches):
+
     """分支数变化只影响骨架规模，不改变"骨架 + 结构 + 说明"这条结构。
 
     "说明"那一段在节点够多时拆成**两次并发**（`DETAIL_SPLIT_MIN`）：3 支的树 10 个

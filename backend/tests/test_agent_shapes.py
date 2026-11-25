@@ -775,14 +775,15 @@ class TestCheckpoint:
         assert [stage.root.label for stage in checkpointed.stages] == [
             stage.root.label for stage in ctx.candidate.stages]
 
-    def test_checkpoint_stamps_cut_nodes_as_unknown(self):
-        """被裁掉子节点的那些，快照里必须是 `unknown` 而不是缺省的 `yes`。
+    def test_checkpoint_and_delivery_agree_on_expandable(self):
+        """快照与最终交付的那一份，`expandable` 必须逐节点一致。
 
-        正式打标（`_stamp_expandable`）在检查点后面，所以快照里那些节点还是 `yes`。
-        用户点开它以为还能长，点下去却报 `too_deep`——被裁的恰好是唯一能再长的地方。
+        这条以前盯"被裁掉子节点的那些在快照里得标 `unknown`"——那时收尾还在裁剪。
+        裁剪与折叠都撤掉之后（`docs/FOLD-RETIRED.md`），可读性参考值不再动手，留下的
+        是更基本的一条性质：用户载入检查点捡回来的树，三态不能和最终交付的不同，否则
+        "点开它以为还能长"或反过来，而界面上看不出是哪一份在说话。
 
-        上限压到 5 是为了真的触发裁剪：`GenerateArgs.branches=6` 决定骨架清单的
-        条数，光给 plan 更多分支不会让树变大。
+        顺带钉住"压小参考值不会拿走节点"：`INITIAL_MAX_NODES` 压到 5，树上一个都不少。
         """
         seen: list[Any] = []
         with patch("app.agent.tools.INITIAL_MAX_NODES", 5):
@@ -793,12 +794,10 @@ class TestCheckpoint:
         checkpointed = seen[0]
         assert isinstance(checkpointed, MindMapContent)
         stamped = {node.id: node.expandable for node in shapes.iter_nodes(checkpointed)}
-        assert "unknown" in stamped.values(), "被裁的节点在快照里必须标成没长完"
-        # 交付的那份与快照的标记口径一致：两边都说"没长完"，用户不会因为载入的是
-        # 检查点而看到一个不同的可展开状态。
         delivered = {node.id: node.expandable for node in shapes.iter_nodes(ctx.candidate)}
-        assert {key for key, value in delivered.items() if value == "unknown"} == {
-            key for key, value in stamped.items() if value == "unknown"}
+        assert stamped == delivered
+        assert len(stamped) == len(delivered)   # 一个节点都没被拿走
+        assert "unknown" not in stamped.values()
 
     def test_checkpoint_does_not_disturb_the_tree_the_rest_of_the_run_uses(self):
         """折叠只作用于副本：检查点之后 `_fill_details` / `check` 仍按一棵树工作。"""

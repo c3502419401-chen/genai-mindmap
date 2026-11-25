@@ -255,9 +255,9 @@ def test_thin_material_keeps_every_branch(monkeypatch):
     模型替身写的是 6 支 × 10 个节点（61 个）。旧口径下 `_clip_tree(content, 10)` 按
     前序只能留下一支——用户选 6 条拿到 1 条。
 
-    现在这条路上**没有任何配额**可压：`node_limit` 是可读性上限 80（不是"这次要几个"），
-    61 < 80 所以连折叠都不触发，六支原样落树。真超了 80 也是折叠（
-    `test_over_the_readability_limit_is_folded_not_clipped` 钉那条），不是裁。
+    61 < 80 所以连参考值都没碰到，六支原样落树。真超了 80 现在也只是记一条
+    `TREE_OVER_READABILITY`——折与裁都退休了（`docs/FOLD-RETIRED.md`），
+    见 `test_over_the_readability_limit_keeps_every_node`。
     """
     monkeypatch.setenv(budget.NODE_SCALE_ENV, "1")
     monkeypatch.delenv(budget.NODE_POOL_ENV, raising=False)
@@ -276,17 +276,16 @@ def test_thin_material_keeps_every_branch(monkeypatch):
     assert "每条一级分支" not in seen[1][0]
     assert ctx.candidate.root.children[0].children  # 每支都还有内容，不是光杆标签
     codes = [item["code"] for item in result.data["diagnostics"]]
-    assert "TREE_CLIPPED_TO_INITIAL" not in codes
-    assert "TREE_FOLDED_TO_READABILITY" not in codes
+    assert "TREE_OVER_READABILITY" not in codes
 
 
 def test_the_old_preorder_clip_still_collapses_to_one_branch():
     """为什么**不能**回到前序裁剪：同一个 61 节点的树、`limit=10`，只剩一支。
 
-    这条以前是"对照臂"（`MINDMAP_NODE_POOL=1` 走旧口径）。旧口径已经从生成路径上
-    撤掉了，所以对照直接打在 `_clip_tree` 上——它仍在，但只剩一个入口：四档折叠都
-    折不动之后的兜底（`tools._fold_tree`）。把这条留在测试里，是为了让"为什么不该
-    用它"这件事永远有一条可执行的证据，而不是一段注释。
+    这条以前是"对照臂"（`MINDMAP_NODE_POOL=1` 走旧口径），后来是"折叠折不动之后的
+    兜底"，现在 `_clip_tree` **没有生产调用方**了（折与裁都退休，`docs/FOLD-RETIRED.md`）。
+    把这条留在测试里，是为了让"为什么不该用它"这件事永远有一条可执行的证据，
+    而不是一段注释——这正是那个函数还留在模块里的唯一理由。
     """
     content = _content(branches=6, per_branch=10)      # 1 + 6×10 = 61
     trimmed, dropped = _clip_tree(content, 10)

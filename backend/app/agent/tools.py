@@ -93,7 +93,6 @@ from app.contracts.source import (
     Source,
     SourceKind,
     SourceMetadata,
-    SourceRef,
     SourceUsage,
 )
 from app.generation import budget
@@ -1146,6 +1145,12 @@ def _clip_tree(
 ) -> tuple[MindMapContent, int]:
     """前序保留前 `limit` 个节点，返回 `(裁剪后的内容, 丢掉的节点数)`。
 
+    **生产路径上已经没有人调它了**（`_generate` 不再裁，`_generate_deep` 走
+    `_node_limit` 与 `NODE_BUDGET_CUT`，也不走这里）。留着它 + `tests/test_branch_budget.py`
+    里那几条直接打它的用例，是因为"为什么不该按前序砍尾巴"这件事需要一个**可执行的
+    反面证据**，而文字说明会被后来的人当成一段历史轶事：同一个 61 节点的树、
+    `limit=10`，裁完只剩 1 支——这就是它退休的理由。
+
     **前序**是刻意的：父节点一定排在它自己的子节点前面，所以裁出来的仍是一棵合法
     的树（不会出现"有子无父"）。代价是"一层的末尾被切掉"——第 80 个节点之后的分支
     整支消失，而不是每个分支均匀地少一点。均匀裁剪反而更难解释：用户会看到每个分支
@@ -1159,8 +1164,8 @@ def _clip_tree(
         root 占一个，剩下的名额按支均分，每支最多 `per_branch` 个（含分支自己），
         支内仍按前序。
 
-    这样名额不够时缩的是**每一支的深度**，不是分支数。`per_branch=None` 保持原样
-    （默认 80 那个路径上几乎不触发裁剪，改了等于白改还多一份回归风险）。
+    这样名额不够时缩的是**每一支的深度**，不是分支数。`per_branch=None` 是纯前序，
+    也就是上面那个"6 支变 1 支"的形态——两条都在用例里钉着。
 
     裁剪之后要重新走一遍契约校验（`model_validate`）：`relations` 可能指向被裁掉的
     节点，`source_usage` 也不会自己变。**先裁再校验**，校验失败仍然如实报错——一次
@@ -1209,216 +1214,32 @@ def _clip_tree(
     return trimmed, total - _count_nodes(trimmed.root)
 
 
-# ---------------------------------------------------------------- 超出可读性：折叠，不裁
+# ------------------------------------------------- 超出可读性：不折、不裁，只报数
 #
-# `_clip_tree` 处理的是"装不下"（契约上限 1000），而"超过可读性"是另一件事：一棵 200
-# 节点的树不是装不下，是读不完。两者用同一个动作的后果是**丢内容**，而且丢得没有规律：
+# 这一段以前是 `_fold_tree`：超过 `INITIAL_MAX_NODES`（80）就把某个父节点下多出来的
+# 兄弟并成一个「其他 N 项」节点——label 报个数、detail 列被并的标题、引用取被并子树
+# 的并集，三档 cap 阶梯 8 → 4 → 2，都折不动才落 `_clip_tree`。它在真实材料上的形态
+# 不是"稍微窄一点"，而是**把一级分支整条抹掉**。三次真实生成（无材料、外部检索关）
+# 的同一棵树上，"折"与"不折"的对照是：
 #
-#     实测（同一批材料、骨架 6 支）→ 落树 5 支、裁 14 个节点；
-#     `initial_nodes=10` 那组更极端：模型写了 39 个节点 3 支齐全，裁完只剩 **1 支**
-#     （前序把第 1 支的深子树吃完，第 2、3 支一个名额都没剩下）。
+#     85 节点 / 8 条一级分支  →  47 / 5 支   一个「其他 4 项」吞掉 38 个节点
+#     88 节点 / 7 支          →  54 / 5 支   「其他 3 项」，吞掉 34 个
+#     98 节点 / 9 支          →  49 / 5 支   「其他 5 项」，吞掉 49 个（一半的树）
 #
-# 所以超限时先**折叠**：把某个父节点下面超出 `cap` 个的最后那几个兄弟并成一个
-# 「其他 N 项」节点，被并的那些兄弟的标题进它的 detail、引用取并集。丢的是**层级**，
-# 不是**内容与出处**——它们每一个仍然读得到，每一处出处也仍然点得开。
+# 起因是"折到装得下为止"：超出量只有 5–18 个，而 cap=4 那一趟在根上做的第一件事就是
+# 把后 4 条分支整体收进一个节点。更要紧的是它**不可逆**——被折掉的子树已经不在树里，
+# `node_expand` 走的是模型重新生成，拿不回原来那几个；「其他 3 项」这个 label 也不说
+# 是哪三项（清单在 `detail` 里，得先点开才知道）。
 #
-# 为什么不是"不裁，只报一句"（另一个能想到的做法）：那条路把问题推给读图的人。
-# 一张 200 节点的画布没人能读完，而"超过可读性建议 80"这句话要用户自己去数——他手上
-# 没有节点计数器。折叠不需要用户做任何事，且它留下的是一个**能看出来**的节点（「其他
-# 7 项」），而不是一个只能从日志里发现的"这次被裁了 12 个"。
+# 所以现在**不折也不裁**：树上有什么就交什么。可读性是渲染层的事（缩放、平移，以及
+# 将来画布上的折叠），不是内容层可以替用户决定的事；超限只在诊断里报一句实数，让
+# "这棵树有点大"看得见。三条替代路径（塞进契约的某个字段 / 前端默认收起 / 后端另存
+# 一棵被折的子树）各自卡在哪，见 `docs/FOLD-RETIRED.md`。
 #
-# 四档递进（`FOLD_CAPS`）：8 → 4 → 2。一档折不动（没有父节点超过 cap 个孩子）就换下一
-# 档；三档都折不动说明超出的量平摊在**每一层都已经很窄**的树上（例如 200 个节点、每个
-# 父最多 2 个孩子），那时才退回 `_clip_tree`——那才是"这份材料撑不起这么多节点"。
-#
-# **折叠顺序是自底向上的**（`_fold_pass` 递归里先处理孩子、再处理自己）：先把最深处
-# 的兄弟并起来，一级分支那层最后才动。这条顺序是刻意的——被压窄的分支数是这套机制
-# 最不该再制造的东西，而前序裁剪恰恰总是从一级分支那层开始丢。
-FOLD_CAPS = (8, 4, 2)
-
-#: 折叠节点的 label 模板。`{n}` 是被并进来的兄弟个数。
-#:
-#: 为什么是"其他 N 项"而不是复述其中一个的标题：折叠节点的身份是**一个集合**，任何
-#: 复述都会让读图的人以为它就是那一个，然后对另外几个的消失毫无察觉。带上 N 是这句
-#: label 唯一的信息量——它说"这里原本还有 N 个"。个数在 `data` 与诊断里也能查到，但
-#: 读图的人不会去翻诊断。
-FOLD_LABEL = "其他 {n} 项"
-
-#: 折叠节点的 detail 里最多列几个标题。再多就已经不是"说明"而是清单了；剩下的一律
-#: 汇总成"以及另外 N 项"，与 label 那个 N 同一个口径。
-FOLD_DETAIL_ITEMS = 15
-
-#: 折叠节点带几条引用（= `Node.source_refs` 的 `max_length`）。超出的截掉：这一步是
-#: 收尾，写不进契约就等于把整张图判废。
-FOLD_MAX_REFS = 20
-
-
-@dataclass(frozen=True)
-class _Fold:
-    """一次折叠的账。`clipped` 只在四档都折不动之后的兜底里非零。"""
-
-    #: 造出来的折叠节点 label，按生成顺序。
-    rollups: tuple[str, ...] = ()
-    #: 造出来的折叠节点的 id。**必须单独带出来**：它们是新节点，`_shortened_ids` 只在
-    #: "原来就有、现在孩子变少"的节点里找，找不到它们；而收尾那一步的
-    #: `_stamp_expandable` 会把不在名单里的一律标成 `yes`（= 到底了），那样界面就把
-    #: 唯一能把这些内容长回来的入口灰掉了。
-    rollup_ids: tuple[str, ...] = ()
-    #: 因此少掉的节点总数（被并的兄弟 + 它们的子树）。
-    dropped: int = 0
-    #: 走投无路时真正裁掉的节点数（0 表示没裁）。
-    clipped: int = 0
-
-    @property
-    def happened(self) -> bool:
-        return bool(self.rollups) or self.clipped > 0
-
-
-def _fold_refs(node: Node) -> list[SourceRef]:
-    """一个节点连同它整棵子树的引用（去重、保序）。"""
-    seen: set[tuple[Any, ...]] = set()
-    out: list[SourceRef] = []
-    for item in _iter_nodes(node):
-        for ref in item.source_refs:
-            key = (ref.source_id, ref.page, ref.start, ref.end, ref.quote)
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(ref)
-    return out
-
-
-def _rollup_node(tail: list[Node], taken: set[str]) -> Node:
-    """把一组兄弟压成一个节点：label 报个数、detail 列标题、引用取并集。
-
-    三处都是有据可依的，不是随手：
-      - **引用取整棵子树的并集**，不只看被并节点自己那一层：它们的下级也是被这一步
-        折掉的东西，只并第一层会得到一条"引用了 A、B，但 A、B 的内容已经不在图上"的
-        半截记录；
-      - **`expandable="unknown"`**：这不是"到底了"，是"这里还有内容、只是没画出来"。
-        标成 `no` 会让界面把这一支的展开按钮灰掉，而那正是唯一还能把它长回来的入口
-        （`NODE_EXPANDABLE` 的三态就是为这件事分出来的）；
-      - **`detail` 只列标题，不复述每条的说明**：折叠节点的作用是回答"这里原本是哪几个"，
-        把每条说明也搬进来会长成一屏读不完的正文，而那份正文本来就在被折的节点上。
-    """
-    labels = [item.label for item in tail]
-    shown = labels[:FOLD_DETAIL_ITEMS]
-    rest = len(labels) - len(shown)
-    detail = "含：" + "；".join(shown) + (f"；以及另外 {rest} 项" if rest > 0 else "") + "。"
-    refs: list[SourceRef] = []
-    seen: set[tuple[Any, ...]] = set()
-    for item in tail:
-        for ref in _fold_refs(item):
-            key = (ref.source_id, ref.page, ref.start, ref.end, ref.quote)
-            if key in seen:
-                continue
-            seen.add(key)
-            refs.append(ref)
-            if len(refs) >= FOLD_MAX_REFS:
-                break
-        if len(refs) >= FOLD_MAX_REFS:
-            break
-    node_id = new_node_id(taken)
-    taken.add(node_id)
-    return Node(
-        id=node_id, label=FOLD_LABEL.format(n=len(labels)), detail=detail,
-        expandable="unknown", source_refs=refs)
-
-
-def _fold_pass(root: Node, cap: int, taken: set[str]) -> tuple[Node, list[Node]]:
-    """一趟：每个父节点超过 `cap` 个的孩子，从第 `cap + 1` 个起并成一个节点。
-
-    递归里**先处理孩子、再处理自己**（自底向上，理由见 `FOLD_CAPS` 上面那段）。
-    返回 `(新根, 这一趟造出来的折叠节点)`；返回值为空表示这一趟什么都没折
-    ——调用方据此换下一档 cap。
-
-    **判据是 `len(kids) > cap + 1` 而不是 `> cap`，这一个 `+ 1` 是防死循环的**：
-    折完的结果是 `cap 个兄弟 + 1 个聚合节点` = `cap + 1` 个孩子。所以当父节点正好有
-    `cap + 1` 个孩子时，折一次**一个节点都省不下来**，而形状变了（末尾两个并成一个），
-    于是下一轮它仍然"超过 cap 个孩子"、仍然要折——`_fold_tree` 那个 `while` 永远退不
-    出去（实测：`test_the_rollup_takes_the_union_of_refs` 与
-    `test_deep_siblings_fold_before_the_top_level_does` 卡死在这里）。
-
-    要求"至少省一个"之后，这一趟对每个父节点都是**严格递减**的，循环因此必然收敛。
-    """
-    made: list[Node] = []
-
-    def walk(node: Node) -> Node:
-        kids = [walk(child) for child in node.children]
-        if len(kids) <= cap + 1:
-            return node.model_copy(update={"children": kids})
-        rollup = _rollup_node(kids[cap:], taken)
-        made.append(rollup)
-        return node.model_copy(update={"children": [*kids[:cap], rollup]})
-
-    return walk(root), made
-
-
-def _fold_tree(content: MindMapContent, limit: int) -> tuple[MindMapContent, _Fold]:
-    """超过 `limit` 时**折叠**（而不是裁）到 `limit` 以内。
-
-    与 `_clip_tree` 的契约一致：返回的仍是合法内容（关系与附加边按活着的端点重挂，
-    最后走一次 `model_validate`）。三档都折不动时才落到 `_clip_tree`。
-    """
-    before = _count_nodes(content.root)
-    if before <= limit:
-        return content, _Fold()
-    root = content.root
-    taken = set(_node_ids(root))
-    made: list[Node] = []
-    for cap in FOLD_CAPS:
-        while _count_nodes(root) > limit:
-            remaining = _count_nodes(root)
-            root, created = _fold_pass(root, cap, taken)
-            if not created:
-                break
-            made.extend(created)
-            # **二道守卫**：这一趟折出来的东西必须真的减了节点数。`_fold_pass` 的
-            # `cap + 1` 判据已经保证严格递减，但那条保证依赖"聚合节点自己是叶子"这个
-            # 前提——哪天聚合节点改成保留一部分下级，递减就不成立了，而这个 `while`
-            # 会立刻变回死循环。宁可多算一次 `_count_nodes`。
-            if _count_nodes(root) >= remaining:  # pragma: no cover — 见上
-                logger.warning("折叠没有减少节点数（cap=%s / %s 个），停止折叠",
-                               cap, remaining)
-                break
-        if _count_nodes(root) <= limit:
-            break
-    kept_ids = _node_ids(root)
-    folded = content.model_copy(update={
-        "root": root,
-        "relations": [item for item in content.relations
-                      if item.source in kept_ids and item.target in kept_ids],
-        "edges": [edge for edge in content.edges
-                  if edge.source in kept_ids and edge.target in kept_ids],
-    })
-    folded = MindMapContent.model_validate(folded.model_dump())
-    report = _Fold(
-        rollups=tuple(item.label for item in made),
-        rollup_ids=tuple(item.id for item in made),
-        dropped=before - _count_nodes(root))
-    if _count_nodes(root) <= limit:
-        return folded, report
-    # 走到这里：每一层都已经窄到折不动。这才是真的装不下。
-    clipped_content, clipped = _clip_tree(folded, limit)
-    return clipped_content, _Fold(
-        rollups=report.rollups, rollup_ids=report.rollup_ids,
-        dropped=before - _count_nodes(clipped_content.root), clipped=clipped)
-
-
-def _shortened_ids(original: Node, trimmed: Node) -> set[str]:
-    """裁剪之后**掉了子节点**的那些节点的 id。
-
-    `_clip_tree` 只做前序裁剪，它不会增删已保留节点的其他字段，所以"子节点个数
-    变少"就是"这一支被切掉了尾巴"。这批节点随后被标成 `expandable="unknown"`：
-    它们是"没长完"，不是"到底了"——把被裁的那批标成 `no`，界面上恰好是唯一还能
-    继续长的地方灰着按钮。
-    """
-    kept = {node.id: node for node in _iter_nodes(trimmed)}
-    return {
-        node.id for node in _iter_nodes(original)
-        if (survivor := kept.get(node.id)) is not None
-        and len(survivor.children) < len(node.children)
-    }
+# 承载能力不是这里的事：越过**契约上限** `MAX_TREE_NODES`(1000) 的产物在 `_validate`
+# 那一步就被整棵树拒了（`invalid_map`），走不到这一段。所以这条路上没有任何"裁"的
+# 入口——`_clip_tree` 也因此**失去了生产调用方**（详见它的 docstring）。真实生成的
+# 规模实测是 85–157 个节点，本机库里最大的一棵树 561。
 
 
 def _count_refs(root) -> int:
@@ -8822,18 +8643,20 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
          由材料决定而不是由配额决定 —— 可引的段落少，节点就少。
          按章切开着（`MINDMAP_SECTION_SLICE`）时这一步是 **N 次**（每章一次，
          各给它那一章的原文），见 `_slice_structure`。
-      4. 折叠：超出可读性上限时**折而不裁**（`_fold_tree`，`FOLD_CAPS=(8,4,2)`
-         四档阶梯）。把某个父节点下面多出来的兄弟收成一个 roll-up：`label` 写
-         「其他 N 项」、`detail` 写「含：A；B；C」（被并的标题一个不落）、引用取
-         被并那些节点**整棵子树**的并集、`expandable="unknown"`（不是到底了，点了
-         能长回来）。三档都折不动才落回 `_clip_tree`。实测厚批折掉 103 个节点、
-         `cut_nodes=0` —— 折的是形状，不是内容。
+      4. 规模：**不折、不裁，只报数**。可读性参考值是 `INITIAL_MAX_NODES`(80)，超过它
+          只记一条 info（`TREE_OVER_READABILITY`），树上一个节点都不动——实测真实生成
+          常在 85–157 个节点，而以前那套"折到装得下为止"会把它们压到 47–54，代价是
+          2–4 条一级分支整体消失（三组同树对照见 `docs/FOLD-RETIRED.md`）。唯一的硬
+          边界是契约的 `MAX_TREE_NODES`(1000)，越过它才落 `_clip_tree`——那一条在真实
+          生成里从不触发，是"存不下"的保险，不是配额。
+
       5. 说明：`_fill_details` 发**两次并发的 `chat_async`**（节点够多时，见
          `DETAIL_SPLIT_MIN`），每半的输入是"这半节点（id / label / 层级路径）+
          同一份原文"，输出是 `{"id":"说明"}`，**按 id 对号**（不靠顺序）。这一轮
          不碰结构、不碰引用。
-         **roll-up 节点不进这一轮**（`fold.rollup_ids` 并进 `skip_ids`）：它的
-         detail 是那份标题清单，被改写成散文就等于把折进来的标题全丢了。
+          **分组节点（两级骨架）不进这一轮**（并进 `skip_ids`）：它是分类名，写出来
+          只有一句"这一组在讲什么"的空话，而它占掉的正是那几节的输出预算。
+
       6. 核对（`MINDMAP_VERIFY_AFTER_GENERATE`，默认关）：用 title + 一级分支拼
          一个 query 搜一次，逐节点判 supported / unverified / contradicted，三态
          只进 `data["verify"]`。实测 supported 17.5%、引文逐字 95.2%，代价 +8 秒
@@ -9329,9 +9152,11 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     # 只会让模型把它当填额目标（实测：材料翻 135 倍、说明总量只涨 30%，见
     # `docs/GRAPH-SCALE.md`）。
     #
-    # 留下的这一个数**换了语义**：`INITIAL_MAX_NODES` 从"不许超过"变成"超过就折叠"
-    # （`_fold_tree`）。它量的是**可读性**，不是产能，所以它与材料无关地固定在那里是
-    # 对的——一棵 300 个节点的图在画布上就是读不完，那与材料多厚没有关系。
+    # 留下的这一个数**换了语义**：`INITIAL_MAX_NODES` 从"不许超过"变成"超过就记一条
+    # 诊断"（`TREE_OVER_READABILITY`）。它量的是**可读性**，不是产能，所以它与材料无关
+    # 地固定在那里是对的——一棵 300 个节点的图在画布上就是读不完，那与材料多厚没有
+    # 关系。而"读不完"该怎么处理属于渲染层（缩放、收起），不属于内容层：曾经在这里
+    # 折过，代价是整条一级分支被换成一行「其他 N 项」（`docs/FOLD-RETIRED.md`）。
     initial_nodes = INITIAL_MAX_NODES
 
     # 外部来源的可信度提示：两条路共用（第三段也用它），所以必须在 if/else **之前**
@@ -9583,48 +9408,34 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
                 ),
             ))
 
-    # ---- 超出可读性上限：折叠，不裁 ------------------------------------------------
+    # ---- 超出可读性上限：不折、不裁，只报数 ------------------------------------------
     #
-    # 这一步以前是 `_clip_tree`：按前序砍尾巴。它有两个已经量到的坏形态（见 `FOLD_CAPS`
-    # 上面那段）——后几条一级分支整条消失，以及小配额下 3 支被砍成 1 支。而"超过 80 个
-    # 节点"**不等于**"装不下"（契约给到 1000），它只意味着画布上读不完，那就该降级而不
-    # 该删。所以这里换成 `_fold_tree`：兄弟并成「其他 N 项」、引用取并集，实在折不动
-    # （每一层都已经窄到 2 支以内）才落到 `_clip_tree`——那才是真的撑不起。
+    # 这一段的历史有两代，都被撤掉了，撤的理由不一样：
     #
-    # 两条诊断分开报，因为用户能做的事不同：
-    #   `TREE_FOLDED_TO_READABILITY`  info  内容还在，只是有几处收进了「其他 N 项」；
-    #   `TREE_CLIPPED_TO_INITIAL`     warn  真的丢了内容（折不动之后的兜底）。
-    before_fold = _count_nodes(content.root)
-    fold = _Fold()
-    cut_ids: set[str] = set()
-    if before_fold > initial_nodes:
-        original_root = content.root
-        content, fold = _fold_tree(content, initial_nodes)
-        cut_ids = _shortened_ids(original_root, content.root)
-        # 折叠节点也必须进这张表：`_stamp_expandable` 把不在表里的一律标成 `yes`
-        # （"到底了"），而聚合节点的意思恰恰相反——它身后那些内容只是没画出来。
-        cut_ids |= set(fold.rollup_ids)
-        if fold.rollups:
-            diagnostics.append(Diagnostic(
-                level=DiagnosticLevel.info, code="TREE_FOLDED_TO_READABILITY",
-                message=(
-                    f"模型写了 {before_fold} 个节点，超过可读性上限 {initial_nodes}；"
-                    f"已把 {len(fold.rollups)} 处并列的兄弟并成「其他 N 项」节点"
-                    f"（共少掉 {fold.dropped - fold.clipped} 个节点，落树 "
-                    f"{_count_nodes(content.root)} 个、{len(content.root.children)} 条一级分支）："
-                    "被并的那些标题仍在聚合节点的 detail 里、引用也一并带上了，"
-                    "它们的展开按钮没有关掉——要长回来就点那个聚合节点"
-                ),
-            ))
-        if fold.clipped:
-            diagnostics.append(Diagnostic(
-                level=DiagnosticLevel.warn, code="TREE_CLIPPED_TO_INITIAL",
-                message=(
-                    f"模型写了 {before_fold} 个节点，折叠到每一层都只剩 2 支以内仍然超过 "
-                    f"{initial_nodes} 个，最后裁掉了 {fold.clipped} 个（这份材料撑不起这么多内容）；"
-                    "想要更大的树，请生成后用 node_expand 逐支展开"
-                ),
-            ))
+    #   `_clip_tree(content, initial_nodes)`  按前序砍尾巴。坏形态：后几条一级分支整条
+    #       消失；小配额下 3 支被砍成 1 支（用户选了 6 条分支，拿到 1 条）。
+    #   `_fold_tree(content, initial_nodes)`  把多出来的兄弟并成「其他 N 项」。坏形态：
+    #       为了少 5 个节点折掉 38 个——`cap=4` 那一趟在根上做的第一件事就是把后 4 条
+    #       分支整体收进一个节点（实测 85/8 支 → 47/5 支）。而且不可逆：被折掉的子树
+    #       已经不在树里，`node_expand` 是模型重新生成，拿不回原来那几个。
+    #
+    # 共同点是**替用户做了一个他没要求过的决定**：把内容拿走，换一个据说读得完的形状。
+    # 可读性是渲染层能处理的事（缩放、平移，以及将来画布上的折叠），内容层只该如实交付。
+    #
+    # 契约上限那一道**不需要在这里补**：超过 `MAX_TREE_NODES`(1000) 的产物在
+    # `_validate` 那一步就被整棵树拒掉（`invalid_map`），走不到这里——这也说明
+    # "存不下"从来是契约在管的事，`INITIAL_MAX_NODES` 从头到尾只是可读性口味。
+    tree_nodes = _count_nodes(content.root)
+    if tree_nodes > initial_nodes:
+        diagnostics.append(Diagnostic(
+            level=DiagnosticLevel.info, code="TREE_OVER_READABILITY",
+            message=(
+                f"模型写了 {tree_nodes} 个节点、{len(content.root.children)} 条一级分支，"
+                f"超过可读性参考值 {initial_nodes}：内容一个都没有折、也没有裁，"
+                "画布上每一处都在。嫌挤可以缩一档看图，或者删掉几支不需要的"
+                "（以前这里会把几条分支并成一行「其他 N 项」，那等于把结构丢掉）"
+            ),
+        ))
 
     # 骨架的产物（颜色 / 图标 / flowgraph 的边）套上去。放在裁剪之后：端点表必须
     # 用裁剪后还活着的 id 建，否则 `clean_edges` 会把边留在指向已消失节点的状态。
@@ -9713,12 +9524,11 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     # 把同一批诊断算两次。
     #
     # `expandable` 要在快照上补一次：正式那一次打标在这条线之后（`_stamp_expandable`），
-    # 快照里被裁掉子节点的那些因此还是缺省的 `yes`——用户点开它以为还能长，点下去
-    # 却报 `too_deep`。这里对副本按同一张表补成 `unknown`（"没长完，不是到底了"）。
+    # 快照里的节点因此还是缺省的 `unknown` 之外的旧值。这里对副本按同一张表打一遍，
+    # 让"捡回来的那一份"与"最终交付的那一份"在三态上一致。
     if ctx.checkpoint is not None:
         snapshot = content.model_copy(deep=True)
-        _stamp_expandable(snapshot, {node_id: "unknown" for node_id in cut_ids},
-                          max_depth=mindmap_contract.MAX_TREE_DEPTH)
+        _stamp_expandable(snapshot, {}, max_depth=mindmap_contract.MAX_TREE_DEPTH)
         await ctx.checkpoint(_shape_output(
             snapshot, diagram_type=diagram_type,
             raw_plan=raw_plan, diagnostics=[]))
@@ -9739,14 +9549,9 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     content, detail_report = await _fill_details(
         content, ctx=ctx, topic=args.topic, sections=sections,
         external_rules=external_rules, diagnostics=diagnostics,
-        # 两级骨架的分组节点**与折叠节点**都不进这份清单，理由不同但都是"它没有说明
-        # 可写"：
-        #   - 分组：它是分类名，写出来只有一句"这一组在讲什么"的空话；
-        #   - 折叠（「其他 N 项」）：它的 `detail` **是那张清单本身**（"含：A；B；C"），
-        #     是这个节点存在的理由。不跳过它，第三段会按"说明少于 40 字"把它重写成
-        #     一段模型 prose——实测厚批两条都是这样：聚合节点还在、`含：…` 没了，
-        #     读图的人再也说不清"其他 3 项"是哪三项。
-        skip_ids=[*group_ids, *fold.rollup_ids],
+        # 两级骨架的分组节点不进这份清单：它是分类名，写出来只有一句"这一组在讲什么"
+        # 的空话，而它占掉的正是那二十节里某一节的输出预算。
+        skip_ids=[*group_ids],
         full_text=full_text,
         chapters=tuple(slice_chapters or ()),
         source=sources[0] if slice_chapters else None,
@@ -9754,11 +9559,9 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         # `max(...)` 的理由也一样——外部检索补进来的那份也在这一次的 prompt 里。
         material_chars=max(material_chars, full_text_chars))
 
-    # `expandable` 三态：被裁掉子节点的那些是**没长完**（`unknown`），不是"到底了"
-    # ——这个区别在这里最实，用户下一步就是点开某个节点继续展开，而把被裁的那几个
-    # 标成 `no`，界面上恰好是唯一能再长的地方灰着。
-    _stamp_expandable(content, {node_id: "unknown" for node_id in cut_ids},
-                      max_depth=mindmap_contract.MAX_TREE_DEPTH)
+    # `expandable` 三态：这一轮没有任何节点因为"装不下"被拿走（不折也不裁），所以
+    # 除了契约的 8 层算"到底了"，其余一律 `yes`——它们本来就能再展开。
+    _stamp_expandable(content, {}, max_depth=mindmap_contract.MAX_TREE_DEPTH)
 
     # 结构与语义两层复核（与 `_generate_deep` 的收尾同一份）：诊断只是提示，
     # 不影响这棵树能不能用——契约校验在上一步就决定过了。
@@ -10011,13 +9814,6 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             "但这张图的节点没有留下任何引用（模型没写，或写了没通过逐字校验）；"
             "全文就在上下文里，这不代表「材料里没有相关内容」。"
         )
-    if fold.happened:
-        summary += (
-            f"节点数超过可读性上限 {initial_nodes}：已把 {len(fold.rollups)} 处并列的兄弟"
-            f"并成「其他 N 项」节点（少 {fold.dropped} 个，内容与引用都还在那些聚合节点里）"
-            + (f"，最后裁掉 {fold.clipped} 个" if fold.clipped else "")
-            + "；想要更细的树，用 node_expand 点开聚合节点逐支展开。"
-        )
     if detail_report["requested"] and detail_report["filled"] < detail_report["requested"]:
         # 只在**没补全**的时候说一句：补全是常态（结构那一轮按提示词留空、第三段
         # 一次写回），把它写进 every-run 的话术只是在噪声里加一行。
@@ -10040,19 +9836,20 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         # 两段式没有"骨架定的条数"这个概念（一级分支就是树的最外层，模型直接写进
         # 树里），所以报**落树后的**实际条数——这是同一个问题的答案，只是来源不同。
         "planned_branches": len(plan.flat) if plan is not None else len(content.root.children),
-        # 初次规模的两个上限：报出来才能解释"为什么这棵树只有这么深/这么大"。
-        # 节点上限是**可读性上限**（不再是配额：超过就折叠，折不动才裁）。
+        # 初次规模的两个参考值：报出来才能解释"为什么这棵树只有这么深/这么大"。
+        # 节点那一个是**可读性参考值**（不是配额，也不是裁剪线：超过它只记一条
+        # `TREE_OVER_READABILITY`，节点一个不少；真正的硬边界是契约的
+        # `MAX_TREE_NODES`）。
         # 深度上限仍是常量——材料量只改规模，不改层数（层数由可读性定）。
         "node_limit": initial_nodes,
         "depth_limit": INITIAL_MAX_DEPTH,
-        # 两个来源：输出被截断（`SalvagedOutput`）、节点被折叠或裁掉。都是"少了一块"
-        # 而不是失败，而 `ok=true` 与"完整成功"长得一模一样。
-        "partial": bool(truncated or fold.happened),
-        # `cut_nodes` 只数**真裁掉**的那些（折叠不算：折叠的内容还在聚合节点里）。
-        # 两个数分开报，是因为它们对用户的意思相反——折叠是"收起来了"，裁是"没了"。
-        "cut_nodes": fold.clipped,
-        "folded_nodes": fold.dropped - fold.clipped,
-        "folded_rollups": len(fold.rollups),
+        # 唯一来源是输出被截断（`SalvagedOutput`）：这条路上没有折叠、也没有裁剪，
+        # 所以"少了一块"只可能来自模型没写完。`ok=true` 与"完整成功"长得一模一样，
+        # 这个位就是它们之间唯一的差别。
+        "partial": bool(truncated),
+        # 这条路上恒为 0（不折也不裁），留着是为了与 `mindmap_generate_deep` 的 data
+        # 同形——读这两个工具产物的脚本，不该因为换了工具就少一个键。
+        "cut_nodes": 0,
         # 跨支重复的**节点数**（判据见 `_cross_branch_duplicates`）：库里那张
         # 56 节点的分片图量出来是 6（3 个说法各写 2 遍），这个数就是这次改动最想
         # 改善的指标。只在诊断里说一句"有重复"的话，事后比较两条路还得人肉数。

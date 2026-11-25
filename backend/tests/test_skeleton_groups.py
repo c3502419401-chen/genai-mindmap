@@ -27,7 +27,6 @@ from app.agent.contracts import AgentRunRequest, RunBudget, RunContext, ToolCall
 from app.agent.tools import (
     DETAIL_ONLY_PROMPT,
     GROUPED_TREE_RULES,
-    INITIAL_MAX_NODES,
     PLAN_PROMPT,
     SKELETON_GROUP_HARD_MAX,
     SKELETON_GROUP_MAX,
@@ -489,26 +488,25 @@ def test_evidence_unused_still_reported_on_the_two_tier_path():
     assert result.data["source_refs"]["declared"] == 0
 
 
-def test_partial_and_folding_still_work_on_the_two_tier_path():
-    """两级这条路上 `partial` 语义不变：超过可读性上限 → **折叠**并标 `partial`。
+def test_a_big_two_tier_tree_is_delivered_intact():
+    """两级这条路上，超过可读性参考值的树**原样交付**：不折、不裁、不标 `partial`。
 
-    这条以前钉"裁到 80"。裁剪现在只剩四档折叠都折不动之后的兜底（`tools._fold_tree`），
-    而两级树的每一个父节点扇出都很宽（根 5 组、每组 4 支、每支 6 个要点），正是折叠
-    最省节点的那种形状——146 个节点被折进可读性上限以内，一个都不用裁。
+    这条以前钉"裁到 80"，后来钉"折到 80"。两代都是同一个毛病：为了把树塞进 80 个节点，
+    把`一级 / 二级`那两层里的分支整条拿走——而两级骨架刚刚花了一次调用才归出来的分组，
+    正是最该原样留给用户看的东西（实测：85/8 支 → 47/5 支、98/9 支 → 49/5 支）。
 
-    钉它要守住的两件事：一级、二级这两层**照样成立**（`_apply_groups` 的结果没有被后来
-    的折叠抹平），以及 `partial` 仍然如实上报。
+    现在只剩一条 info 诊断（`TREE_OVER_READABILITY`），节点一个不少；`partial` 只在
+    "真的少了内容"（输出被截断、或越过契约上限 1000 被裁）时为真。
     """
     big = _grouped_tree(points=6)      # 1 + 5 + 20 + 120 = 146 个节点
     result = _run(_ctx(), _chat(skeleton=_grouped_response(), tree=big))
 
     assert result.ok, result.content
-    assert result.data["node_count"] <= INITIAL_MAX_NODES
-    assert result.data["cut_nodes"] == 0            # 一个都没裁
-    assert result.data["folded_rollups"] >= 1
-    assert result.data["partial"] is True
-    assert "TREE_FOLDED_TO_READABILITY" in _codes(result)
-    assert "TREE_CLIPPED_TO_INITIAL" not in _codes(result)
+    assert result.data["node_count"] == 146          # 一个都没少
+    assert result.data["cut_nodes"] == 0
+    assert result.data["partial"] is False
+    assert "TREE_OVER_READABILITY" in _codes(result)
+    assert "TREE_CLIPPED_TO_CONTRACT" not in _codes(result)
 
 
 def test_node_grow_frames_cover_the_three_levels():

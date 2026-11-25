@@ -53,9 +53,10 @@ _ASCII_TOKENS_PER_CHAR = 1 / 4
 #
 # **`_generate`（整树一次生成）已经不再把它当配额**：提示词里那句"控制在 N 个节点
 # 以内"撤掉了（`agent.tools.DETAIL_PROMPT_OPEN` / `SCALE_BY_MATERIAL_RULE`），这个数
-# 在那条路上换了语义——它现在是**可读性上限**，超过就折叠（`tools._fold_tree`），
-# 不是"不许写"。`budget.initial_nodes` 那三个函数因此只剩测量脚本与分片那条路
-# （`_generate_deep` 的 `node_limit`）在用；生成路径不再读它们。
+# 在那条路上换了语义——它现在是**可读性参考值**：超过它只记一条 info，节点一个都不动
+# （既不折也不裁，理由与实测见 `docs/FOLD-RETIRED.md`）。`budget.initial_nodes` 那三个
+# 函数因此只剩测量脚本与分片那条路（`_generate_deep` 的 `node_limit`）在用；生成路径
+# 不再读它们。
 INITIAL_MAX_NODES = 80
 
 # 初次生成的深度上限，**按 root 之下算**（与 `GenerateDeepArgs.max_depth` 同口径）。
