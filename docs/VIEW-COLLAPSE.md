@@ -287,6 +287,11 @@ cd D:\genai-mindmap\frontend ; npm run build
 （`docs/FOLD-RETIRED.md` §5 记过一条批量概括调用的实测：1.87 秒 / 5 组），而这一轮的
 承诺是"不新增调用"。
 
+**这一枚已经做了**（`MINDMAP_BRANCH_DIGEST`，默认关）：角标长
+`还有 21 个 · 分数归一化与向量加权`，挂在节点左上、深底白字，点下去放出**整支**
+（数字是整支的，动作就是整支的）。实测两次提示词的对照、成本与"它会不会变成第二套
+标题"的自评在 [`BRANCH-DIGEST.md`](BRANCH-DIGEST.md)。
+
 ## 八、代码地图与回滚
 
 | 位置 | 干什么 |
