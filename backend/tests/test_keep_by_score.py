@@ -217,3 +217,35 @@ def test_default_policy_matches_the_measured_numbers():
     assert tools.RAG_QUERY_KEEP.max_k == 8
     assert tools.DEEP_BRANCH_TOP_K == tools.DEEP_BRANCH_KEEP.min_k
     assert tools.DETAIL_RETRIEVAL_TOP_K == tools.DETAIL_RETRIEVAL_KEEP.min_k
+
+
+def test_the_switch_defaults_to_off(monkeypatch):
+    """**总开关默认关**——这条钉的是"量完之后翻回来"这个决定本身。
+
+    为什么它值得一条用例：默认值是这一轮唯一被推翻的东西（代码与策略都留着）。
+    下一次有人想翻回 `1`，会先撞到这面墙，然后去读
+    `tools.KEEP_BY_SCORE_ENV` 上面那三条依据（+5.9pp 是低端样本造成的假象、
+    样本间波动 20–30pp、on 臂 33% 失败率 vs off 0%）。
+
+    同时钉住三件事：
+      - 缺省（`delenv`）→ 关；
+      - `1/on/true/yes` → 开；
+      - `0/off/空串/"随便写的"` → 关（正列举真值，不是"不在假值集合里"）。
+    """
+    from app.agent import tools
+
+    monkeypatch.delenv(tools.KEEP_BY_SCORE_ENV, raising=False)
+    assert tools.keep_by_score_enabled() is False
+    assert tools.branch_keep() is None
+    assert tools.detail_keep() is None
+    assert tools.rag_keep() is None
+
+    for value in ("1", "on", "true", "yes", " ON "):
+        monkeypatch.setenv(tools.KEEP_BY_SCORE_ENV, value)
+        assert tools.keep_by_score_enabled() is True, value
+        assert tools.branch_keep() == tools.DEEP_BRANCH_KEEP
+
+    for value in ("0", "off", "false", "no", "", "随便写的"):
+        monkeypatch.setenv(tools.KEEP_BY_SCORE_ENV, value)
+        assert tools.keep_by_score_enabled() is False, value
+        assert tools.branch_keep() is None

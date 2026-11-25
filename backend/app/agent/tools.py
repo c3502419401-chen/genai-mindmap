@@ -262,25 +262,45 @@ DEEP_MIN_BREADTH = 2
 DEEP_BRANCH_KEEP = KeepPolicy(min_k=3, max_k=6, rel=0.85)
 DEEP_BRANCH_TOP_K = DEEP_BRANCH_KEEP.min_k
 
-# 按分数取数的总开关（`MINDMAP_KEEP_BY_SCORE`，默认**开**）。
+# 按分数取数的总开关（`MINDMAP_KEEP_BY_SCORE`，**默认关**）。
 #
-# 为什么要有它：这一改动改的是**取数口径**——同一批材料、同一个 query，返回条数不再
-# 等于 `top_k`。这类改动必须有回到旧口径的路，否则下一次回归只能靠 revert。它与
-# `MINDMAP_PARENT_RETRIEVAL` 同一个写法（默认开、正列举假值），因为两者改的都是
-# "返回什么粒度/多少条"：
+# ## 为什么默认是 0（不是"懒得开"，是量完之后翻回来的）
 #
-#   - `0` → 四个调用点都传 `keep=None`，**逐字节回到 "取排序后前 N 条"**；
-#   - `1`（缺省）→ 按 `KeepPolicy` 取，条数落在 `[min_k, max_k]`。
+# 这个改动的初衷成立：固定 `top_k=3` 会砍掉同分的证据（第 3→4 条跌幅中位 0.026、
+# 被砍掉的 94% 落在不同父块），代码与 `tests/test_keep_by_score.py` 都留着——那是
+# 证据，删了就没人知道量过什么。但**它没有拿到"有收益"的证据**，而当时是默认开的：
 #
-# 真生成的 A/B（`scripts/measure_generation_strategy.py --keep off`）就是靠它跑的：
-# 两臂唯一差别是这一个环境变量。
+#   1. **首轮那个 +5.9pp 是低端样本造成的假象**。`repeat=3` 之后厚批 on 91.0%、
+#      off 92.1%（方向还偏向 off）——两臂分布完全重叠，**off 不动任何代码也能到
+#      98.9%**。首轮 off 那次 74.8% 落在它自己的低端。
+#   2. **样本间波动是 20–30pp 量级**：厚批两臂各自极差 20.6pp / 19.3pp；薄批（673 字
+#      全塞、**不经过检索**）的 3.7pp 臂间差配 33.6pp 极差，是独立的量级参照。
+#      小于它的臂间差读不出来。
+#   3. **有一条负向信号没量测**：厚批 on 臂 6 次尝试 2 次失败（模型返回非 JSON，
+#      33%），off 臂 3 次 0 失败。方向与"keep 让 prompt 变长（材料字数 1.42–1.68x）"
+#      一致。那是**交不出树**，代价比覆盖率低 1.1pp 高一个量级。
+#
+# 一个默认开的功能让用户承担"收益未证实 + 可能交不出树"的组合，不成立。所以默认翻成 0：
+# 代码、测试、量测脚本都保留，想开的人显式写 `MINDMAP_KEEP_BY_SCORE=1`。
+# 下一个想翻回来的人，先把上面三条推翻——判它需要每臂 5–10 轮 + **与树规模无关**的
+# 指标（`node_count` 臂内极差就有 16–64，覆盖率的分母自己会漂）。
+#
+# 三条口径：
+#
+#   - `0`（缺省）→ 四个调用点都传 `keep=None`，**逐字节回到"取排序后前 N 条"**；
+#   - `1` → 按 `KeepPolicy` 取，条数落在 `[min_k, max_k]`；
+#   - 真生成的 A/B（`scripts/measure_generation_strategy.py --keep on|off`）就是靠它跑。
 KEEP_BY_SCORE_ENV = "MINDMAP_KEEP_BY_SCORE"
 
 
 def keep_by_score_enabled() -> bool:
-    """按分数取数是否生效。默认**开**；`0/off/false/no/空串` 一律关。"""
-    return os.getenv(KEEP_BY_SCORE_ENV, "1").strip().lower() not in {
-        "0", "off", "false", "no", ""}
+    """按分数取数是否生效。**默认关**；显式 `1/on/true/yes` 才开。
+
+    正列举真值而不是"不在假值集合里"：默认关时两种写法等价，而正列举让"改默认值"这件
+    事只需要改一个字面——与实际行为一致，也免得空串被当成开。
+    """
+    return os.getenv(KEEP_BY_SCORE_ENV, "0").strip().lower() in {
+        "1", "on", "true", "yes"}
 
 
 def branch_keep() -> KeepPolicy | None:

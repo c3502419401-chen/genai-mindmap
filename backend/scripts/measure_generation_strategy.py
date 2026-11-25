@@ -46,6 +46,12 @@ if str(BACKEND) not in sys.path:
 
 DB = BACKEND / "data" / "generation_strategy.db"
 
+#: 每一次模型调用的记录（`_instrument_chat` 往里写）。失败时它随行返回——
+#: 「模型返回非 JSON」有两种来路，只有这两个能分开：输出被 `finish_reason=length`
+#: 截断（参数缺一半），还是输出完整但跑了格式。两者的修法完全不同（调 max_tokens
+#: vs 调提示词/条数），不分开就只能瞎猜。
+_CALLS: list[dict] = []
+
 #: 本机代理。实测（用户那一轮）走它维基 / openalex / crossref 都是 200，直连超时。
 PROXY = "http://127.0.0.1:7897"
 
@@ -93,18 +99,78 @@ def _prepare() -> None:
         os.environ[name] = PROXY
 
 
-def _snapshot_library() -> None:
+def _snapshot_library(db_path: Path) -> None:
     """把**用户真实库**里的材料读进内存，然后才把库切到本脚本的临时文件。
 
     顺序不能反：`MINDMAP_DB_PATH` 一改，`library.recent()` 读到的就是那个空的临时库
     （实测第一次跑就是这么得到 0 份材料的）。材料一旦读进内存，后面全链路用的都是
     `ctx.sources` 里的 `Source` 对象，检索也直接打这些正文——不再回头读库。
+
+    `db_path` 由调用方按"臂 + 批次"命名：原来固定一个文件名，两臂并行会互相
+    `unlink` 对方的库（实测过一次——后启动的那个把先启动的库删了）。A/B 要能并行跑，
+    这一条必须先解决。
     """
     global _LIBRARY
     from app.knowledge import library as knowledge_library
 
     _LIBRARY = knowledge_library.recent(limit=400)
-    os.environ["MINDMAP_DB_PATH"] = str(DB)
+    os.environ["MINDMAP_DB_PATH"] = str(db_path)
+
+
+def _instrument_chat() -> None:
+    """插桩两个点，回答一个具体问题：**那几次失败是不是输出被 max_tokens 截断**。
+
+    为什么需要两个点（单点不够，实测过）：
+
+      - `tools._chat` 是工具内部唯一的模型出口（`tests/test_model_exit_single_path.py`
+        用 AST 钉着），但它返回的是**已经解析好的 JSON**，不是 raw response——
+        从那里拿不到 `finish_reason` 与 `usage`（第一次插桩就是这样，字段全 None）。
+        它只用来记 `prompt_chars`（"prompt 有没有变长"）。
+      - `generation.service._choice_message(body)` 是**一次性路径**的必经点，从 `body`
+        里能同时拿到 `choices[0].finish_reason`、`message.content` 长度与 `usage`。
+        流式路径（`on_delta` 非空时）不经过它，所以响应记录可能少于 prompt 记录——
+        那一条差额本身也是信息（这次走了流式）。
+
+    分类口径（写进 `docs/RETRIEVAL-KEEP.md` §4.2）：
+
+      - `truncated`：出现过 `finish_reason=length`，且这一轮最终失败 → max_tokens 的
+        问题，不是 keep 的问题（修法是调 max_tokens / 少要节点）；
+      - `format`：所有调用都是 `stop` 但最终失败 → 输出完整、跑了格式（修法是提示词
+        或条数）；
+      - `no_call`：一次响应都没记到 → 插桩没覆盖到，不能下结论。
+    """
+    from app.agent import tools as agent_tools
+    from app.generation import service as generation_service
+
+    original_chat = agent_tools._chat
+    original_choice = generation_service._choice_message
+
+    async def wrapped_chat(ctx, system, user, **kwargs):
+        raw = await original_chat(ctx, system, user, **kwargs)
+        _CALLS.append({"kind": "prompt", "prompt_chars": len(system) + len(user)})
+        return raw
+
+    def wrapped_choice(body):
+        try:
+            choice = (body.get("choices") or [{}])[0] or {}
+            message = choice.get("message") or {}
+            content = message.get("content") or ""
+            usage = body.get("usage") or {}
+            _CALLS.append({
+                "kind": "response",
+                "finish": choice.get("finish_reason"),
+                "prompt_tokens": usage.get("prompt_tokens"),
+                "completion_tokens": usage.get("completion_tokens"),
+                "content_chars": len(content),
+                "content_tail": content[-160:],
+                "tool_calls": len(message.get("tool_calls") or []),
+            })
+        except Exception:  # noqa: BLE001 — 插桩永不改变被测行为
+            pass
+        return original_choice(body)
+
+    agent_tools._chat = wrapped_chat
+    generation_service._choice_message = wrapped_choice
 
 
 def _load_batch(batch: str) -> list:
@@ -216,6 +282,7 @@ def _run_once(batch: str, index: int) -> dict:
     from app.agent import tools as agent_tools
     from app.agent.contracts import AgentRunRequest, RunBudget, RunContext, ToolCall
 
+    _CALLS.clear()
     sources = _load_batch(batch)
     topic = {
         "thin": "碳中和的主要方面",
@@ -242,9 +309,16 @@ def _run_once(batch: str, index: int) -> dict:
         "seconds": seconds,
         "material_chars": sum(len(item.text or "") for item in sources),
         "sources": len(sources),
+        "calls": list(_CALLS),
     }
     if not result.ok:
         row["error"] = result.content[:300]
+        # 失败分类（`docs/RETRIEVAL-KEEP.md` §4.2）：`length` = 输出被 max_tokens
+        # 截断；`stop` + content 不是 JSON = 输出完整但跑了格式。两者修法不同。
+        responses = [call for call in _CALLS if call.get("kind") == "response"]
+        truncated = any(call.get("finish") == "length" for call in responses)
+        row["failure_kind"] = ("truncated" if truncated
+                              else "format" if responses else "no_call")
         return row
     tree = ctx.candidate
     if tree is None:
@@ -314,9 +388,12 @@ def main() -> int:
     if not os.environ.get("MINDMAP_LLM_API_KEY"):
         print("缺 MINDMAP_LLM_API_KEY（用户级环境变量里也没有）", file=sys.stderr)
         return 2
-    DB.unlink(missing_ok=True)
-    _snapshot_library()
-    print(f"材料快照 {len(_LIBRARY)} 份", flush=True)
+    # 库按"臂 + 批次"分文件：两臂并行时共用一个文件名会互相 `unlink`（实测过一次）。
+    db_path = BACKEND / "data" / f"generation-strategy-{args.keep}-{args.batch}.db"
+    db_path.unlink(missing_ok=True)
+    _snapshot_library(db_path)
+    _instrument_chat()
+    print(f"材料快照 {len(_LIBRARY)} 份；库 {db_path.name}", flush=True)
 
     batches = ("thin", "thick", "topic") if args.batch == "all" else (args.batch,)
     rows: list[dict] = []
@@ -331,10 +408,10 @@ def main() -> int:
             rows.append(row)
             print(json.dumps({key: row.get(key) for key in (
                 "ok", "seconds", "node_count", "branches", "ref_coverage",
-                "citable", "citable_coverage", "folded_rollups", "cut_nodes")},
+                "citable", "citable_coverage", "failure_kind", "error")},
                 ensure_ascii=False), flush=True)
 
-    out = BACKEND / "data" / f"generation-strategy-keep-{args.keep}.json"
+    out = BACKEND / "data" / f"generation-strategy-keep-{args.keep}-{args.batch}.json"
     out.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n明细：{out}")
 
@@ -354,31 +431,59 @@ def main() -> int:
 
 
 def _report_aggregate(rows: list[dict], keep: str) -> None:
-    """多轮汇总：**均值与极差**，不是单次。
+    """多轮汇总：**均值、极差、失败率**，不是单次。
 
     判据要提前定死（`docs/RETRIEVAL-KEEP.md` §4.1）：`repeat=1` 时两臂的差里混着"这次
     树长得大不大"，`repeat=3` 之后看两件事——
 
       1. 可引用覆盖率的均值差还在不在（厚批那 +5.9pp）；
       2. 两臂各自的极差有多大。**极差大于均值差**时，这个差别不该归因于改动。
+
+    `repeat=10` 之后再加第三件：**失败率**。它是"交不出树"，代价比覆盖率低几个 pp 高
+    一个量级，所以要单独一列，并按时长把 `truncated`（输出被 max_tokens 截断）与
+    `format`（输出完整但跑了格式）分开——两者的修法完全不同（调 max_tokens vs 调提示词
+    或条数）。
     """
-    ok = [row for row in rows if row.get("ok")]
-    if not ok:
-        print("\n没有一次成功，无法汇总")
+    if not rows:
+        print("\n没有观测")
         return
-    print(f"\n汇总（keep={keep}，每批 {len(ok)} 轮有效）")
-    print(f"{'批次':<8}{'可引用覆盖率 均值':>18}{'极差':>10}{'全部节点覆盖率 均值':>20}"
-          f"{'极差':>10}{'节点数 均值':>12}{'极差':>8}")
-    batches = sorted({row["batch"] for row in ok})
+    print(f"\n汇总（keep={keep}，共 {len(rows)} 次尝试）")
+    print(f"{'批次':<8}{'成功':>5}{'失败':>5}{'失败率':>8}{'截断':>6}{'格式':>6}"
+          f"{'可引用覆盖率 均值':>18}{'极差':>10}{'节点数 均值':>12}{'极差':>8}")
+    batches = sorted({row["batch"] for row in rows})
     for batch in batches:
-        group = [row for row in ok if row["batch"] == batch]
-        cite = [row.get("citable_coverage", 0.0) for row in group]
-        cover = [row.get("ref_coverage", 0.0) for row in group]
-        nodes = [row.get("node_count", 0) for row in group]
-        print(f"{batch:<8}{statistics.mean(cite):>17.1%}"
-              f"{max(cite) - min(cite):>10.1%}"
-              f"{statistics.mean(cover):>19.1%}{max(cover) - min(cover):>10.1%}"
-              f"{statistics.mean(nodes):>12.0f}{max(nodes) - min(nodes):>8}")
+        group = [row for row in rows if row["batch"] == batch]
+        ok = [row for row in group if row.get("ok")]
+        truncated = sum(1 for row in group if row.get("failure_kind") == "truncated")
+        fmt = sum(1 for row in group if row.get("failure_kind") == "format")
+        cite = [row.get("citable_coverage", 0.0) for row in ok]
+        nodes = [row.get("node_count", 0) for row in ok]
+        mean_cite = statistics.mean(cite) if cite else 0.0
+        spread_cite = (max(cite) - min(cite)) if cite else 0.0
+        mean_nodes = statistics.mean(nodes) if nodes else 0.0
+        spread_nodes = (max(nodes) - min(nodes)) if nodes else 0
+        print(f"{batch:<8}{len(ok):>5}{len(group) - len(ok):>5}"
+              f"{(len(group) - len(ok)) / len(group):>8.1%}"
+              f"{truncated:>6}{fmt:>6}"
+              f"{mean_cite:>17.1%}{spread_cite:>10.1%}"
+              f"{mean_nodes:>12.0f}{spread_nodes:>8}")
+    failures = [row for row in rows if not row.get("ok")]
+    if failures:
+        print("\n失败明细（`finish` 里有没有 length = 是不是被截断）")
+        for row in failures:
+            responses = [call for call in (row.get("calls") or [])
+                         if call.get("kind") == "response"]
+            prompts = [call for call in (row.get("calls") or [])
+                       if call.get("kind") == "prompt"]
+            print(f"  {row['batch']}#{row['run']}  {row.get('failure_kind')}"
+                  f"  finish={[r.get('finish') for r in responses]}"
+                  f"  completion={[r.get('completion_tokens') for r in responses]}"
+                  f"  prompt={[r.get('prompt_tokens') for r in responses]}"
+                  f"  prompt_chars(max)={max((p['prompt_chars'] for p in prompts), default=0)}"
+                  f"  {str(row.get('error'))[:36]}")
+            tails = [r.get("content_tail") for r in responses if r.get("content_tail")]
+            if tails:
+                print(f"      最后一次输出结尾：{str(tails[-1])[-90:]!r}")
 
 
 if __name__ == "__main__":
