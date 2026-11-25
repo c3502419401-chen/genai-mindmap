@@ -6,7 +6,7 @@ import MindMapCanvas from '../src/canvas/MindMapCanvas.vue';
 import { REAL_TREES } from './fixtures/real-trees';
 import type { MindMapContent, MindNode } from '../src/api/types';
 import { MINDMAP_VISIBLE_NODE_LIMIT, countSubtree, viewTree } from '../src/canvas/view-collapse';
-import { useMindMapStore } from '../src/stores/mindmap';
+import { useMindMapStore, type MindNodeData } from '../src/stores/mindmap';
 
 /**
  * 一级分支上的**概括角标**：「还有 21 个 · 训练与并行」。
@@ -49,9 +49,19 @@ function withDigests(texts: Record<string, string>): MindMapContent {
 const DIGEST_TEXT: Record<string, string> = Object.fromEntries(
   BRANCHES.map((branch, index) => [branch.id, `第${index + 1}支讲的事`]));
 
-/** 画布上真的画出来的概括角标：**两半都在**才算（与模板的 `v-if` 同一判据）。 */
+/** 画布上真的画出来的概括角标：**两半都在**才算（与模板的 `v-if` 同一判据）。
+ *
+ * 返回的形状把 `data` 收成"一定有值"：`MindFlowNode.data` 在类型上是可选的，
+ * 而这个函数已经把"没有 data 的节点"滤掉了——不这么收，断言里每一处都要写 `!`。
+ */
 function marksOf(store: ReturnType<typeof useMindMapStore>) {
-  return store.nodes.filter(node => node.data.branchDigest && node.data.branchHidden);
+  const out: Array<{ id: string; data: MindNodeData }> = [];
+  for (const node of store.nodes) {
+    const data = node.data;
+    if (!data || !data.branchDigest || !data.branchHidden) continue;
+    out.push({ id: node.id, data });
+  }
+  return out;
 }
 
 const wrappers: VueWrapper[] = [];
@@ -133,7 +143,7 @@ describe('一级分支的概括角标：数字与文案', () => {
     await wrapper.vm.$nextTick();
 
     for (const node of store.nodes) {
-      if (node.data.branchDigest) expect(node.data.depth).toBe(1);
+      if (node.data?.branchDigest) expect(node.data.depth).toBe(1);
     }
   });
 });
