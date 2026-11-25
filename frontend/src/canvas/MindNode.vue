@@ -43,6 +43,16 @@ const emit = defineEmits<{
    */
   toggleFold: [];
   collapse: [];
+  /**
+   * 一级分支上那枚**概括角标**点下去：展开**整支**。
+   *
+   * 与 `toggleFold` 分成两个事件，不是因为方向不同，而是因为**粒度**不同，而这个
+   * 差别恰好由角标上的数字写死：`+N` 写的是"这一处缺几个直接孩子"，点它就只放一层；
+   * 概括角标写的是"这一支还有 21 个"，点下去就该冒出 21 个。合成一个事件，外面就
+   * 必须再猜一次"这枚角标说的是哪一层的数"，而那个判断在模板里做不了（模板只知道
+   * 自己被点了一下）。
+   */
+  expandBranch: [];
 }>();
 
 const POSITIONS: Record<ChildSide, Position> = {
@@ -545,6 +555,48 @@ onBeforeUnmount(() => {
       @click.stop="emit('collapse')"
       @focusin.stop
     >−</button>
+
+    <!--
+      **一级分支的概括角标**：「还有 21 个 · 训练与并行」。
+
+      它回答的是 `+N` 答不了的那个问题：一枚 `+3` 只证明"这里还有 3 个直接孩子"，
+      证明不了"这一支一共还有 21 个、说的是什么"（`docs/VIEW-COLLAPSE.md` §七）。
+      而"这一支讲完了没有"正是用户判断"要不要展开"的唯一依据。
+
+      与 `+N` 的区分靠**三处同时不同**，缺一处就会有人把两者看混：
+
+        位置   `+N` 在**右下**（节点出口那一侧，说"这里断了"）；这枚在**左上**
+        形状   短胶囊一枚只有数字 vs 长胶囊"数字 · 一句话"
+        配色   白底细边（技术性标记）vs 深底白字（内容性标注）
+
+      一行而不是两行：它是绝对定位的，不参与布局，两行会向上多吃 20px——而在
+      `both` / `down` 两种朝向里，节点上方正好是上一层节点的连线。压住线比截断
+      一句概括更糟（概括本来就限定 8–12 字，`max-w` 之外的部分 `truncate` 掉）。
+
+      常驻、不等 hover：与 `+N` 同一条理由——"这一支有多大"必须在不点、不悬停时
+      就看得见，否则用户扫一眼画布会得出"这棵树就这么大"。
+
+      `@click.stop` + `@focusin.stop` 与 `+N` 同规矩：这一下只该改一次状态，也不该
+      把悬停卡片顶出来盖住它自己。
+
+      没有概括就不画（`v-if` 里的 `data.branchDigest`）：那时它只剩一个数字，而
+      "这一支还有 N 个"与 `+N`、顶部「显示 40 / 136」说的是同一件事——一枚只会
+      重复别人的角标不值得占位置。
+    -->
+    <button
+      v-if="data.branchDigest && data.branchHidden"
+      type="button"
+      data-test="node-branch-digest"
+      class="absolute -top-2 left-0 flex h-5 max-w-[11.5rem] items-center gap-1 rounded-full bg-slate-900/90 px-2 text-[10px] font-medium leading-none text-white shadow-sm hover:bg-slate-700"
+      :title="`这一支还没显示 ${data.branchHidden} 个节点，点一下全部展开；这一支讲的是「${data.branchDigest}」`"
+      :aria-label="`展开这一支：还没显示 ${data.branchHidden} 个节点，这一支讲的是${data.branchDigest}`"
+      @click.stop="emit('expandBranch')"
+      @focusin.stop
+    >
+      <span class="shrink-0 tabular-nums">还有 {{ data.branchHidden }} 个</span>
+      <span class="shrink-0 text-white/50" aria-hidden="true">·</span>
+      <span class="truncate">{{ data.branchDigest }}</span>
+    </button>
 
     <!--
       悬停卡片：`Teleport` 到 `body`、`position: fixed`。

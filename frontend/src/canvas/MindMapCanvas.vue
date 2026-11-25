@@ -347,6 +347,18 @@ function collapseFold(id: string): void {
 }
 
 /**
+ * 点一级分支上那枚**概括角标**：把这一支**整支**摊开。
+ *
+ * 与 `toggleFold`（`+N`）分开的判据只有一条：**角标上的数字是哪一层的数，动作就是
+ * 哪一层的动作**。`+N` 写"这一处缺 3 个直接孩子"，所以只放一层；概括角标写"这一支
+ * 还有 21 个"，所以放整支。两者共用"点下去冒出来的个数必须与数字相等"这条规矩。
+ */
+function expandBranch(id: string): void {
+  store.expandBranchInView(id);
+  void nextTick(() => applyView(viewMode.value, true));
+}
+
+/**
  * 换了一张图，之前存下的那一屏就作废了。
  *
  * 不复位的后果：在全图档下打开另一张图，再切回「适应宽度」，视口会被还回到**上一张
@@ -491,6 +503,7 @@ onBeforeUnmount(() => {
           @next="label => store.commitAndAddChild(label)"
           @toggle-fold="toggleFold(nodeProps.id)"
           @collapse="collapseFold(nodeProps.id)"
+          @expand-branch="expandBranch(nodeProps.id)"
           @cancel="store.endEdit()"
         />
       </template>

@@ -41,6 +41,7 @@ import { childSide, NODE_SIZE, type ChildSide, type Direction } from '../canvas/
 import { diagramTypeOf, layoutDiagram, type DiagramLayout } from '../canvas/layout';
 import type { NodeSize } from '../canvas/layout/flow';
 import {
+  MINDMAP_BRANCH_BADGE_MIN_HIDDEN,
   MINDMAP_VISIBLE_NODE_LIMIT,
   foldActionOf,
   viewTree,
@@ -646,6 +647,22 @@ export interface MindNodeData {
    * 不同的状态，反推会把它们混成一种。
    */
   visibleChildren?: number;
+  /**
+   * **一级分支**这一支在讲什么（8–12 字，生成时调的模型）。
+   *
+   * 只在一级分支（`depth === 1`）上有值，其余节点恒为 `undefined`。与 `label` 并列
+   * 显示在节点上方那枚角标里，说的是"这一支的范围"，而 `label` 说的是"这一支叫什么"
+   * ——两者重合时这枚角标就是噪声，那正是 `branchHidden` 与它必须同时成立的原因。
+   */
+  branchDigest?: string;
+  /**
+   * **一级分支**整支还有几个节点没画（含更深处）。
+   *
+   * 与 `hiddenSubtree` 的区别是覆盖面：那个只在"这个父节点自己有直接孩子没画"时
+   * 存在（`+N` 的判据），这个是"这一支下面任何一处有节点没画"就存在。角标说的是
+   * "这一支还有 21 个"，那 21 个可以全在三四层深处、中间没有一处断口。
+   */
+  branchHidden?: number;
 }
 
 export interface FlatNode {
@@ -791,6 +808,23 @@ interface RenderSource {
   folded?: ReadonlyMap<string, FoldInfo>;
   /** 子节点正显示着的节点 id → 为什么显示（渲染层据此决定给不给"叠回去"的角标）。 */
   foldOpen?: ReadonlyMap<string, FoldOpenReason>;
+  /**
+   * **这一支还有几个节点没画**：节点 id → 整棵子树里没画出来的节点数。
+   *
+   * 与 `folded` 的区别见 `view-collapse.ts::ViewTreeResult.unshown`：`folded` 只说
+   * "这个父节点自己有直接孩子没画"，这一份连"孩子都画了、但孙子被截"的支也算进来。
+   * 一级分支上的概括角标要的是后者——它说"这一支还有 21 个"，而中间可能没有一处断口。
+   */
+  unshown?: ReadonlyMap<string, number>;
+  /**
+   * 一级分支 id → **这一支在讲什么**（8–12 字，生成时调的模型，落库在
+   * `content.branch_digests`）。
+   *
+   * 原样透传 `content` 里那份 `Record`（不转 Map）：渲染层每个节点只查一次
+   * `digests?.[id]`，而转换要在每次内容变化时重建一份 Map —— 为一次取值建一张表
+   * 不划算。键可能指向已经不存在的节点（契约层不校验），取值必须容忍 `undefined`。
+   */
+  digests?: Readonly<Record<string, string>>;
 }
 
 /** 共用的空表：非预览来源不需要这份映射，别每次重算都新建一个。 */
@@ -1709,6 +1743,17 @@ export const useMindMapStore = defineStore('mindmap', () => {
         layoutEdges: canvasStageEdgesOf(content.value),
         ...(foldedView && foldedView.folded.size ? { folded: foldedView.folded } : {}),
         ...(foldedView && foldedView.open.size ? { foldOpen: foldedView.open } : {}),
+        ...(foldedView && foldedView.unshown.size ? { unshown: foldedView.unshown } : {}),
+        // 一级分支的概括：**只读内容里那一份**（生成时调模型写的，落库、随图走）。
+        // 只在树型上取，与 `foldedView` 同一条判据：鱼骨/流程的产物里根本没有这个
+        // 字段，而它们的"一级"是固定六类 / 阶段序列，概括不出新东西。
+        //
+        // 空表不挂：`undefined` 就是"这些分支没有概括"，渲染层据此退回只显示数字
+        // ——与加这个字段之前的行为一致（旧图、开关关着时生成的图都是这一档）。
+        ...(tree.root && foldedView && content.value.branch_digests
+          && Object.keys(content.value.branch_digests).length
+          ? { digests: content.value.branch_digests }
+          : {}),
       };
     }
     if (agentPreview.value) {
@@ -1922,6 +1967,26 @@ export const useMindMapStore = defineStore('mindmap', () => {
       // `folded` / `foldOpen` 只收树型，鱼骨/流程恒为空表。
       const fold = source.folded?.get(node.id);
       /**
+       * **一级分支的概括角标**：「还有 21 个 · 训练与并行」。
+       *
+       * 为什么只在一级分支上（`depth === 1`）：一枚 `+N` 只说得出"这里还有 3 个
+       * 直接孩子"，说不出"这一支一共还有 21 个、说的是什么"。后者只有按支统计才
+       * 答得出来，而一级分支只有几条、位置固定——给每个父节点都挂一枚概括，画布
+       * 会被字糊满（`docs/VIEW-COLLAPSE.md` §七 的结论）。
+       *
+       * 两半各有一个来源，缺任何一半都不画：
+       *   - `branchHidden` 是**渲染层自己数的**（`viewTree` 的 `unshown`，免费）；
+       *   - `branchDigest` 是**生成时调模型写的**（`content.branch_digests`）。
+       *
+       * 没有概括就不画，是刻意的：那时这枚角标只剩一个数字，而"这一支还有 N 个"
+       * 与 `+N`、顶部「显示 40 / 136」说的是同一件事——一枚只会重复别人的角标不值得
+       * 占位置。
+       */
+      const branchHidden = depth === 1 ? source.unshown?.get(node.id) : undefined;
+      const branchDigest = (branchHidden ?? 0) >= MINDMAP_BRANCH_BADGE_MIN_HIDDEN
+        ? source.digests?.[node.id]
+        : undefined;
+      /**
        * 这个节点的子节点正显示着、而且是**用户要求**显示着的（点开过 / 全部展开）——
        * 渲染层据此给一枚常驻的「−」：那是"再点一下叠回去"的入口。
        *
@@ -2022,6 +2087,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
           // "一个都没少画"，渲染层据此连角标都不画（绝大多数节点是这一档）。
           hiddenChildren: fold?.hidden,
           hiddenSubtree: fold?.closedSubtree,
+          // 一级分支的概括角标（见上面 `branchDigest` 那一段）。两个都可能是
+          // `undefined`：绝大多数节点是这一档，渲染层连角标都不画。
+          branchDigest,
+          branchHidden,
           // 画布上这个节点**正显示着几个子节点**。渲染层拿它判"有没有东西可以叠回去"
           // ——0 就是叶子，「−」角标根本不该出现。
           visibleChildren: node.children.length,
@@ -3329,6 +3398,40 @@ export const useMindMapStore = defineStore('mindmap', () => {
   }
 
   /**
+   * **展开一整支**：一级分支上那枚概括角标点下去走这里。
+   *
+   * 为什么不是 `expandNodeInView(id)`（= `+N` 那一层）：角标上写的是**整支**的
+   * 数字（「还有 21 个」），点下去就该冒出 21 个。写成"只放一层"会得到一个比 `+N`
+   * 更没用的角标——预算铺满时一级分支的孩子通常**已经全在画布上**，再放一次等于
+   * 什么都没发生（`view-collapse.ts` 的 BFS 前三层就是这样）。**数字决定粒度**，
+   * 这条规则 `+N` 与它共用：`+N` 写的是这一处缺几个，所以只放一层。
+   *
+   * 做法是把这一支里**每一个有孩子的节点**都放进 `expanded`（"用户要求看它"那一档），
+   * 同时清掉这一支内部的收起标记。视图层不用新增概念——`expanded` 的语义本来就是
+   * "无视预算，自己的全部子节点一律显示"，逐节点交上去就是整支摊开。
+   *
+   * 代价是这一支里每个有孩子的节点都会挂一枚「−」（叶子不挂，`canCollapse` 判着）：
+   * 一支 22 个节点里通常只有 4 个内部节点，而用户刚刚明确要求了"看这一支"。回程有
+   * 顶部「收起到上限」与逐枚「−」两条。
+   */
+  function expandBranchInView(id: string): void {
+    const current = content.value;
+    if (!current || !isTree(current)) return;
+    const branch = findIn(current, id);
+    if (!branch || !branch.children.length) return;
+    const nextExpanded = new Set(viewExpandedNodes.value);
+    const nextCollapsed = new Set(viewCollapsedNodes.value);
+    const walk = (node: MindNode): void => {
+      nextCollapsed.delete(node.id);
+      if (node.children.length) nextExpanded.add(node.id);
+      for (const child of node.children) walk(child);
+    };
+    walk(branch);
+    viewExpandedNodes.value = nextExpanded;
+    viewCollapsedNodes.value = nextCollapsed;
+  }
+
+  /**
    * 「全部展开」：一个节点都不收起。
    *
    * 这是收起的**逃生舱**，也是"这棵树到底有多大"的唯一诚实答案。两个集合一起清空：
@@ -4293,6 +4396,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     expandNodeInView,
     collapseNodeInView,
     toggleFoldInView,
+    expandBranchInView,
     expandAllInView,
     collapseViewToCap,
     revealInView,

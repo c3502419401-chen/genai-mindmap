@@ -77,6 +77,20 @@ export const MINDMAP_VISIBLE_NODE_LIMIT = 40;
  */
 export const NO_NODE_LIMIT = 0;
 
+/**
+ * 一级分支上那枚**概括角标**最少要"还有几个"才值得画。
+ *
+ * `4` 的判据是**决策成本**不是审美：一支下面只差 1–3 个节点时，用户会直接点开
+ * （成本一次点击），而读一句概括再决定要不要点，反而更贵；何况那 3 个数与它头上
+ * 那枚 `+N` 说的是同一件事。反过来，差 6 个以上时"这一支讲什么"才真的能帮上忙
+ * ——实测那棵 136 节点的真树六支分别是 12/15/21/6/18/24（都过线，一枚都没被这条
+ * 判据拦掉，所以它不制造"为什么这枚没了"的困惑）。
+ *
+ * 与 `MINDMAP_VISIBLE_NODE_LIMIT` 不同，这个数**不影响任何可见性**：它只决定画不画
+ * 那枚角标，收起与展开的规则一个字都不动。
+ */
+export const MINDMAP_BRANCH_BADGE_MIN_HIDDEN = 4;
+
 /** 一个节点在画布上缺了多少东西。 */
 export interface FoldInfo {
   /**
@@ -118,6 +132,24 @@ export interface ViewTreeResult {
   root: MindNode;
   /** 被截断的节点 id → 它缺了什么。没缺东西的节点没有条目（不是 `{hidden: 0}`）。 */
   folded: ReadonlyMap<string, FoldInfo>;
+  /**
+   * **这一支还有几个节点没画**：节点 id → 它整棵子树里没画出来的节点数（`> 0` 才有
+   * 条目）。
+   *
+   * 与 `folded.closedSubtree` 是**同一个量的两个出口**，但覆盖面不同，这个区别就是
+   * 它存在的全部理由：
+   *
+   *   - `folded` 只有条目 ⟺ **这个父节点自己有直接孩子没画**（`+N` 挂在这里）；
+   *   - `unshown` 只要**它下面任何一处**有节点没画就有条目，哪怕它自己的孩子全画了。
+   *
+   * 一级分支上的概括角标要的是后者：它说"这一支还有 21 个"，而那 21 个完全可能
+   * 分布在三四层深处、中间没有一处直接丁口。用 `folded` 判会漏掉那些支——它们的
+   * 角标会凭空消失，而用户看不出为什么这一支没有。
+   *
+   * **不合并进 `folded`**：`folded.has(id)` 现在等于"这里能点开、点了会冒出 N 个"，
+   * 给一个孩子全显示着的节点塞进 `folded`，`+N` 就会长在一个点下去什么都不变的位置。
+   */
+  unshown: ReadonlyMap<string, number>;
   /** 子节点正显示着的节点 id → 为什么显示。叶子节点没有条目。 */
   open: ReadonlyMap<string, FoldOpenReason>;
   /** 画布上真正画出来的节点数（界面那句「显示 N / M」的 N）。 */
@@ -144,6 +176,7 @@ export interface ViewTreeOptions {
 const NO_IDS: ReadonlySet<string> = new Set<string>();
 const NO_FOLDS: ReadonlyMap<string, FoldInfo> = new Map<string, FoldInfo>();
 const NO_OPEN: ReadonlyMap<string, FoldOpenReason> = new Map<string, FoldOpenReason>();
+const NO_UNSHOWN: ReadonlyMap<string, number> = new Map<string, number>();
 
 /** 一棵子树有多少节点（含自身）。折叠点的「整支还有 N 个」用它。 */
 export function countSubtree(node: MindNode): number {
@@ -185,7 +218,7 @@ export function viewTree(root: MindNode, options: ViewTreeOptions): ViewTreeResu
 
   // 快路径：没有任何显式闸门，且预算本来就够 → 一个节点都不动。
   if (!expanded.size && !collapsed.size && !expandAll && (limit <= 0 || total <= limit)) {
-    return { root, folded: NO_FOLDS, open: NO_OPEN, visible: total };
+    return { root, folded: NO_FOLDS, open: NO_OPEN, visible: total, unshown: NO_UNSHOWN };
   }
 
   /**
@@ -267,6 +300,15 @@ export function viewTree(root: MindNode, options: ViewTreeOptions): ViewTreeResu
   const folded = new Map<string, FoldInfo>();
   const open = new Map<string, FoldOpenReason>();
   const kept = new Map<string, readonly MindNode[]>();
+  /**
+   * `unshown`：每个节点"整棵子树里还差几个"。与 `stats` 同一遍算完就够，不需要
+   * 再遍历一次树——`totalIn` / `shownIn` 两个表已经给出了差。
+   */
+  const unshown = new Map<string, number>();
+  for (const [id, sum] of totalIn) {
+    const gap = sum - (shownIn.get(id) ?? 0);
+    if (gap > 0) unshown.set(id, gap);
+  }
 
   /**
    * 第四步：定"每个父节点保留哪些孩子"，并同时写下 `folded` / `open`。
@@ -326,7 +368,7 @@ export function viewTree(root: MindNode, options: ViewTreeOptions): ViewTreeResu
     return { ...node, children: keep.map(build) };
   };
 
-  return { root: build(root), folded, open, visible: visible.size };
+  return { root: build(root), folded, open, visible: visible.size, unshown };
 }
 
 /** 前序遍历一棵树（含自身）。 */
