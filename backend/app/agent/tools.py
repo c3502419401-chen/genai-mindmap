@@ -9437,8 +9437,8 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             ),
         ))
 
-    # 骨架的产物（颜色 / 图标 / flowgraph 的边）套上去。放在裁剪之后：端点表必须
-    # 用裁剪后还活着的 id 建，否则 `clean_edges` 会把边留在指向已消失节点的状态。
+    # 骨架的产物（颜色 / 图标 / flowgraph 的边）套上去。放在树定形之后：端点表必须
+    # 用最终还活着的 id 建，否则 `clean_edges` 会把边留在指向已消失节点的状态。
     #
     # 两段式跳过：它的颜色是结构那一次直接写在节点上的（一级分支由模型自己挑，
     # 不存在"骨架产物与树按第几支对齐"这件事），`raw_plan` 也是 None。
@@ -9447,9 +9447,9 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             content, plan, raw_plan, diagram_type=diagram_type)
         diagnostics.extend(edge_diagnostics)
 
-    # 跨分支关系（两段式才有）。放在**裁剪之后**：端点表要按还活着的节点建，
-    # `_relations_from` 的第一道过滤就是"端点不在树里就丢"——拿裁剪前的表建，
-    # 留下来的会是几条指向已被砍掉的节点的虚线，而契约会因此拒收整张图。
+    # 跨分支关系（两段式才有）。放在树定形之后：端点表要按还活着的节点建，
+    # `_relations_from` 的第一道过滤就是"端点不在树里就丢"——拿一张旧表建，
+    # 留下来的会是几条指向已消失节点的虚线，而契约会因此拒收整张图。
     relation_drops: dict[str, int] = {}
     if graph_mode:
         relations, relation_drops = _relations_from(raw_relations, content)
