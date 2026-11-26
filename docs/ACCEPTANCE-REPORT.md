@@ -449,11 +449,11 @@ print("节点",tot,"恰好16字",clip16,"含' / '",slash,"≥20字",ge20,"重复
 
 **这个区别决定了下一轮派哪一份活**：改渲染层（盒子加宽、字号缩小）**无效**——数据里就没有后半截。有效的修法只有两条：① 把 16 字硬切改成语义切（不在拉丁词、括号、书名号中间切），并把被切下的后半截写进 `detail` 首行（`原上级：…` 已有先例）；② 或提高生成侧上限，代价是画布上放不下（那 24 个 ≥20 字的 label 已经在挤）。
 
-### 6.3 两条未修的缺口
+### 6.3 两条本轮未覆盖的缺口（其中一条在被测提交之后已修）
 
 **① `DIAGRAM_TYPE_OPTIONS` 与 `thinking_options` 同一种病——在被测提交 `a8cb421` 上未修。**
 它的值域在后端（`AgentRunRequest.diagram_type` 的 `Literal`），中文名与 `hint` 是纯表现层，而前端 `api/types.ts::DiagramType` 是**手写**的、与 `schema.d.ts` 的 union 之间没有任何用例连着——加一个图型（比如"时间轴"）什么都不会红。
-> **口径核对**：工作区里已经有这条的修法（`frontend/src/api/diagram-labels.json`、`backend/scripts/export_diagram_labels.py`、`backend/tests/test_diagram_options.py` 三个未跟踪文件 + `types.ts`/`options.ts` 的改动），但**未提交**。因此本报告只主张"被测提交上未修"，不主张"已修"——验收材料不能拿未提交的工作区状态当交付物。
+> **口径核对（这条在本报告定稿后发生了变化，如实写清）**：本报告被测的提交是 `a8cb421`，**在它上面这条未修**，本报告不主张"已修"。核对时它的修法还只在工作区（三个未跟踪文件 + `types.ts`/`options.ts` 的改动）；此后它已随 `93acee6 fix(图型): 值域与中文名也改成单一源（构建期生成）` 提交（6 个文件 +360/−16，含 `backend/tests/test_diagram_options.py` 与 `frontend/tests/diagram-options-source.spec.ts`）。**所以它现在是"被测提交之后已修"，不是"未修"，也不是"本轮已验收"**——本轮的 20 条测量与 80 条判语全部来自 `a8cb421`，没有一条重跑。
 
 **② `unwired_baseline.json` 里 5 条 `status=todo` 的零引用公开函数，本轮不判。**
 `close_driver`、`add_edge`、`clear_aliases`、`resolve_entities`、`forget`。**"todo" 是"这一轮不判"的账，不是"判定它们可以零引用"**——其中 `add_edge`（产品里写边走 `add_edges_bulk`，它一次都没被调用）与 `forget`（产品里没有"删掉这份材料"的入口）看起来是真缺口，`close_driver` 是"docstring 说给进程退出用、但产品里没有进程退出钩子"。下一轮要么接上，要么删掉并改 docstring。
