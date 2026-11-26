@@ -1,0 +1,71 @@
+{
+  "_note": [
+    "零引用公开函数的基线：每一条都要说清『为什么它可以零引用』。",
+    "闸门（scripts/acc3/find_unwired.py --gate）只拦基线之外的新增，所以这是一条棘轮：",
+    "今天的清单被冻结，新增一条就红；修掉一条应该顺手把它从下面删掉（闸门会提示）。",
+    "status=accepted：有理由（测试隔离、度量脚本、生成物的上游……）。",
+    "status=todo：还没判——它多半是真缺口，只是不在那一轮的改动边界里。",
+    "evidence 是理由的凭据（仓库根相对路径）。凭据被删掉而条目还在时，闸门红。"
+  ],
+  "entries": {
+    "thinking_options": {
+      "status": "accepted",
+      "reason": "被 scripts/export_thinking_options.py 消费，产物 frontend/src/api/thinking-options.json 由 tests/test_thinking_options.py 守卫；app/** 里没有调用者是设计（前端不需要在运行时请求它）。",
+      "evidence": [
+        "backend/scripts/export_thinking_options.py",
+        "frontend/src/api/thinking-options.json",
+        "backend/tests/test_thinking_options.py"
+      ]
+    },
+    "reset_graph_notices": {
+      "status": "accepted",
+      "reason": "测试隔离专用（docstring 明写）：清掉上一个用例留下的图提示。",
+      "evidence": ["backend/tests/conftest.py", "backend/tests/test_graph_skip_notice.py"]
+    },
+    "reset_learned_max_tokens": {
+      "status": "accepted",
+      "reason": "测试隔离专用（docstring 明写『只给测试用』）：清掉 max_tokens 的学习值。",
+      "evidence": ["backend/tests/test_budget.py", "backend/tests/test_free_models.py"]
+    },
+    "is_detail_only_prompt": {
+      "status": "accepted",
+      "reason": "用例与度量脚本用它判『这是哪一轮』（说明阶段 vs 骨架阶段），产品代码不需要问这个问题。",
+      "evidence": ["backend/tests/test_detail_length.py", "backend/tests/test_detail_sentences.py"]
+    },
+    "quote_in": {
+      "status": "accepted",
+      "reason": "内部工具，只被 verify 的用例直接调；产品路径走 verify_source_refs。可以私有化或删，不是接线缺口。",
+      "evidence": ["backend/tests/test_verify_states.py"]
+    },
+    "prime_history": {
+      "status": "accepted",
+      "reason": "只在度量脚本 scripts/measure_cross_map.py 里被调用：给一次消融准备历史图。产品路径按需现查。",
+      "evidence": ["backend/scripts/measure_cross_map.py"]
+    },
+    "close_driver": {
+      "status": "todo",
+      "reason": "只在测试里被调（conftest 与几个图用例）。docstring 说『供测试与进程退出调用』，但产品里没有进程退出钩子——这条要么接上退出路径，要么把那半句删掉。",
+      "evidence": ["backend/tests/conftest.py", "backend/tests/test_graph_neo4j.py"]
+    },
+    "add_edge": {
+      "status": "todo",
+      "reason": "只在图用例里被调，产品代码一次都没调（写边走 add_edges_bulk）。它是『写了接口、没人用』的候选，下一轮判：接上还是删。",
+      "evidence": ["backend/tests/test_graph_rag.py", "backend/tests/test_graph_resolve.py"]
+    },
+    "clear_aliases": {
+      "status": "todo",
+      "reason": "只在 test_graph_resolve 里被调。别名一旦写错，产品里没有撤销入口。",
+      "evidence": ["backend/tests/test_graph_resolve.py"]
+    },
+    "resolve_entities": {
+      "status": "todo",
+      "reason": "只在 test_graph_resolve 里被调。产品路径走 graph_resolve 内部的批量入口。",
+      "evidence": ["backend/tests/test_graph_resolve.py"]
+    },
+    "forget": {
+      "status": "todo",
+      "reason": "library.forget（删一份材料）只在用例里被调：产品里没有『删掉这份材料』的入口，而 prune 有自己的回收路径。",
+      "evidence": ["backend/tests/test_library_wiring.py", "backend/tests/test_library.py"]
+    }
+  }
+}

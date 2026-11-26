@@ -295,6 +295,11 @@ python scripts/acc3/find_unwired.py --suspects # 只列真正可疑的
 动态调用（`getattr`、注册表）会被误判成零引用，那是**误报**方向。
 因此它适合用来"扫一遍给出候选清单"，不适合直接做成 CI 闸门。
 
+> **第二轮修正**：上面这段边界当时低估了误差的**方向**。判据 v2（语法树而不是字面）
+> 实测把"真正可疑"从 6 条抬到 11 条，多出来的 6 条全是**名字只出现在注释里**、
+> 所以 v1 从来看不见的（`graph_store.add_edge` 被注释提到 24 次、被调用 0 次）。
+> 量具、闸门与"为什么只能做成棘轮"见第九节。
+
 ---
 
 ## 六、边界与残留风险
@@ -316,3 +321,257 @@ python scripts/acc3/find_unwired.py --suspects # 只列真正可疑的
   各多几行，`mindmaps` 未新增（没保存）。
 - 顺手清掉 4 条 `ruff` 告警（都在 `scripts/`，是上一轮证据脚本留下的未用变量 /
   未用 import）：现在 `python -m ruff check .` 全绿。
+
+---
+
+# 第二轮：第五、第六处缺口（`thinking_options` / `diagnose_density`）
+
+> 起点 `main` = `8d2f098`。这一轮只动两件事，都是为了把"两份定义源"和"一个没有产出的
+> 诊断码"这两类**静默不一致**变成红灯。第七节是 `thinking_options`，第八节是
+> `SPARSE_BRANCH`（结论是**码留着、函数删掉**），第九节把第五节那个"扫零引用"
+> 判据的量具重新校了一遍——那里有一个必须先说清的数：**旧判据漏报 6/11**。
+
+## 七、`thinking_options()` 零引用：两张表现在一份都不差，差的是"没有任何一处会红"
+
+### 7.1 现状：四份手写副本 + 一份生成副本，逐项**全部对得上**
+
+| 副本 | 位置 | 内容 | 谁保证它不变 |
+|---|---|---|---|
+| 真源 | `app/generation/service.py::THINKING_MODELS` | 5 个键 + 5 个标签 + 5 段提示词 | — |
+| 手写② | `app/agent/contracts.py::AgentRunRequest.thinking_model` 的 `Literal` | 5 个键 | `test_thinking_options.py`（本轮加） |
+| 手写③ | `backend/tests/test_generation.py:459` | 5 个标签 | 就是它自己（断言写死） |
+| 手写④ | `frontend/src/stores/options.ts:19`（**本轮删**） | 5 个键 + 5 个标签 | 没有 |
+| 手写⑤ | `frontend/tests/diagram-type.spec.ts:136`（**本轮删**） | 5 个键 + 5 个标签 | 没有 |
+| 生成 | `frontend/src/api/schema.d.ts:971` 的 union | 5 个键 | `test_openapi_snapshot.py` + `npm run gen:api` |
+
+逐项比对（键 / 标签）：`default/通用`、`first-principles/第一性原理`、`feynman/费曼`、
+`systematic/5W1H`、`critical/批判性`——**五个全对得上，顺序也一样，零处不一致**。
+
+所以这一处**不是"修一次对齐"**。它现在的状态是"恰好一致"：后端往 `THINKING_MODELS`
+加一种思考方式，界面上什么都不会发生，也没有任何一条用例会红。②③④⑤ 四份手写副本里，
+只有 ② 的**值域**会在拼错时被后端 422 挡住（那是运行期、点了才知道），"少一种"谁都不管。
+
+### 7.2 路线：**不加接口**，改成"后端表 → 生成物 → 前端 import"
+
+判据只有一条：**这个下拉必须在首屏可用**。它在 `ChatDock.vue` 里、生成按钮旁边，用户
+点开就要能选。这条判据把"运行时请求"整条路否掉了：
+
+1. 走 `GET /api/generation/thinking-options`，要么下拉在响应到达之前**是空的**，要么前端
+   再抄一份兜底副本——后者就是现在这个病的动态版本，定义源从两份变成三份；
+2. 值域本来就**已经在契约里**（`AgentRunRequest.thinking_model` 是 `Literal`，
+   `schema.d.ts` 里已经是同一条 union）。再开一个接口，等于把同一件事用第二种形状
+   说第二遍；
+3. 仓库里没有"运行时发现全集"的客户端：`scripts/**` 全是 `import` 后端模块，第三方
+   集成也不在下拉这件事上。现在开这个接口是投机。
+
+改判条件写在前面：**如果哪天后端独立升级、前端静态托管**（旧包 + 新后端），运行期
+发现才有价值——那时旧包连新值都发不出来，只有接口能救。当前仓库不是这个部署形状。
+
+于是链路变成单向的一条：
+
+```
+app/generation/service.py::THINKING_MODELS          ← 唯一的那一份（键/标签/提示词）
+    ↓ scripts/export_thinking_options.py（手跑，像 export_openapi.py）
+frontend/src/api/thinking-options.json              ← 提交、可 review 的生成物
+    ↓ import（构建期，零往返）
+frontend/src/stores/options.ts::THINKING_MODEL_OPTIONS
+    ↓ v-for
+ChatDock.vue #thinking-model
+```
+
+### 7.3 "以后不一致会红"靠三件事
+
+| 用例 | 拦的失败 |
+|---|---|
+| `test_table_and_contract_literal_agree` | 后端内部：往表里加了键、忘了改 `Literal` → 用户选了就 422 |
+| `test_exported_snapshot_is_up_to_date` / `test_export_has_one_entry_per_thinking_model` | 后端 → 前端：改了表没重跑导出脚本 → 生成物过期 |
+| `test_frontend_store_holds_no_copy_of_the_table` | 前端内部：有人把候选表**抄回去**（那正是本轮修掉的形状） |
+| `test_default_is_first` | 顺序契约：`default` 排第一，否则"不选就生成"的默认值与界面显示的不是同一个 |
+| `diagram-type.spec.ts` 那条（改断言，不删） | 组件把整张表**一条不漏、按顺序**渲染出来（期望值从生成物读，不再写死） |
+
+### 7.4 ★ 造一次"后端多一种思考方式"：三段落红读数
+
+把 `socratic / 苏格拉底` 加进 `THINKING_MODELS`，什么都不重跑：
+
+```
+$ python -m pytest -q tests/test_thinking_options.py
+3 failed, 2 passed
+FAILED test_table_and_contract_literal_agree          ← Literal 没跟上
+FAILED test_exported_snapshot_is_up_to_date           ← 生成物过期
+FAILED test_export_has_one_entry_per_thinking_model   ← 生成物少一条
+```
+
+只重跑导出脚本（假装"忘了改契约"）：
+
+```
+$ python scripts/export_thinking_options.py && python -m pytest -q tests/test_thinking_options.py
+1 failed, 4 passed
+FAILED test_table_and_contract_literal_agree          ← 仍然红：这个值发出去就是 422
+```
+
+补齐 `Literal` + 重导快照 + 重生成类型：
+
+```
+$ python scripts/export_openapi.py && (cd ../frontend && npm run gen:api) && npm test -- --run tests/diagram-type.spec.ts
+backend/openapi.json        | 3 ++-      （只多一个字面量成员）
+frontend/src/api/schema.d.ts| 2 +-
+14 passed                                ← 前端**一行源码都没改**，下拉从 5 项变 6 项
+$ node -e "require('./frontend/src/api/thinking-options.json').length"
+6
+```
+
+**这就是"单一源"的验收标准**：后端加一项 → 先是三处红（改的人知道必须动），补完
+契约后前端自动跟上（不用再改第二处）。探针已完整回滚：`openapi.json`、`schema.d.ts`、
+`contracts.py` 三份与 HEAD 逐字节相同。
+
+## 八、`diagnose_density()` 零引用：先纠正前提，再判 b
+
+### 8.1 前提要纠正：`SPARSE_BRANCH` **不是**"从来不存在的诊断码"
+
+第五节写的是"它产出的 `SPARSE_BRANCH` 是一个从来不存在的诊断码"。**这一句只对了
+一半**，而这半个错正是它被拖了两轮的原因：
+
+- 码是**活**的：`app/agent/tools.py::_generate_deep` 的分片路径在
+  `sparse, overfull = _audit_branches(content, need)` 之后逐支产出 `SPARSE_BRANCH`
+  （`tools.py:13193` 取值、`13184` 产出），两条用例钉着它**出现**与**不该出现**
+  （`tests/test_agent_tools.py:504` `assertIn`、`:388` `assertNotIn`）。
+- 死的是 `generation/service.py::diagnose_density()`：零调用方，`check()` 里没有，
+  前端 `DIAGNOSTIC_LABELS` 里也没有。
+
+也就是说，缺口不是"码没接上"，而是**同一件事有两份实现，其中一份没人用**。
+
+### 8.2 三条候选逐条过
+
+| 候选 | 判 | 依据 |
+|---|---|---|
+| **a 接进 `check()` 的规则层** | 不接 | `check()` 是**已落库的图**的事后体检，判据必须与生成过程无关、且是相对的（`SHALLOW_BRANCH` = "比同级浅"）。密度是**生成期**的交付判据（"要求 3 个要点、拿到 1 个"）。搬进事后体检，会在每一张导入图、每一张手改图上误报——那些图从来没人"要求过要点数"。 |
+| **a′ 加前端 `DIAGNOSTIC_LABELS`** | 不加（加了没用） | 生成链上的诊断在 `AgentPanel.vue:513-517` **只渲染 `message`**（后端给的整句中文），码根本不上屏；把码当标题显示的是另一个面板（`structure.ts` → `StructureCheck.vue`，那里的码来自 `check()`/`repair`）。所以"给生成码补标签"是装饰，不是接线。 |
+| **c 改用途（数值给视图层当"该收起了"判据）** | 不接 | 视图层已经有三档判据（`structureCounts` 的 `attention` / `suggestions` / `hints`，见 `mindmap/diagnostics.ts`），密度数值没有消费方；硬塞进去会让"该收起了"这件事有两个来源。 |
+| **b 删掉** | **✔** | 见 8.3 |
+
+### 8.3 b 的依据：它是同一件事的**第二份、更弱**的实现
+
+不是"没人要"，而是"要的东西已经有了，这一份更差"：
+
+1. **阈值**：写死 `minimum=2`；分片路径的 `need` 是从本次配置算出来的。
+2. **说不出为什么**：`tools.py` 那条会带一句尾注——"已补调一次模型，仍不足，按现状接受"
+   或"模型调用额度不足，未能补调"；`diagnose_density` 只有一句"少于建议的 2 个"。
+3. **会重复告警**：它把"因额度没展开"和"展开失败"的分支也算成稀疏；`tools.py` 那边
+   用 `skipped_set` / `failed_set` 排掉了（那里有一条注释专门解释这件事）。
+4. **口径不可调**：`minimum` 参数没有任何调用方传过，等于第二套阈值。
+
+判据回放（"用户看到它会不会采取行动"）：**会**——他能做的是手动展开那一支。而他要
+做这个动作所需的信息（哪一支、差几个、为什么不足、是不是已经补调过）**全部在
+`message` 里**，函数对这个动作没有贡献。所以：**码留，函数删**。
+
+删掉的东西：`diagnose_density()`（17 行）、`tests/test_generation.py` 的
+`DensityDiagnosticTest`（3 条用例）、`test_generation.py` 里那一行 import。
+
+补上的守卫：`tests/test_diagnostic_codes.py` 两条——`SPARSE_BRANCH` 全仓**只有一个
+产出点**（且它是 `agent/tools.py`，不是 `generation/service.py`）。哪天有人再养一份，
+红的是这条，而不是等用户在同一块面板上读到两句不一样的话。
+
+## 九、第五节那个判据的漏报率：**6/11**，而且量具本身要换
+
+### 9.1 旧判据（字面）与新判据（语法树）的实测对照
+
+`scripts/acc3/find_unwired.py` 换掉了量具：v1 数 `\bname\b` 在文本里出现几次，v2 数
+**语法树里真正被引用的节点**（`ast.Name`(Load) / `ast.Attribute` / `ast.alias`）。
+同一棵树、同一批 515 个顶层公开函数：
+
+| | v1（字面） | v2（ast） |
+|---|---|---|
+| 零引用（含路由/装饰器/`__all__`） | 39（其中 route 33） | 66（route 37 / exported 18） |
+| 真正可疑 | **6** | **11** |
+| 其中 v1 **看不见**的 | — | **6** |
+| 全跑一次耗时 | **约 1.6 分钟**（每个名字把三棵树重读一遍：107 个文件 × 515 名字） | **2 秒**（一遍建索引，之后查表） |
+
+（route 从 33 变 37 是量具差异：ast 也把 `X.handler` 这类属性引用算进引用，于是更多
+路由落进"零引用"那一档。两者都整类豁免，不影响"真正可疑"。）
+
+v1 看不见的那 6 条（它们 `text>0`、`refs=0`——名字**只出现在注释或字符串里**）：
+
+| 位置 | 名字 | 只在注释里被提到的次数 |
+|---|---|---|
+| `knowledge/graph_store.py:787` | `add_edge` | 24 |
+| `knowledge/graph_store.py:670` | `close_driver` | 2 |
+| `knowledge/graph_store.py:1125` | `clear_aliases` | 1 |
+| `knowledge/graph_resolve.py:609` | `resolve_entities` | 1 |
+| `knowledge/library.py:443` | `forget` | 1 |
+| `optimization/cross_map.py:215` | `prime_history` | 1 |
+
+**这个方向的漏报在这个仓库特别致命**：注释与 docstring 里写函数名是这里的书写习惯
+（"`verify_source_refs` 做过了"、"`close_driver()` 会重置它"），于是**越是被文档认真
+描述过的函数，越容易被字面判据放过**。`add_edge` 24 次提及、0 次调用，是最干净的一例。
+
+用 `ast` 逐个复核（只数 `Call` 节点）确认这 11 条**都真的没有被调用过**，所以 v2 在
+"零引用"这个方向上没有假阳性；假阴性（同名局部变量被算成引用）理论上存在，实际这 11
+条一条都没被它误伤。
+
+### 9.2 但"零引用"仍然不等于"缺口"：精确率 5/11
+
+11 条逐条判（写进 `scripts/acc3/unwired_baseline.json`，每条带理由与凭据）：
+
+- **6 条有正当理由**：`reset_graph_notices` / `reset_learned_max_tokens`（测试隔离专用）、
+  `is_detail_only_prompt`（用例判"这是哪一轮"）、`quote_in`（内部工具，只被 verify 的
+  用例调）、`prime_history`（只在 `scripts/measure_cross_map.py` 里）、
+  `thinking_options`（被导出脚本消费，产物由用例守）。
+- **5 条待判（真候选，不在这一轮的边界里）**：`graph_store.add_edge` /
+  `close_driver` / `clear_aliases`、`graph_resolve.resolve_entities`、`library.forget`。
+  共同形状是"写接口 + 只有用例调"，与第五节那三处同源。下一轮该拿它们开刀。
+
+所以三层判据的精度是：**"零引用"→ 11/11**（这 11 条真的没被调用过，逐条用 `Call`
+节点复核）；**"缺口候选"→ 5/11 ≈ 45%**（还没逐条判完，是上限）；**"这一轮必须修"→ 0**
+——两条真缺口一条已经修掉（`thinking_options`，它现在被导出脚本消费，落在上面那 6 条
+"正当理由"里）、一条已经删掉（`diagnose_density`，所以它压根不在 v2 的 11 条里）。
+
+这也是第五节那个 "39 → 6" 的真实含义：**6 条里只有 2 条是真缺口**（`thinking_options`、
+`diagnose_density`），另外 4 条是"只在测试/脚本里用"的合理存在。v1 对真缺口的召回是
+**5/11 ≈ 45%**：它给出 6 条，其中 5 条与 v2 重合，漏掉 6 条只被注释提到的。
+
+### 9.3 下一轮该不该进 CI：该，但只能是**棘轮**，且要加一条反向检查
+
+`--gate` 已经实现，读 `scripts/acc3/unwired_baseline.json`：
+
+1. **新增即红**：任何不在基线里的零引用公开函数 → 退出码 1。
+   （实测：往 `service.py` 加一个无人调用的公开函数，闸门立刻退 1 并指名 `文件:行 名字`。）
+2. **理由必须有凭据**：每个基线条目写着 `evidence`（脚本 / 用例 / 生成物的仓库相对路径）。
+   凭据文件被删掉而条目还在 → **红**。这一条防的是"理由消失、结论留下"，也就是第五节
+   那个反例（`include_in_schema=False` 旁边那段"这一轮为什么先不导出"）消失之后没人发现。
+3. **修好了要销账**：条目不再是零引用 → 打印提示（不红）。
+4. `status: todo` 的条目每次都会被打出来，数量就是"还没判的账"。
+
+**不做绝对闸门**（"零引用必须为 0"）：那等于逼人往豁免名单里塞东西，然后忘掉它。
+
+**不做"契约-客户端对账"当闸门**：我试了两种最自然的字符串做法——`openapi.json` 的
+38 条 path 与 `frontend/src/api/client.ts` 对账，一种报"18 条没有客户端"、另一种（把
+`{id}`/`${id}` 归一后）报"36 条没有客户端"，**两次都不对**：路径是拼出来的
+（`${BASE}/mindmaps/${id}`），字符串层面量不准。这条要成立得做模板串归一的静态分析，
+不属于这一轮。它恰恰也是一个真实的洞：33 条路由被 v1 当作"框架调用"整类豁免，而
+"这条路由有没有前端在调"从来没人问——本轮我拒绝再加一条路由，理由之一就是它。
+
+**该进 CI 的是这三件事**：`find_unwired.py --gate`（棘轮）、`test_openapi_snapshot.py`
+（已有）、`test_thinking_options.py`（本轮加的"生成物必须新鲜"）。都是"红得起来、且
+红得有话说"的那种。
+
+## 十、这一轮的边界与残留风险
+
+- 改动的产品文件：`app/generation/service.py`（删一个函数）、
+  `frontend/src/stores/options.ts`（改成 import 生成物）。
+  新增：`scripts/export_thinking_options.py`、`frontend/src/api/thinking-options.json`
+  （生成物）、`tests/test_thinking_options.py`、`tests/test_diagnostic_codes.py`、
+  `scripts/acc3/unwired_baseline.json`；改写：`scripts/acc3/find_unwired.py`（判据 v2 +
+  闸门）。
+  **没碰** `app/agent/tools.py`、`app/knowledge/service.py`、`frontend/src/canvas/*`。
+- **契约零变化**：`openapi.json` 与 `schema.d.ts` 与 HEAD 逐字节相同（7.4 的探针加过
+  一个字面量成员，已完整回滚）。
+- 用例读数：后端 **3259 通过 / 37 跳过**；前端 **82 文件 / 1360 用例**。
+  相对 `8d2f098` 的**净增量 +4**（新增 5 + 2，删掉 3），不是 3259 与旧文档里那个
+  3247 的差——那个差里还有另一条线的东西（`tests/test_few_branches.py` 等）。
+- **同一条病还有一个没修的**：`DIAGRAM_TYPE_OPTIONS`。它的值域在后端
+  （`AgentRunRequest.diagram_type` 的 `Literal`），标签与 `hint` 是纯表现层的，而前端
+  `api/types.ts::DiagramType` 是**手写**的，与 `schema.d.ts` 的 union 之间没有任何用例
+  连着。加一个图型（比如"时间轴"）同样不会红。修法与本轮同一条（值域走生成物），
+  但 `hint` 得先决定放在哪一侧，所以没顺手改。
+- `scripts/acc3/unwired_baseline.json` 里 5 条 `todo` 是**这一轮不判**的账，
+  不是"判定它们可以零引用"。
