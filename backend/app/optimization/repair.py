@@ -60,6 +60,26 @@
 所以这里做重定向，并把每一次改写记进 `RepairUndo.redirected`，撤销时改回来。
 
 ======================================================================
+压链的标题：**可读是 24 字，契约是 200 字，两者不是一件事**
+======================================================================
+`_absorb` 要把两层的标题放到一个节点上。契约允许 200 字，但画布上是一个**两行盒子**
+（`MindNode.vue` 的 `line-clamp-2` + `stores/mindmap.ts` 的 `TRUNCATE_CHARS = 24`），
+超过就截成半句。所以拼接有一个**可读预算** `READABLE_LABEL_CHARS`，三档：
+
+    两段有包含关系      取长的那个      「监督学习」/「有监督学习」本来是一层的两种写法
+    拼起来 ≤ 24 字      拼接            信息最全，两行放得下
+    再长                取内层 + 降级     外层标题写进 detail 第一行（`原上级：…`）
+
+第三档是"不把两句话合成一句"：label 归**内容层**（内层有 children / detail / refs），
+外层那句挪进 detail（悬停卡片里能读到，`displayBody` 优先取 detail）。**不丢内容**，
+只是换个位置——这是这条规则唯一的取舍，`test_collapse_never_loses_the_outer_title`
+把它钉住。
+
+用修复自己造的缺陷，同时也要被修复自己量到：`overlong_labels()` 是**修完之后**那一份
+口径（修复前的那份在 `generation/service.py` 的 `LABEL_CLIPPED_TO_GENERATED`）。
+`scripts/_structure_audit.py` 的 F 判据从 `READABLE_LABEL_CHARS` 取，不各写一份。
+
+======================================================================
 不碰的东西
 ======================================================================
 - **层级不动**：不自动增删层级，只压缩"一层只有一个孩子"这种没有信息量的层。
@@ -79,7 +99,6 @@ from app.contracts.diagnostic import Diagnostic
 from app.contracts.mindmap import (
     MAX_NODE_CHILDREN,
     MAX_NODE_DETAIL_CHARS,
-    MAX_NODE_LABEL_CHARS,
     MindMapContent,
     Node,
 )
@@ -110,6 +129,26 @@ MAX_SOURCE_REFS = 20
 #: 已经读作"层级"（「机器学习 / 监督学习」），而且它不改变任何一层的字面，用户
 #: 撤销前后看到的是同一批名词。
 LABEL_JOINER = " / "
+
+#: **画布上一个节点盒子两行装得下的字数**，不是契约上限。
+#:
+#: 契约给的是 `MAX_NODE_LABEL_CHARS = 200`（`contracts/mindmap.py:82`），渲染层给的是
+#: 这个数：`frontend/src/stores/mindmap.ts:90 TRUNCATE_CHARS = 24` 把超出的部分截成
+#: `…`，`canvas/MindNode.vue:536` 的 `line-clamp-2` 只留两行。两处是同一个数字的
+#: 两个侧面，所以压链拼接的天花板取它——**不是**契约。
+#:
+#: 为什么放在 `repair.py` 而不是契约：它是**这一条修复的生成预算**，不是"什么算合法
+#: 的图"。放契约里会让别处（模型输出、导入）也被判 24 字，那是另一件事。
+#: `scripts/_structure_audit.py` 的 F 判据从这里导入同一个数（口径同源，不各写一份）。
+READABLE_LABEL_CHARS = 24
+
+#: 压链放不下两行时，外层标题降级进 `detail` 的前缀。
+#:
+#: 为什么还要留它：`_absorb` 的语义是"外层只是个标题、内层是内容"，合并后 label 归
+#: 内层、外层的话不进 label（进就变成一句读不完的长话）。但**外层的话不能就这么消失**
+#: ——它往往是分类名（「教材与参考资源」），用户撤销前在画布上看到过它。写进 detail
+#: 的第一行：悬停卡片能读到（`displayBody` 优先取 `detail`），画布上保持短。
+DEFERRED_LABEL_PREFIX = "原上级："
 
 
 class RepairKind(str, Enum):
@@ -286,24 +325,58 @@ def _join_text(outer: str | None, inner: str | None) -> str | None:
     return joined
 
 
-def _joined_label(outer: str, inner: str) -> str | None:
-    """压缩两层标题。超长返回 `None`。
+def _joined_label(outer: str, inner: str) -> tuple[str | None, bool]:
+    """压缩两层标题，返回 `(label, outer_deferred)`。放不下返回 `(None, False)`。
 
-    包含关系时不重复拼：`outer in inner` 时只留 `inner`（「监督学习」/「有监督学习」
-    这类父子标题在实际图里很常见，拼起来是「监督学习 / 有监督学习」——读者会以为
-    这是两个不同的层级，而它们本来就是一层）。
+    ## 为什么不是"两段一直拼到契约上限"
+
+    拼到 200 字在契约里合法，但画布上是一个**两行盒子**：超过 `READABLE_LABEL_CHARS`
+    就截成 `…`（实测产物里拼出过 33 字的
+    「教材与参考资源 / 指定教材 / Silberschatz《操作系」——第三段被截成一个半词）。
+    而这条修复的目的是**消结构冗余**，不是把两句话合成一句：读者要的是"这一层讲
+    什么"，不是"这一层的祖先依次叫什么"。
+
+    所以三档，按可读性从宽到窄：
+
+      包含关系（`监督学习` / `有监督学习`）  取长的那个      本来就是一层的两种写法
+      拼起来 ≤ 24 字                        拼接            两层都在两行内，信息最全
+      再长                                  取内层 + 降级    外层标题进 detail（见下）
+
+    第三档是这次的修法：**label 归内层**（`_absorb` 的语义本来就是"外层是标题、内层是
+    内容"，内层还有 children / detail / refs 挂在它身上），外层那句话由调用方
+    `_defer_label` 写进 `detail` 的第一行——**不丢**，只是从画布挪到卡片里。
+
+    为什么不用"外层 +（含 N 项）"那种摘要：真实产物里压链的 13 个长 label **全部
+    `kids=0`**（`scripts/_probe_long_labels.py` 量过），内层是叶子、项数是 0，摘要
+    形式在那里什么都没说，反而把叶子自己的标题挤掉了。
     """
     left, right = outer.strip(), inner.strip()
     if not left:
-        return right or None
+        return (right or None), False
     if not right:
-        return left
+        return left, False
     if left in right:
-        return right
+        return right, False
     if right in left:
-        return left
+        return left, False
     joined = f"{left}{LABEL_JOINER}{right}"
-    return joined if len(joined) <= MAX_NODE_LABEL_CHARS else None
+    if len(joined) <= READABLE_LABEL_CHARS:
+        return joined, False
+    # 内层自己就超可读线时也照用：那是它原本的长度，压链**没有加剧**它；
+    # 换成外层会把这个节点真正讲的内容藏起来，比留着长标题更糟。契约上限（200）
+    # 不会被踩到：`inner` 是已经通过契约校验的那棵树上的节点。
+    return right, True
+
+
+def _defer_label(text: str, detail: str | None) -> str | None:
+    """把放不进 label 的那层标题接到 `detail` 前面。超 detail 上限返回 `None`。
+
+    顺序是"最近的上层在前"：三层单子链压两次时，detail 会得到
+    `原上级：指定教材` + `原上级：教材与参考资源` 两行，读起来是从近到远的。
+    """
+    head = f"{DEFERRED_LABEL_PREFIX}{text.strip()}"
+    joined = f"{head}\n\n{detail}" if detail else head
+    return joined if len(joined) <= MAX_NODE_DETAIL_CHARS else None
 
 
 _EXPANDABLE_RANK = {"no": 0, "unknown": 1, "yes": 2}
@@ -318,29 +391,42 @@ def _wider_expandable(left: str, right: str) -> str:
     return left if _EXPANDABLE_RANK.get(left, 1) >= _EXPANDABLE_RANK.get(right, 1) else right
 
 
-def _absorb(outer: Node, inner: Node) -> Node | None:
+def _absorb(outer: Node, inner: Node) -> tuple[Node | None, bool]:
     """把 `outer` 并进 `inner`（`inner` 的 id、子节点、形状保留），返回新节点。
 
     用于"消掉单子链"：外层只是个标题、内层是内容。`inner` 当骨架是因为**引用与
     关系线大多指向有内容的那个**——保留它的 id，`relations` / `edges` / 用户记住的
     选中都不失效。
 
-    超出上限（label / refs / detail / 子节点数）返回 `None`。
+    超出上限（refs / detail / 子节点数）返回 `None`。**label 不再有"超契约就放弃"
+    这一档**：外层那句放不进两行时降级进 `detail`（`_joined_label` + `_defer_label`），
+    所以"外层标题没地方放"不再是放弃修复的理由。
+
+    `inner.children` **原样保留**——这是这个函数唯一搬动子节点的地方，也是"压链会不会
+    丢内容"的答案：不会。外层的 `children` 恒等于 `[inner]`（`_collapse_chain` 已经
+    确认过 `len(outer.children) == 1`），所以它除了 inner 之外没有别的孩子可丢；真正
+    可能丢的是**外层的 label / detail / note / refs**，四样都并进结果（label 见上、
+    后三样拼接或取并集）。
     """
-    label = _joined_label(outer.label, inner.label)
+    label, deferred = _joined_label(outer.label, inner.label)
     if label is None:
-        return None
+        return None, False
     refs = _union_refs(outer.source_refs, inner.source_refs)
     if refs is None:
-        return None
+        return None, False
     detail = _join_text(outer.detail, inner.detail)
     note = _join_text(outer.note, inner.note)
     if (outer.detail or inner.detail) and detail is None:
-        return None
+        return None, False
     if (outer.note or inner.note) and note is None:
-        return None
+        return None, False
+    if deferred:
+        # label 归了内层，外层那句话挪进 detail 的第一行（不丢，只是换了个位置）。
+        detail = _defer_label(outer.label, detail)
+        if detail is None:
+            return None, False
     if len(inner.children) > MAX_NODE_CHILDREN:
-        return None
+        return None, False
     return Node(
         id=inner.id,
         label=label,
@@ -359,7 +445,7 @@ def _absorb(outer: Node, inner: Node) -> Node | None:
         # `pos` 是**手动坐标**（layoutMode=manual 时才生效）。两层合成一层之后旧坐标
         # 没有意义，取内层的那个：它是用户最后动过的位置的概率更高。
         pos=inner.pos if inner.pos is not None else outer.pos,
-    )
+    ), deferred
 
 
 def _merge_siblings(keep: Node, drop: Node) -> Node | None:
@@ -497,11 +583,15 @@ def _collapse_chain(content: MindMapContent, parent_id: str, code: str
     inner = outer.children[0]
     grandparent_id = parents.get(parent_id)
 
-    merged = _absorb(outer, inner)
+    merged, deferred = _absorb(outer, inner)
     if merged is None:
         return None, RepairSkip(code=code, node_id=parent_id,
-                                reason=(f"合并后超出契约上限（标题 ≤{MAX_NODE_LABEL_CHARS} 字、"
-                                        f"引用 ≤{MAX_SOURCE_REFS}、正文 ≤{MAX_NODE_DETAIL_CHARS} 字）"))
+                                reason=(f"合并后超出契约上限（引用 ≤{MAX_SOURCE_REFS}、"
+                                        f"正文 ≤{MAX_NODE_DETAIL_CHARS} 字）"))
+    # 两层的标题放不进一个两行盒子时，label 归内层（内容层）、外层那句进了 detail。
+    # 这句话必须说出来：用户点开修复记录看到"标题变成了内层的那个"，需要一个解释。
+    fate = ("，原上级标题「{}」放不进两行、已写进说明".format(outer.label.strip())
+            if deferred else "")
 
     if grandparent_id is None:
         # 根自己只有一个孩子：根不能消失，所以把孩子的子树并进根，根的内容留下。
@@ -513,7 +603,7 @@ def _collapse_chain(content: MindMapContent, parent_id: str, code: str
         # 根自己的 id 保住了，消失的是**孩子**的 id。
         undo.redirected = _redirect(content, inner.id, outer.id)
         message = (f"根「{outer.label.strip()}」下只有一条支「{inner.label.strip()}」，"
-                   f"已把两层合成一层（标题为「{merged.label.strip()}」）")
+                   f"已把两层合成一层（标题为「{merged.label.strip()}」{fate}）")
     else:
         siblings = nodes[grandparent_id].children
         index = next(position for position, node in enumerate(siblings) if node.id == parent_id)
@@ -524,7 +614,7 @@ def _collapse_chain(content: MindMapContent, parent_id: str, code: str
         siblings[index] = merged
         undo.redirected = _redirect(content, outer.id, inner.id)
         message = (f"「{outer.label.strip()}」下只有一条支「{inner.label.strip()}」，"
-                   f"已把两层合成一层（标题为「{merged.label.strip()}」）")
+                   f"已把两层合成一层（标题为「{merged.label.strip()}」{fate}）")
 
     return RepairItem(
         code=code,
@@ -678,6 +768,30 @@ def revert(content: MindMapContent, items: Sequence[RepairItem]) -> MindMapConte
     return work
 
 
+def overlong_labels(content: MindMapContent, *,
+                    limit: int = READABLE_LABEL_CHARS) -> list[tuple[str, str]]:
+    """`(node_id, label)`：画布上会被截成半句的那些节点。
+
+    ## 为什么这是一个**独立于 check()** 的量
+
+    `check()` 的七条码里没有"标题太长"：那不是结构缺陷（树形是对的），是**渲染缺陷**
+    （两行盒子装不下）。而它偏偏是收尾自动修复**唯一可能自己造出来**的缺陷——压链要
+    把两层的标题放进一个盒子，放不下就会拼出 `A / B / C` 这种 30 字的半句。
+    修复前后都没有人量它，所以它一直躺在产物里（`docs/OFF-TOPIC-AND-FEW-BRANCHES.md`
+    记的 9/20 条只差 F）。
+
+    契约侧的量已经有了：生成入口把 label 截到 `GENERATED_LABEL_MAX_CHARS` 并报
+    `LABEL_CLIPPED_TO_GENERATED`（`generation/service.py`）。那是**修复之前**的口径；
+    这个函数是**修复之后**的那一份。两处都跑、分别报，因为"模型原本写了长的"与
+    "修复把它拼长了"是两个不同的失效，混成一条就再也分不开。
+
+    口径（`limit`）与渲染层同源：`frontend/src/stores/mindmap.ts` 的 `TRUNCATE_CHARS`
+    超了就截成 `…`。`scripts/_structure_audit.py` 的 F 判据从这个常量取，不各写一份。
+    """
+    return [(node.id, label) for node, _, _ in _iter_nodes(content.root)
+            if len(label := node.label.strip()) > limit]
+
+
 def repair_summary(result: RepairResult) -> str:
     """一句人话，给状态行/日志用。空修复时返回空串（调用方据此不加这一段）。"""
     if not result.applied:
@@ -697,6 +811,8 @@ def repair_summary(result: RepairResult) -> str:
 
 __all__ = [
     "AUTO_REPAIRABLE_CODES",
+    "DEFERRED_LABEL_PREFIX",
+    "READABLE_LABEL_CHARS",
     "MANUAL_ONLY",
     "MAX_SOURCE_REFS",
     "NodeFields",
@@ -705,6 +821,7 @@ __all__ = [
     "RepairResult",
     "RepairSkip",
     "RepairUndo",
+    "overlong_labels",
     "repair",
     "repair_summary",
     "revert",
