@@ -138,6 +138,41 @@ POST /api/agent/runs/stream       → intent=create, diagram_type=tree, sources=
 | 项目立项 | 3 | 0.792 | 0.664 |
 | 会议纪要 | 7 | **0.632** | 0.804 |
 
+### 2.2b 修订 D：收尾自动修复拼出来的长 label（已修，复算 85%）
+
+`§0` 与 `2.2` 两栏记的是 `3431810` 那次的数。之后接上了**收尾的确定性修复**
+（`MINDMAP_AUTO_REPAIR=1`，接线在 `backend/app/agent/tools.py`），它带来过一个回归：
+
+压链（把"一层只有一个孩子"的那层去掉）会把两层标题拼成一句长话，31 字的
+`基础：CSS 布局与事件循环清楚 / 浏览器渲染流程回答不完整` 就是这么来的。契约给 title
+的上限是 200（`contracts/mindmap.py:82`），**管不到**可读性；而 F 判据只跑在交付产物上，
+**修完之后没有任何一条东西再量它**——20 条里 9 条只差 F。
+
+修法（两半，第二半是这次才补的）：
+
+- **拼接有可读预算**：`optimization/repair.py::READABLE_LABEL_CHARS = 24`，与渲染层
+  `frontend/src/stores/mindmap.ts::TRUNCATE_CHARS = 24` 同源（两行盒子放得下的字数，
+  **不是契约**，所以不写进 `contracts/`）。放不下时 label 归**内层**（`_absorb` 的语义
+  本来就是"外层是标题、内层是内容"），外层那句写进 `detail` 第一行（`原上级：…`）：
+  **不截断、不丢内容**，只是从画布挪到悬停卡片里。
+- **修完也要量**：收尾新增两条 warn——`LABEL_OVERLONG_IN_DELIVERY`（交付树上有节点会
+  在画布上被截成半句）与 `STRUCTURE_FEW_BRANCHES_AFTER_REPAIR`（合并同名一级分支把
+  一级分支数压到 `MIN_BRANCHES` 以下）。`scripts/_structure_audit.py` 的 F 判据改成
+  从同一个常量取值，并同时报"基线快照 / 当前产物"两档，把"旧拼接逻辑拼长的"与
+  "本次改动引入的"分开。
+
+复算（只重跑 F 红的 11 条，其余 9 条保留；`python scripts/_structure_audit.py`）：
+
+| 口径 | 修订前 | 修订后 |
+|---|---|---|
+| 结构合规 A–F | 45%（9/20） | **85%（17/20）** |
+| F label ≤24 字 | 11/20 过 | **20/20 过**（超长 0 条） |
+| 内容覆盖 ≥0.7 | 65% | 65%（与该修法无关） |
+
+**85% 是"刚好等于"计划书的 >85%，不是超过**：剩下的 3 条（S02 / S08 / S14）全是 **D
+重复 label**，而且是跨支同名（模型把同一批章节名写进两支），与压链无关——S08/S14 的
+重复与改动之前的产物逐字相同。完整过程见 `docs/OFF-TOPIC-AND-FEW-BRANCHES.md` 3.3。
+
 ### 2.3 人评层：4 维打分（20 条）
 
 评分依据 `backend/data/acc_score_cards.md` 的逐条卡片。**合格判据 = 四维均 ≥3 且总分 ≥14。**
