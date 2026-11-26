@@ -307,12 +307,20 @@ def test_cross_branch_duplicates_are_judged_before_the_repair():
     """压链会改 label（`外层 / 内层`），而跨支重复**只比逐字**——判据要跑在修复之前。
 
     这是一个真的会漏掉的形状：两条一级分支各只有一个孩子、两个孩子同名。修完
-    之后它们变成「甲 / 迁移学习」与「乙 / 迁移学习」，`_cross_branch_duplicates`
+    之后两个父都被吃掉，两个「迁移学习」升到同一层，`_cross_branch_duplicates`
     就再也看不见了，而模型确实把同一件事写了两遍。
 
     所以 `duplicates` 在修复之前取（`_generate` 里那一行 `duplicates =
     _cross_branch_duplicates(content.root)`），诊断说的是"模型写了什么"。节点 id
     在压链后仍然有效——压链保留内层 id。
+
+    **这里顺带钉住了一个压链准入条件的后果**：两段共享「学习」两个字，判为复述，
+    不拼（见 `test_optimization_repair.py::test_collapse_does_not_join_two_titles_
+    that_say_the_same_thing`），于是两个节点都只剩「迁移学习」——然后同层同名，
+    被 DUPLICATE_LABEL 合并成一条。**两个外层标题都没丢**：各降级成 detail 的第一行，
+    合并时拼在一起。代价是画布上看不出它们原本分属哪条分支（要悬停才能读到），
+    这个形状在 20 棵验收树里一次都没出现过（`scripts/_probe_replay_collapse.py`
+    重放 74 条压链，节点数不变 = 没有额外的同级合并），所以按"两害相权"接受。
     """
     tree = {"title": TOPIC, "root": {
         "id": "root", "label": TOPIC, "detail": "中心主题",
@@ -333,10 +341,13 @@ def test_cross_branch_duplicates_are_judged_before_the_repair():
 
     assert result.data["cross_branch_duplicates"] == 2
     assert "CROSS_BRANCH_DUPLICATE" in _codes(result)
-    # 压链确实发生了：两条分支的标题都变成了合成的两层说法。
+    # 压链确实发生了：两条分支各只剩一个孩子，外层被吃掉。
     labels = [child.label for child in ctx.candidate.root.children]
-    assert "监督学习 / 迁移学习" in labels
-    assert "无监督学习 / 迁移学习" in labels
+    assert labels.count("迁移学习") == 1, labels
+    folded = next(child for child in ctx.candidate.root.children if child.label == "迁移学习")
+    detail = folded.detail or ""
+    assert "原上级：监督学习" in detail, detail
+    assert "原上级：无监督学习" in detail, detail
 
 
 def test_a_collapsed_branch_keeps_the_inner_title_when_it_contains_the_outer():

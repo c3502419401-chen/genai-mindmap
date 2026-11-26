@@ -67,8 +67,20 @@
 超过就截成半句。所以拼接有一个**可读预算** `READABLE_LABEL_CHARS`，三档：
 
     两段有包含关系      取长的那个      「监督学习」/「有监督学习」本来是一层的两种写法
-    拼起来 ≤ 24 字      拼接            信息最全，两行放得下
-    再长                取内层 + 降级     外层标题写进 detail 第一行（`原上级：…`）
+    两段各说各的        拼接            维度名 + 它的取值，信息最全，两行放得下
+    再长 / 在说同一件事  取内层 + 降级    外层标题写进 detail 第一行（`原上级：…`）
+
+**第二档的准入不是长度，是"两段有没有在说同一件事"**。这条纠正过一次：原来第二档
+只判 `len(拼接) <= 24`，于是任何放得下的父子标题都被拼上——包括「经典篇目背诵 20% /
+背诵成绩占比两成」这种同一句话的两种说法（21 字，放得下，但拼起来是重复不是补充）。
+验收报告把这一类点名为"可读"维扣分的主因，量到 75 处（`data/acc_trees`）。
+
+判据方向是**黑名单**（拦复述），不是**白名单**（限定"上位词 / 量化补充才许拼"）。
+这个选择有数据：把 74 对真实压链标题逐对读一遍，其中「维度名 + 取值」占 3/4
+（`服务器费用 / 300 元/月`、`数据库选型 / 使用 PostgreSQL`、`第 1 月里程碑 / 体测与
+计划生成 MVP`）——它们是互补的、拼起来是一个合法的层级表达。白名单会把这一批全赶进
+第三档，那是拿"外层标题从画布上消失"换"没有病句"，等于换个方式不可读。黑名单只拦
+真正重复的那一批（约 40%→见 `scripts/_probe_join_rule.py` 的回测）。
 
 第三档是"不把两句话合成一句"：label 归**内容层**（内层有 children / detail / refs），
 外层那句挪进 detail（悬停卡片里能读到，`displayBody` 优先取 detail）。**不丢内容**，
@@ -90,6 +102,7 @@
 """
 from __future__ import annotations
 
+import re
 from enum import Enum
 from typing import Any, Iterator, Literal, Sequence
 
@@ -141,6 +154,43 @@ LABEL_JOINER = " / "
 #: 的图"。放契约里会让别处（模型输出、导入）也被判 24 字，那是另一件事。
 #: `scripts/_structure_audit.py` 的 F 判据从这里导入同一个数（口径同源，不各写一份）。
 READABLE_LABEL_CHARS = 24
+
+#: 两段标题**允许共享的连续汉字**上限。超过就判"在说同一件事"，不拼。
+#:
+#: 为什么是 1 而不是 0：中文里一个字的共用不说明任何事（「第一层 / 第二层」共用
+#: 「第」），而两个字就已经是一个主题词了（「背诵」「学时」「确认」「培训」）——它们
+#: 是两段在讲**同一个对象**的证据，而互补的两段各在各的域里（维度名 vs 取值）。
+#:
+#: 标点、数字、空格、拉丁字母不参与：`20%` 与「两成」是同一个数的两种写法，那要靠
+#: 数字判据才能认出来，不在这一条里做（见 `scripts/_probe_join_rule.py` 的回测数据）。
+JOIN_MAX_SHARED_CHARS = 1
+
+_HAN_ONLY = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _shared_han_run(left: str, right: str) -> str:
+    """两段标题的最长公共**连续汉字**子串（空串表示没有共享主题词）。
+
+    朴素 DP（`O(len(left)*len(right))`）：标题上限 200 字，而压链的典型长度是
+    10–20 字，四万次比较在修复一次的成本里读不出来。写清楚比写快重要——这条判据
+    要被读、被改、被质疑，不能是位运算。
+    """
+    a = "".join(_HAN_ONLY.findall(left))
+    b = "".join(_HAN_ONLY.findall(right))
+    if not a or not b:
+        return ""
+    best_len = best_end = 0
+    previous = [0] * (len(b) + 1)
+    for i in range(1, len(a) + 1):
+        current = [0] * (len(b) + 1)
+        for j in range(1, len(b) + 1):
+            if a[i - 1] != b[j - 1]:
+                continue
+            current[j] = previous[j - 1] + 1
+            if current[j] > best_len:
+                best_len, best_end = current[j], i
+        previous = current
+    return a[best_end - best_len:best_end]
 
 #: 压链放不下两行时，外层标题降级进 `detail` 的前缀。
 #:
@@ -339,10 +389,27 @@ def _joined_label(outer: str, inner: str) -> tuple[str | None, bool]:
     所以三档，按可读性从宽到窄：
 
       包含关系（`监督学习` / `有监督学习`）  取长的那个      本来就是一层的两种写法
-      拼起来 ≤ 24 字                        拼接            两层都在两行内，信息最全
-      再长                                  取内层 + 降级    外层标题进 detail（见下）
+      两段各说各的 + 拼得下               拼接            维度名 + 取值，信息最全
+      两段在说同一件事 / 拼不下            取内层 + 降级    外层标题进 detail（见下）
 
-    第三档是这次的修法：**label 归内层**（`_absorb` 的语义本来就是"外层是标题、内层是
+    **第三档有两个入口，不是一个。** 原来只有"拼不下"（超 `READABLE_LABEL_CHARS`）
+    一个，于是第二档退化成纯粹的"放得下就拼"——而"放得下"不是"读得懂"：真产物里
+    「经典篇目背诵 20% / 背诵成绩占比两成」（21 字，放得下）是同一句话的两种说法，
+    拼起来是重复。第二个入口是**判两段有没有共享主题词**（`_shared_han_run`）：
+    共享 ≥ 2 个连续汉字就是在复述，不拼。
+
+    为什么这个入口默认走第三档，而不是"判不出来就拼"：第三档**不丢内容**（外层那句
+    进 detail，悬停可读），而拼错的代价是画布上一句读不通的标题。"本该拼的没拼"
+    只是把外层标题换了个位置；"不该拼的拼了"是让用户每次扫图都读到一句病句。两害
+    相权，前者轻——而且这条规则守的本来就是可读，不是信息密度。
+
+    ## 为什么不用模型判"是不是同一件事"
+
+    本文件零网络调用（模块 docstring 第 86 行），一次模型调用都不许有：压链是生成
+    收尾的确定性步骤（`agent/tools.py` 的 `MINDMAP_AUTO_REPAIR`），它跑在每一张图上，
+    而且要在修复记录里给出"为什么这么做"的可复述理由。词面判据给了那个理由。
+
+    第三档本身：**label 归内层**（`_absorb` 的语义本来就是"外层是标题、内层是
     内容"，内层还有 children / detail / refs 挂在它身上），外层那句话由调用方
     `_defer_label` 写进 `detail` 的第一行——**不丢**，只是从画布挪到卡片里。
 
@@ -359,6 +426,10 @@ def _joined_label(outer: str, inner: str) -> tuple[str | None, bool]:
         return right, False
     if right in left:
         return left, False
+    shared = _shared_han_run(left, right)
+    if len(shared) > JOIN_MAX_SHARED_CHARS:
+        # 两段共享一个主题词 = 在讲同一个对象 = 拼起来是复述而不是补充。
+        return right, True
     joined = f"{left}{LABEL_JOINER}{right}"
     if len(joined) <= READABLE_LABEL_CHARS:
         return joined, False
