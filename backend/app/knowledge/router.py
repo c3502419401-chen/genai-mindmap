@@ -1,7 +1,8 @@
 """知识增强路由。
 
-`/search` 是早期留下的检索桩（`implemented=false`）；`/library` 两个 GET 是
-知识库的**只读入口**：列出库里有哪些材料、每份被几张已保存导图引用、点开看
+`/search` 是**库内检索**（候选集是用户知识库，不是本次请求的材料）：返回片段 +
+它在原文里的码点区间 + 持久 `source_id`，调用方可据此回查全文。`/library` 两个
+GET 是知识库的**只读入口**：列出库里有哪些材料、每份被几张已保存导图引用、点开看
 正文预览。`/fetch` 是按 URL 读一篇网页（DeepSeek 的 Fetch 工具 API），读到的正文
 原样变成一份 `Source`，与"粘贴一段正文"走完全同一条路。
 
@@ -31,14 +32,19 @@ router = APIRouter(prefix="/knowledge", tags=["知识增强"])
 
 @router.post("/search", response_model=SearchResponse)
 def search_knowledge(body: SearchRequest):
-    """知识库检索（F12/F13）。
+    """知识库检索（F12/F13）：在**用户自己的知识库**里找相关片段。
 
-    当前实现返回空结果且 `implemented=false`，前端应据此禁用相关入口，
-    不要把它当成"已经接好了知识库"。
+    返回的 `source_id` 是库里的**持久 id**，可以拿它去
+    `GET /api/knowledge/library/{source_id}` 取全文（`start` / `end` 是片段在该份
+    原文里的码点偏移，用来看"为什么是这段"）。
+
+    空结果有两种原因，界面必须分开说：`hits` 为空而库里有材料 → "没检索到"；
+    库本身是空的 → "先去用一份材料生成一张图"（入库发生在生成时，见
+    `knowledge/remember.py`）。接口不能替调用方猜，所以 `implemented` 只说
+    "这条路接上了没有"，恒为 true。
     """
     hits = search(body.query, body.top_k)
-    # 是否实现与是否命中是两件事；接入真实检索时须显式改为 True。
-    return SearchResponse(hits=hits, implemented=False)
+    return SearchResponse(hits=hits, implemented=True)
 
 
 @router.get("/library", response_model=shelf.LibraryList)

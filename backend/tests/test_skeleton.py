@@ -189,10 +189,19 @@ class SkeletonTest(unittest.TestCase):
         self.assertIn('version="2.0"', text)
         self.assertIn('text="根"', text)
 
-    def test_knowledge_reports_not_implemented(self):
+    def test_knowledge_search_is_wired_even_on_an_empty_library(self):
+        """`implemented` 现在是"接上了没有"，不再是"有没有命中"。
+
+        这条用例此前断言的是 `"implemented":false`——也就是**把桩的形状钉死**。
+        接上真实检索之后，空库（本文件用临时库）应当返回空 `hits` 且 `implemented`
+        为真：两种"空"必须能分开，否则"库是空的"会被读成"功能没做"。
+        有材料时真的检索得到，见 `tests/test_knowledge_search_route.py`。
+        """
         status, raw = request("POST", "/api/knowledge/search", {"query": "碳中和"})
         self.assertEqual(status, 200)
-        self.assertIn('"implemented":false', raw.decode())
+        body = json.loads(raw)
+        self.assertTrue(body["implemented"])
+        self.assertEqual(body["hits"], [])
 
     def test_agent_returns_plan_without_map(self):
         status, raw = request("POST", "/api/agent/tasks", {"goal": "设计一款智能家居产品"})

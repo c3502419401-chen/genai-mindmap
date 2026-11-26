@@ -4,7 +4,9 @@
 用检索结果给模型补上下文，不进导图契约。
 
 两条线，互不影响：
-  - `search()` / `KnowledgeHit`：面向向量库的检索桩，仍然返回空列表（未接）
+  - `search()` / `KnowledgeHit`：**对外**的库内检索（`POST /api/knowledge/search`），
+    候选集是用户知识库。它此前是桩（恒返回空 + `implemented=false`），现在接的是
+    下面那条 `search_sources` / `search_parent` 那一套，选法与生成时逐条一致
   - `search_sources()` / `EvidenceHit`：只在本**次请求带来的来源**里定位片段，
     这是 `rag_query` 真正走的路，也是本文件的主体
 
@@ -52,10 +54,33 @@ logger = logging.getLogger(__name__)
 
 
 class KnowledgeHit(BaseModel):
+    """一条**库内**检索命中：来源身份 + 原文区间 + 片段。
+
+    形状与 `EvidenceHit` 刻意分开，不要合并：那个回答"在这次请求带来的材料里
+    哪一段最相关"，候选集由调用方给定、`source_id` 是请求内 uuid；这个回答
+    "我的知识库里有什么"，候选集是库、`source_id` 是**持久 id**——拿它可以
+    `library.load()` 回查原文，也可以 `GET /api/knowledge/library/{id}` 点开。
+
+    `start` / `end` 是 `snippet` 在那份来源全文里的**码点**偏移（与 `SourceRef`
+    同口径），前端要定位高亮就靠它，别用 UTF-16 下标。
+
+    分数三列与 `EvidenceHit` 同一个意思（`score` 是融合分、只在本次检索内可比；
+    `score_bm25` / `score_vector` 是两路原始分，没走那一路时是 None 而不是 0）。
+    """
+
     model_config = ConfigDict(extra="forbid")
-    source_id: str | None = None
+    source_id: str
+    # 人类可读的"哪一份"。缺了它，调用方拿到一串持久 id 还得再查一次列表接口。
+    filename: str | None = None
+    kind: SourceKind | None = None
+    start: int = Field(ge=0)
+    end: int = Field(ge=0)
     snippet: str = ""
     score: float = 0.0
+    score_bm25: float | None = None
+    score_vector: float | None = None
+    method: Literal["lexical", "hybrid"] = "lexical"
+    rerank_score: float | None = None
 
 
 class SearchRequest(BaseModel):
@@ -66,19 +91,60 @@ class SearchRequest(BaseModel):
 
 class SearchResponse(BaseModel):
     hits: list[KnowledgeHit] = Field(default_factory=list)
-    implemented: bool = False
+    #: 这条路接上了没有。**只回答"接没接"，不回答"有没有命中"**：接上之后它恒为
+    #: True，`hits=[]` 就只表示"这次没检索到"。两者混在一个字段里时，"库是空的"
+    #: 会被读成"功能没做"（本字段此前就是这个用法：恒为 false）。
+    implemented: bool = True
 
 
 def search(query: str, top_k: int = 5) -> list[KnowledgeHit]:
-    """检索知识库。
+    """在**用户知识库**里检索：`POST /api/knowledge/search` 的全部逻辑。
 
-    TODO(F12/F13)：
-      - 建索引：文档 → 分块 → 嵌入 → 存向量列
-      - 检索：query → 嵌入 → 相似度排序 → 返回片段 + 来源定位
-    现在返回空列表，调用方能正常跑完流程，但不会得到任何增强。
+    在接上之前这里返回空列表且 `implemented=false`——而库里明明有 4913 条向量，
+    内部 `search_sources()` 也一直是好的。用例覆盖的是 service 层那几个函数，
+    没有一条走路由，所以"绿"与"不可用"同时成立了很久。
+
+    现在走的是**生成链路同一套检索**，不另写一条：
+
+      1. `_library_sources` 挑候选（按 `last_used_at` 取最近 100 份 → 查询词字面
+         覆盖率粗筛 → 至多 `LIBRARY_PICK` 份）。选法必须与生成时一致，否则"库检索
+         能查到"与"生成时能用到"会是两份不同的答案；
+      2. `search_parent` 打分（子块匹配、父块返回；开关关着时它自己转发给
+         `search_sources`，粒度退回单级块）——同样是生成链路那个入口；
+      3. `touch` 记一次"被用到"，与 `_library_batch` 同口径（`prune` 的保留依据
+         就是它）。
+
+    空库、库读不出来、粗筛一份都没选中 → 返回 `[]`，不抛错（与生成侧一致：
+    库不可用只是"这次没有库证据"）。
+
+    **同步**：这条路要切块、算 BM25、可能 embed 一次查询。它是 FastAPI 的同步
+    路由，跑在线程池里，不会占住事件循环。
     """
-    _ = (query, top_k)
-    return []
+    question = (query or "").strip()
+    if not question or top_k <= 0:
+        return []
+    picked = _library_sources(question, None, [])
+    if not picked:
+        return []
+    knowledge_library.touch([source.id for source in picked])
+    by_id = {source.id: source for source in picked}
+    return [
+        KnowledgeHit(
+            source_id=hit.source_id,
+            filename=(by_id[hit.source_id].filename
+                      if hit.source_id in by_id else None),
+            kind=by_id[hit.source_id].kind if hit.source_id in by_id else None,
+            start=hit.start,
+            end=hit.end,
+            snippet=hit.quote,
+            score=hit.score,
+            score_bm25=hit.score_bm25,
+            score_vector=hit.score_vector,
+            method=hit.method,
+            rerank_score=hit.rerank_score,
+        )
+        for hit in search_parent(picked, question, top_k)
+    ]
 
 
 # ---------------------------------------------------------------- 本次来源内检索
@@ -719,6 +785,23 @@ OUTLINE_MIN_TITLE_CHARS = 2
 OUTLINE_COLON_TAIL_CHARS = 20
 """冒号后的分句超过这么长就判为正文。见 `_looks_like_prose`。"""
 
+_SENTENCE_TAIL_CHARS = "。！？；"
+"""以这些收尾的候选是**一句话**，不是章节名。见 `_looks_like_prose` 第四条。"""
+
+STRUCTURAL_KINDS = frozenset({"chapter", "section", "article", "cn1"})
+"""**本身就算结构证据**的编号形状：`第N章` / `第N节` / `第N条` / `一、`。
+
+它们不需要 `_followed_by_blank_line` 那道版式证据——"标题后面空一行"是排版习惯
+（markdown、docx 导出都是这样），而中文手写材料十有八九是"`一、背景` 下一行就是
+正文"。实测（`backend/scripts/acc_samples.json` 的 20 条真实材料）：这一类行**全部**
+被那道版式闸挡掉，于是 20 条样本一条目录都抽不出来——骨架那一次只剩"主题 + 文件名"，
+一级分支只能按模型对**这类文档**的先验走。这正是"会议纪要生成成会议纪要怎么写"
+与"项目立项给 2 条分支被判死"两处缺陷的共同上游（`docs/OFF-TOPIC-AND-FEW-BRANCHES.md`）。
+
+小数编号（`1.` / `3.1`）**不在此列**，继续要求后面跟空行：假阳性全在那里
+（正文里的编号列表项），而 `一、` 与 `第N章` 几乎不会被列表使用。
+"""
+
 # markdown 标题行：`#` 到 `######`，中间**必须有空格**（`#tag` 不是标题）；
 # 行尾的闭合 `#`（`## 标题 ##`）是 ATX 语法的一部分，取标题时剥掉。
 # 用 `[ \t]` 而不是 `\s`：`\s` 会让一行孤零零的 `#`（正文在下一行）也匹配上。
@@ -837,7 +920,7 @@ def _numbering_line(line: str) -> tuple[str, str] | None:
 def _looks_like_prose(title: str, max_title_chars: int) -> bool:
     """这条候选长得像**正文句子 / 表格行 / 列表项**，而不是标题。
 
-    三条都是实测出来的假阳性特征（`scripts/measure_outline_headings.py` 的报告段
+    四条都是实测出来的假阳性特征（`scripts/measure_outline_headings.py` 的报告段
     直接列出了误判行）：
 
       - 含 `**`：`1. **判断器不是噪声源，是系统性失效**。同一 query 跑 3 次…`
@@ -845,11 +928,21 @@ def _looks_like_prose(title: str, max_title_chars: int) -> bool:
       - 含 `|`：`| 4 | 单换行 | 列…` 是表格行；
       - 冒号后跟长分句（> `OUTLINE_COLON_TAIL_CHARS`）或带逗号句号：
         `1. 检索：把整份材料交给模型、让模型自己找` 是编号列表项。真标题的冒号
-        后面是短语（`5 下一步：结构引导的召回`，7 字）。
+        后面是短语（`5 下一步：结构引导的召回`，7 字）；
+      - **以句末标点收尾**（`。！？；`）：章节名是一个名词短语，句子才带句号。
+        这一条是 `backend/scripts/acc_samples.json` 那批真实材料实测出来的：
+        20 条里有 3 条（S17/S19/S20 项目立项）的"目录"是
+        `3. 半年内支持 20 个热门项目、100 位贡献者。` 这种**正文列表项**——
+        它们恰好满足"行首大写编号 + 后面跟一个空行"两条版式证据，于是成了
+        目录里仅有的两条，骨架照着它给 2 条一级分支，`MIN_BRANCHES = 3` 当场
+        判废（`docs/OFF-TOPIC-AND-FEW-BRANCHES.md`）。句末标点是这一批假阳性
+        唯一共有的、与版式无关的特征。
     """
     if "**" in title or "|" in title:
         return True
     if len(title) > max_title_chars:
+        return True
+    if title and title[-1] in _SENTENCE_TAIL_CHARS:
         return True
     tail = _COLON_TAIL_RE.search(title)
     if tail:
@@ -926,7 +1019,7 @@ def _outline_lines(text: str, *, max_title_chars: int) -> list[tuple[int, str]]:
             continue
         if _looks_like_prose(title, max_title_chars):
             continue
-        if not _followed_by_blank_line(text, line_end):
+        if kind not in STRUCTURAL_KINDS and not _followed_by_blank_line(text, line_end):
             continue
         numbered.append((line_start, title[:max_title_chars], kind))
     # 整个段落加粗的编号行（`**一、实验须知**`）：`_HEADING_RE` 的 `^` 吃不到它
@@ -944,7 +1037,7 @@ def _outline_lines(text: str, *, max_title_chars: int) -> list[tuple[int, str]]:
             continue
         if _looks_like_prose(title, max_title_chars):
             continue
-        if not _followed_by_blank_line(text, line_end):
+        if kind not in STRUCTURAL_KINDS and not _followed_by_blank_line(text, line_end):
             continue
         numbered.append((line_start, title[:max_title_chars], kind))
     numbered.sort(key=lambda item: item[0])
