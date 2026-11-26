@@ -2750,6 +2750,51 @@ export const useMindMapStore = defineStore('mindmap', () => {
   }
 
   /**
+   * 一次**整体替换**进撤销栈：`/optimization/repair` 修好的树落地的唯一入口。
+   *
+   * ## 为什么需要它，而不是直接 `content.value = next`
+   *
+   * 一次修复会同时动多处（重名合并要删节点、单子链要把两层压成一层），它**不是**一串
+   * 能逐步重放的编辑：节点 id 会消失、孩子会被搬到别的节点下面、标题会被改写。逐项
+   * 入口（`deleteNode` / `moveNodeTo` / `commitLabel`）描述不了它；而绕过它们手写
+   * `content.value = next` 会同时丢掉四件事——撤销栈、`dirty`、`clientRevision`、
+   * 改动账本（`edit_events`）。
+   *
+   * ## 撤销粒度：**一条**
+   *
+   * `applyContent(next, true)` 只压**一步**快照（`recordPast` 存的是改之前那棵树
+   * 的整份 JSON），所以用户按一次 Ctrl+Z 就回到修复之前，而不是"第 1 处修复之前"。
+   * 这是刻意的，两条理由：
+   *
+   *  - 修复是**一次幂等运算跑到不动点**（`optimization/repair.py::repair`），中途那些
+   *    中间态用户从来没看见过。让他按 N 次才回到原样，等于为一段看不见的历史付账；
+   *  - 后端每步都带 `undo`，理论上能逐步重放，但那要把 `RepairUndo` 的反操作逻辑
+   *    （槽位、摘尾巴、关系线重定向）在前端再实现一遍。两份实现迟早漂移，而漂移的
+   *    表现是"撤销之后图更乱了"。
+   *
+   * 粒度不按"改了几处"分，按"用户按了几次扳机"分：点一次「应用」= 一步。重做
+   * 同样一步——`undo()` 会把整棵树压进 `future`，`redo()` 原样装回来。
+   *
+   * ## 收尾的那两行不是可选的
+   *
+   * 整棵树换掉了，`selectedId` 可能指向一个刚被合并掉的节点，`editingId` 可能指着一个
+   * 已经不存在的输入框。逐项入口各自处理这件事（`deleteNode` 会把选中挪给父节点），
+   * 整体替换得自己收。
+   *
+   * 账本记谁：`actor` 保持 `user`。修复没有调模型，扳机是用户按的；记成 `agent` 会让
+   * "模型改的"这个桶被确定性规则污染。理由与代价见 `docs/OPTIMIZATION-REPAIR.md` §7。
+   */
+  function replaceContent(next: DiagramContent): boolean {
+    // 空画布没有"修复前"可退，也没有可修的东西：后端那三条规则都要读 `content.root`。
+    // 返回 false 而不是悄悄装进去——调用方据此能说清"为什么什么都没发生"。
+    if (!content.value) return false;
+    applyContent(next, true);
+    ensureSelection();
+    editingId.value = null;
+    return true;
+  }
+
+  /**
    * 节点深度，1 起算（与契约的"最多 8 层"同一口径）。
    *
    * 直接读 `shape.depthIn` 而不是扁平表：鱼骨与流程的布局树上多一层合成根，拿
@@ -4980,6 +5025,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // "真正落下的位置"在结构上是同一份推导。
     previewMove,
     moveNodeTo,
+    // 整体替换（修复建议落地的唯一入口）：一次性换掉整棵树，**只压一步撤销**
+    // （见 `replaceContent` 的注释；粒度这一条是这套接线的全部难点）。
+    replaceContent,
     // 就地输入框：点节点出框、写一句话、交给模型改（`canvas/NodeIntentBox.vue` 的
     // 全部输入）。`canEditIntent` 是"这一处能不能开框"的唯一判据。
     intentTargetId,

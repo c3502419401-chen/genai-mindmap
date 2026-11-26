@@ -1,0 +1,590 @@
+{
+  "note": "构造输入（真库里唯一有同级重名的图是 561 节点的异常图、600KB，塞不进仓库）。响应同样由后端路由函数真跑：一次修两处，用来验证“多处修复 = 一条撤销”。",
+  "before": {
+    "schema_version": 2,
+    "title": "重名合并",
+    "theme": {
+      "preset": "default",
+      "accent": null,
+      "font": "system",
+      "direction": "right"
+    },
+    "relations": [],
+    "source_usage": [
+      {
+        "source_id": "s1",
+        "kind": "text",
+        "filename": "一.txt",
+        "char_count": 100,
+        "url": null
+      },
+      {
+        "source_id": "s2",
+        "kind": "text",
+        "filename": "二.txt",
+        "char_count": 200,
+        "url": null
+      }
+    ],
+    "root": {
+      "id": "r",
+      "label": "根",
+      "children": [
+        {
+          "id": "a",
+          "label": "甲",
+          "children": [
+            {
+              "id": "a1",
+              "label": "甲的子",
+              "children": [],
+              "note": null,
+              "detail": null,
+              "expandable": "unknown",
+              "collapsed": false,
+              "color": null,
+              "icon": null,
+              "style": null,
+              "role": null,
+              "source_refs": [
+                {
+                  "source_id": "s1",
+                  "page": 1,
+                  "start": 0,
+                  "end": 4,
+                  "quote": "引用一"
+                }
+              ],
+              "pos": null
+            }
+          ],
+          "note": null,
+          "detail": null,
+          "expandable": "unknown",
+          "collapsed": false,
+          "color": null,
+          "icon": null,
+          "style": null,
+          "role": null,
+          "source_refs": [],
+          "pos": null
+        },
+        {
+          "id": "b",
+          "label": "甲",
+          "children": [
+            {
+              "id": "b1",
+              "label": "乙的子",
+              "children": [],
+              "note": null,
+              "detail": null,
+              "expandable": "unknown",
+              "collapsed": false,
+              "color": null,
+              "icon": null,
+              "style": null,
+              "role": null,
+              "source_refs": [
+                {
+                  "source_id": "s2",
+                  "page": 2,
+                  "start": 10,
+                  "end": 14,
+                  "quote": "引用二"
+                }
+              ],
+              "pos": null
+            },
+            {
+              "id": "b2",
+              "label": "第二支",
+              "children": [
+                {
+                  "id": "b2x",
+                  "label": "更深一层",
+                  "children": [],
+                  "note": null,
+                  "detail": null,
+                  "expandable": "unknown",
+                  "collapsed": false,
+                  "color": null,
+                  "icon": null,
+                  "style": null,
+                  "role": null,
+                  "source_refs": [],
+                  "pos": null
+                }
+              ],
+              "note": null,
+              "detail": null,
+              "expandable": "unknown",
+              "collapsed": false,
+              "color": null,
+              "icon": null,
+              "style": null,
+              "role": null,
+              "source_refs": [],
+              "pos": null
+            }
+          ],
+          "note": null,
+          "detail": null,
+          "expandable": "unknown",
+          "collapsed": false,
+          "color": null,
+          "icon": null,
+          "style": null,
+          "role": null,
+          "source_refs": [],
+          "pos": null
+        },
+        {
+          "id": "c",
+          "label": "丙",
+          "children": [],
+          "note": null,
+          "detail": null,
+          "expandable": "unknown",
+          "collapsed": false,
+          "color": null,
+          "icon": null,
+          "style": null,
+          "role": null,
+          "source_refs": [],
+          "pos": null
+        }
+      ],
+      "note": null,
+      "detail": null,
+      "expandable": "unknown",
+      "collapsed": false,
+      "color": null,
+      "icon": null,
+      "style": null,
+      "role": null,
+      "source_refs": [],
+      "pos": null
+    },
+    "layout": "tree",
+    "edges": [],
+    "diagram_type": "tree"
+  },
+  "first": {
+    "content": {
+      "schema_version": 2,
+      "title": "重名合并",
+      "theme": {
+        "preset": "default",
+        "accent": null,
+        "font": "system",
+        "direction": "right"
+      },
+      "relations": [],
+      "source_usage": [
+        {
+          "source_id": "s1",
+          "kind": "text",
+          "filename": "一.txt",
+          "char_count": 100,
+          "url": null
+        },
+        {
+          "source_id": "s2",
+          "kind": "text",
+          "filename": "二.txt",
+          "char_count": 200,
+          "url": null
+        }
+      ],
+      "root": {
+        "id": "r",
+        "label": "根",
+        "children": [
+          {
+            "id": "a",
+            "label": "甲",
+            "children": [
+              {
+                "id": "a1",
+                "label": "甲的子",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [
+                  {
+                    "source_id": "s1",
+                    "page": 1,
+                    "start": 0,
+                    "end": 4,
+                    "quote": "引用一"
+                  }
+                ],
+                "pos": null
+              },
+              {
+                "id": "b1",
+                "label": "乙的子",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [
+                  {
+                    "source_id": "s2",
+                    "page": 2,
+                    "start": 10,
+                    "end": 14,
+                    "quote": "引用二"
+                  }
+                ],
+                "pos": null
+              },
+              {
+                "id": "b2x",
+                "label": "第二支 / 更深一层",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              }
+            ],
+            "note": null,
+            "detail": null,
+            "expandable": "unknown",
+            "collapsed": false,
+            "color": null,
+            "icon": null,
+            "style": null,
+            "role": null,
+            "source_refs": [],
+            "pos": null
+          },
+          {
+            "id": "c",
+            "label": "丙",
+            "children": [],
+            "note": null,
+            "detail": null,
+            "expandable": "unknown",
+            "collapsed": false,
+            "color": null,
+            "icon": null,
+            "style": null,
+            "role": null,
+            "source_refs": [],
+            "pos": null
+          }
+        ],
+        "note": null,
+        "detail": null,
+        "expandable": "unknown",
+        "collapsed": false,
+        "color": null,
+        "icon": null,
+        "style": null,
+        "role": null,
+        "source_refs": [],
+        "pos": null
+      },
+      "layout": "tree",
+      "edges": [],
+      "diagram_type": "tree"
+    },
+    "applied": [
+      {
+        "code": "DUPLICATE_LABEL",
+        "kind": "merge_duplicate",
+        "node_id": "b",
+        "message": "把「甲」并进了同级同名节点「甲」：子树取并集（1 + 2 个），引用取并集（0 条）",
+        "undo": {
+          "parent_id": "r",
+          "at": 0,
+          "replaced": {
+            "data": {
+              "id": "a",
+              "label": "甲",
+              "note": null,
+              "detail": null,
+              "expandable": "unknown",
+              "collapsed": false,
+              "color": null,
+              "icon": null,
+              "style": null,
+              "role": null,
+              "source_refs": [],
+              "pos": null
+            }
+          },
+          "replaced_children": 1,
+          "inserted": [
+            {
+              "index": 1,
+              "fields": {
+                "data": {
+                  "id": "b",
+                  "label": "甲",
+                  "note": null,
+                  "detail": null,
+                  "expandable": "unknown",
+                  "collapsed": false,
+                  "color": null,
+                  "icon": null,
+                  "style": null,
+                  "role": null,
+                  "source_refs": [],
+                  "pos": null
+                }
+              },
+              "children": 2
+            }
+          ],
+          "inner": null,
+          "redirected": []
+        }
+      },
+      {
+        "code": "SINGLE_CHILD",
+        "kind": "collapse_chain",
+        "node_id": "b2",
+        "message": "「第二支」下只有一条支「更深一层」，已把两层合成一层（标题为「第二支 / 更深一层」）",
+        "undo": {
+          "parent_id": "a",
+          "at": 2,
+          "replaced": {
+            "data": {
+              "id": "b2",
+              "label": "第二支",
+              "note": null,
+              "detail": null,
+              "expandable": "unknown",
+              "collapsed": false,
+              "color": null,
+              "icon": null,
+              "style": null,
+              "role": null,
+              "source_refs": [],
+              "pos": null
+            }
+          },
+          "replaced_children": 1,
+          "inserted": [],
+          "inner": {
+            "data": {
+              "id": "b2x",
+              "label": "更深一层",
+              "note": null,
+              "detail": null,
+              "expandable": "unknown",
+              "collapsed": false,
+              "color": null,
+              "icon": null,
+              "style": null,
+              "role": null,
+              "source_refs": [],
+              "pos": null
+            }
+          },
+          "redirected": []
+        }
+      }
+    ],
+    "skipped": [],
+    "diagnostics": [],
+    "steps": 2,
+    "summary": "合并了 1 处同级重名，压掉了 1 处单子链"
+  },
+  "second": {
+    "content": {
+      "schema_version": 2,
+      "title": "重名合并",
+      "theme": {
+        "preset": "default",
+        "accent": null,
+        "font": "system",
+        "direction": "right"
+      },
+      "relations": [],
+      "source_usage": [
+        {
+          "source_id": "s1",
+          "kind": "text",
+          "filename": "一.txt",
+          "char_count": 100,
+          "url": null
+        },
+        {
+          "source_id": "s2",
+          "kind": "text",
+          "filename": "二.txt",
+          "char_count": 200,
+          "url": null
+        }
+      ],
+      "root": {
+        "id": "r",
+        "label": "根",
+        "children": [
+          {
+            "id": "a",
+            "label": "甲",
+            "children": [
+              {
+                "id": "a1",
+                "label": "甲的子",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [
+                  {
+                    "source_id": "s1",
+                    "page": 1,
+                    "start": 0,
+                    "end": 4,
+                    "quote": "引用一"
+                  }
+                ],
+                "pos": null
+              },
+              {
+                "id": "b1",
+                "label": "乙的子",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [
+                  {
+                    "source_id": "s2",
+                    "page": 2,
+                    "start": 10,
+                    "end": 14,
+                    "quote": "引用二"
+                  }
+                ],
+                "pos": null
+              },
+              {
+                "id": "b2x",
+                "label": "第二支 / 更深一层",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              }
+            ],
+            "note": null,
+            "detail": null,
+            "expandable": "unknown",
+            "collapsed": false,
+            "color": null,
+            "icon": null,
+            "style": null,
+            "role": null,
+            "source_refs": [],
+            "pos": null
+          },
+          {
+            "id": "c",
+            "label": "丙",
+            "children": [],
+            "note": null,
+            "detail": null,
+            "expandable": "unknown",
+            "collapsed": false,
+            "color": null,
+            "icon": null,
+            "style": null,
+            "role": null,
+            "source_refs": [],
+            "pos": null
+          }
+        ],
+        "note": null,
+        "detail": null,
+        "expandable": "unknown",
+        "collapsed": false,
+        "color": null,
+        "icon": null,
+        "style": null,
+        "role": null,
+        "source_refs": [],
+        "pos": null
+      },
+      "layout": "tree",
+      "edges": [],
+      "diagram_type": "tree"
+    },
+    "applied": [],
+    "skipped": [],
+    "diagnostics": [],
+    "steps": 0,
+    "summary": ""
+  },
+  "diagnostics_before": [
+    {
+      "level": "info",
+      "code": "HEADING_ONLY_BRANCH",
+      "node_id": "a",
+      "message": "一级分支「甲」只有一个子节点「甲的子」，而其他分支最深的还有 3 层：这一支可能只是个标题",
+      "evidence": "a1"
+    },
+    {
+      "level": "info",
+      "code": "SINGLE_CHILD",
+      "node_id": "b2",
+      "message": "节点「第二支」只有一个子节点，可考虑展开或合并",
+      "evidence": null
+    },
+    {
+      "level": "warn",
+      "code": "DUPLICATE_LABEL",
+      "node_id": "b",
+      "message": "同级节点「甲」与 a 文字相同，请确认是否重复",
+      "evidence": "a"
+    },
+    {
+      "level": "info",
+      "code": "SHALLOW_BRANCH",
+      "node_id": "c",
+      "message": "「丙」这一支还没展开：它是「根」下的叶子，而同级最深的一支往下还有 3 层",
+      "evidence": "根"
+    }
+  ]
+}

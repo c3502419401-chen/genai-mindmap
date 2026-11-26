@@ -1,0 +1,1257 @@
+{
+  "note": "真图：库里 0b82a740「机器学习」，三条单子链。before/first/second 全部由后端路由函数真跑，不是手写的。",
+  "before": {
+    "schema_version": 2,
+    "title": "机器学习",
+    "theme": {
+      "preset": "default",
+      "accent": null,
+      "font": "system",
+      "direction": "right"
+    },
+    "relations": [],
+    "source_usage": [
+      {
+        "source_id": "c3427ee4-cfe2-4db6-9086-8588b86d398a",
+        "kind": "text",
+        "filename": null,
+        "char_count": 4,
+        "url": null
+      }
+    ],
+    "root": {
+      "id": "root",
+      "label": "机器学习",
+      "children": [
+        {
+          "id": "n1",
+          "label": "定义与范畴",
+          "children": [
+            {
+              "id": "n1-1",
+              "label": "机器学习是人工智能的一个分支领域",
+              "children": [],
+              "note": null,
+              "detail": null,
+              "expandable": "unknown",
+              "collapsed": false,
+              "color": null,
+              "icon": null,
+              "style": null,
+              "role": null,
+              "source_refs": [],
+              "pos": null
+            },
+            {
+              "id": "n1-2",
+              "label": "研究如何让计算机从数据中学习规律",
+              "children": [],
+              "note": null,
+              "detail": null,
+              "expandable": "unknown",
+              "collapsed": false,
+              "color": null,
+              "icon": null,
+              "style": null,
+              "role": null,
+              "source_refs": [],
+              "pos": null
+            }
+          ],
+          "note": null,
+          "detail": null,
+          "expandable": "unknown",
+          "collapsed": false,
+          "color": null,
+          "icon": null,
+          "style": null,
+          "role": null,
+          "source_refs": [],
+          "pos": null
+        },
+        {
+          "id": "n2",
+          "label": "主要学习范式",
+          "children": [
+            {
+              "id": "n2-1",
+              "label": "监督学习",
+              "children": [
+                {
+                  "id": "n2-1-1",
+                  "label": "利用带标签的数据训练模型",
+                  "children": [],
+                  "note": null,
+                  "detail": null,
+                  "expandable": "unknown",
+                  "collapsed": false,
+                  "color": null,
+                  "icon": null,
+                  "style": null,
+                  "role": null,
+                  "source_refs": [],
+                  "pos": null
+                }
+              ],
+              "note": null,
+              "detail": null,
+              "expandable": "unknown",
+              "collapsed": false,
+              "color": null,
+              "icon": null,
+              "style": null,
+              "role": null,
+              "source_refs": [],
+              "pos": null
+            },
+            {
+              "id": "n2-2",
+              "label": "无监督学习",
+              "children": [
+                {
+                  "id": "n2-2-1",
+                  "label": "从无标签数据中发现结构",
+                  "children": [],
+                  "note": null,
+                  "detail": null,
+                  "expandable": "unknown",
+                  "collapsed": false,
+                  "color": null,
+                  "icon": null,
+                  "style": null,
+                  "role": null,
+                  "source_refs": [],
+                  "pos": null
+                }
+              ],
+              "note": null,
+              "detail": null,
+              "expandable": "unknown",
+              "collapsed": false,
+              "color": null,
+              "icon": null,
+              "style": null,
+              "role": null,
+              "source_refs": [],
+              "pos": null
+            },
+            {
+              "id": "n2-3",
+              "label": "强化学习",
+              "children": [
+                {
+                  "id": "n2-3-1",
+                  "label": "通过与环境交互和奖励信号学习策略",
+                  "children": [],
+                  "note": null,
+                  "detail": null,
+                  "expandable": "unknown",
+                  "collapsed": false,
+                  "color": null,
+                  "icon": null,
+                  "style": null,
+                  "role": null,
+                  "source_refs": [],
+                  "pos": null
+                }
+              ],
+              "note": null,
+              "detail": null,
+              "expandable": "unknown",
+              "collapsed": false,
+              "color": null,
+              "icon": null,
+              "style": null,
+              "role": null,
+              "source_refs": [],
+              "pos": null
+            }
+          ],
+          "note": null,
+          "detail": null,
+          "expandable": "unknown",
+          "collapsed": false,
+          "color": null,
+          "icon": null,
+          "style": null,
+          "role": null,
+          "source_refs": [],
+          "pos": null
+        },
+        {
+          "id": "n3",
+          "label": "典型任务",
+          "children": [
+            {
+              "id": "n3-1",
+              "label": "分类",
+              "children": [],
+              "note": null,
+              "detail": null,
+              "expandable": "unknown",
+              "collapsed": false,
+              "color": null,
+              "icon": null,
+              "style": null,
+              "role": null,
+              "source_refs": [],
+              "pos": null
+            },
+            {
+              "id": "n3-2",
+              "label": "回归",
+              "children": [],
+              "note": null,
+              "detail": null,
+              "expandable": "unknown",
+              "collapsed": false,
+              "color": null,
+              "icon": null,
+              "style": null,
+              "role": null,
+              "source_refs": [],
+              "pos": null
+            },
+            {
+              "id": "n3-3",
+              "label": "聚类",
+              "children": [],
+              "note": null,
+              "detail": null,
+              "expandable": "unknown",
+              "collapsed": false,
+              "color": null,
+              "icon": null,
+              "style": null,
+              "role": null,
+              "source_refs": [],
+              "pos": null
+            }
+          ],
+          "note": null,
+          "detail": null,
+          "expandable": "unknown",
+          "collapsed": false,
+          "color": null,
+          "icon": null,
+          "style": null,
+          "role": null,
+          "source_refs": [],
+          "pos": null
+        },
+        {
+          "id": "n4",
+          "label": "常见算法",
+          "children": [
+            {
+              "id": "n4-1",
+              "label": "线性回归与逻辑回归",
+              "children": [],
+              "note": null,
+              "detail": null,
+              "expandable": "unknown",
+              "collapsed": false,
+              "color": null,
+              "icon": null,
+              "style": null,
+              "role": null,
+              "source_refs": [],
+              "pos": null
+            },
+            {
+              "id": "n4-2",
+              "label": "决策树与随机森林",
+              "children": [],
+              "note": null,
+              "detail": null,
+              "expandable": "unknown",
+              "collapsed": false,
+              "color": null,
+              "icon": null,
+              "style": null,
+              "role": null,
+              "source_refs": [],
+              "pos": null
+            },
+            {
+              "id": "n4-3",
+              "label": "支持向量机",
+              "children": [],
+              "note": null,
+              "detail": null,
+              "expandable": "unknown",
+              "collapsed": false,
+              "color": null,
+              "icon": null,
+              "style": null,
+              "role": null,
+              "source_refs": [],
+              "pos": null
+            },
+            {
+              "id": "n4-4",
+              "label": "神经网络与深度学习",
+              "children": [],
+              "note": null,
+              "detail": null,
+              "expandable": "unknown",
+              "collapsed": false,
+              "color": null,
+              "icon": null,
+              "style": null,
+              "role": null,
+              "source_refs": [],
+              "pos": null
+            }
+          ],
+          "note": null,
+          "detail": null,
+          "expandable": "unknown",
+          "collapsed": false,
+          "color": null,
+          "icon": null,
+          "style": null,
+          "role": null,
+          "source_refs": [],
+          "pos": null
+        },
+        {
+          "id": "n5",
+          "label": "应用领域",
+          "children": [
+            {
+              "id": "n5-1",
+              "label": "自然语言处理",
+              "children": [],
+              "note": null,
+              "detail": null,
+              "expandable": "unknown",
+              "collapsed": false,
+              "color": null,
+              "icon": null,
+              "style": null,
+              "role": null,
+              "source_refs": [],
+              "pos": null
+            },
+            {
+              "id": "n5-2",
+              "label": "计算机视觉",
+              "children": [],
+              "note": null,
+              "detail": null,
+              "expandable": "unknown",
+              "collapsed": false,
+              "color": null,
+              "icon": null,
+              "style": null,
+              "role": null,
+              "source_refs": [],
+              "pos": null
+            },
+            {
+              "id": "n5-3",
+              "label": "推荐系统",
+              "children": [],
+              "note": null,
+              "detail": null,
+              "expandable": "unknown",
+              "collapsed": false,
+              "color": null,
+              "icon": null,
+              "style": null,
+              "role": null,
+              "source_refs": [],
+              "pos": null
+            }
+          ],
+          "note": null,
+          "detail": null,
+          "expandable": "unknown",
+          "collapsed": false,
+          "color": null,
+          "icon": null,
+          "style": null,
+          "role": null,
+          "source_refs": [],
+          "pos": null
+        }
+      ],
+      "note": null,
+      "detail": null,
+      "expandable": "unknown",
+      "collapsed": false,
+      "color": null,
+      "icon": null,
+      "style": null,
+      "role": null,
+      "source_refs": [],
+      "pos": null
+    },
+    "layout": "tree",
+    "edges": [],
+    "diagram_type": "tree"
+  },
+  "first": {
+    "content": {
+      "schema_version": 2,
+      "title": "机器学习",
+      "theme": {
+        "preset": "default",
+        "accent": null,
+        "font": "system",
+        "direction": "right"
+      },
+      "relations": [],
+      "source_usage": [
+        {
+          "source_id": "c3427ee4-cfe2-4db6-9086-8588b86d398a",
+          "kind": "text",
+          "filename": null,
+          "char_count": 4,
+          "url": null
+        }
+      ],
+      "root": {
+        "id": "root",
+        "label": "机器学习",
+        "children": [
+          {
+            "id": "n1",
+            "label": "定义与范畴",
+            "children": [
+              {
+                "id": "n1-1",
+                "label": "机器学习是人工智能的一个分支领域",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              },
+              {
+                "id": "n1-2",
+                "label": "研究如何让计算机从数据中学习规律",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              }
+            ],
+            "note": null,
+            "detail": null,
+            "expandable": "unknown",
+            "collapsed": false,
+            "color": null,
+            "icon": null,
+            "style": null,
+            "role": null,
+            "source_refs": [],
+            "pos": null
+          },
+          {
+            "id": "n2",
+            "label": "主要学习范式",
+            "children": [
+              {
+                "id": "n2-1-1",
+                "label": "监督学习 / 利用带标签的数据训练模型",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              },
+              {
+                "id": "n2-2-1",
+                "label": "无监督学习 / 从无标签数据中发现结构",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              },
+              {
+                "id": "n2-3-1",
+                "label": "强化学习 / 通过与环境交互和奖励信号学习策略",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              }
+            ],
+            "note": null,
+            "detail": null,
+            "expandable": "unknown",
+            "collapsed": false,
+            "color": null,
+            "icon": null,
+            "style": null,
+            "role": null,
+            "source_refs": [],
+            "pos": null
+          },
+          {
+            "id": "n3",
+            "label": "典型任务",
+            "children": [
+              {
+                "id": "n3-1",
+                "label": "分类",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              },
+              {
+                "id": "n3-2",
+                "label": "回归",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              },
+              {
+                "id": "n3-3",
+                "label": "聚类",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              }
+            ],
+            "note": null,
+            "detail": null,
+            "expandable": "unknown",
+            "collapsed": false,
+            "color": null,
+            "icon": null,
+            "style": null,
+            "role": null,
+            "source_refs": [],
+            "pos": null
+          },
+          {
+            "id": "n4",
+            "label": "常见算法",
+            "children": [
+              {
+                "id": "n4-1",
+                "label": "线性回归与逻辑回归",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              },
+              {
+                "id": "n4-2",
+                "label": "决策树与随机森林",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              },
+              {
+                "id": "n4-3",
+                "label": "支持向量机",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              },
+              {
+                "id": "n4-4",
+                "label": "神经网络与深度学习",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              }
+            ],
+            "note": null,
+            "detail": null,
+            "expandable": "unknown",
+            "collapsed": false,
+            "color": null,
+            "icon": null,
+            "style": null,
+            "role": null,
+            "source_refs": [],
+            "pos": null
+          },
+          {
+            "id": "n5",
+            "label": "应用领域",
+            "children": [
+              {
+                "id": "n5-1",
+                "label": "自然语言处理",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              },
+              {
+                "id": "n5-2",
+                "label": "计算机视觉",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              },
+              {
+                "id": "n5-3",
+                "label": "推荐系统",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              }
+            ],
+            "note": null,
+            "detail": null,
+            "expandable": "unknown",
+            "collapsed": false,
+            "color": null,
+            "icon": null,
+            "style": null,
+            "role": null,
+            "source_refs": [],
+            "pos": null
+          }
+        ],
+        "note": null,
+        "detail": null,
+        "expandable": "unknown",
+        "collapsed": false,
+        "color": null,
+        "icon": null,
+        "style": null,
+        "role": null,
+        "source_refs": [],
+        "pos": null
+      },
+      "layout": "tree",
+      "edges": [],
+      "diagram_type": "tree"
+    },
+    "applied": [
+      {
+        "code": "SINGLE_CHILD",
+        "kind": "collapse_chain",
+        "node_id": "n2-1",
+        "message": "「监督学习」下只有一条支「利用带标签的数据训练模型」，已把两层合成一层（标题为「监督学习 / 利用带标签的数据训练模型」）",
+        "undo": {
+          "parent_id": "n2",
+          "at": 0,
+          "replaced": {
+            "data": {
+              "id": "n2-1",
+              "label": "监督学习",
+              "note": null,
+              "detail": null,
+              "expandable": "unknown",
+              "collapsed": false,
+              "color": null,
+              "icon": null,
+              "style": null,
+              "role": null,
+              "source_refs": [],
+              "pos": null
+            }
+          },
+          "replaced_children": 1,
+          "inserted": [],
+          "inner": {
+            "data": {
+              "id": "n2-1-1",
+              "label": "利用带标签的数据训练模型",
+              "note": null,
+              "detail": null,
+              "expandable": "unknown",
+              "collapsed": false,
+              "color": null,
+              "icon": null,
+              "style": null,
+              "role": null,
+              "source_refs": [],
+              "pos": null
+            }
+          },
+          "redirected": []
+        }
+      },
+      {
+        "code": "SINGLE_CHILD",
+        "kind": "collapse_chain",
+        "node_id": "n2-2",
+        "message": "「无监督学习」下只有一条支「从无标签数据中发现结构」，已把两层合成一层（标题为「无监督学习 / 从无标签数据中发现结构」）",
+        "undo": {
+          "parent_id": "n2",
+          "at": 1,
+          "replaced": {
+            "data": {
+              "id": "n2-2",
+              "label": "无监督学习",
+              "note": null,
+              "detail": null,
+              "expandable": "unknown",
+              "collapsed": false,
+              "color": null,
+              "icon": null,
+              "style": null,
+              "role": null,
+              "source_refs": [],
+              "pos": null
+            }
+          },
+          "replaced_children": 1,
+          "inserted": [],
+          "inner": {
+            "data": {
+              "id": "n2-2-1",
+              "label": "从无标签数据中发现结构",
+              "note": null,
+              "detail": null,
+              "expandable": "unknown",
+              "collapsed": false,
+              "color": null,
+              "icon": null,
+              "style": null,
+              "role": null,
+              "source_refs": [],
+              "pos": null
+            }
+          },
+          "redirected": []
+        }
+      },
+      {
+        "code": "SINGLE_CHILD",
+        "kind": "collapse_chain",
+        "node_id": "n2-3",
+        "message": "「强化学习」下只有一条支「通过与环境交互和奖励信号学习策略」，已把两层合成一层（标题为「强化学习 / 通过与环境交互和奖励信号学习策略」）",
+        "undo": {
+          "parent_id": "n2",
+          "at": 2,
+          "replaced": {
+            "data": {
+              "id": "n2-3",
+              "label": "强化学习",
+              "note": null,
+              "detail": null,
+              "expandable": "unknown",
+              "collapsed": false,
+              "color": null,
+              "icon": null,
+              "style": null,
+              "role": null,
+              "source_refs": [],
+              "pos": null
+            }
+          },
+          "replaced_children": 1,
+          "inserted": [],
+          "inner": {
+            "data": {
+              "id": "n2-3-1",
+              "label": "通过与环境交互和奖励信号学习策略",
+              "note": null,
+              "detail": null,
+              "expandable": "unknown",
+              "collapsed": false,
+              "color": null,
+              "icon": null,
+              "style": null,
+              "role": null,
+              "source_refs": [],
+              "pos": null
+            }
+          },
+          "redirected": []
+        }
+      }
+    ],
+    "skipped": [],
+    "diagnostics": [],
+    "steps": 3,
+    "summary": "压掉了 3 处单子链"
+  },
+  "second": {
+    "content": {
+      "schema_version": 2,
+      "title": "机器学习",
+      "theme": {
+        "preset": "default",
+        "accent": null,
+        "font": "system",
+        "direction": "right"
+      },
+      "relations": [],
+      "source_usage": [
+        {
+          "source_id": "c3427ee4-cfe2-4db6-9086-8588b86d398a",
+          "kind": "text",
+          "filename": null,
+          "char_count": 4,
+          "url": null
+        }
+      ],
+      "root": {
+        "id": "root",
+        "label": "机器学习",
+        "children": [
+          {
+            "id": "n1",
+            "label": "定义与范畴",
+            "children": [
+              {
+                "id": "n1-1",
+                "label": "机器学习是人工智能的一个分支领域",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              },
+              {
+                "id": "n1-2",
+                "label": "研究如何让计算机从数据中学习规律",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              }
+            ],
+            "note": null,
+            "detail": null,
+            "expandable": "unknown",
+            "collapsed": false,
+            "color": null,
+            "icon": null,
+            "style": null,
+            "role": null,
+            "source_refs": [],
+            "pos": null
+          },
+          {
+            "id": "n2",
+            "label": "主要学习范式",
+            "children": [
+              {
+                "id": "n2-1-1",
+                "label": "监督学习 / 利用带标签的数据训练模型",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              },
+              {
+                "id": "n2-2-1",
+                "label": "无监督学习 / 从无标签数据中发现结构",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              },
+              {
+                "id": "n2-3-1",
+                "label": "强化学习 / 通过与环境交互和奖励信号学习策略",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              }
+            ],
+            "note": null,
+            "detail": null,
+            "expandable": "unknown",
+            "collapsed": false,
+            "color": null,
+            "icon": null,
+            "style": null,
+            "role": null,
+            "source_refs": [],
+            "pos": null
+          },
+          {
+            "id": "n3",
+            "label": "典型任务",
+            "children": [
+              {
+                "id": "n3-1",
+                "label": "分类",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              },
+              {
+                "id": "n3-2",
+                "label": "回归",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              },
+              {
+                "id": "n3-3",
+                "label": "聚类",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              }
+            ],
+            "note": null,
+            "detail": null,
+            "expandable": "unknown",
+            "collapsed": false,
+            "color": null,
+            "icon": null,
+            "style": null,
+            "role": null,
+            "source_refs": [],
+            "pos": null
+          },
+          {
+            "id": "n4",
+            "label": "常见算法",
+            "children": [
+              {
+                "id": "n4-1",
+                "label": "线性回归与逻辑回归",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              },
+              {
+                "id": "n4-2",
+                "label": "决策树与随机森林",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              },
+              {
+                "id": "n4-3",
+                "label": "支持向量机",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              },
+              {
+                "id": "n4-4",
+                "label": "神经网络与深度学习",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              }
+            ],
+            "note": null,
+            "detail": null,
+            "expandable": "unknown",
+            "collapsed": false,
+            "color": null,
+            "icon": null,
+            "style": null,
+            "role": null,
+            "source_refs": [],
+            "pos": null
+          },
+          {
+            "id": "n5",
+            "label": "应用领域",
+            "children": [
+              {
+                "id": "n5-1",
+                "label": "自然语言处理",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              },
+              {
+                "id": "n5-2",
+                "label": "计算机视觉",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              },
+              {
+                "id": "n5-3",
+                "label": "推荐系统",
+                "children": [],
+                "note": null,
+                "detail": null,
+                "expandable": "unknown",
+                "collapsed": false,
+                "color": null,
+                "icon": null,
+                "style": null,
+                "role": null,
+                "source_refs": [],
+                "pos": null
+              }
+            ],
+            "note": null,
+            "detail": null,
+            "expandable": "unknown",
+            "collapsed": false,
+            "color": null,
+            "icon": null,
+            "style": null,
+            "role": null,
+            "source_refs": [],
+            "pos": null
+          }
+        ],
+        "note": null,
+        "detail": null,
+        "expandable": "unknown",
+        "collapsed": false,
+        "color": null,
+        "icon": null,
+        "style": null,
+        "role": null,
+        "source_refs": [],
+        "pos": null
+      },
+      "layout": "tree",
+      "edges": [],
+      "diagram_type": "tree"
+    },
+    "applied": [],
+    "skipped": [],
+    "diagnostics": [],
+    "steps": 0,
+    "summary": ""
+  },
+  "diagnostics_before": [
+    {
+      "level": "info",
+      "code": "SINGLE_CHILD",
+      "node_id": "n2-1",
+      "message": "节点「监督学习」只有一个子节点，可考虑展开或合并",
+      "evidence": null
+    },
+    {
+      "level": "info",
+      "code": "SINGLE_CHILD",
+      "node_id": "n2-2",
+      "message": "节点「无监督学习」只有一个子节点，可考虑展开或合并",
+      "evidence": null
+    },
+    {
+      "level": "info",
+      "code": "SINGLE_CHILD",
+      "node_id": "n2-3",
+      "message": "节点「强化学习」只有一个子节点，可考虑展开或合并",
+      "evidence": null
+    }
+  ],
+  "map_id": "0b82a740-b2c9-4e30-aeae-ee7d0aa83aaa"
+}
