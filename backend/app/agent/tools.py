@@ -11777,7 +11777,17 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         #
         # 两段式没有"骨架定的条数"这个概念（一级分支就是树的最外层，模型直接写进
         # 树里），所以报**落树后的**实际条数——这是同一个问题的答案，只是来源不同。
-        "planned_branches": len(plan.flat) if plan is not None else len(content.root.children),
+        #
+        # 数的那一层走 `shapes.top_branches`，与下面 `branches` 的 `_top_level_rows`
+        # 是同一个口径（树是一级分支、鱼骨是六根骨、流程是各阶段）。**不写
+        # `content.root.children`**：那样写等于要求"走到这里的 `content` 一定是树"，
+        # 而那个保证在三百行之外——`plan is None` 只出现在两段式成功那一条
+        # （`if graph_mode:` 的 if 分支），`graph_mode` 只在 `diagram_type == "tree"`
+        # 时为真，`diagram_type` 是一次快照，`_shape_output` 收的是同一个值。四步
+        # 推理都对才成立；其中任何一步改了（给两段式加鱼骨、出口的返回约定变了），
+        # 症状是 `AttributeError` 打穿整次生成，而不是"这一支数错了"。
+        "planned_branches": (
+            len(plan.flat) if plan is not None else len(shapes.top_branches(content))),
         # 初次规模的两个参考值：报出来才能解释"为什么这棵树只有这么深/这么大"。
         # 节点那一个是**可读性参考值**（不是配额，也不是裁剪线：超过它只记一条
         # `TREE_OVER_READABILITY`，节点一个不少；真正的硬边界是契约的

@@ -20,6 +20,8 @@ from unittest.mock import patch
 
 import pytest
 
+from app.agent import shapes
+from app.agent import tools as agent_tools
 from app.agent.contracts import AgentRunRequest, RunBudget, RunContext, ToolCall
 from app.agent.tools import (
     DETAIL_ONLY_PROMPT,
@@ -377,3 +379,40 @@ def test_graph_rules_forbid_copying_the_entity_list():
     assert "不是要照抄的清单" in GRAPH_TREE_RULES
     assert "只能连不同一级分支" in GRAPH_RELATION_RULES
     assert "why" in GRAPH_RELATION_RULES
+
+
+# ------------------------------------------- 6. `planned_branches` 不假设产物是树
+
+
+def test_planned_branches_does_not_assume_the_folded_content_is_a_tree(monkeypatch):
+    """`planned_branches` 数的是**画布最外那一层**，不是"树的一级分支"。
+
+    产品路径上这条不变量确实恒成立——`plan is None` 只出现在两段式成功那一条
+    （`if graph_mode:` 的 if 分支），`graph_mode` 只在 `diagram_type == "tree"` 时为
+    真，`diagram_type` 是一次快照，`_shape_output` 收的是同一个值——所以折叠产物
+    一定是 `MindMapContent`。
+
+    这条用例故意把那个保证拿掉（把出口换成鱼骨），因为**恒成立靠的是三百行之外的
+    四步推理**，而任何一步改了都不会有人知道：症状是 `AttributeError:
+    'FishboneContent' object has no attribute 'root'`，整次生成 500，与"这一支数错
+    了"根本不是一回事。把跨文件的隐含约束换成一次显式取值，代价是这里多走一遍。
+
+    改前 `len(content.root.children)` 在这条用例上抛 AttributeError；改后与
+    `data["branches"]` 同一个口径，报鱼的骨数。
+    """
+    monkeypatch.setenv(GRAPH_SKELETON_ENV, "1")
+    tree, _ = _content_with(_tree())
+    fishbone, _ = shapes.to_fishbone(tree, problem=TOPIC)
+    # 出口换成鱼骨：两段式（`plan is None`）的产物不再是树。
+    monkeypatch.setattr(
+        agent_tools, "_shape_output", lambda _content, **_kwargs: fishbone)
+
+    result = _run(_ctx(), _chat(_tree()))
+
+    assert result.ok, result.content
+    assert result.data["planned_branches"] == len(fishbone.bones)
+    # 而且与 `branches` 的行数一致——同一个问题的两个出口不该有两个答案。
+    assert result.data["planned_branches"] == len(result.data["branches"])
+    # 鱼骨没有中心主题：`root_id` 为 None 是既有约定，顺手钉住（它与上面那处读
+    # `content.root` 是同一类假设，只是那一处已经用 isinstance 判过了）。
+    assert result.data["root_id"] is None
