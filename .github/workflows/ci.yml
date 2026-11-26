@@ -61,11 +61,11 @@ jobs:
       # 探针脚本的另一半保护。`ruff` 管"文件名内"的问题（未使用的导入、空 f-string），
       # 但它不核对 `from app.x import 名字` 里那个名字还在不在——那是探针脚本跟着
       # `app/**` 重构漂掉的主要形态。这里补上"能不能加载"与"import 目标还在不在"，
-      # 外加"docs 引用的脚本是否存在"与"临时产物有没有悄悄落库"。
-      # 机制与为什么是这四条，都在 `scripts/check_script_hygiene.py` 的 docstring 里。
+      # 外加"docs 引用的脚本是否存在""临时产物有没有悄悄落库""部署文档里的开关还有
+      # 没有人在读"。五档的机制与取舍都在 `scripts/check_script_hygiene.py` 的 docstring 里。
       #
-      # 确定性与上面那条棘轮同一标准：判据是 `scripts/` 与 `docs/` 的树形内容，
-      # 只有 artifacts 一档读 `git check-ignore`（用来确认产物被忽略而不是游离）。
+      # 确定性与上面那条棘轮同一标准：判据是 `scripts/`、`docs/`、`.env.example` 的
+      # 树形内容，只有 artifacts 一档读 `git check-ignore`（用来确认产物被忽略而不是游离）。
       - name: 探针脚本卫生
         run: python scripts/check_script_hygiene.py --gate
 

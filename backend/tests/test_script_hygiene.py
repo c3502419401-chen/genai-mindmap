@@ -228,3 +228,45 @@ def test_artifact_check_catches_a_committed_artifact_nobody_references(
     report = hygiene.Report()
     hygiene.check_artifacts(report)
     assert report.of("artifacts") == []
+
+
+def test_env_check_catches_a_documented_variable_nobody_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`.env.example` 里留着一个代码已经不读的变量 = 部署的人照设了、什么都不会发生。
+
+    这条与"设了但静默不生效"是同一族失败，只是发生在部署那一层。方向是**单向**的：
+    只查"文档写了、代码里没有"；反方向实测 59 条（行为开关与实验开关大多不该交给
+    部署的人去设），要查就得维护一份 59 条豁免名单，成本远高于收益。
+    """
+    _fake_repo(tmp_path, monkeypatch)
+    (tmp_path / "backend" / "app").mkdir()
+    (tmp_path / "backend" / ".env.example").write_text(
+        "MINDMAP_STILL_READ=1\nMINDMAP_GONE=0\n", encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        hygiene, "_ENV_EXAMPLE", tmp_path / "backend" / ".env.example")
+    # 变量名以**字符串字面量**出现即算在用：`REMEMBER_ENV = "X"` 之后
+    # `os.getenv(REMEMBER_ENV)` 是仓库里的主流写法，只认 `os.getenv("X")` 会误报。
+    (tmp_path / "backend" / "app" / "settings.py").write_text(
+        'STILL_READ_ENV = "MINDMAP_STILL_READ"\n', encoding="utf-8",
+    )
+
+    report = hygiene.Report()
+    hygiene.check_env(report)
+    found = report.of("env")
+    assert len(found) == 1
+    assert "MINDMAP_GONE" in found[0].where
+    assert "照着设不会有任何效果" in found[0].why
+
+
+def test_env_check_is_quiet_when_the_file_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """没有 `.env.example` 的副本（解压出来的、裁剪过的）不该让检查崩。"""
+    _fake_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        hygiene, "_ENV_EXAMPLE", tmp_path / "backend" / ".env.example")
+    report = hygiene.Report()
+    hygiene.check_env(report)
+    assert report.of("env") == []

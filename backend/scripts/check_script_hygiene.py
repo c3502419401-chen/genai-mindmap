@@ -22,7 +22,7 @@ lint 不在 CI 里，本地也只有想得起来的时候才跑。
 | 脚本 `scripts/**/*.py` | 留在 repo | 必须**能加载**（下文 A）+ import 目标必须存在（B） |
 | 产物 `scripts/**/_*.json` | 默认不进 repo | 已跟踪的必须在 `docs/` 里被引用（D），否则它就是没有引用的裸文件 |
 
-## 四条检查，为什么是这四条
+## 五条检查，为什么是这五条
 
 **A · 能不能真的加载（`load`）**
 
@@ -57,6 +57,19 @@ lint 不在 CI 里，本地也只有想得起来的时候才跑。
 `docs/SUBAGENT-VS-SELFCHECK.md` 把它们当留档的实测结果引用。判据不写成人工名单，而是
 **"已跟踪的必须被 docs 引用"**——这样任何新提交的裸产物都会红，而留档证据因为被引用而合法。
 
+**E · 部署文档里的开关还在不在（`env`）**
+
+`.env.example` 里的变量，在 `app/` 与 `scripts/` 里还找得到吗。方向是**单向**的：只查
+"文档写了、代码里没有"。反方向（代码里有、文档没写）实测 59 条——`MINDMAP_SECTION_SLICE`
+这类行为开关与实验开关大多不该交给部署的人去设；查它就要维护一份 59 条的豁免名单，
+而它拦的东西（一个没人读的开关）不会让任何东西坏。单向这一侧是零噪声的：照着
+`.env.example` 设了一个代码已经不读的变量，表现是"设了、什么都不会发生"——与仓库里
+反复在治的"静默失败"是同一族，只是发生在部署这一层。
+
+变量名按**字符串字面量**认（`"MINDMAP_X"`），因为仓库的主流写法是
+`REMEMBER_ENV = "MINDMAP_X"` 之后 `os.getenv(REMEMBER_ENV)`；只认 `os.getenv("MINDMAP_X")`
+会把 23 个声明里的 18 个判成没人读（实测过）。
+
 ## 跑法
 
     cd backend
@@ -64,9 +77,10 @@ lint 不在 CI 里，本地也只有想得起来的时候才跑。
     python scripts/check_script_hygiene.py --gate     # 闩门：有违规退出码 1
     python scripts/check_script_hygiene.py --only imports,docs
 
-`--gate` 是**零容忍**，不是棘轮：这四条检查的基线当前就是全绿（22 个探针脚本全部可加载），
-所以不存在"历史欠账要挂 baseline"。真出现需要长期豁免的东西，再加白名单并写明理由——
-但默认姿态是"这条规矩现在成立，破了就红"。
+`--gate` 是**零容忍**，不是棘轮：这五条检查的基线当前就是全绿（43 个探针脚本全部
+可加载、121 个脚本的 import 目标全部还在、83 处文档引用全部落得到文件、9 个产物全部
+各就各位、23 个环境变量全部有人在读），所以不存在"历史欠账要挂 baseline"。真出现
+需要长期豁免的东西，再加白名单并写明理由——但默认姿态是"这条规矩现在成立，破了就红"。
 """
 from __future__ import annotations
 
@@ -117,6 +131,19 @@ _DOCS_REF_EXEMPT: dict[str, str] = {
 
 #: 产物（`_*.json`）在 docs 里的点名形式：带不带 `scripts/` 前缀都算。
 _ARTIFACT_REF = re.compile(r"(?:backend/)?(?:scripts/)?(_[A-Za-z0-9_.-]+\.json)(?![\w-])")
+
+#: `.env.example` 的变量声明。部署的人照着它设环境变量。
+_ENV_EXAMPLE = BACKEND_DIR / ".env.example"
+_ENV_DECL = re.compile(r"^\s*([A-Z][A-Z0-9_]+)\s*=", re.M)
+
+#: 变量名在源码里的形态：字符串字面量。**两种写法都要认**——`os.getenv("X")`
+#: 与 `REMEMBER_ENV = "X"` 之后 `os.getenv(REMEMBER_ENV)`。只认前者会把
+#: `MINDMAP_LIBRARY_REMEMBER` 这类"常量集中声明"的变量判成没人读（实测：23 个声明里
+#: 会误报 18 个），那种假红正是让人开始无视一条检查的方式。
+_ENV_NAME = re.compile(r"""["']([A-Z][A-Z0-9_]{2,})["']""")
+
+#: 变量名去这两棵树里找。不含 `tests/`：用例里出现一个变量名不代表产品会读它。
+_ENV_SOURCES = ("app", "scripts")
 
 
 @dataclass
@@ -374,6 +401,45 @@ def check_artifacts(report: Report) -> None:
             )
 
 
+# --------------------------------------------------------------------------- E
+
+
+def check_env(report: Report) -> None:
+    """`.env.example` 里的变量，代码里还在读吗。
+
+    **方向是单向的**：只查"文档写了、代码里没有"，不查"代码里有、文档没写"。
+
+    后一个方向的实测数是 59 条（`MINDMAP_SECTION_SLICE`、`MINDMAP_KEEP_BY_SCORE`、
+    `MINDMAP_NODE_POOL` 这类行为开关与实验开关，大多不该交给部署的人去设）。把它
+    也查了就要维护一份 59 条的豁免名单——那正是 `find_unwired` 基线那套成本，而它
+    拦的东西（一个没人读的开关）不会让任何东西坏。
+
+    这一个方向是确定性的零噪声：`.env.example` 是给部署的人看的。里面留着一个
+    **代码已经不读的变量**，意味着他照着设了、而什么都不会发生——与"设了但静默
+    不生效"是同一族失败，只是发生在部署这一层。
+    """
+    if not _ENV_EXAMPLE.exists():
+        return
+    declared = _ENV_DECL.findall(_ENV_EXAMPLE.read_text(encoding="utf-8", errors="replace"))
+    report.stats["env_declared"] = len(declared)
+    if not declared:
+        return
+    mentioned: set[str] = set()
+    for folder in _ENV_SOURCES:
+        root = BACKEND_DIR / folder
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*.py"):
+            mentioned.update(_ENV_NAME.findall(
+                path.read_text(encoding="utf-8", errors="replace")))
+    for name in declared:
+        if name not in mentioned:
+            report.add(
+                "env", f"backend/.env.example → {name}",
+                "这个变量在代码里一次都没出现过：照着设不会有任何效果",
+            )
+
+
 # --------------------------------------------------------------------------- main
 
 CHECKS = {
@@ -381,6 +447,7 @@ CHECKS = {
     "imports": check_imports,
     "docs": check_docs,
     "artifacts": check_artifacts,
+    "env": check_env,
 }
 
 
@@ -389,7 +456,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--gate", action="store_true", help="有违规时退出码 1")
     parser.add_argument(
         "--only", default="",
-        help="只跑指定检查，逗号分隔（load,imports,docs,artifacts）",
+        help=f"只跑指定检查，逗号分隔（{','.join(CHECKS)}）",
     )
     args = parser.parse_args(argv)
 
