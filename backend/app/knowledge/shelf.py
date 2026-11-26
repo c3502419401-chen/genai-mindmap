@@ -23,7 +23,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.contracts.mindmap import MindMapContent
+from app.agent import shapes
+from app.contracts.mindmap import DiagramContent
 from app.contracts.source import SourceKind
 from app.knowledge import library as knowledge_library
 from app.mindmaps import repository
@@ -166,6 +167,14 @@ def _scan_cited_counts() -> dict[str, int]:
     warning（由 `repository.list_maps(tolerant=True)` 逐行兜住），导图表整个读不
     出来时返回空计数、列表照常展示（`cited_by` 退化成 0）。真正"坏在哪儿"由列表
     页/单图接口去暴露，不是这里。
+
+    **遍历必须与形状无关**：`MindMapContent.root` 只是三种 content 里的一种，
+    流程图是 `FlowContent`（阶段在 `stages[i].root`）、鱼骨图是 `FishboneContent`
+    （骨在 `bones[i].root`），两者都没有 `.root`。写死 `content.root` 的那一版会让
+    "库里躺着一张流程图"变成整个列表 500——而 `cited_by` 是旁路展示，它没有资格
+    把入口打挂。所以这里用 `agent.shapes.iter_nodes`：仓库里**唯一**一份认三种形状
+    的遍历（树 / 六根骨 / 若干阶段），诊断、体检、优化那一侧用的都是它。自己再写
+    一个 if/elif 只会成为第四个"只处理了一种形状"的地方。
     """
     counts: dict[str, int] = {}
     try:
@@ -176,14 +185,11 @@ def _scan_cited_counts() -> dict[str, int]:
         return counts
 
     for record in maps:
-        content: MindMapContent = record.content
+        content: DiagramContent = record.content
         used = {usage.source_id for usage in content.source_usage}
-        stack = [content.root]
-        while stack:
-            node = stack.pop()
+        for node in shapes.iter_nodes(content):
             for ref in node.source_refs or ():
                 used.add(ref.source_id)
-            stack.extend(node.children)
         # 同一张图里同一份来源出现多次只算一张：口径是"被几张导图引用"，
         # 不是"被引用几次"。
         for source_id in used:
