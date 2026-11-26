@@ -261,6 +261,44 @@ class Source(BaseModel):
     content_hash: str | None = None
 
 
+class SourceIdentity(BaseModel):
+    """一份来源**在生成结束之后**的身份：id + 人认得出的那几个字段，**不带正文**。
+
+    为什么需要它：生成链路开流之前会把材料入库，而库给的是另一个持久 id
+    （`knowledge/remember.py::remember_sources`）。导图里 `source_refs.source_id`
+    记的是持久 id，调用方手里那份"材料清单"（ingestion 的应答）却是请求内 uuid。
+    两套 id 并存时，只有一方知道怎么换算——前端从前靠 SSE 的 `mapping` 就地改写；
+    不带前端那一层的调用方（脚本、移动端、第三方集成）没有任何地方能看到换算结果，
+    于是拿原 id 去 `/optimization/check` 会得到满屏 `SOURCE_TEXT_UNAVAILABLE`。
+
+    所以 SSE 的 `sources` 帧除了 `mapping`（旧 id → 新 id）还带上**这份清单**：
+    它就是"最终版本的来源列表"，`id` 逐个等于导图里 `source_refs` 用的那个。
+    客户端拿 id 对正文（自己的正文按 `mapping` 换 id，或者直接按顺序对）就闭环了。
+
+    **不带正文**：50 份材料 × 4000 字塞进一个 SSE 帧，既撑大帧也把材料正文
+    复制到了事件流里——正文只有调用方自己有，事件只需要给身份。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(min_length=1, max_length=100)
+    kind: SourceKind
+    filename: str | None = None
+    status: Literal["pending", "parsed", "failed"] = "pending"
+    # 正文长度（码点）。客户端用它核对"这份材料我看过，只是换了个 id"。
+    chars: int = Field(default=0, ge=0)
+
+    @classmethod
+    def of(cls, source: Source) -> "SourceIdentity":
+        """从一份 `Source` 摘出身份。正文不进结果，只留长度。"""
+        return cls(
+            id=source.id,
+            kind=source.kind,
+            filename=source.filename,
+            status=source.status,
+            chars=len(source.text or ""),
+        )
+
+
 class SourceUsage(BaseModel):
     """整张导图使用过的来源摘要；不代表具体节点已建立证据链接。"""
     model_config = ConfigDict(extra="forbid")

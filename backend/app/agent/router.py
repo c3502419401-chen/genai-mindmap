@@ -41,6 +41,7 @@ from app.agent.service import AgentPlan, AgentTaskRequest, plan, run
 from app.agent.stream import DONE_FRAME, encode_event
 from app.auth import identity as identity_module
 from app.auth import owner as owner_module
+from app.contracts.source import SourceIdentity
 from app.core.errors import AppError
 from app.generation import quota
 from app.generation.service import GenerationError, ModelNotConfigured
@@ -265,7 +266,16 @@ async def _frames(
             remembered = await run_in_threadpool(remember_sources, body.sources)
             if remembered.mapping:
                 seq += 1
-                yield encode_event(SourcesEvent(seq=seq, mapping=remembered.mapping))
+                # 帧里同时给 `mapping`（换算）与 `sources`（最终清单）：前者让已经
+                # 手里有正文的调用方就地改 id，后者让只解析事件流的调用方直接拿到
+                # "导图里 `source_refs.source_id` 指向的那份材料是谁"。只给一半时，
+                # 不带前端那层缝的调用方会拿旧 id 去核对引用，结果全红——理由见
+                # `SourcesEvent` 的 docstring。
+                yield encode_event(SourcesEvent(
+                    seq=seq,
+                    mapping=remembered.mapping,
+                    sources=[SourceIdentity.of(item) for item in remembered.sources],
+                ))
                 body = body.model_copy(update={"sources": remembered.sources})
         # `aclosing` 不是为了好看：客户端断开时这里被关掉，不显式关内层生成器，
         # 它的收尾（取消工具任务、交回候选）要等垃圾回收才执行——那段时间工具里

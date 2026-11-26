@@ -18,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 from app.contracts.diagnostic import Diagnostic
 from app.contracts.mindmap import DiagramContent, DiagramKind
 from app.contracts.ops import OpBatch
-from app.contracts.source import Source
+from app.contracts.source import Source, SourceIdentity
 from app.optimization.source_refs import EvidenceSpan
 
 logger = logging.getLogger(__name__)
@@ -893,11 +893,27 @@ class SourcesEvent(_EventBase):
 
     只在真有 id 变化时发：没有材料、或用不到库（开关关掉）时这一帧根本不出现，
     既有帧序列逐字节不变。
+
+    **`sources` 与 `mapping` 回答的是同一个问题的两半，两个都要**：
+
+      - `mapping` 是**换算**（旧 → 新），给"手上已经有正文"的调用方用：它按这张
+        表把自己的材料改个 id 就对齐了。前端 `stores/sources.ts::remap()` 走这条。
+      - `sources` 是**最终清单**（`SourceIdentity`，不带正文），给"只解析事件流、
+        不打算自己算差集"的调用方用：`id` 逐个等于导图里 `source_refs.source_id`，
+        `filename` / `chars` 足够认出是哪份材料。
+
+    之前只有 `mapping`，等于把"最终清单是什么"留给调用方自己算：前端算了（`remap`），
+    脚本与第三方没算——它们拿 ingestion 应答里的旧 id 去 `/optimization/check`，会得到
+    一条不落的 `SOURCE_TEXT_UNAVAILABLE`。这不是"少一个便利字段"，是**接口对外只给了
+    一半答案**。`sources` 就是把另一半补上，`mapping` 保留（删了会让前端白改一遍）。
     """
 
     type: Literal["sources"] = "sources"
     # 旧 id → 持久 id。空字典不该发这一帧，前端也不必处理空表。
     mapping: dict[str, str] = Field(default_factory=dict)
+    # 入库之后的**全部**材料（含没换 id 的那些，含入库失败按原 id 继续的那些）。
+    # 与 `RunContext.request.sources` 同一份、同一个顺序，只是不带正文。
+    sources: list[SourceIdentity] = Field(default_factory=list)
 
 
 class HeartbeatEvent(_EventBase):
