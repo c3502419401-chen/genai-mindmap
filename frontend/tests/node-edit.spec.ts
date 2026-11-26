@@ -124,15 +124,24 @@ describe('引用角标', () => {
   it('没有引用时不画角标', () => {
     const wrapper = render();
 
-    expect(wrapper.find('[title="0 处来源引用"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="node-refs"]').exists()).toBe(false);
     wrapper.unmount();
   });
 
   it('有引用时显示条数', () => {
     const wrapper = render({ data: { ...data, refs: 3 } });
 
-    const badge = wrapper.get('[title="3 处来源引用"]');
+    const badge = wrapper.get('[data-test="node-refs"]');
     expect(badge.text()).toBe('3');
+    wrapper.unmount();
+  });
+
+  it('角标可以点：点它发出 openRefs（原来它是 pointer-events-none 的纯装饰）', async () => {
+    const wrapper = render({ data: { ...data, refs: 3 } });
+
+    await wrapper.get('[data-test="node-refs"]').trigger('click');
+
+    expect(wrapper.emitted('openRefs')).toHaveLength(1);
     wrapper.unmount();
   });
 });

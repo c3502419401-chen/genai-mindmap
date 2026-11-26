@@ -779,7 +779,13 @@ export interface paths {
         };
         /**
          * Read Library Source
-         * @description 单份材料的正文预览（前 4000 字，`truncated` 说明是否截断）。
+         * @description 单份材料的正文，默认前 4000 字（`truncated` 说明是否截断）。
+         *
+         *     `limit` 给"点引用跳原文"用：`SourceRef.start/end` 是全文码点偏移，界面要
+         *     定位到第 N 字就必须能拿到那之前的正文。传 `total_chars`（列表里就有）即可
+         *     拿到整份；上限 `MAX_READ_CHARS` 由 schema 的 `le` 直接挡成 422，而不是在
+         *     服务层悄悄夹一下——一个越界的 `limit` 是调用方的错，静默纠正会让它以为
+         *     自己拿到的是全文。
          */
         get: operations["read_library_source_api_knowledge_library__source_id__get"];
         put?: never;
@@ -3859,7 +3865,9 @@ export interface operations {
     };
     read_library_source_api_knowledge_library__source_id__get: {
         parameters: {
-            query?: never;
+            query?: {
+                limit?: number;
+            };
             header?: never;
             path: {
                 source_id: string;

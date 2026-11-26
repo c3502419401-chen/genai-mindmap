@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { MindNode, Source, SourceRef, SourceUsage } from '../src/api/types';
-import { buildRefIndex, excerptOf, locateInText, refName, refWhere, resolveRef, resolveRefs, windowOf } from '../src/mindmap/refs';
+import { buildRefIndex, excerptOf, locateAll, locateInText, quoteOffsets, refName, refWhere, resolveRef, resolveRefs, resolveRefWithText, windowOf } from '../src/mindmap/refs';
 
 const TEXT = '矩阵的秩等于行向量组的极大线性无关组的个数。初等变换不改变矩阵的秩。';
 
@@ -185,5 +185,138 @@ describe('来源反向索引', () => {
     const index = buildRefIndex(null);
     expect(index.counts).toEqual({});
     expect(index.hits).toEqual({});
+  });
+});
+
+/**
+ * "点引用跳原文"依赖的定位：**同一句引文可能出现多次**，而 `locateInText`
+ * 只回答"第一处在哪"——那会让界面笃定地指向一个没有依据的位置。
+ */
+describe('定位的全部候选（locateAll）', () => {
+  const LONG = '开头一段话。目标句子在这里。中间隔了一些字。目标句子在这里。结尾。';
+
+  it('有坐标时直接采用，不去猜别处', () => {
+    const found = locateAll('矩阵的秩等于行向量组的极大线性无关组的个数。', {
+      source_id: 's1', start: 0, end: 6, quote: '矩阵的秩等于',
+    });
+    expect(found).toEqual({ start: 0, end: 6, others: [], via: 'range' });
+  });
+
+  it('坐标越界时退回到按引文搜，并给出**其余**位置', () => {
+    const found = locateAll(LONG, { source_id: 's1', start: 0, end: 999, quote: '目标句子在这里' });
+    const first = LONG.indexOf('目标句子在这里');
+    const second = LONG.indexOf('目标句子在这里', first + 1);
+
+    expect(found.via).toBe('quote');
+    expect(found.start).toBe(Array.from(LONG.slice(0, first)).length);
+    expect(found.others).toEqual([Array.from(LONG.slice(0, second)).length]);
+  });
+
+  it('只有一处命中时 others 为空', () => {
+    const found = locateAll(LONG, { source_id: 's1', quote: '中间隔了一些字' });
+    expect(found.via).toBe('quote');
+    expect(found.others).toEqual([]);
+    expect(LONG.startsWith('中间', found.start) || Array.from(LONG).slice(found.start, found.start + 2).join('') === '中间').toBe(true);
+  });
+
+  it('引文被换行/空格改写过：按空白归一后仍能定位，但只算"搜到"不算精确坐标', () => {
+    const text = '第一句。第二句\n  换行之后的内容。第三句。';
+    const found = locateAll(text, { source_id: 's1', quote: '第二句 换行之后的内容' });
+    expect(found.via).toBe('quote');
+    expect(found.start).toBeGreaterThan(0);
+  });
+
+  it('定位不到时 via 是 none，且不带一个假坐标', () => {
+    const found = locateAll('很短的一段', { source_id: 's1', quote: '原文里没有这句' });
+    expect(found).toEqual({ start: 0, end: 0, others: [], via: 'none' });
+  });
+
+  it('空正文 / 空引用都不抛错', () => {
+    expect(locateAll('', { source_id: 's1', quote: '甲' }).via).toBe('none');
+    expect(locateAll('甲乙丙', { source_id: 's1' }).via).toBe('none');
+  });
+
+  it('重叠命中各算一处（与后端 _quote_occurrences 同口径）', () => {
+    expect(quoteOffsets('aaaa', 'aa')).toEqual([0, 1, 2]);
+    expect(quoteOffsets('甲乙丙', '丁')).toEqual([]);
+  });
+
+  it('码点下标：emoji 与汉字混排时不会切在半个字符上', () => {
+    const text = '🎯🎯矩阵的秩';
+    const found = locateAll(text, { source_id: 's1', quote: '矩阵的秩' });
+    expect(found.start).toBe(2);
+    expect(Array.from(text).slice(found.start, found.end).join('')).toBe('矩阵的秩');
+  });
+
+  // 实测踩出来的：引用片段以空格/换行开头时（英文论文段落很常见），
+  // 旧实现拿 `quote.trim()` 与原文区间比较 → 判成"坐标对不上" → 退回全文搜索 →
+  // 高亮少一个字、位置说明偏 1、还多出一句"这条引用没有坐标"。
+  it('引文带前导空白时坐标仍然可信，不退回搜索', () => {
+    const text = ' 甲乙丙丁戊';
+    const found = locateAll(text, { source_id: 's1', start: 0, end: 3, quote: ' 甲乙' });
+    expect(found).toEqual({ start: 0, end: 3, others: [], via: 'range' });
+
+    // 引文被 trim 过（只剩正文）也要认：首尾空白不改变"指的是哪一段"
+    const trimmed = locateAll(text, { source_id: 's1', start: 0, end: 3, quote: '甲乙' });
+    expect(trimmed.via).toBe('range');
+    expect(trimmed.start).toBe(0);
+    expect(trimmed.end).toBe(3);
+  });
+
+  it('引文带尾随空白时同样不误判', () => {
+    const text = '甲乙丙\n\n下一段';
+    const found = locateAll(text, { source_id: 's1', start: 0, end: 4, quote: '甲乙丙' });
+    expect(found.via).toBe('range');
+    expect(found.end).toBe(4);
+  });
+
+  it('坐标真的指向别的内容时才退回搜索（不是所有不等都放过）', () => {
+    const text = '前文。目标是甲。后文。';
+    const found = locateAll(text, { source_id: 's1', start: 0, end: 3, quote: '目标是甲' });
+    expect(found.via).toBe('quote');
+    expect(Array.from(text).slice(found.start, found.end).join('')).toBe('目标是甲');
+  });
+});
+
+/**
+ * `resolveRefWithText`：正文不在 `sources` 数组里（从知识库取回来的那份）时，
+ * 也要能算出高亮。这是"打开已保存导图之后还能跳回原文"的唯一通道。
+ */
+describe('用外部原文解析引用', () => {
+  const TEXT2 = '矩阵的秩等于行向量组的极大线性无关组的个数。初等变换不改变矩阵的秩。';
+
+  it('正文来自参数而不是 sources，位置按码点切', () => {
+    const resolved = resolveRefWithText(
+      { source_id: 's1', start: 0, end: 6, quote: '矩阵的秩等于' },
+      TEXT2,
+      null,
+      usage,
+    );
+    expect(resolved.hit).toBe('矩阵的秩等于');
+    expect(resolved.start).toBe(0);
+    expect(resolved.end).toBe(6);
+    // 名字仍然能取到：来自 usage，不依赖 Source
+    expect(resolved.name).toContain('线代第一章');
+  });
+
+  it('定位不到时 start/end 为 null，摘录为空（界面据此不高亮）', () => {
+    const resolved = resolveRefWithText(
+      { source_id: 's1', quote: '这句原文里没有' },
+      TEXT2,
+      null,
+      usage,
+    );
+    expect(resolved.start).toBeNull();
+    expect(resolved.excerpt).toBe('');
+    // 但引文本身还在：不会因为定位失败就丢
+    expect(resolved.quote).toBe('这句原文里没有');
+  });
+
+  it('resolveRef 与它同源：本地有原文时两者结果一致', () => {
+    const ref: SourceRef = { source_id: 's1', start: 6, end: 16, quote: '行向量组的极大' };
+    const viaSource = resolveRef(ref, [source('s1', TEXT2)], usage);
+    const viaText = resolveRefWithText(ref, TEXT2, null, usage);
+    expect(viaText.hit).toBe(viaSource.hit);
+    expect(viaText.excerpt).toBe(viaSource.excerpt);
   });
 });

@@ -974,6 +974,7 @@ onBeforeUnmount(() => {
           @toggle-fold="toggleFold(nodeProps.id)"
           @collapse="collapseFold(nodeProps.id)"
           @expand-branch="expandBranch(nodeProps.id)"
+          @open-refs="store.openRefs(nodeProps.id)"
           @cancel="store.endEdit()"
         />
       </template>

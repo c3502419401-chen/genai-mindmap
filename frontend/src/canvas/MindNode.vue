@@ -54,6 +54,14 @@ const emit = defineEmits<{
    * 自己被点了一下）。
    */
   expandBranch: [];
+  /**
+   * 点了右上角那枚引用角标：请外面把这个节点的引用清单摆出来。
+   *
+   * 与 `expandBranch` 一样是"角标被点了"，但两者回答的不是同一个问题：
+   * 那个角标说"这一支还有 21 个节点"，这个说"这个节点有 3 处来源引用"。
+   * 合成一个事件的话，画布必须再猜一次被点的是哪一枚。
+   */
+  openRefs: [];
 }>();
 
 const POSITIONS: Record<ChildSide, Position> = {
@@ -538,15 +546,27 @@ onBeforeUnmount(() => {
 
     <!--
       引用角标：只给"有引用"的节点画，没引用的节点保持干净。
-      用 pointer-events-none 让它不挡节点点击（角标压在节点边缘上）。
+
+      **可点**（原来是 `pointer-events-none` 的纯装饰）。它是"这个节点有依据"唯一
+      的视觉锚点——一枚写着 3 的圆标就长在节点边上，用户会去点它。点了什么都不
+      发生，那枚数字就只是一块贴纸；这里把它接成"把这个节点的引用清单摆出来"
+      （事件走 store 的 `openRefs`，由 `App` 打开右抽屉）。
+
+      `nodrag` + `@mousedown.stop` 两处都要：Vue Flow 的节点容器监听的是 mousedown，
+      只在 click 上 `.stop` 挡不住拖拽——按住角标拖一下会把整个节点拖走。
     -->
-    <div
+    <button
       v-if="(data.refs ?? 0) > 0"
-      class="pointer-events-none absolute -right-1.5 -top-1.5 flex h-5 min-w-5 items-center justify-center rounded-full border border-slate-300 bg-white px-1 text-[10px] font-medium leading-none text-slate-600 shadow-sm"
-      :title="`${data.refs ?? 0} 处来源引用`"
+      type="button"
+      data-test="node-refs"
+      class="nodrag absolute -right-1.5 -top-1.5 flex h-5 min-w-5 items-center justify-center rounded-full border border-slate-300 bg-white px-1 text-[10px] font-medium leading-none text-slate-600 shadow-sm hover:border-slate-900 hover:bg-slate-900 hover:text-white"
+      :title="`${data.refs ?? 0} 处来源引用（点击查看）`"
+      :aria-label="`查看这 ${data.refs ?? 0} 处来源引用`"
+      @mousedown.stop
+      @click.stop="emit('openRefs')"
     >
       {{ data.refs ?? 0 }}
-    </div>
+    </button>
 
     <!--
       视图层收起：这一处的两个方向——「+N 还有没显示的」与「− 叠回去」。

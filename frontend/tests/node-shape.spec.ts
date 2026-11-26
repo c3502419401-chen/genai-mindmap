@@ -457,7 +457,7 @@ describe('MindNode：五种形状的 DOM', () => {
     const cell = wrapper.find('[data-node-shape="diamond"]');
     expect(cell.find('input').exists()).toBe(true);
     // 引用角标挂在**外层**容器上（`relative`），所以在菱形之外、不会被裁。
-    expect(wrapper.find('[title="2 处来源引用"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="node-refs"]').exists()).toBe(true);
   });
 
   it('平行四边形：三层同形背景 + 自己的外接框 + 文字仍是框的直接子元素', () => {

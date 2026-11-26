@@ -62,15 +62,25 @@ def list_library(limit: int = Query(shelf.DEFAULT_LIMIT, ge=1, le=200)):
         503: {"description": "知识库暂时读不出来（`code=library_unavailable`）"},
     },
 )
-def read_library_source(source_id: str):
-    """单份材料的正文预览（前 4000 字，`truncated` 说明是否截断）。"""
+def read_library_source(
+    source_id: str,
+    limit: int = Query(shelf.PREVIEW_CHARS, ge=1, le=shelf.MAX_READ_CHARS),
+):
+    """单份材料的正文，默认前 4000 字（`truncated` 说明是否截断）。
+
+    `limit` 给"点引用跳原文"用：`SourceRef.start/end` 是全文码点偏移，界面要
+    定位到第 N 字就必须能拿到那之前的正文。传 `total_chars`（列表里就有）即可
+    拿到整份；上限 `MAX_READ_CHARS` 由 schema 的 `le` 直接挡成 422，而不是在
+    服务层悄悄夹一下——一个越界的 `limit` 是调用方的错，静默纠正会让它以为
+    自己拿到的是全文。
+    """
     # 这里用 AppError 而不是 HTTPException：后者会被全局处理器兜成"请求处理失败
     # （HTTP 404）"，前端读顶层 message，用户看到的就是那句没信息量的话。
     #
     # 404 与 503 必须分开：前者是"这份材料没了，重试也没用"，后者是"库暂时读不
     # 出来，稍后再看"。把库故障说成 404，用户会以为材料被删了。
     try:
-        return shelf.read_entry(source_id)
+        return shelf.read_entry(source_id, limit=limit)
     except shelf.SourceNotFound as error:
         raise AppError("not_found", "这份来源不在知识库里", status=404) from error
     except shelf.LibraryUnavailable as error:

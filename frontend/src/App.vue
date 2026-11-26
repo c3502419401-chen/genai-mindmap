@@ -9,6 +9,7 @@ import HistoryDrawer from './components/HistoryDrawer.vue';
 import MessageFab from './components/MessageFab.vue';
 import NodeToolbar from './components/NodeToolbar.vue';
 import SettingsPanel from './components/SettingsPanel.vue';
+import SourceContextDrawer from './components/SourceContextDrawer.vue';
 import StructureCheck from './components/StructureCheck.vue';
 import { SOURCE_LABELS } from './sources/input';
 import { ApiError, exportFilename, exportLabel, exportMindMap, getHealth, listLibrary, readLibrarySource, type ExportFormat } from './api/client';
@@ -41,6 +42,28 @@ const selectedRefs = computed(() =>
 
 /** 正在右侧抽屉里查看的引用；null 表示抽屉关着。 */
 const activeRef = ref<ResolvedRef | null>(null);
+
+/**
+ * 全图引用覆盖率的一句话说明，只在"这个节点没有引用"时出现。
+ *
+ * 三档写法，各自对应一个真实形态：
+ *   - 一个都没有 → 说清"这次生成没有可回查的材料"，而不是让用户去点空白；
+ *   - 有部分 → 给出比例，让"没引用的节点"变成这张图的常态而不是一处异常；
+ *   - 全都有 → 这一档不会进来（节点没有任何引用才算覆盖率说明），
+ *     所以不写第 3 句。
+ *
+ * 最后那句"或者是你自己加的"是**诚实的边界**：`MindNode` 没有"手动/生成"标记，
+ * 分不出这两种，所以不假装能分。
+ */
+const citationSummary = computed(() => {
+  const { total, cited } = store.refCoverageStat;
+  if (!total) return '';
+  if (!cited) {
+    return '这张图的节点都没有原文引用——生成时没有可回查的材料，或者这张图是手工画的。';
+  }
+  const percent = Math.round((cited / total) * 100);
+  return `这张图 ${total} 个节点里有 ${cited} 个带原文引用（${percent}%）。没有引用的节点不代表内容有错：生成时模型没在材料里找到对应句子，或者这个节点是你自己加的。`;
+});
 
 const copied = ref('');
 
@@ -875,6 +898,19 @@ watch(() => prefs.error, message => {
   if (message) flash('error', message);
 });
 
+/**
+ * 点了节点上的引用角标：把右抽屉打开，露出这个节点的引用清单。
+ *
+ * 抽屉原本只在"点了抽屉开关"或"选中节点时已经在开着"的情况下可见。角标是
+ * 主动动作（"我要看这个节点的依据"），把它接成"点开一个本来就藏着的东西"
+ * 会让用户以为没反应——所以这一次必须自己把面板打开。
+ *
+ * 用计数器而不是监听选中：点画布上的节点只该换详情，不该把抽屉硬推出来。
+ */
+watch(() => store.refsTick, () => {
+  sideOpen.value = true;
+});
+
 // ---- 新外壳的三件事：历史 / 新对话 / 消息流 ----------------------------------
 
 /** 当前图的来历（原来顶栏那枚徽章，现在在抽屉的状态区里）。 */
@@ -1392,9 +1428,28 @@ const agentHasDetail = computed(() => agentDetailVisible(store));
               </li>
             </ul>
           </section>
-          <p v-else class="border-t border-slate-200 pt-3 text-xs text-slate-400">
-            这个节点没有来源引用。
-          </p>
+          <!--
+            **没有引用的节点：不许写成一次失败。**
+
+            一次生成里总有节点拿不到引文（实测薄批 78–80%、厚批 86% 的覆盖率）。
+            只写一句"这个节点没有来源引用"，用户看到的是一枚**洞**：是不是引用功能
+            坏了、是不是这条点不开、是不是漏生成了一步。而这恰恰不是数据层能回答的
+            问题——`MindNode` 契约里没有"这个节点是手动的还是生成的"，只有
+            `label` / `detail` / `source_refs`，所以界面无法断言原因。
+
+            能做的是**把口径摆出来**：告诉用户这张图本来就有多少节点没有引文。
+            这样"这个节点没依据"读起来才是一张图的属性，而不是一个坏掉的功能。
+          -->
+          <section
+            v-else
+            class="flex flex-col gap-1 border-t border-slate-200 pt-3"
+            data-test="ref-empty"
+          >
+            <p class="text-xs text-slate-500">这个节点没有原文引用。</p>
+            <p v-if="citationSummary" class="text-xs leading-relaxed text-slate-400">
+              {{ citationSummary }}
+            </p>
+          </section>
 
           <!--
             附加关系（流程图的条件分支 / 汇合 / 回退）。
@@ -1663,44 +1718,15 @@ const agentHasDetail = computed(() => agentDetailVisible(store));
     </div>
 
     <!--
-      原文抽屉：从右侧滑出，不挤掉详情面板。只有本次会话解析过的来源才有原文，
-      从已保存导图打开时只能看摘录——这一点在底部明确写出来，别让用户以为功能坏了。
+      引用原文抽屉：点引用 → 看那句 → 看上下文（定位到 `start/end` 并高亮）。
+      组件自己决定正文从哪来（本次会话解析过的 `Source.text` 优先，否则按
+      `source_id` 从知识库取整份），所以这里只负责"打开哪一条"与"关掉"。
     -->
-    <aside
+    <SourceContextDrawer
       v-if="activeRef"
-      class="fixed inset-y-0 right-0 z-40 flex w-[480px] max-w-full flex-col border-l border-slate-200 bg-white shadow-2xl"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="ref-title"
-    >
-      <header class="flex items-start justify-between gap-3 border-b border-slate-200 p-4">
-        <div class="min-w-0">
-          <h2 id="ref-title" class="truncate text-sm font-semibold">{{ activeRef.name }}</h2>
-          <p class="mt-0.5 text-xs text-slate-500">{{ activeRef.where || '未标注位置' }}</p>
-        </div>
-        <button
-          type="button"
-          class="shrink-0 text-xs text-slate-500 hover:text-slate-900"
-          @click="activeRef = null"
-        >
-          关闭
-        </button>
-      </header>
-      <div class="flex-1 overflow-y-auto p-4">
-        <p v-if="activeRef.excerpt" class="whitespace-pre-wrap break-words text-sm leading-relaxed text-slate-700">
-          {{ activeRef.before }}<mark class="rounded bg-amber-200 px-0.5 text-slate-900">{{ activeRef.hit }}</mark>{{ activeRef.after }}
-        </p>
-        <p v-else-if="activeRef.quote" class="whitespace-pre-wrap break-words text-sm leading-relaxed text-slate-700">
-          {{ activeRef.quote }}
-        </p>
-        <p v-else class="text-sm text-slate-400">这条引用没有摘录，也没有可回查的原文。</p>
-
-        <p v-if="!activeRef.source" class="mt-4 rounded-md bg-slate-50 p-3 text-xs leading-relaxed text-slate-500">
-          原文没有随导图保存，这里只能看到生成时记下的摘录。
-          {{ activeRef.start != null ? '打开这张图时重新解析同一份来源，才能回到原文。' : '' }}
-        </p>
-      </div>
-    </aside>
+      :item="activeRef"
+      @close="activeRef = null"
+    />
 
     <!-- 遮罩：点空白处也算关闭。抽屉本身 z-40，盖在它上面 -->
     <div

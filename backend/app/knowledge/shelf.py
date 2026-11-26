@@ -38,6 +38,14 @@ DEFAULT_LIMIT = 50
 # 不提供全文阅读——真要看全文，用户手里有原文件。
 PREVIEW_CHARS = 4000
 
+# 单次响应最多返回多少字正文（按码点）。
+#
+# 存在的理由是"点引用跳原文"：`SourceRef.start/end` 是**全文码点偏移**，要让界面
+# 定位到第 20000 字处，就必须能拿到那之前的正文。一份 2 万字的中文 PDF 转成 JSON
+# 约 60KB，20 万字约 600KB——本机回环下都是毫秒级，而这个上限挡住的是"把一份
+# 几十万字的音频转写整份塞进一次响应"。
+MAX_READ_CHARS = 200_000
+
 
 class LibraryEntry(BaseModel):
     """列表里的一份材料。**不含正文**，与 `library.list_sources` 同口径。"""
@@ -199,11 +207,18 @@ def list_entries(*, limit: int = DEFAULT_LIMIT) -> LibraryList:
     )
 
 
-def read_entry(source_id: str) -> LibrarySource:
-    """单份来源的正文预览。不存在抛 `SourceNotFound`，库读不出来抛 `LibraryUnavailable`。
+def read_entry(source_id: str, *, limit: int = PREVIEW_CHARS) -> LibrarySource:
+    """单份来源的正文。不存在抛 `SourceNotFound`，库读不出来抛 `LibraryUnavailable`。
 
-    `truncated` / `total_chars` 两个字段是给界面的：只截了前 4000 字就必须说清，
+    `truncated` / `total_chars` 两个字段是给界面的：只截了前若干字就必须说清，
     否则用户会拿预览当全文，回头在导图里引用一句"材料里其实没有"的话。
+
+    `limit` 是**单次返回多少字**，默认仍是预览口径。界面点"看上下文"时要按
+    `SourceRef.start/end` 定位到原文的某一处，而那个坐标是**全文码点偏移**——
+    只给前 4000 字的话，引用落在第 20000 字处就什么也看不见。调用方传全文长度
+    即可拿到整份正文；`MAX_READ_CHARS` 是这一次传输的上限，超过它仍然只给前
+    这么多，并由 `truncated` 如实标记（界面据此说"后面的没载入"，而不是假装
+    引用不存在）。
     """
     try:
         source = knowledge_library.load(source_id)
@@ -215,20 +230,24 @@ def read_entry(source_id: str) -> LibrarySource:
         raise SourceNotFound(source_id)
 
     text = source.text or ""
+    # 夹一次而不是信任调用方：`limit` 直接来自 query string，负数会让切片从尾部
+    # 取（`text[:-5]` 是一个**合法**但完全错误的结果），超大则把响应撑成几 MB。
+    size = max(1, min(limit, MAX_READ_CHARS))
     # 不带 created_at / last_used_at：界面是从列表点进来的，那两个字段已经在
     # 手上；这里再查一次库只为它们，等于每次点开都多一次 SELECT。
     return LibrarySource(
         source_id=source.id,
         filename=source.filename,
         kind=source.kind,
-        text=text[:PREVIEW_CHARS],
-        truncated=len(text) > PREVIEW_CHARS,
+        text=text[:size],
+        truncated=len(text) > size,
         total_chars=len(text),
     )
 
 
 __all__ = [
     "DEFAULT_LIMIT",
+    "MAX_READ_CHARS",
     "PREVIEW_CHARS",
     "LibraryEntry",
     "LibraryList",

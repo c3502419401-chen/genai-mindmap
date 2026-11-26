@@ -1,4 +1,4 @@
-﻿import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
+import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
 import { createPinia } from 'pinia';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -324,17 +324,26 @@ describe('节点引用', () => {
     expect(wrapper.text()).toContain('矩阵的秩');
   });
 
-  it('没有引用的节点明确说明没有，而不是留一片空白', async () => {
+  it('没有引用的节点明确说明没有，并给出全图覆盖率（不是一个坏掉的功能）', async () => {
     const wrapper = mountApp();
     const store = useMindMapStore();
     store.preview(withRefs([]), 'right');
     store.select('r');
     await wrapper.vm.$nextTick();
 
-    expect(wrapper.text()).toContain('这个节点没有来源引用');
+    const empty = wrapper.get('[data-test="ref-empty"]');
+    expect(empty.text()).toContain('这个节点没有原文引用');
+    // 全图 0 个节点有引用 → 说清是"没有可回查的材料"，而不是让用户去点空白
+    expect(empty.text()).toContain('都没有原文引用');
   });
 
-  it('点引用打开右侧抽屉；手边没有原文时说明只能看摘录', async () => {
+  it('点引用打开右侧抽屉；来源不在知识库里时说明只能看摘录', async () => {
+    // 抽屉会按 `source_id` 去知识库取原文——这份临时来源（`s1`）不在库里，后端 404。
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: false,
+      status: 404,
+      json: async () => ({ code: 'not_found', message: '这份来源不在知识库里' }),
+    })));
     const wrapper = mountApp();
     const store = useMindMapStore();
     store.preview(withRefs([{ source_id: 's1', page: 2, quote: '矩阵的秩' }]), 'right');
@@ -342,10 +351,12 @@ describe('节点引用', () => {
     await wrapper.vm.$nextTick();
 
     await buttonByText(wrapper, '矩阵的秩').trigger('click');
-    const drawer = wrapper.find('[aria-labelledby="ref-title"]');
+    await flushPromises();
+    const drawer = wrapper.find('[data-test="ref-drawer"]');
     expect(drawer.exists()).toBe(true);
+    // 摘录始终看得见：取不到原文不该连这句话一起消失。
     expect(drawer.text()).toContain('矩阵的秩');
-    expect(drawer.text()).toContain('原文没有随导图保存');
+    expect(drawer.find('[data-test="ref-note"]').text()).toContain('原文没能读取');
   });
 
   it('本次会话解析过的来源能在抽屉里高亮命中句', async () => {
@@ -360,9 +371,15 @@ describe('节点引用', () => {
     await wrapper.vm.$nextTick();
 
     await buttonByText(wrapper, '矩阵的秩等于').trigger('click');
-    const drawer = wrapper.find('[aria-labelledby="ref-title"]');
+    const drawer = wrapper.find('[data-test="ref-drawer"]');
+    // ① 先看到那句引用本身（不点上下文也有）。
+    expect(drawer.text()).toContain('矩阵的秩等于');
+
+    // ② 点「看上下文」才展开高亮——分两步是为了"先确认是不是这句"。
+    await drawer.get('[data-test="ref-context-toggle"]').trigger('click');
+    await flushPromises();
     expect(drawer.find('mark').text()).toBe('矩阵的秩等于');
-    expect(drawer.text()).not.toContain('原文没有随导图保存');
+    expect(drawer.find('[data-test="ref-note"]').exists()).toBe(false);
   });
 });
 

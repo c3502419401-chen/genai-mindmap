@@ -24,7 +24,7 @@ import { CONNECTION_LOST, guideForFailure, INVALID_SOURCES, NO_CONTENT, type Fai
 import { evictCount } from '../mindmap/history-limit';
 import { moveScopeProblem } from '../mindmap/move-scope';
 import { applyOps } from '../mindmap/ops';
-import { buildRefIndex } from '../mindmap/refs';
+import { buildRefIndex, refCoverage } from '../mindmap/refs';
 import { diagnosticCount, diagnosticsHint } from '../mindmap/run-status';
 import {
   canvasEdgesOf,
@@ -2504,6 +2504,14 @@ export const useMindMapStore = defineStore('mindmap', () => {
   const refIndex = computed(() => buildRefIndex(content.value ? rootsOf(content.value) : null));
 
   /**
+   * 全图的引用覆盖率（多少节点有依据）。
+   *
+   * 与 `refIndex` 同一次遍历口径：只从 `content` 算，不含预览节点。详情面板在
+   * "这个节点没有引用"时把它摆出来——见 `refCoverage` 的说明。
+   */
+  const refCoverageStat = computed(() => refCoverage(content.value ? rootsOf(content.value) : null));
+
+  /**
    * **这次生成改了什么**：生成落地那一刻算好的一份静态快照；没有基线时为 `null`。
    *
    * 为什么是 `ref` 而不是 `computed`：`computed` 要两份实时值（基线树 + 当前树），
@@ -2567,6 +2575,16 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 视图会把人刚拖到的位置又拽回中心。只有从引用列表主动跳转时才加一。
    */
   const focusTick = ref(0);
+
+  /**
+   * "把这个节点的引用清单摆出来"的触发计数（点节点右上角的引用角标）。
+   *
+   * 与 `focusTick` 分开两个计数器，因为它们是**两件事**：跳转要动视图，
+   * 摆清单要开面板。`App.vue` 监听这个值来把右抽屉打开，而画布只监听
+   * `focusTick`——合成一个的话，点角标也会触发一次"居中"，把用户刚摆好的视野
+   * 拽走。
+   */
+  const refsTick = ref(0);
 
   /** 从容器根到当前节点的路径，详情面板用来标明"这句话出自哪一支"。 */
   const breadcrumb = computed<MindNode[]>(() => {
@@ -3851,6 +3869,24 @@ export const useMindMapStore = defineStore('mindmap', () => {
   }
 
   /**
+   * 点了节点右上角那枚引用角标：**选中 + 把详情面板叫出来**。
+   *
+   * 角标原来只是装饰（`pointer-events-none`，`title` 里写一句"N 处来源引用"），
+   * 而它恰恰是"这个节点有依据"唯一的视觉锚点——用户会去点它，而那里什么都没发生。
+   *
+   * 不在这里直接打开抽屉：抽屉在 `App.vue`，而详情面板才是"这个节点有哪几条引用"
+   * 那一层（①）。点角标要的是那个列表，不是某一条引用。
+   *
+   * `refsTick` 与 `focusTick` 分开：那个是"把节点挪到视野中心"，这个是"把面板叫
+   * 出来"。合成一个信号的话，App 只能靠"谁在监听"来猜，而两件事都要发生。
+   */
+  function openRefs(id: string) {
+    locate(id);
+    if (selectedId.value !== id) return;
+    refsTick.value += 1;
+  }
+
+  /**
    * 画布上点了一个折叠点的「+N」：把它没画出来的子节点放出来。
    *
    * 只动视图（`viewExpandedNodes`），不动 `content`——所以它不进撤销栈、不置脏。
@@ -4978,6 +5014,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     selectedNode,
     selectedRefs,
     refIndex,
+    refCoverageStat,
     // 这次生成改了什么：落地瞬间冻结的一份静态快照（`create` 意图无基线时为 null）
     generatedChanges,
     // 这次落地的规模与改动条数：面板用它说"已落到画布（42 个节点，改了 6 处）"
@@ -4991,6 +5028,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     canUndoGenerate,
     changedNodeIds,
     focusTick,
+    refsTick,
     breadcrumb,
     canUndo,
     canRedo,
@@ -5009,6 +5047,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     loadPreset,
     select,
     locate,
+    openRefs,
     setDirection,
     beginEdit,
     endEdit,
