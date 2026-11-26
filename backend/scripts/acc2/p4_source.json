@@ -1,0 +1,28 @@
+{
+ "source": {
+  "id": "944ef72c-8e74-4690-a034-98c99c6d7c50",
+  "kind": "text",
+  "filename": null,
+  "text": "城市内涝治理方案\n\n- 一、源头减排\n  - 海绵型小区改造\n    - 透水铺装面积占比 35%\n\n- 二、管网提升\n  - 主干管扩容至 DN1200\n    - 雨污分流率从 62% 提到 90%\n\n- 三、调蓄与预警\n  - 地下调蓄池 2.4 万立方米\n    - 内涝预警提前 45 分钟",
+  "span": null,
+  "status": "parsed",
+  "error": null,
+  "parsed_pages": null,
+  "truncated": false,
+  "failed_pages": [],
+  "duration_seconds": null,
+  "sentences": [],
+  "metadata": {
+   "author": null,
+   "created_at": null,
+   "modified_at": null,
+   "category": null,
+   "tags": [],
+   "url": null,
+   "raw_chars": null,
+   "authority": null,
+   "rerank_score": null
+  },
+  "content_hash": null
+ }
+}

@@ -1,0 +1,40 @@
+{
+ "label": "p14_fragment",
+ "nodes": 85,
+ "branches": 25,
+ "max_depth": 4,
+ "first_level": [
+  "压测与定位方法",
+  "连接池与线程池调优",
+  "线上故障排查实录",
+  "慢查询与接口优化"
+ ],
+ "semantic_hits": {
+  "问题描述": {
+   "branch_labels": [
+    "线上故障排查实录"
+   ],
+   "any_label_count": 2
+  },
+  "解决方案": {
+   "branch_labels": [
+    "方案选型为何选MySQL加Red"
+   ],
+   "any_label_count": 1
+  },
+  "待验证假设": {
+   "branch_labels": [
+    "慢SQL与连接池假设",
+    "网络抖动假设"
+   ],
+   "any_label_count": 2
+  }
+ },
+ "top_branch_labels": [
+  "接口变慢排查与优化实录",
+  "压测与定位方法",
+  "连接池与线程池调优",
+  "线上故障排查实录",
+  "慢查询与接口优化"
+ ]
+}

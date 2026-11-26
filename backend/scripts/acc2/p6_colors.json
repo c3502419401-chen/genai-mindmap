@@ -1,0 +1,344 @@
+{
+ "total": 31,
+ "bones": [
+  {
+   "text": "为什么员工报销从提交到入账要拖这么久−",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": false
+  },
+  {
+   "text": "👤人−",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [
+    "blue"
+   ],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": true
+  },
+  {
+   "text": "报销操作能力参差不齐1",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [
+    "blue"
+   ],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": false
+  },
+  {
+   "text": "审批人出差休假流程停摆2",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [
+    "blue"
+   ],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": false
+  },
+  {
+   "text": "员工与财务对标准理解不一2",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [
+    "blue"
+   ],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": false
+  },
+  {
+   "text": "中层外出无固定代岗机制1",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [
+    "blue"
+   ],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": false
+  },
+  {
+   "text": "⚙️机−",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [
+    "teal"
+   ],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": true
+  },
+  {
+   "text": "报销系统与业务系统数据不通1",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [
+    "teal"
+   ],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": false
+  },
+  {
+   "text": "未上线专业人事与财务报销系统1",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [
+    "teal"
+   ],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": false
+  },
+  {
+   "text": "审核自动化程度低靠人工核验2",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [
+    "teal"
+   ],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": false
+  },
+  {
+   "text": "系统安全保障机制不完善1",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [
+    "teal"
+   ],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": false
+  },
+  {
+   "text": "📦料−",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [
+    "amber"
+   ],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": true
+  },
+  {
+   "text": "各部门表单重复填报同一信息1",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [
+    "amber"
+   ],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": false
+  },
+  {
+   "text": "票据不全凭证丢失被打回1",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [
+    "amber"
+   ],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": false
+  },
+  {
+   "text": "报销制度与材料清单不清晰2",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [
+    "amber"
+   ],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": false
+  },
+  {
+   "text": "纸质单据线下传递易滞留1",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [
+    "amber"
+   ],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": false
+  },
+  {
+   "text": "📐法−",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [
+    "purple"
+   ],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": true
+  },
+  {
+   "text": "审批链条过长多头审批1",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [
+    "purple"
+   ],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": false
+  },
+  {
+   "text": "流程节点设置不合理1",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [
+    "purple"
+   ],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": false
+  },
+  {
+   "text": "部门串行处理互相等待1",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [
+    "purple"
+   ],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": false
+  },
+  {
+   "text": "流程混乱先借款还是先报销不清1",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [
+    "purple"
+   ],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": false
+  },
+  {
+   "text": "🌐环−",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [
+    "green"
+   ],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": true
+  },
+  {
+   "text": "部门壁垒各自独立审批标准1",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [
+    "green"
+   ],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": false
+  },
+  {
+   "text": "报销被当成财务一家的事1",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [
+    "green"
+   ],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": false
+  },
+  {
+   "text": "财务月末集中批量支付1",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [
+    "green"
+   ],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": false
+  },
+  {
+   "text": "政策额度预算事后才告知变化1",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [
+    "green"
+   ],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": false
+  },
+  {
+   "text": "📏测−",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [
+    "red"
+   ],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": true
+  },
+  {
+   "text": "缺少超时提醒与异常自动流转2",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [
+    "red"
+   ],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": false
+  },
+  {
+   "text": "无平均周期与超时率等指标1",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [
+    "red"
+   ],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": false
+  },
+  {
+   "text": "提交阶段无合规校验与预算控制1",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [
+    "red"
+   ],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": false
+  },
+  {
+   "text": "人员外出动态监管存在盲区1",
+   "expected_color": null,
+   "expected_icon": null,
+   "data_colors": [
+    "red"
+   ],
+   "bg": "rgba(0, 0, 0, 0)",
+   "border": "oklch(0.208 0.042 265.755)",
+   "has_emoji": false
+  }
+ ]
+}

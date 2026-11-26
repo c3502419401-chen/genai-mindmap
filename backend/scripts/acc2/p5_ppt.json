@@ -1,0 +1,699 @@
+{
+ "label": "p5_ppt",
+ "http_status": 200,
+ "goal": "根据这份产品评审 PPT 整理成思维导图",
+ "intent": "create",
+ "diagram_type": null,
+ "sources": 1,
+ "seconds": 36.11,
+ "frames": 51,
+ "seq_last": 51,
+ "frame_kinds": {
+  "sources": 1,
+  "stage": 5,
+  "tool_start": 1,
+  "node_grow": 39,
+  "heartbeat": 2,
+  "tool_end": 1,
+  "snapshot": 1,
+  "done": 1
+ },
+ "first_frames": [
+  {
+   "t": 0.08,
+   "type": "sources",
+   "keys": [
+    "mapping",
+    "seq",
+    "type"
+   ]
+  },
+  {
+   "t": 1.22,
+   "type": "stage",
+   "keys": [
+    "detail",
+    "seq",
+    "stage",
+    "type"
+   ]
+  },
+  {
+   "t": 2.83,
+   "type": "tool_start",
+   "keys": [
+    "args_summary",
+    "call_id",
+    "name",
+    "seq",
+    "type"
+   ]
+  },
+  {
+   "t": 5.09,
+   "type": "stage",
+   "keys": [
+    "detail",
+    "seq",
+    "stage",
+    "type"
+   ]
+  },
+  {
+   "t": 7.32,
+   "type": "node_grow",
+   "keys": [
+    "expandable",
+    "label",
+    "path",
+    "seq",
+    "type"
+   ]
+  },
+  {
+   "t": 7.32,
+   "type": "node_grow",
+   "keys": [
+    "expandable",
+    "label",
+    "path",
+    "seq",
+    "type"
+   ]
+  }
+ ],
+ "content": {
+  "schema_version": 2,
+  "title": "产品评审 PPT",
+  "theme": {
+   "preset": "default",
+   "font": "system",
+   "direction": "right"
+  },
+  "relations": [],
+  "source_usage": [
+   {
+    "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+    "kind": "document",
+    "filename": "acceptance_sample.pptx",
+    "char_count": 521
+   }
+  ],
+  "root": {
+   "id": "root",
+   "label": "产品评审 PPT",
+   "children": [
+    {
+     "id": "s1-1",
+     "label": "智能家居产品设计评审 / 评审时间与主题",
+     "children": [
+      {
+       "id": "s1-1-1",
+       "label": "2026年11月评审",
+       "children": [],
+       "detail": "评审安排在 2026 年 11 月，作为整份材料的版本时间基准，后续市场数据与设计方案的讨论都以这一时点为准。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+         "start": 14,
+         "end": 37,
+         "quote": "2026 年 11 月 · 产品与硬件联合评审"
+        }
+       ]
+      },
+      {
+       "id": "s1-1-2",
+       "label": "产品与硬件联合评审",
+       "children": [],
+       "detail": "评审由产品团队与硬件团队联合进行，意味着设计方案的可行性、结构堆叠、成本与量产条件需要与产品定义同步接受质询，而不只是外观与交互层面的评审。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+         "start": 14,
+         "end": 37,
+         "quote": "2026 年 11 月 · 产品与硬件联合评审"
+        }
+       ]
+      }
+     ],
+     "detail": "本页是整份 PPT 的封面与开篇，点明评审对象为智能家居产品设计，并交代评审发生的时间与参与方，让读者一开始就知道这是什么会、什么时候开、谁参与。\n\n封面信息层，把评审的两个基本要素并置：时间定在 2026 年 11 月，性质为产品与硬件联合评审，说明这次评审不是单一部门内部过稿，而是产品与硬件两条线共同参与。",
+     "expandable": "yes",
+     "collapsed": false,
+     "color": "blue",
+     "icon": "🏠",
+     "source_refs": [
+      {
+       "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+       "start": 14,
+       "end": 37,
+       "quote": "2026 年 11 月 · 产品与硬件联合评审"
+      }
+     ]
+    },
+    {
+     "id": "s2",
+     "label": "市场分析",
+     "children": [
+      {
+       "id": "s2-1",
+       "label": "目标人群定位",
+       "children": [
+        {
+         "id": "s2-1-1",
+         "label": "一线城市有孩家庭",
+         "children": [],
+         "detail": "一线城市家庭居住空间相对紧凑、对智能设备的接受度和付费意愿较高，是有孩家庭中智能家居方案的核心消费群体，也是线下体验渠道覆盖较好的区域。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+           "start": 49,
+           "end": 70,
+           "quote": "目标人群：一线城市 25-40 岁有孩家庭"
+          }
+         ]
+        },
+        {
+         "id": "s2-1-2",
+         "label": "年龄 25-40 岁",
+         "children": [],
+         "detail": "25-40 岁覆盖了组建家庭到孩子学龄前后的阶段，这一年龄段既有稳定收入支撑整套方案支出，也是对新产品形态接受度较高的主力人群。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+           "start": 49,
+           "end": 70,
+           "quote": "目标人群：一线城市 25-40 岁有孩家庭"
+          }
+         ]
+        }
+       ],
+       "detail": "目标人群定位回答“卖给谁”。结论是把人群收窄到一线城市、25-40 岁、有孩家庭三个条件同时满足的群体，三个条件分别对应购买力、家庭生命周期与真实使用场景，收窄后便于后续功能取舍与价格设定。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+         "start": 49,
+         "end": 70,
+         "quote": "目标人群：一线城市 25-40 岁有孩家庭"
+        }
+       ]
+      },
+      {
+       "id": "s2-2",
+       "label": "竞品格局",
+       "children": [
+        {
+         "id": "s2-2-1",
+         "label": "小米华为涂鸦占中低端",
+         "children": [],
+         "detail": "小米、华为、涂鸦三系品牌在中低端市场形成合围：小米以生态与性价比见长，华为以连接与品牌背书见长，涂鸦以方案商与白牌生态见长。三者覆盖了主流价位，正面进入中低端将面临激烈价格竞争。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+           "start": 73,
+           "end": 98,
+           "quote": "竞品格局：小米、华为、涂鸦三系占据中低端，高端缺位"
+          }
+         ]
+        },
+        {
+         "id": "s2-2-2",
+         "label": "高端市场存在缺位",
+         "children": [],
+         "detail": "高端市场目前没有强势玩家，是本次产品设计的机会窗口。高端缺位意味着可以通过设计品质、系统体验与服务能力建立差异化，而不必与三系品牌在中低端正面拼价。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+           "start": 73,
+           "end": 98,
+           "quote": "竞品格局：小米、华为、涂鸦三系占据中低端，高端缺位"
+          }
+         ]
+        }
+       ],
+       "detail": "竞品格局说明当前市场的竞争位置：中低端已被三系品牌占据，高端存在空白。这一判断直接指向产品的定位选择——不在中低端打价格战，而是向高端缺位处寻找机会。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+         "start": 73,
+         "end": 98,
+         "quote": "竞品格局：小米、华为、涂鸦三系占据中低端，高端缺位"
+        }
+       ]
+      },
+      {
+       "id": "s2-3",
+       "label": "价格带与敏感度",
+       "children": [
+        {
+         "id": "s2-3-1",
+         "label": "整套方案 8000-20000",
+         "children": [],
+         "detail": "整套方案的价格区间为 8000-20000 元，覆盖从入门整套到较高配置的跨度，产品线可据此划分档位，用不同配置组合对应区间内的不同位置。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+           "start": 101,
+           "end": 138,
+           "quote": "价格带：整套方案 8000-20000 元，用户对 15000 元以上敏感"
+          }
+         ]
+        },
+        {
+         "id": "s2-3-2",
+         "label": "15000 元以上用户敏感",
+         "children": [],
+         "detail": "用户对 15000 元以上的价格敏感，说明区间上沿的实际接受度有限。定价越过这一线需要更强的价值理由，或在配置上做出可感知的差异化，否则容易流失。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+           "start": 101,
+           "end": 138,
+           "quote": "价格带：整套方案 8000-20000 元，用户对 15000 元以上敏感"
+          }
+         ]
+        }
+       ],
+       "detail": "价格带与敏感度界定产品的定价空间：整套方案的主流区间是 8000-20000 元，但用户对 15000 元以上明显敏感，因此定价与配置组合需要在这一区间内做分层设计。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+         "start": 101,
+         "end": 138,
+         "quote": "价格带：整套方案 8000-20000 元，用户对 15000 元以上敏感"
+        }
+       ]
+      },
+      {
+       "id": "s2-4-1",
+       "label": "增长点 / 适老化改造需求年增 25%",
+       "children": [],
+       "detail": "增长点指出市场的增量来源，本次判断集中在适老化改造方向，其需求年增 25%，是五条市场结论中唯一给出明确增速数据的方向。\n\n适老化改造需求年增 25%，是当前市场中的结构性增量。这一方向与有孩家庭人群并不冲突，可在同一套系统能力上做适老化适配，作为产品线延伸与增量市场的切入口。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+         "start": 141,
+         "end": 158,
+         "quote": "增长点：适老化改造需求年增 25%"
+        }
+       ]
+      },
+      {
+       "id": "s2-5",
+       "label": "渠道效率",
+       "children": [
+        {
+         "id": "s2-5-1",
+         "label": "线下体验店转化率更高",
+         "children": [],
+         "detail": "线下体验店能够实际演示联动场景与安装效果，用户可现场感受，因此转化率高于线上。对整套方案这类需要体验才能理解价值的产品，线下是更有效的成交场景。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+           "start": 161,
+           "end": 182,
+           "quote": "渠道：线下体验店转化率是线上的 3.2 倍"
+          }
+         ]
+        },
+        {
+         "id": "s2-5-2",
+         "label": "线下为线上的 3.2 倍",
+         "children": [],
+         "detail": "线下体验店转化率是线上的 3.2 倍，这一倍数关系量化了渠道效率差距，支持把体验店作为重点渠道投入，线上更多承担认知与引流作用。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+           "start": 161,
+           "end": 182,
+           "quote": "渠道：线下体验店转化率是线上的 3.2 倍"
+          }
+         ]
+        }
+       ],
+       "detail": "渠道效率比较线上与线下的转化能力，结论是线下体验店转化率明显更高，为销售资源投放与首发渠道选择提供依据。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+         "start": 161,
+         "end": 182,
+         "quote": "渠道：线下体验店转化率是线上的 3.2 倍"
+        }
+       ]
+      }
+     ],
+     "detail": "市场分析是本次评审的事实依据部分，用五组结论支撑设计方向：目标人群锁定一线城市 25-40 岁有孩家庭；竞品在中低端已被小米、华为、涂鸦三系占据而高端缺位；整套方案价格带落在 8000-20000 元且用户对 15000 元以上敏感；适老化改造需求年增 25% 构成增长点；线下体验店转化率是线上的 3.2 倍。这五条分别回答卖给谁、和谁竞争、卖多少钱、增量在哪、在哪卖。",
+     "expandable": "yes",
+     "collapsed": false,
+     "color": "teal",
+     "icon": "📈",
+     "source_refs": []
+    },
+    {
+     "id": "s3",
+     "label": "功能设计",
+     "children": [
+      {
+       "id": "s3-1",
+       "label": "中枢网关",
+       "children": [
+        {
+         "id": "s3-1-1",
+         "label": "本地语音唤醒，断网可用",
+         "children": [],
+         "detail": "语音唤醒在网关本地完成，不依赖云端识别链路，因此断网时仍能响应唤醒并执行已配置的本地场景。这一点是区别于纯云端语音方案的核心卖点，评审时应现场演示断网状态下的唤醒与执行。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+           "start": 205,
+           "end": 216,
+           "quote": "本地语音唤醒，断网可用"
+          }
+         ]
+        },
+        {
+         "id": "s3-1-2",
+         "label": "支持 Matter 与 Zigb",
+         "children": [],
+         "detail": "网关同时支持 Matter 与 Zigbee 两种协议：Matter 面向新生态与跨品牌互联，Zigbee 覆盖存量传感器、开关等大量低功耗设备。双协议并存让老设备不必更换即可接入，同时保留向 Matter 生态演进的空间。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+           "start": 223,
+           "end": 245,
+           "quote": "支持 Matter 与 Zigbee 双协议"
+          }
+         ]
+        }
+       ],
+       "detail": "中枢网关是全屋智能的控制中心，向下接入各类子设备、向上承接 App 与云端。本章给它列了两项关键能力：本地语音唤醒（断网可用）和 Matter 与 Zigbee 双协议支持，前者决定断网时的可用性，后者决定能接多少品牌的设备。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+         "start": 194,
+         "end": 198,
+         "quote": "中枢网关"
+        }
+       ]
+      },
+      {
+       "id": "s3-2",
+       "label": "场景引擎",
+       "children": [
+        {
+         "id": "s3-2-1",
+         "label": "离家 / 回家 / 睡眠三类内置",
+         "children": [],
+         "detail": "内置离家、回家、睡眠三类场景，覆盖日常最高频的三个状态切换：离家时关闭设备并布防，回家时开灯、开空调，睡眠时关灯、拉窗帘并降低干扰。用户开箱即可使用，无需自己编排规则。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+           "start": 259,
+           "end": 282,
+           "quote": "离家 / 回家 / 睡眠三类内置场景，可自定义"
+          }
+         ]
+        },
+        {
+         "id": "s3-2-2",
+         "label": "场景支持自定义",
+         "children": [],
+         "detail": "在内置三类场景之外，用户可自行增删触发条件与执行动作，组合出自己的场景。自定义能力决定产品能否适配不同户型与生活习惯，也是与只提供固定模式的竞品拉开差距的地方。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+           "start": 259,
+           "end": 282,
+           "quote": "离家 / 回家 / 睡眠三类内置场景，可自定义"
+          }
+         ]
+        }
+       ],
+       "detail": "场景引擎把单个设备的能力组合成面向生活场景的自动化规则，用户不需要逐个设备操作。本章把它分为内置场景与自定义场景两层：内置场景降低开箱门槛，自定义场景覆盖个性化需求。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+         "start": 248,
+         "end": 252,
+         "quote": "场景引擎"
+        }
+       ]
+      }
+     ],
+     "detail": "功能设计这一章只讲两块内容：中枢网关和场景引擎。中枢网关负责设备接入与语音入口，场景引擎负责把设备能力组织成用户可感知的自动化。两者构成产品功能的主干，评审时按「网关打底、场景出体验」的顺序讲。",
+     "expandable": "yes",
+     "collapsed": false,
+     "color": "green",
+     "icon": "🧩",
+     "source_refs": []
+    },
+    {
+     "id": "s4",
+     "label": "技术难点与风险",
+     "children": [
+      {
+       "id": "s4-1",
+       "label": "多协议共存信道拥塞",
+       "children": [
+        {
+         "id": "s4-1-1",
+         "label": "2.4G 信道拥塞",
+         "children": [],
+         "detail": "2.4G 频段本身拥挤，Wi-Fi、蓝牙、Zigbee 以及邻居家的无线设备都在争用，加上网关下挂设备数量多、上报频繁，空口冲突会让配网成功率下降、控制指令延迟升高。这是多协议共存最直接的表现，也是必须先量化的问题。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+           "start": 409,
+           "end": 425,
+           "quote": "多协议共存时 2.4G 信道拥塞"
+          }
+         ]
+        },
+        {
+         "id": "s4-1-2",
+         "label": "网关侧信道调度",
+         "children": [],
+         "detail": "在网关侧统一编排各协议的信道占用：协调 Zigbee 与 Wi-Fi 的信道选择以避开重叠，对设备上报做聚合与限流，降低空口竞争。调度在本地完成，不依赖云端下发，断网时同样生效。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+           "start": 428,
+           "end": 443,
+           "quote": "网关侧信道调度 + 5G 回传"
+          }
+         ]
+        },
+        {
+         "id": "s4-1-3",
+         "label": "5G 回传分流",
+         "children": [],
+         "detail": "用 5G 回传承担网关与云端之间的大流量，减少对本地 2.4G 链路的占用，把 2.4G 留给设备接入与控制指令。这样既缓解了信道拥塞，也让网关在没有宽带布线的位置可以部署。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+           "start": 428,
+           "end": 443,
+           "quote": "网关侧信道调度 + 5G 回传"
+          }
+         ]
+        }
+       ],
+       "detail": "多协议共存是网关同时跑 Matter 与 Zigbee 带来的直接后果：两者都工作在 2.4G 频段，设备数量上来后空口竞争加剧，表现为配网失败、控制延迟和丢包。应对从三个方向展开：识别拥塞本身、在网关侧做信道调度、用 5G 回传分担链路压力。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+         "start": 409,
+         "end": 425,
+         "quote": "多协议共存时 2.4G 信道拥塞"
+        }
+       ]
+      },
+      {
+       "id": "s4-2",
+       "label": "本地语音模型体积过大",
+       "children": [
+        {
+         "id": "s4-2-1",
+         "label": "模型体积过大",
+         "children": [],
+         "detail": "完整的语音识别模型体积大，直接放进网关会挤占存储与内存、推高硬件成本与功耗，并影响唤醒响应速度。这是本地语音方案落地前必须解决的前置问题。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+           "start": 448,
+           "end": 458,
+           "quote": "本地语音模型体积过大"
+          }
+         ]
+        },
+        {
+         "id": "s4-2-2",
+         "label": "蒸馏到 12MB 唤醒词模型",
+         "children": [],
+         "detail": "通过蒸馏把唤醒词模型压缩到 12MB，使其能在网关端侧常驻运行，从而支撑本地唤醒、断网可用。压缩只针对唤醒环节，换取的是体积、功耗与响应速度的平衡。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+           "start": 467,
+           "end": 482,
+           "quote": "蒸馏到 12MB 的唤醒词模型"
+          }
+         ]
+        }
+       ],
+       "detail": "本地语音要在网关这类资源受限的硬件上跑起来，模型体积是首要约束：体积大则占用存储与内存、拉高成本与功耗，还会拖慢唤醒响应。应对思路是把模型压缩到可在端侧常驻的规模。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+         "start": 448,
+         "end": 458,
+         "quote": "本地语音模型体积过大"
+        }
+       ]
+      },
+      {
+       "id": "s4-3",
+       "label": "摄像头数据隐私合规",
+       "children": [
+        {
+         "id": "s4-3-1",
+         "label": "摄像头数据隐私合规",
+         "children": [],
+         "detail": "摄像头采集的家庭影像属于敏感个人信息，存储、传输、留存期限都受合规约束，一旦上云就涉及数据出境与第三方处理等额外义务。这是本章列出的第三项风险，需要在方案设计阶段就定好边界。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+           "start": 487,
+           "end": 498,
+           "quote": "隐私合规（摄像头数据）"
+          }
+         ]
+        },
+        {
+         "id": "s4-3-2",
+         "label": "端侧脱敏",
+         "children": [],
+         "detail": "在摄像头或网关端侧完成人脸、车牌等敏感信息的脱敏处理，原始画面在离开设备前就已被处理，减少可识别个人信息的外流。脱敏在本地完成，不依赖云端算力。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+           "start": 505,
+           "end": 515,
+           "quote": "端侧脱敏，默认不上云"
+          }
+         ]
+        },
+        {
+         "id": "s4-3-3",
+         "label": "默认不上云",
+         "children": [],
+         "detail": "默认情况下摄像头数据不上传云端，仅在本地存储与处理，用户主动开启才走云端链路。默认关闭既降低了合规风险，也减少了带宽与云存储成本。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+           "start": 505,
+           "end": 515,
+           "quote": "端侧脱敏，默认不上云"
+          }
+         ]
+        }
+       ],
+       "detail": "摄像头涉及家庭影像数据，是隐私合规风险最集中的部分。应对原则是数据尽量不出户：在端侧完成脱敏处理，并默认不上云，从数据流向的源头上降低合规风险。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "8007363c-1f0f-478e-9c01-98fb4df2766d",
+         "start": 487,
+         "end": 498,
+         "quote": "隐私合规（摄像头数据）"
+        }
+       ]
+      }
+     ],
+     "detail": "技术难点与风险这一章以表格形式列出三项难点及对应应对：多协议共存导致的 2.4G 信道拥塞、本地语音模型体积过大、摄像头数据的隐私合规。评审时应逐项说明风险等级、应对方案与验证结果，避免只列问题不给解法。",
+     "expandable": "yes",
+     "collapsed": false,
+     "color": "red",
+     "icon": "⚠️",
+     "source_refs": []
+    }
+   ],
+   "detail": "这份 PPT 用于智能家居产品的设计评审，面向产品与硬件团队，内容分两块：一是评审本身的时间与组织方式，二是支撑设计决策的市场分析。市场分析从目标人群、竞品格局、价格带、增长点、渠道五个方面给出结论，为后续方案讨论提供依据。",
+   "expandable": "yes",
+   "collapsed": false,
+   "source_refs": []
+  },
+  "layout": "tree",
+  "edges": [],
+  "diagram_type": "tree"
+ },
+ "content_stats": {
+  "present": true,
+  "title": "产品评审 PPT",
+  "nodes": 37,
+  "depth": 4,
+  "type": null
+ }
+}

@@ -1,0 +1,38 @@
+[
+ {
+  "file": "i1_sketch_map.png",
+  "bytes": 57795,
+  "status": 200,
+  "seconds": 1.9,
+  "kind": "image",
+  "status_field": "parsed",
+  "text_chars": 131,
+  "text_head": "- 考研复习\n  - 数学\n    - 高数\n    - 线代\n  - 英语\n    - 阅读\n    - 作文\n  - 专业课\n    - 操作系统\n    - 数据结构\n  - 政治\n    - 近代史\n    - 马原\n\n日期：3月-12月 每天 6 小时",
+  "sentences": 0
+ },
+ {
+  "file": "i4_outline.png",
+  "bytes": 118387,
+  "status": 200,
+  "seconds": 2.3,
+  "kind": "image",
+  "status_field": "parsed",
+  "text_chars": 287,
+  "text_head": "# 《操作系统》课程大纲\n\n- 一、概述（4 学时）\n  - 操作系统的定义与作用\n  - 内核态与用户态、系统调用\n- 二、进程与线程（8 学时）\n  - 进程状态转换与进程控制块\n  - 线程模型：用户级与内核级\n  - 进程间通信：管道、共享内存\n- 三、调度与并发（6 学时）\n  - 时间片轮转与多级反馈队列\n  - 信号量、管程、死锁与银行家算法\n- 四、内存管理（8 学时）\n  - 分页、分段、段页式\n  - 页面置换：FIFO、LRU、Clock\n- 五、文件系统（6 学时）\n  - 文件分配与 inode\n  - 磁盘调度：FCFS、SSTF、SCAN",
+  "sentences": 0
+ },
+ {
+  "file": "a1_real_line00.wav",
+  "bytes": 139566,
+  "status": 422,
+  "seconds": 0.0,
+  "detail": "语音转写未配置：缺少环境变量 DASHSCOPE_API_KEY；在阿里云百炼控制台创建后填入，详见 docs/DEPLOY.md 的「语音输入」"
+ },
+ {
+  "file": "a3_tts_16k_mono.wav",
+  "bytes": 922286,
+  "status": 422,
+  "seconds": 0.0,
+  "detail": "语音转写未配置：缺少环境变量 DASHSCOPE_API_KEY；在阿里云百炼控制台创建后填入，详见 docs/DEPLOY.md 的「语音输入」"
+ }
+]

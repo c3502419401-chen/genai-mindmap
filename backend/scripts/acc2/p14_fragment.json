@@ -1,0 +1,1505 @@
+{
+ "label": "p14_fragment",
+ "http_status": 200,
+ "goal": "把这份会议纪要整理成思维导图",
+ "intent": "create",
+ "diagram_type": null,
+ "sources": 1,
+ "seconds": 62.41,
+ "frames": 97,
+ "seq_last": 97,
+ "frame_kinds": {
+  "sources": 1,
+  "stage": 5,
+  "tool_start": 1,
+  "node_grow": 85,
+  "heartbeat": 2,
+  "tool_end": 1,
+  "snapshot": 1,
+  "done": 1
+ },
+ "first_frames": [
+  {
+   "t": 0.11,
+   "type": "sources",
+   "keys": [
+    "mapping",
+    "seq",
+    "type"
+   ]
+  },
+  {
+   "t": 0.99,
+   "type": "stage",
+   "keys": [
+    "detail",
+    "seq",
+    "stage",
+    "type"
+   ]
+  },
+  {
+   "t": 2.52,
+   "type": "tool_start",
+   "keys": [
+    "args_summary",
+    "call_id",
+    "name",
+    "seq",
+    "type"
+   ]
+  },
+  {
+   "t": 2.56,
+   "type": "stage",
+   "keys": [
+    "detail",
+    "seq",
+    "stage",
+    "type"
+   ]
+  },
+  {
+   "t": 7.13,
+   "type": "stage",
+   "keys": [
+    "count",
+    "detail",
+    "seq",
+    "stage",
+    "type"
+   ]
+  },
+  {
+   "t": 11.5,
+   "type": "node_grow",
+   "keys": [
+    "expandable",
+    "label",
+    "path",
+    "seq",
+    "type"
+   ]
+  }
+ ],
+ "content": {
+  "schema_version": 2,
+  "title": "接口变慢排查与优化实录",
+  "theme": {
+   "preset": "default",
+   "font": "system",
+   "direction": "right"
+  },
+  "relations": [],
+  "source_usage": [
+   {
+    "source_id": "b632cf08-f7d6-41cc-9484-18fd62c4d23b",
+    "kind": "text",
+    "char_count": 205
+   },
+   {
+    "source_id": "5df500dd-bac6-43e8-a8f2-db5f740f1a0f",
+    "kind": "web",
+    "filename": "deepseek: 接口变慢先别加机器：一次 P99 抖动的压测定位与连接池调优 - 接口变慢先别加机器：一次 P99 抖动的压测定位与连接池调优",
+    "char_count": 2526,
+    "url": "https://developer.aliyun.com/article/1763735#1"
+   },
+   {
+    "source_id": "c8bab9a0-004d-43aa-ac46-26c3fcaf9105",
+    "kind": "web",
+    "filename": "deepseek: 看板 P99 一直 1.2 秒 用户仍说卡",
+    "char_count": 603,
+    "url": "https://www.lu0.cn/faq/4059.html"
+   },
+   {
+    "source_id": "b68a7570-4c22-49fc-8e0b-be891e557678",
+    "kind": "web",
+    "filename": "deepseek: 被新领导约谈，我差点辞职上周五，新来的总监把我叫进会议室。聊了40分钟，核心就一句话:你的产出，我看不到价值。",
+    "char_count": 4000,
+    "url": "http://mp.weixin.qq.com/s?__biz=Mzk0MDI3MTE0MQ==&mid=2247515123&idx=1&sn=0ffb1ef3ff34d43395be40199b067798"
+   },
+   {
+    "source_id": "ce1dabec-86a6-428d-926d-02350d68296e",
+    "kind": "web",
+    "filename": "deepseek: 一次通宵都没解决的线上故障，最后是一个配置项",
+    "char_count": 2544,
+    "url": "http://mp.weixin.qq.com/s?__biz=MzYzNjg2OTc3NQ==&mid=2247483879&idx=1&sn=b00a944cc92c934ad99ba8215598f519"
+   },
+   {
+    "source_id": "2213381f-1232-4f38-b9a8-f218eb62d88d",
+    "kind": "web",
+    "filename": "deepseek: 一次接口偶发超时的排查记录：从线程池打满到 TCP 连接复用 - 云宝助手",
+    "char_count": 2295,
+    "url": "https://bbs.huaweicloud.com/blogs/498817#1"
+   },
+   {
+    "source_id": "cc8ae706-01ad-4085-a1c9-309fb124f538",
+    "kind": "web",
+    "filename": "deepseek: 百万订单统计从3秒压到30毫秒，我是怎么一步步把慢接口救回来的 - 百万订单统计从3秒压到30毫秒，我是怎么一步步把慢接口救回来的",
+    "char_count": 4000,
+    "url": "https://developer.aliyun.com/article/1773003#1"
+   },
+   {
+    "source_id": "f94017d7-b110-4621-8658-d10d3f6a0b64",
+    "kind": "web",
+    "filename": "deepseek: 上周五，新来的总监把我叫进会议室。聊了40分钟，核心就一句话:你的产出，我看不到价值。我坐在那，脑子里翻江倒海。",
+    "char_count": 4000,
+    "url": "http://mp.weixin.qq.com/s?__biz=Mzk0NjIxNDYxMQ==&mid=2247544778&idx=1&sn=a034efc9198f7768e595f59d3b408804"
+   },
+   {
+    "source_id": "ce5df76a-58f5-422e-83ef-c100c95d89b0",
+    "kind": "web",
+    "filename": "deepseek: 日志里藏着的慢查询：一次接口变慢排查的三点实用经验",
+    "char_count": 1440,
+    "url": "https://bbs.huaweicloud.com/blogs/518815"
+   }
+  ],
+  "root": {
+   "id": "root",
+   "label": "接口变慢排查与优化实录",
+   "children": [
+    {
+     "id": "g1",
+     "label": "压测与定位方法",
+     "children": [
+      {
+       "id": "g1b1",
+       "label": "接口变慢先别加机器",
+       "children": [
+        {
+         "id": "g1b1p1",
+         "label": "先盯P95与P99分位数",
+         "children": [],
+         "detail": "排查的起点是 P95、P99 甚至 P999，而不是平均值或 P50。原文举例：100 个请求里 99 个 80 毫秒、1 个 3000 毫秒，平均值只被拉到约 110 毫秒看着还行，但那 1% 的用户体感就是卡了 3 秒。所以长尾问题必须先看高分位，才能判断抖动是否真实存在、量级多大。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "5df500dd-bac6-43e8-a8f2-db5f740f1a0f",
+           "start": 541,
+           "end": 564,
+           "quote": "所以排查要先盯 P95、P99，甚至 P999"
+          }
+         ]
+        },
+        {
+         "id": "g1b1p2",
+         "label": "平均值掩盖长尾体感",
+         "children": [],
+         "detail": "平均值和 P50 会把长尾“平均掉”：少数极慢请求被大量正常请求稀释，指标看起来健康，用户却在真实地转圈。原文把这一点列为第一个坑——只看平均值就扩容，结果加了机器 P99 依旧抖。这条与上一条互为因果：正因为平均值掩盖长尾，才必须改看分位数。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "5df500dd-bac6-43e8-a8f2-db5f740f1a0f",
+           "start": 466,
+           "end": 540,
+           "quote": "假设有 100 个请求，99 个 80 毫秒、1 个 3000 毫秒，平均值只被拉到约 110 毫秒看着还行，但那 1% 的用户体感就是卡了 3 秒"
+          }
+         ]
+        },
+        {
+         "id": "g1b1p3",
+         "label": "wrk分档压测找拐点",
+         "children": [],
+         "detail": "用 wrk 在压测环境复现，固定 4 个线程，从 50 并发逐步加到 200、500，每档压 60 秒并开启 --latency 观察延迟分布。压到 200 并发时 P99 开始飙升，但服务 CPU 才 40%、数据库 CPU 也不高。这个“CPU 没满却排队”的拐点，正是判断瓶颈属于等待型而非算力型的关键证据。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "5df500dd-bac6-43e8-a8f2-db5f740f1a0f",
+           "start": 844,
+           "end": 889,
+           "quote": "压到 200 并发时 P99 开始飙升，但服务 CPU 才 40%、数据库 CPU 也不高"
+          }
+         ]
+        }
+       ],
+       "detail": "这一节的核心主张：P50 正常、只有长尾抖动时，加机器往往解决不了问题，应先做一次性能体检找到卡点。原文给出的理由是这类抖动属于“等待型”瓶颈——CPU 没满却排队，说明卡在锁、连接或 IO 上，堆算力没有用。做法是先盯分位数确认长尾确实存在，再用 wrk 逐档加压找出长尾开始抬头的并发点，为后面的分段定位提供入口。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "5df500dd-bac6-43e8-a8f2-db5f740f1a0f",
+         "start": 359,
+         "end": 398,
+         "quote": "P50 正常、只有长尾抖动，加机器往往解决不了，得先做一次性能体检找到底卡在哪"
+        }
+       ]
+      },
+      {
+       "id": "g1b2",
+       "label": "把慢拆成三段再定位",
+       "children": [
+        {
+         "id": "g1b2p1",
+         "label": "分段计时先定慢在哪段",
+         "children": [],
+         "detail": "分段计时的目的是先回答“慢在哪一段”，而不是先回答“为什么慢”。原文把一次请求拆成网络与网关耗时、业务处理耗时、数据库耗时三段分别计时，监控显示网关正常、数据库平均只有 40 毫秒，业务处理却占了九成以上，范围立刻从“数据库/网络”收缩到服务内部。这一步做对了，后面的下钻才有方向。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "ce5df76a-58f5-422e-83ef-c100c95d89b0",
+           "start": 765,
+           "end": 805,
+           "quote": "监控显示网关耗时正常，数据库平均耗时只有 40 毫秒，业务处理耗时却占了九成以上"
+          }
+         ]
+        },
+        {
+         "id": "g1b2p2",
+         "label": "段内下钻到内存计算",
+         "children": [],
+         "detail": "确定慢在业务段之后继续下钻，最终发现是一个缓存键的生成逻辑在数据量变大后退化成了全量扫描：每次请求都要遍历一份不断增长的配置列表。根因既不是数据库慢也不是网络抖动，而是一段平时不起眼的内存计算。这条说明“段内下钻”要一直钻到具体代码行为止，否则分段只完成了一半。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "ce5df76a-58f5-422e-83ef-c100c95d89b0",
+           "start": 817,
+           "end": 864,
+           "quote": "发现一个缓存键的生成逻辑在数据量变大后退化成了全量扫描：每次请求都要遍历一份不断增长的配置列表"
+          }
+         ]
+        },
+        {
+         "id": "g1b2p3",
+         "label": "分阶段埋点看借连接耗时",
+         "children": [],
+         "detail": "另一条材料里的做法：给接口各阶段加埋点后看到，真正的 SQL 执行只有几十毫秒，大量时间花在“从连接池借连接”这一步。连接池 maximumPoolSize 配成 10，并发一上来几十个请求排队等连接，借到的很快、借不到的一直等到超时，正好形成 P50 正常、P99 难看的形态。把“借连接耗时”单独埋点，是把等待与执行分开的关键动作。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "5df500dd-bac6-43e8-a8f2-db5f740f1a0f",
+           "start": 958,
+           "end": 1008,
+           "quote": "加上接口各阶段耗时埋点后发现，真正的 SQL 执行只有几十毫秒，大量时间花在\"从连接池借连接\"这一步"
+          }
+         ]
+        }
+       ],
+       "detail": "定位方法不是一上来就猜 SQL 或网络，而是把一次请求按阶段拆开分别计时，先确定慢在哪一段，再在段内继续下钻。原文的实践是先加接口各阶段耗时埋点，发现真正的 SQL 执行只有几十毫秒，大量时间花在“从连接池借连接”上；另一份材料则把请求拆成网络与网关、业务处理、数据库三段，发现业务处理占九成以上，下钻后根因是一段内存计算。两种拆法共同点是：先分段缩小范围，再谈具体原因。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "ce5df76a-58f5-422e-83ef-c100c95d89b0",
+         "start": 728,
+         "end": 764,
+         "quote": "我们把一次请求拆成三段分别计时：网络与网关耗时、业务处理耗时、数据库耗时"
+        }
+       ]
+      },
+      {
+       "id": "g1b3",
+       "label": "先对齐时间再看日志",
+       "children": [
+        {
+         "id": "g1b3p1",
+         "label": "确认各节点时钟偏差",
+         "children": [],
+         "detail": "排查前先核对各节点时钟，确认偏差在毫秒级。原因是日志时间戳来自不同机器，若存在秒级偏差，拼接出来的先后顺序就是错的，会把人引向错误的环节。这一步成本很低，却是后面按请求 ID 串联日志可信的前提。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "ce5df76a-58f5-422e-83ef-c100c95d89b0",
+           "quote": "我们先确认了所有节点的时钟偏差在毫秒级"
+          }
+         ]
+        },
+        {
+         "id": "g1b3p2",
+         "label": "按请求ID串联各环节日志",
+         "children": [],
+         "detail": "用请求 ID 作为串联键，把网关、业务服务、数据库三处日志按同一次请求拼起来看。原文正是靠这一步发现：业务服务收到请求后 1.8 秒才发出第一条 SQL。单看任何一处的日志都看不出这个空档，只有串起来才暴露出来。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "ce5df76a-58f5-422e-83ef-c100c95d89b0",
+           "start": 594,
+           "end": 621,
+           "quote": "然后按请求 ID 把网关、业务服务和数据库的日志串起来"
+          }
+         ]
+        },
+        {
+         "id": "g1b3p3",
+         "label": "发现1.8秒才发第一条SQL",
+         "children": [],
+         "detail": "串联日志后得到的关键事实：业务服务收到请求后 1.8 秒才发出第一条 SQL，说明问题不在数据库，而在服务内部。原文特别指出这一步省掉大量无用功——如果直接盯着慢 SQL，很可能在错误方向上越走越远。这条是“先对齐时间再看日志”方法的价值证明。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "ce5df76a-58f5-422e-83ef-c100c95d89b0",
+           "start": 627,
+           "end": 667,
+           "quote": "业务服务收到请求后 1.8 秒才发出第一条 SQL，问题不在数据库，而在服务内部"
+          }
+         ]
+        }
+       ],
+       "detail": "这条经验来自一次 P99 从 80 毫秒涨到 2.3 秒、报错率却没明显上升的排查。第一反应通常是翻日志，但如果各服务时钟没对齐，日志的先后顺序本身就会骗人。所以顺序是：先确认所有节点时钟偏差在毫秒级，再按请求 ID 把网关、业务服务、数据库的日志串成一条链路，然后才判断慢在哪一环。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "ce5df76a-58f5-422e-83ef-c100c95d89b0",
+         "quote": "接口变慢的第一反应往往是翻日志，但如果各服务时间没有对齐，日志顺序本身就会误导人"
+        }
+       ]
+      },
+      {
+       "id": "g1b4",
+       "label": "看错监控大盘反被误导",
+       "children": [
+        {
+         "id": "g1b4p1",
+         "label": "QPS与错误率无异常",
+         "children": [],
+         "detail": "先看 QPS 和错误率，两者都没有明显变化，说明不是流量突增导致的慢；错误率不涨也说明请求大多最终成功，只是变慢。这一条排除了“流量型”原因，把范围推向服务内部的等待。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "2213381f-1232-4f38-b9a8-f218eb62d88d",
+           "start": 328,
+           "end": 355,
+           "quote": "先看了QPS和错误率，都没有明显变化，说明不是流量突增"
+          }
+         ]
+        },
+        {
+         "id": "g1b4p2",
+         "label": "GC与CPU排除资源不足",
+         "children": [],
+         "detail": "再看应用 GC：Young GC 频率正常，Full GC 一次都没有；CPU 使用率 40% 左右，远没到瓶颈。到这里基本可以排除“资源不够”这类最常见原因，也就意味着扩容加机器不会是解药。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": []
+        },
+        {
+         "id": "g1b4p3",
+         "label": "抖动窗口内抓线程栈",
+         "children": [],
+         "detail": "真正有价值的线索来自线程 dump：让运维连抓 5 次线程栈、间隔 10 秒，其中两次正好落在抖动窗口里。对比后发现抖动时 http-nio-8080-exec 线程全部处于 WAITING，栈顶停在 org.apache.http.pool.AbstractConnPool.lease，即 HttpClient 在等连接池归还连接。原文的结论是：排查这类偶发抖动，最有效的动作往往是在抖动窗口内抓线程栈，静态配置和监控大盘都容易骗人。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "2213381f-1232-4f38-b9a8-f218eb62d88d",
+           "start": 676,
+           "end": 711,
+           "quote": "让运维连抓了 5 次线程栈，间隔 10 秒，其中两次正好落在抖动窗口里"
+          }
+         ]
+        }
+       ],
+       "detail": "这条来自一次订单查询接口的偶发抖动：P99 从平时 80 毫秒抬到 3 秒以上，每过十几分钟抖一次，持续一两分钟又自己恢复，平均延迟看着正常、监控大盘一片绿，只有 P99 曲线反复横跳。作者按 QPS/错误率、GC、CPU 逐项看下去，都排除了，真正有价值的线索反而来自抖动窗口内抓的线程栈。所谓“看错大盘被误导”，指的是大盘上的常规指标全都正常，容易让人误以为没有资源问题就无从下手。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "2213381f-1232-4f38-b9a8-f218eb62d88d",
+         "quote": "第一反应：看错监控大盘反而被误导"
+        }
+       ]
+      },
+      {
+       "id": "g1b5",
+       "label": "修完留证据不凭感觉",
+       "children": [
+        {
+         "id": "g1b5p1",
+         "label": "P99回到90毫秒观察两天",
+         "children": [],
+         "detail": "修复上线后 P99 回到 90 毫秒左右，并且连续观察两天没有反弹，才认定问题真的解决。用具体分位数指标加持续观察窗口来验收，而不是上线当天看一眼曲线就收工，是为了排除“只是这一波流量过去了”的假象。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "ce5df76a-58f5-422e-83ef-c100c95d89b0",
+           "start": 959,
+           "end": 990,
+           "quote": "修复上线后，P99 回到 90 毫秒左右，连续观察两天没有反弹"
+          }
+         ]
+        },
+        {
+         "id": "g1b5p2",
+         "label": "写进团队故障记录",
+         "children": [],
+         "detail": "把排查过程写进团队故障记录，内容包括现象、时间线、证据链、根因和验证结果。这样记录的价值在于可复核：别人能顺着证据链判断结论是否成立，而不是只留下一句“已修复”。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "ce5df76a-58f5-422e-83ef-c100c95d89b0",
+           "start": 997,
+           "end": 1033,
+           "quote": "我们把排查过程写进了团队的故障记录：现象、时间线、证据链、根因和验证结果"
+          }
+         ]
+        },
+        {
+         "id": "g1b5p3",
+         "label": "沉淀一张排查清单",
+         "children": [],
+         "detail": "最后把方法固化成一张排查清单，原文给出的顺序是：第一，对齐时间，用请求 ID 串联各环节日志；第二，分段计时，先确定慢在哪一段，再在段内下钻；第三，修复后保留可复核的证据和记录。原文的判断是：慢查询很少是单一原因造成的，但排查方法可以是确定的。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "ce5df76a-58f5-422e-83ef-c100c95d89b0",
+           "start": 1082,
+           "end": 1161,
+           "quote": "接口变慢时，可以按这个顺序走：第一，对齐时间，用请求 ID 串联各环节日志；第二，分段计时，先确定慢在哪一段，再在段内下钻；第三，修复后保留可复核的证据和记录"
+          }
+         ]
+        }
+       ],
+       "detail": "修复上线不等于事情结束，还要留下可复核的证据，而不是凭“感觉快了”。原文的做法分三层：用指标验证修复效果并持续观察一段时间，把排查过程写成团队故障记录，最后沉淀成一张可复用的排查清单。这样下次遇到类似告警，任何人都能按图索骥，而不是从头摸索。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "ce5df76a-58f5-422e-83ef-c100c95d89b0",
+         "start": 919,
+         "end": 958,
+         "quote": "定位根因后，我们把配置列表改成按需加载加本地缓存，并给关键步骤加上分段耗时日志"
+        }
+       ]
+      }
+     ],
+     "expandable": "yes",
+     "collapsed": false,
+     "color": "blue",
+     "icon": "🎯",
+     "source_refs": []
+    },
+    {
+     "id": "g2",
+     "label": "连接池与线程池调优",
+     "children": [
+      {
+       "id": "g2b1",
+       "label": "连接池满了不代表池太小",
+       "children": [
+        {
+         "id": "g2b1p1",
+         "label": "先查连接为何不归还",
+         "children": [],
+         "detail": "排查方向应该是“连接为什么一直不归还”，而不是“池子够不够大”。原文的做法是把持有连接时间超过 1 秒的调用打出来，看到 createOrder 持有 3187ms、confirmPayment 持有 2904ms 这类记录，再顺着方法名去追代码，才找到连接被长时间占住的具体位置。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "f94017d7-b110-4621-8658-d10d3f6a0b64",
+           "start": 1668,
+           "end": 1687,
+           "quote": "把持有连接时间超过 1 秒的调用打出来"
+          }
+         ]
+        },
+        {
+         "id": "g2b1p2",
+         "label": "长事务里夹着远程调用",
+         "children": [],
+         "detail": "追到 createOrder 后看到典型写法：@Transactional 方法里先 insert 订单，接着调用 inventoryClient.reserve（1240ms）和 couponClient.lock（860ms）。事务开启后数据库连接已被占住，后面两个 RPC 期间数据库什么都没干，连接却跟着等了两秒多。调用量一上来，50 个连接很快被占完，后面的请求堵在 dataSource.getConnection() 上。原文给的改法是把远程调用移出长事务：先做外部校验拿到预占凭证，再让本地事务只处理数据库状态；同时指出这带来新边界——库存预占成功而订单写库失败（甚至 JVM 直接崩溃、catch 根本没执行）时如何释放，需要靠预占超时置为 EXPIRED 或订单侧事件表加后台重试来补偿。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "f94017d7-b110-4621-8658-d10d3f6a0b64",
+           "start": 2130,
+           "end": 2157,
+           "quote": "事务开启后执行 insert，数据库连接已经被事务占住"
+          }
+         ]
+        },
+        {
+         "id": "g2b1p3",
+         "label": "盲目调大反而吞吐下降",
+         "children": [],
+         "detail": "原文明确反对“50 不够就改 100”这种操作。理由是数据库连接是重资源，连接数超过数据库能并行处理的能力后，连接们在数据库内部争抢 CPU 和锁、上下文切换变多，整体吞吐反而下降。所以正确做法是先治连接不归还的根因，再结合压测把池子调到长尾不再恶化的拐点。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "5df500dd-bac6-43e8-a8f2-db5f740f1a0f",
+           "start": 1130,
+           "end": 1183,
+           "quote": "连接数超过数据库能并行处理的能力后，连接们在数据库内部争抢 CPU 和锁，上下文切换变多，整体吞吐反而下降"
+          }
+         ]
+        }
+       ],
+       "detail": "这一节纠正一个常见误解：看到连接池打满就以为池子太小，直接调大参数。原文的立场是，连接为什么一直不归还还没查清楚之前，不要先动 maximumPoolSize。因为连接池满只是症状，真正的原因可能是长事务里夹着远程调用、慢查询占着连接不放，盲目调大反而会让数据库内部争抢加剧、整体吞吐下降。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "f94017d7-b110-4621-8658-d10d3f6a0b64",
+         "start": 1626,
+         "end": 1644,
+         "quote": "因为连接为什么一直不归还，还没查清楚"
+        }
+       ]
+      },
+      {
+       "id": "g2b2",
+       "label": "复盘连接池配置",
+       "children": [
+        {
+         "id": "g2b2p1",
+         "label": "单路由默认值只有2",
+         "children": [],
+         "detail": "setDefaultMaxPerRoute 控制单个路由（单个下游域名）的连接上限，默认值只有 2。原文特别点出这一点：很多团队都是踩过一次才记住这个默认值。本例中它被设成了 20，看似不小，但面对单路由上百并发的瞬时冲击仍然不够，是这次抖动的直接触发点。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "2213381f-1232-4f38-b9a8-f218eb62d88d",
+           "start": 982,
+           "end": 1028,
+           "quote": "cm.setDefaultMaxPerRoute(20); // 单路由上限，默认只有 2！"
+          }
+         ]
+        },
+        {
+         "id": "g2b2p2",
+         "label": "借连接等待上限3秒",
+         "children": [],
+         "detail": "connectionRequestTimeout 控制从连接池借连接的等待上限，本例配的是 3000 毫秒。它的含义是：连接被占满时，后续请求最多在 lease 上排队 3 秒，这正好对应观测到的 P99 抖到 3 秒上下。也就是说，这个参数值直接决定了抖动的幅度上限，配得多长，长尾就能拖多长。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "2213381f-1232-4f38-b9a8-f218eb62d88d",
+           "start": 1121,
+           "end": 1173,
+           "quote": "// 关键：从池里借连接的等待上限\n.setConnectionRequestTimeout(3000)"
+          }
+         ]
+        },
+        {
+         "id": "g2b2p3",
+         "label": "HikariCP关键参数收敛",
+         "children": [],
+         "detail": "原文列出的 HikariCP 关键参数及取值理由：maximumPoolSize=16，结合压测从 10 逐步加到长尾不再恶化的点；minimumIdle=16，固定大小避免运行时频繁建连；connectionTimeout=3000，借连接最多等 3 秒，超时快速失败而不是干等；maxLifetime=1800000（30 分钟），要小于数据库 wait_timeout；keepaliveTime=300000（5 分钟），定期探活，避免拿到被数据库静默关闭的连接。原文还给了一个经验估算式：连接池大小 ≈ CPU 核心数 * 2 + 有效磁盘 IO 数，4 核应用、数据库主要走 SSD 时池子配 10 上下是合理的——问题不在数值本身，而在业务并发远超池子、且借连接超时与等待队列没配套调好。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "5df500dd-bac6-43e8-a8f2-db5f740f1a0f",
+           "start": 1413,
+           "end": 1456,
+           "quote": "maximumPoolSize=16 # 结合压测，从 10 逐步加到长尾不再恶化的点"
+          }
+         ]
+        }
+       ],
+       "detail": "这一节复盘 HttpClient 连接池的具体配置。原文把配置翻出来看：setMaxTotal(200) 是全局连接上限，setDefaultMaxPerRoute(20) 是单路由上限（默认只有 2），RequestConfig 里 connectTimeout 1000、socketTimeout 3000、connectionRequestTimeout 3000。问题在于该服务依赖的下游只拆了两个域名，单路由 20 个连接平时够用，但订单查询下游存在“热点用户”效应——大客户轮询拉单，一秒能打过来上百个并发，瞬时把单路由 20 个连接全部占满，后续请求就在 lease 上排队、最多等 3 秒。这正好解释了 P99 为什么抖到 3 秒上下、又会在流量峰过去后自愈。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "2213381f-1232-4f38-b9a8-f218eb62d88d",
+         "start": 844,
+         "end": 867,
+         "quote": "把 HttpClient 的连接池配置翻出来看"
+        }
+       ]
+      },
+      {
+       "id": "g2b3",
+       "label": "连接不复用的坑",
+       "children": [
+        {
+         "id": "g2b3p1",
+         "label": "TIME_WAIT涨到四万多",
+         "children": [],
+         "detail": "长稳压测 10 分钟后，机器上 TIME_WAIT 数量涨到四万多。大量 TIME_WAIT 意味着连接被频繁新建又关闭，而不是在池中被复用，这既是性能损耗也是端口资源压力。它是“连接不复用”这个问题最直观的外部症状。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "2213381f-1232-4f38-b9a8-f218eb62d88d",
+           "start": 1683,
+           "end": 1711,
+           "quote": "长稳跑 10 分钟后，TIME_WAIT 数量涨到四万多"
+          }
+         ]
+        },
+        {
+         "id": "g2b3p2",
+         "label": "下游返回Connection c",
+         "children": [],
+         "detail": "抓包定位到原因：响应头里下游返回的是 Connection: close，同时我们自建 HttpClient 时没有显式开启 keep-alive 策略。两边都不保持连接，结果就是每次请求都重新建 TCP 连接，连接池形同虚设。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "2213381f-1232-4f38-b9a8-f218eb62d88d",
+           "start": 1732,
+           "end": 1802,
+           "quote": "原因是响应头里下游返回的是Connection: close，而且我们自建 HttpClient 时没有显式开启 keep-alive 策略"
+          }
+         ]
+        },
+        {
+         "id": "g2b3p3",
+         "label": "补keep-alive并驱逐空闲",
+         "children": [],
+         "detail": "修复动作有两步：补上默认的 keep-alive 策略，并让连接池定期驱逐空闲连接，具体是 cm.setValidateAfterInactivity(2000)，即空闲 2 秒后先校验再复用；顺带在内核层开了 tcp_tw_reuse，TIME_WAIT 回落到一万以内。前者解决复用与拿到失效连接的问题，后者缓解已经产生的 TIME_WAIT 堆积。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "2213381f-1232-4f38-b9a8-f218eb62d88d",
+           "start": 1835,
+           "end": 1888,
+           "quote": "cm.setValidateAfterInactivity(2000); // 空闲 2s 后先校验再复用"
+          }
+         ]
+        }
+       ],
+       "detail": "这是压测复验时发现的次生问题：长稳跑 10 分钟后 TIME_WAIT 数量涨到四万多，抓包看是每次请求都新建了 TCP 连接，连接根本没有被复用。原因是响应头里下游返回的是 Connection: close，而自建 HttpClient 时又没有显式开启 keep-alive 策略。这条坑的教训是：连接池调好只是第一步，连接能不能真正复用还要单独验证。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "2213381f-1232-4f38-b9a8-f218eb62d88d",
+         "start": 1651,
+         "end": 1665,
+         "quote": "一个容易忽略的坑：连接不复用"
+        }
+       ]
+      },
+      {
+       "id": "g2b4",
+       "label": "线程池打满到连接复用",
+       "children": [
+        {
+         "id": "g2b4p1",
+         "label": "线程全WAITING在等连接",
+         "children": [],
+         "detail": "线程 dump 显示 200 个业务线程里有 187 个卡在同一个地方——等一个下游服务返回，栈顶停在 AbstractConnPool.awaitAvailable。原文点出这类问题的隐蔽性：日志里看不到，因为请求根本没有发出去，它在等连接，而等连接不产生日志。“没有日志的地方，往往就是答案。”",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "2213381f-1232-4f38-b9a8-f218eb62d88d",
+           "start": 718,
+           "end": 803,
+           "quote": "抖动时http-nio-8080-exec 线程全部处于 WAITING，栈顶停在 org.apache.http.pool.AbstractConnPool.lease"
+          }
+         ]
+        },
+        {
+         "id": "g2b4p2",
+         "label": "无界队列只堆积不拒绝",
+         "children": [],
+         "detail": "应用线程池用的是无界队列，请求线程无限堆积，每个都在等连接。高峰时队列只堆积不拒绝，请求全被兜住，最终把系统拖到雪崩。原文把它列为五个坑之一：线程池用无界队列，高峰只堆积不拒绝。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "5df500dd-bac6-43e8-a8f2-db5f740f1a0f",
+           "start": 1802,
+           "end": 1845,
+           "quote": "给业务线程池设了有界队列和拒绝策略，超载时快速返回降级结果，而不是把请求全兜住拖到雪崩"
+          }
+         ]
+        },
+        {
+         "id": "g2b4p3",
+         "label": "借连接超时快速失败",
+         "children": [],
+         "detail": "对应的修复是给业务线程池设有界队列和拒绝策略，超载时快速返回降级结果，而不是把请求全兜住；同时借连接要设超时（如 3 秒）快速失败，而不是让请求线程干等到整体超时。原文强调“快速失败 + 降级”比“无限等待”更可控，故障面能收敛。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "5df500dd-bac6-43e8-a8f2-db5f740f1a0f",
+           "start": 1489,
+           "end": 1536,
+           "quote": "connectionTimeout=3000 # 借连接最多等 3 秒，超时快速失败而不是干等"
+          }
+         ]
+        }
+       ],
+       "detail": "这一节把线程池和连接池串起来看：线程池被打满，根子可能不在线程池本身，而在所有线程都卡在等连接上。原文的链条是——线程全部 WAITING 在借连接，请求线程不断堆积，而线程池用的是无界队列，只堆积不拒绝，最终把系统拖向雪崩。对应的解法是给借连接设超时快速失败，并给业务线程池配有界队列和拒绝策略。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "2213381f-1232-4f38-b9a8-f218eb62d88d",
+         "start": 99,
+         "end": 129,
+         "quote": "一次接口偶发超时的排查记录：从线程池打满到 TCP 连接复用"
+        }
+       ]
+      },
+      {
+       "id": "g2b5",
+       "label": "分层限流加连接池调参",
+       "children": [
+        {
+         "id": "g2b5p1",
+         "label": "单路由20提到50",
+         "children": [],
+         "detail": "单路由连接数从 20 提到 50，同时把 connectionRequestTimeout 从 3000ms 降到 800ms——宁可快速失败也不 hang 住业务线程。提上限是为了容纳热点用户的瞬时并发，降等待上限是为了让超出能力的请求尽早失败、不占着线程干等，两个动作方向相反但配套。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "2213381f-1232-4f38-b9a8-f218eb62d88d",
+           "start": 1406,
+           "end": 1475,
+           "quote": "单路由连接从 20 提到 50，connectionRequestTimeout 降到 800ms，宁可快速失败也不 hang 住业务线程"
+          }
+         ]
+        },
+        {
+         "id": "g2b5p2",
+         "label": "热点用户本地缓存5秒",
+         "children": [],
+         "detail": "对热点用户的查询加本地 Caffeine 缓存，TTL 5 秒，同类请求合并回源。针对的是“大客户轮询拉单、一秒上百并发”这种重复查询同一批数据的场景，用几秒的短缓存把打到下游的瞬时并发削下来，从源头减少连接占用。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "2213381f-1232-4f38-b9a8-f218eb62d88d",
+           "start": 1479,
+           "end": 1519,
+           "quote": "对热点用户的查询加本地 Caffeine 缓存，TTL 5 秒，同类请求合并回源"
+          }
+         ]
+        },
+        {
+         "id": "g2b5p3",
+         "label": "网关对该客户限流50QPS",
+         "children": [],
+         "detail": "在网关层对该客户加 50 QPS 的限流，超额直接返回缓存快照。这是最后一道保护：即使应用侧缓存没命中，也不会让单个客户的流量无限放大到下游，超额请求拿旧快照而不是排队等连接。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "2213381f-1232-4f38-b9a8-f218eb62d88d",
+           "start": 1523,
+           "end": 1553,
+           "quote": "网关层对该客户加 50 QPS 的限流，超额直接返回缓存快照"
+          }
+         ]
+        }
+       ],
+       "detail": "最终修复方案不是单点调参，而是三件事一起做：连接池参数调整、热点用户本地缓存、网关层限流。原文的理由是只调大连接池治标不治本，下游扛不住更大并发反而更危险，所以要在放大入口流量的同时给下游加保护。改完压测：单路由并发 100 时 P99 稳定在 240ms，通过 Micrometer 的 httpclient.pool 指标看到借连接等待时间 P99 只有 6ms。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "2213381f-1232-4f38-b9a8-f218eb62d88d",
+         "start": 1351,
+         "end": 1366,
+         "quote": "修复：分层限流 + 连接池调参"
+        }
+       ]
+      }
+     ],
+     "expandable": "yes",
+     "collapsed": false,
+     "color": "teal",
+     "icon": "🛠",
+     "source_refs": []
+    },
+    {
+     "id": "g3",
+     "label": "线上故障排查实录",
+     "children": [
+      {
+       "id": "g3b1",
+       "label": "第一次报警与重复告警",
+       "children": [
+        {
+         "id": "g3b1p1",
+         "label": "P99从180毫秒涨到4.2秒",
+         "children": [],
+         "detail": "订单创建接口的P99从平时的180毫秒涨到4.2秒，是这次故障的第一个信号。由于十二分钟后就回落，这个尖峰当时被当成高峰抖动处理掉了。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "ce1dabec-86a6-428d-926d-02350d68296e",
+           "start": 248,
+           "end": 276,
+           "quote": "订单创建接口的 P99 从 180 毫秒涨到 4.2 秒"
+          }
+         ]
+        },
+        {
+         "id": "g3b1p2",
+         "label": "十二分钟后自行恢复",
+         "children": [],
+         "detail": "第一次报警后十二分钟，P99回到200毫秒以内。正是这次自愈让值班同学放松了警惕，把它记成一次短暂抖动，也为后面反复走弯路埋下伏笔。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "ce1dabec-86a6-428d-926d-02350d68296e",
+           "start": 279,
+           "end": 301,
+           "quote": "十二分钟后，P99 回到了 200 毫秒以内"
+          }
+         ]
+        },
+        {
+         "id": "g3b1p3",
+         "label": "21:04告警不再自愈",
+         "children": [],
+         "detail": "21:04同样的告警再次出现，这一次没有自行恢复，同时六条慢查询告警亮起、全部指向订单表。故障从这一刻起才真正进入排查状态。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "ce1dabec-86a6-428d-926d-02350d68296e",
+           "start": 337,
+           "end": 353,
+           "quote": "# 21:04，同样的告警又来了"
+          }
+         ]
+        }
+       ],
+       "detail": "订单创建接口在20:12首次触发P99告警，值班同学判断为流量高峰的短暂抖动，记录一笔后未深入处理；21:04同样的告警再次出现且不再自行恢复，慢查询告警同时亮起六条，全部指向订单表。这一节交代了故障的开场：一次被放过的抖动，加上一次没能自愈的复发。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "ce1dabec-86a6-428d-926d-02350d68296e",
+         "start": 233,
+         "end": 246,
+         "quote": "# 20:12，第一次报警"
+        }
+       ]
+      },
+      {
+       "id": "g3b2",
+       "label": "慢SQL与连接池假设",
+       "children": [
+        {
+         "id": "g3b2p1",
+         "label": "六条慢查询是真但不是因",
+         "children": [],
+         "detail": "六条慢查询告警是真的，不是误报，其中一条全表扫了40万行。但材料明确指出它们只是结果而不是原因——顺着它们往下挖，方向从一开始就偏了。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "ce1dabec-86a6-428d-926d-02350d68296e",
+           "start": 405,
+           "end": 435,
+           "quote": "因为那六条慢查询是真的，不是误报 ——它们只是结果，不是原因"
+          }
+         ]
+        },
+        {
+         "id": "g3b2p2",
+         "label": "加索引后22分钟复发",
+         "children": [],
+         "detail": "加索引、改写查询条件后，P99在2分12秒后降回300毫秒，团队一度以为结束了。但二十二分钟后故障又回来了，说明索引只是缓解了表象。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "ce1dabec-86a6-428d-926d-02350d68296e",
+           "start": 489,
+           "end": 524,
+           "quote": "加索引、改写查询条件，02 分 12 秒后 P99 降回 300 毫秒"
+          }
+         ]
+        },
+        {
+         "id": "g3b2p3",
+         "label": "连接池100扩到300又好了20",
+         "children": [],
+         "detail": "应用侧连接数确实打满、一直在等连接，把连接池从100扩到300后服务立刻恢复。但这次恢复也只维持了二十分钟，和加索引一样属于治标。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "ce1dabec-86a6-428d-926d-02350d68296e",
+           "start": 600,
+           "end": 623,
+           "quote": "把连接池从 100 扩到 300，服务立刻恢复"
+          }
+         ]
+        }
+       ],
+       "detail": "第一个正式假设是慢SQL：团队捞出六条慢查询，其中一条全表扫了40万行，于是加索引、改写查询条件，P99在2分12秒后降回300毫秒。但二十二分钟后故障复发，随后又怀疑数据库连接池，把连接池从100扩到300，服务立刻恢复，可只好了二十分钟。两次都拿到了真实证据，两次都不是根因。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "ce1dabec-86a6-428d-926d-02350d68296e",
+         "start": 440,
+         "end": 454,
+         "quote": "我们的第一个假设：慢 SQL"
+        }
+       ]
+      },
+      {
+       "id": "g3b3",
+       "label": "网络抖动假设",
+       "children": [
+        {
+         "id": "g3b3p1",
+         "label": "抓包看丢包率与RTT",
+         "children": [],
+         "detail": "针对网络抖动假设，团队抓包查看了丢包率和RTT两项指标，这是验证网络层是否异常最直接的手段。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "ce1dabec-86a6-428d-926d-02350d68296e",
+           "start": 722,
+           "end": 735,
+           "quote": "抓包，看丢包率，看 RTT"
+          }
+         ]
+        },
+        {
+         "id": "g3b3p2",
+         "label": "结果无异常排除网络",
+         "children": [],
+         "detail": "抓包结果显示丢包率和RTT都没有异常，网络抖动假设被排除。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "ce1dabec-86a6-428d-926d-02350d68296e",
+           "start": 738,
+           "end": 742,
+           "quote": "没有异常"
+          }
+         ]
+        },
+        {
+         "id": "g3b3p3",
+         "label": "当天无发布一分钟排除",
+         "children": [],
+         "detail": "查当天发布记录，答案是当天没有任何发布，这条排查只用了一分钟。材料特别指出它本来应该是第一个被查的。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "ce1dabec-86a6-428d-926d-02350d68296e",
+           "start": 666,
+           "end": 705,
+           "quote": "答案是：当天没有任何发布。这条排查只用了一分钟 —— 它本来应该是第一个被查的"
+          }
+         ]
+        }
+       ],
+       "detail": "第三个假设是有人动了代码，查当天发布记录只用了一分钟就排除——当天没有任何发布，材料里说这本该是第一个被查的。第四个假设是网络抖动，抓包看丢包率和RTT都没有异常。到凌晨一点四十，白板上的假设增加到九个，团队很忙但没有一个人在缩小范围。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "ce1dabec-86a6-428d-926d-02350d68296e",
+         "start": 708,
+         "end": 720,
+         "quote": "# 第四个假设：网络抖动"
+        }
+       ]
+      },
+      {
+       "id": "g3b4",
+       "label": "转折点与真正原因",
+       "children": [
+        {
+         "id": "g3b4p1",
+         "label": "线程dump发现187个在等",
+         "children": [],
+         "detail": "线程dump显示200个业务线程中有187个卡在同一个地方——等一个下游服务返回，栈顶停在org.apache.http.pool.AbstractConnPool.awaitAvailable。日志里看不到这一层，因为请求根本没有发出去，等连接不产生日志。材料由此点出：没有日志的地方，往往就是答案。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "ce1dabec-86a6-428d-926d-02350d68296e",
+           "start": 1235,
+           "end": 1270,
+           "quote": "200 个业务线程，187 个卡在同一个地方 —— 等一个下游服务返回"
+          }
+         ]
+        },
+        {
+         "id": "g3b4p2",
+         "label": "maxConnPerRoute被",
+         "children": [],
+         "detail": "三个月前为了压一个下游服务的连接数占用，有人在配置中心把maxConnPerRoute从200改成50。当时这是对的，那时QPS只有现在的三分之一，50个连接绰绰有余。它之所以三个月没出事，是因为只在特定组合下暴露：下游响应变慢、连接被长时间占用，同时上游并发冲高，连接池才会被打满。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "ce1dabec-86a6-428d-926d-02350d68296e",
+           "start": 1382,
+           "end": 1408,
+           "quote": "maxConnPerRoute: 200 -> 50"
+          }
+         ]
+        },
+        {
+         "id": "g3b4p3",
+         "label": "单量涨四倍连接不够用",
+         "children": [],
+         "detail": "三个月里团队做了两次活动、接了两个大客户，单量涨了四倍，50个连接早就不够用。20:12触发它的是整点对账批处理，那几秒的P99尖峰其实是连接在排队，批处理跑完压力过去服务就自己好了；21:04没能自愈，是因为高峰刚好叠上了另一个业务的下游批量调用。间歇性正是它难查的全部原因。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "ce1dabec-86a6-428d-926d-02350d68296e",
+           "start": 1451,
+           "end": 1492,
+           "quote": "但三个月里，我们做了两次活动、接了两个大客户，单量涨了四倍。50 个连接早就不够了"
+          }
+         ]
+        }
+       ],
+       "detail": "02:30出现转折：一位同学没有继续看日志，而是去看了线程dump，发现200个业务线程里有187个卡在等下游服务返回，栈顶停在HttpClient连接池的awaitAvailable。日志里看不到这个，因为请求根本没发出去，等连接不产生日志。真正原因是三个月前为压下游连接数占用，在配置中心把maxConnPerRoute从200改成了50；当时QPS只有现在的三分之一，而三个月里单量涨了四倍，50个连接早就不够用。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "ce1dabec-86a6-428d-926d-02350d68296e",
+         "start": 898,
+         "end": 909,
+         "quote": "# 02:30，转折点"
+        }
+       ]
+      },
+      {
+       "id": "g3b5",
+       "label": "通宵未解只差一个配置",
+       "children": [
+        {
+         "id": "g3b5p1",
+         "label": "没第一时间缩小范围",
+         "children": [],
+         "detail": "团队七个人各自扑在验证自己的假设上，六条慢查询告警是真的就顺着挖了三个小时，从头到尾没有人问一句「如果数据库是瓶颈，为什么数据库CPU只有30%」。材料总结：忙不等于在推进。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "ce1dabec-86a6-428d-926d-02350d68296e",
+           "start": 1724,
+           "end": 1748,
+           "quote": "我们做错的事其实只有一件：没有第一时间去缩小范围"
+          }
+         ]
+        },
+        {
+         "id": "g3b5p2",
+         "label": "数据链路上找中点二分",
+         "children": [],
+         "detail": "正确做法是在数据链路上找中点——网关、负载均衡、应用、缓存、数据库，随便找一个中点做一次验证就能砍掉一半范围。材料称这是唯一能稳定提速的动作，而团队跳过了这一步。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "ce1dabec-86a6-428d-926d-02350d68296e",
+           "start": 1848,
+           "end": 1884,
+           "quote": "正确的做法是在数据链路上找中点 —— 网关、负载均衡、应用、缓存、数据库"
+          }
+         ]
+        },
+        {
+         "id": "g3b5p3",
+         "label": "先定影响面再冻结变更",
+         "children": [],
+         "detail": "排查顺序表的前两步：先定影响面，谁受影响、多大范围、还在不在扩大，范围决定优先级而原因不决定；再冻结变更，查最近两小时有无上线、配置、数据变更，有就先回滚再慢慢查原因。后面依次是建立精确到分钟的时间线、二分缩小范围、把假设写在白板上逐条打勾划掉、分工不要全员扑一个猜测、48小时内出复盘。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "ce1dabec-86a6-428d-926d-02350d68296e",
+           "start": 2046,
+           "end": 2072,
+           "quote": "1先定影响面，不定原因谁受影响、多大范围、还在扩大吗"
+          }
+         ]
+        }
+       ],
+       "detail": "这一节是复盘：故障本来应该在第一个小时内定位，团队做错的其实只有一件事——没有第一时间去缩小范围，把「哪个环节慢」和「为什么慢」混在一起查了三个小时。材料给出两张表：故障排查顺序表和故障时间线记录表，后者最后一列「是否缩小范围」是关键，填过一次就会发现十二个小时里有九个小时的动作都不属于缩小范围。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "ce1dabec-86a6-428d-926d-02350d68296e",
+         "start": 2,
+         "end": 24,
+         "quote": "一次通宵都没解决的线上故障，最后是一个配置项"
+        }
+       ]
+      }
+     ],
+     "expandable": "yes",
+     "collapsed": false,
+     "color": "amber",
+     "icon": "⚠️",
+     "source_refs": []
+    },
+    {
+     "id": "g4",
+     "label": "慢查询与接口优化",
+     "children": [
+      {
+       "id": "g4b1",
+       "label": "日志里的慢查询经验",
+       "children": [
+        {
+         "id": "g4b1p1",
+         "label": "P99从80毫秒涨到2.3秒",
+         "children": [],
+         "detail": "订单查询接口的P99延迟突然从80毫秒涨到2.3秒，报错率却没有明显上升，告警只提示接口变慢，没有指出慢在哪里。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "ce5df76a-58f5-422e-83ef-c100c95d89b0",
+           "quote": "我们一个订单查询接口的 P99 延迟突然从 80 毫秒涨到 2.3 秒，报错率却没有明显上升"
+          }
+         ]
+        },
+        {
+         "id": "g4b1p2",
+         "label": "两小时靠三条朴素经验",
+         "children": [],
+         "detail": "这次排查用了不到两小时，靠的不是高深工具，而是三条朴素经验：先对齐时间再看日志、把慢拆成三段再定位、修完留证据不只凭感觉。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "ce5df76a-58f5-422e-83ef-c100c95d89b0",
+           "quote": "这次排查只用了不到两小时，靠的不是高深工具，而是三条很朴素的经验"
+          }
+         ]
+        },
+        {
+         "id": "g4b1p3",
+         "label": "慢查询很少是单一原因",
+         "children": [],
+         "detail": "材料在小结里指出，慢查询很少是单一原因造成的，但排查方法可以是确定的：对齐时间用请求ID串联日志、分段计时先确定慢在哪一段再段内下钻、修复后保留可复核的证据和记录。把每次排查沉淀下来，系统和团队都会越来越稳。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "ce5df76a-58f5-422e-83ef-c100c95d89b0",
+           "start": 1162,
+           "end": 1187,
+           "quote": "慢查询很少是单一原因造成的，但排查方法可以是确定的"
+          }
+         ]
+        }
+       ],
+       "detail": "订单查询接口P99从80毫秒涨到2.3秒、报错率没有明显上升，告警只说变慢没说慢在哪里。这次排查不到两小时，靠的是三条朴素经验：先对齐各节点时钟再用请求ID串联网关、业务服务和数据库日志；把一次请求拆成网络与网关、业务处理、数据库三段分别计时再在段内下钻；修完保留可复核的证据和记录。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "ce5df76a-58f5-422e-83ef-c100c95d89b0",
+         "start": 99,
+         "end": 124,
+         "quote": "日志里藏着的慢查询：一次接口变慢排查的三点实用经验"
+        }
+       ]
+      },
+      {
+       "id": "g4b2",
+       "label": "百万订单统计提速",
+       "children": [
+        {
+         "id": "g4b2p1",
+         "label": "P99稳定2.8秒高峰4秒",
+         "children": [],
+         "detail": "运营后台订单统计页的P99耗时稳定在2.8秒，高峰期冲到4秒开外，运营点一次「今日GMV」要转圈半天，老板看数据大屏卡了一次直接在群里@技术。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "cc8ae706-01ad-4085-a1c9-309fb124f538",
+           "start": 172,
+           "end": 205,
+           "quote": "运营后台的订单统计页，P99耗时稳定在2.8秒，高峰期冲到4秒开外"
+          }
+         ]
+        },
+        {
+         "id": "g4b2p2",
+         "label": "加索引治标不治本",
+         "children": [],
+         "detail": "第一反应是加索引，但冷静下来判断这治标不治本：业务查询是找某条具体数据、索引能精准命中，统计查询是算一堆数据的汇总，就算建了覆盖索引，InnoDB的count(*)依然要逐行扫几十万行；多维度任意组合时索引建少了不顶用，建多了写入维护成本爆炸。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "cc8ae706-01ad-4085-a1c9-309fb124f538",
+           "start": 698,
+           "end": 725,
+           "quote": "冷静下来想，这治标不治本。统计型查询和业务型查询不一样"
+          }
+         ]
+        },
+        {
+         "id": "g4b2p3",
+         "label": "实时算改成写入时同步算",
+         "children": [],
+         "detail": "方案的核心是把「查询时实时算」改成「写入时同步算」：在订单创建、支付、取消、退款等状态变更节点同步更新Redis里的预聚合计数器，查询端直接读计数器毫秒级返回，从而绕开MySQL的实时大批量聚合。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "cc8ae706-01ad-4085-a1c9-309fb124f538",
+           "start": 903,
+           "end": 929,
+           "quote": "把\"查询时实时算\"改成\"写入时同步算\"，也就是预聚合"
+          }
+         ]
+        }
+       ],
+       "detail": "运营后台订单统计页P99稳定在2.8秒、高峰冲到4秒开外，原写法是Service拼SQL让MySQL执行count、sum、group by。订单主表500多万行且每天增长几万条，一条SQL扫几十万行还要在临时表里排序分组。团队判断加索引治标不治本：统计查询要算一堆数据的汇总，InnoDB的count(*)仍要逐行扫，多维度任意组合时索引建少了不顶用、建多了写入维护成本爆炸。本质是用MySQL干它不擅长的实时大批量聚合，于是把「查询时实时算」改成「写入时同步算」，即预聚合。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "cc8ae706-01ad-4085-a1c9-309fb124f538",
+         "start": 2,
+         "end": 33,
+         "quote": "百万订单统计从3秒压到30毫秒，我是怎么一步步把慢接口救回来的"
+        }
+       ]
+      },
+      {
+       "id": "g4b3",
+       "label": "方案选型为何选MySQL加Red",
+       "children": [
+        {
+         "id": "g4b3p1",
+         "label": "离线T+1满足不了实时",
+         "children": [],
+         "detail": "离线T+1方案是每天凌晨汇总前一天数据到统计表，但运营要看「今日实时GMV」，T+1满足不了实时性，因此被放弃。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "cc8ae706-01ad-4085-a1c9-309fb124f538",
+           "start": 1040,
+           "end": 1092,
+           "quote": "离线T+1跑批：每天凌晨汇总前一天数据到统计表，但运营要看\"今日实时GMV\"，T+1满足不了实时性。放弃"
+          }
+         ]
+        },
+        {
+         "id": "g4b3p2",
+         "label": "OLAP引擎运维成本扛不起",
+         "children": [],
+         "detail": "ClickHouse、StarRocks这类OLAP引擎性能确实猛，但为了一个后台统计页面就上新中间件，运维成本和数据同步复杂度都上去了，团队小扛不起，只能搁置。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "cc8ae706-01ad-4085-a1c9-309fb124f538",
+           "start": 1095,
+           "end": 1174,
+           "quote": "ClickHouse/StarRocks这类OLAP引擎：性能确实猛，但为了一个后台统计页面就上新中间件，运维成本和数据同步复杂度都上去了，我们团队小，扛不起"
+          }
+         ]
+        },
+        {
+         "id": "g4b3p3",
+         "label": "MySQL兜底Redis加速",
+         "children": [],
+         "detail": "最终架构是MySQL作为唯一数据源，订单可靠落库、任何时候都能重建Redis里的统计；Redis作为加速层，所有实时统计走预聚合计数器、查询只读Redis；每天凌晨定时全量重建，用MySQL重算指标刷新Redis；对账任务周期对比两边值，偏差过大自动重建。概括起来就是「实时增量为主，全量重建兜底」。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "cc8ae706-01ad-4085-a1c9-309fb124f538",
+           "start": 1294,
+           "end": 1331,
+           "quote": "MySQL作为唯一数据源，订单可靠落库，任何时候都能重建Redis里的统计"
+          }
+         ]
+        }
+       ],
+       "detail": "动手前对比了几种思路：SQL优化加索引短期有效长期无解，组合维度一多索引覆盖不过来；离线T+1跑批满足不了运营看「今日实时GMV」的需求；ClickHouse、StarRocks这类OLAP引擎性能虽猛，但为一个后台统计页上新中间件，运维成本和数据同步复杂度都上去了，团队小扛不起，搁置；Redis预聚合毫秒级但有丢数据风险，需要补偿。最终选Redis预聚合加MySQL兜底的组合架构。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "cc8ae706-01ad-4085-a1c9-309fb124f538",
+         "start": 935,
+         "end": 958,
+         "quote": "方案选型：为什么最终选了MySQL+Redis"
+        }
+       ]
+      },
+      {
+       "id": "g4b4",
+       "label": "Key设计预聚合的得失",
+       "children": [
+        {
+         "id": "g4b4p1",
+         "label": "维度指标粒度拼进Key",
+         "children": [],
+         "detail": "Key里把维度标识、维度值、指标名、时间粒度、时间值依次拼进去，例如「2026年10月18日app渠道已支付订单」对应channel:app、status:paid、cnt或gmv、day:20261018。指标名单独拼进Key，是因为计数用INCR、金额用INCRBYFLOAT，拆开后写入互不影响、读取一次mget就行。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "cc8ae706-01ad-4085-a1c9-309fb124f538",
+           "start": 1548,
+           "end": 1596,
+           "quote": "我用的规则：stat:order:{维度标识}:{维度值}:{指标名}:{时间粒度}:{时间值}"
+          }
+         ]
+        },
+        {
+         "id": "g4b4p2",
+         "label": "维度枚举必须白名单收敛",
+         "children": [],
+         "detail": "维度枚举必须预先收敛，不能让用户随便传值当Key后缀，否则恶意请求传个随机字符串当channel，Redis瞬间多出几十万个无用Key、内存直接爆。代码里做了白名单校验，不在枚举里的维度直接拒绝。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "cc8ae706-01ad-4085-a1c9-309fb124f538",
+           "start": 1919,
+           "end": 1946,
+           "quote": "维度枚举一定要预先收敛，不能让用户随便传值当Key后缀"
+          }
+         ]
+        },
+        {
+         "id": "g4b4p3",
+         "label": "三层时间粒度靠roll up",
+         "children": [],
+         "detail": "时间粒度做了day、hour、minute三层：天报表按day，实时大屏看minute，小时和天粒度靠定时任务从分钟粒度roll up上去。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "cc8ae706-01ad-4085-a1c9-309fb124f538",
+           "start": 1841,
+           "end": 1909,
+           "quote": "时间粒度做了三层：day、hour、minute。天报表按day，实时大屏看minute。小时和天粒度靠定时任务从分钟粒度roll up"
+          }
+         ]
+        }
+       ],
+       "detail": "Key设计规则是stat:order:{维度标识}:{维度值}:{指标名}:{时间粒度}:{时间值}，把指标名也拼进Key是因为计数用INCR、金额用INCRBYFLOAT，拆成独立Key写入互不影响、读取一次mget即可。时间粒度做了day、hour、minute三层，小时和天粒度靠定时任务从分钟粒度roll up。材料强调Key设计是预聚合的灵魂，随手写死字符串后期维度一加就会崩。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "cc8ae706-01ad-4085-a1c9-309fb124f538",
+         "start": 1486,
+         "end": 1505,
+         "quote": "Key设计：预聚合成也Key败也Key"
+        }
+       ]
+      },
+      {
+       "id": "g4b5",
+       "label": "双写核心实现",
+       "children": [
+        {
+         "id": "g4b5p1",
+         "label": "按订单ID做幂等去重",
+         "children": [],
+         "detail": "支付回调可能重复投递、MQ也可能重复消费，每次收到「已支付」都INCR就会多算一笔。做法是基于订单ID去重：已处理过的订单ID存入Redis SET，处理前先判断，SET只保留最近7天ID以控制内存。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "cc8ae706-01ad-4085-a1c9-309fb124f538",
+           "start": 2164,
+           "end": 2202,
+           "quote": "我基于订单ID做去重：已处理过的订单ID存入Redis SET，处理前先判断"
+          }
+         ]
+        },
+        {
+         "id": "g4b5p2",
+         "label": "旧状态减一新状态加一",
+         "children": [],
+         "detail": "订单从「待支付」变「已支付」，要给paid_cnt加一、unpaid_cnt减一。最开始只加不减，待支付数量一直涨、数据一塌糊涂；后来抽象出通用方法，传入旧状态和新状态自动算加减，业务代码只管调用。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "cc8ae706-01ad-4085-a1c9-309fb124f538",
+           "start": 2235,
+           "end": 2275,
+           "quote": "订单从\"待支付\"变\"已支付\"，要给paid_cnt加一、unpaid_cnt减一"
+          }
+         ]
+        },
+        {
+         "id": "g4b5p3",
+         "label": "GMV浮点尾差用BigDecim",
+         "children": [],
+         "detail": "GMV用INCRBYFLOAT累加，多次累加后可能出现19.990000000000002这类尾差，读取时统一用BigDecimal做ROUND_HALF_UP保留两位小数即可。",
+         "expandable": "yes",
+         "collapsed": false,
+         "source_refs": [
+          {
+           "source_id": "cc8ae706-01ad-4085-a1c9-309fb124f538",
+           "start": 2346,
+           "end": 2434,
+           "quote": "GMV用INCRBYFLOAT累加，多次累加后可能出现19.990000000000002这种尾差。读取时统一用BigDecimal做ROUND_HALF_UP保留两位小数即可"
+          }
+         ]
+        }
+       ],
+       "detail": "核心动作是在订单状态变更节点——创建、支付、取消、退款——同步更新Redis计数器，听着只是几个INCR，实际有三个坑：计数必须幂等，支付回调可能重复投递、MQ可能重复消费；增减要成对，状态从待支付变已支付要给paid_cnt加一、unpaid_cnt减一；浮点累加会有尾差。材料强调代码不复杂，关键是所有状态流转入口都要调到，漏一个数据就歪。",
+       "expandable": "yes",
+       "collapsed": false,
+       "source_refs": [
+        {
+         "source_id": "cc8ae706-01ad-4085-a1c9-309fb124f538",
+         "start": 2023,
+         "end": 2036,
+         "quote": "核心实现：双写没你想的简单"
+        }
+       ]
+      }
+     ],
+     "expandable": "yes",
+     "collapsed": false,
+     "color": "green",
+     "icon": "📈",
+     "source_refs": []
+    }
+   ],
+   "detail": "一次内容查询接口的线上抖动复盘：平时响应一百毫秒上下，运营活动当天用户反馈“偶尔转半天圈”，监控里 P50 正常、P99 却从两百毫秒窜到两三秒。同事第一反应是扩容加机器，作者拦住，先做性能体检：用 wrk 分档压测复现长尾，加分阶段埋点定位到请求大量时间花在“从连接池借连接”而非 SQL 执行，再围绕 HikariCP 参数、N+1 慢查询、线程池有界队列与降级一起改，最后长尾压下去。全文按“先看分位数—拆段定位—调连接池与线程池—留证据复盘”的顺序组织，并附瓶颈对比表和五个踩坑。",
+   "expandable": "yes",
+   "collapsed": false,
+   "source_refs": []
+  },
+  "layout": "tree",
+  "edges": [],
+  "diagram_type": "tree"
+ },
+ "content_stats": {
+  "present": true,
+  "title": "接口变慢排查与优化实录",
+  "nodes": 85,
+  "depth": 4,
+  "type": null
+ }
+}

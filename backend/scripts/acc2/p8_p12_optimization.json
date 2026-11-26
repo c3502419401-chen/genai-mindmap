@@ -1,0 +1,1040 @@
+{
+ "check:tree_clean": {
+  "status": 200,
+  "count": 0,
+  "codes": {},
+  "levels": {},
+  "items": []
+ },
+ "check:tree_flawed": {
+  "status": 200,
+  "count": 11,
+  "codes": {
+   "SINGLE_CHILD": 3,
+   "DUPLICATE_LABEL": 1,
+   "NEAR_DUPLICATE_LABEL": 1,
+   "SHALLOW_BRANCH": 5,
+   "MISSING_DETAIL": 1
+  },
+  "levels": {
+   "info": 10,
+   "warn": 1
+  },
+  "items": [
+   {
+    "code": "SINGLE_CHILD",
+    "level": "info",
+    "node_id": "c1",
+    "message": "节点「技术选型」只有一个子节点，可考虑展开或合并"
+   },
+   {
+    "code": "SINGLE_CHILD",
+    "level": "info",
+    "node_id": "c1a",
+    "message": "节点「模型层」只有一个子节点，可考虑展开或合并"
+   },
+   {
+    "code": "SINGLE_CHILD",
+    "level": "info",
+    "node_id": "c1a1",
+    "message": "节点「推理成本」只有一个子节点，可考虑展开或合并"
+   },
+   {
+    "code": "DUPLICATE_LABEL",
+    "level": "warn",
+    "node_id": "a2",
+    "message": "同级节点「成本控制」与 a1 文字相同，请确认是否重复"
+   },
+   {
+    "code": "NEAR_DUPLICATE_LABEL",
+    "level": "info",
+    "node_id": "b2",
+    "message": "同级节点「供应链风险的管理」与「供应链风险管理」只多了「的」这 1 个字，请确认是否指的是同一件事"
+   },
+   {
+    "code": "SHALLOW_BRANCH",
+    "level": "info",
+    "node_id": "a1",
+    "message": "「成本控制」这一支还没展开：它是「缺陷样本」下的叶子，而同级最深的一支往下还有 4 层"
+   },
+   {
+    "code": "SHALLOW_BRANCH",
+    "level": "info",
+    "node_id": "a2",
+    "message": "「成本控制」这一支还没展开：它是「缺陷样本」下的叶子，而同级最深的一支往下还有 4 层"
+   },
+   {
+    "code": "SHALLOW_BRANCH",
+    "level": "info",
+    "node_id": "b1",
+    "message": "「供应链风险管理」这一支还没展开：它是「缺陷样本」下的叶子，而同级最深的一支往下还有 4 层"
+   },
+   {
+    "code": "SHALLOW_BRANCH",
+    "level": "info",
+    "node_id": "b2",
+    "message": "「供应链风险的管理」这一支还没展开：它是「缺陷样本」下的叶子，而同级最深的一支往下还有 4 层"
+   },
+   {
+    "code": "SHALLOW_BRANCH",
+    "level": "info",
+    "node_id": "d1",
+    "message": "「组织保障」这一支还没展开：它是「缺陷样本」下的叶子，而同级最深的一支往下还有 4 层"
+   },
+   {
+    "code": "MISSING_DETAIL",
+    "level": "info",
+    "node_id": null,
+    "message": "这 5 个叶子节点没有说明（如 「成本控制」、「成本控制」、「供应链风险管理」），读者看不出它们各自要做什么"
+   }
+  ]
+ },
+ "check:tree_relations": {
+  "status": 200,
+  "count": 11,
+  "codes": {
+   "SINGLE_CHILD": 3,
+   "DUPLICATE_LABEL": 1,
+   "NEAR_DUPLICATE_LABEL": 1,
+   "SHALLOW_BRANCH": 5,
+   "MISSING_DETAIL": 1
+  },
+  "levels": {
+   "info": 10,
+   "warn": 1
+  },
+  "items": [
+   {
+    "code": "SINGLE_CHILD",
+    "level": "info",
+    "node_id": "c1",
+    "message": "节点「技术选型」只有一个子节点，可考虑展开或合并"
+   },
+   {
+    "code": "SINGLE_CHILD",
+    "level": "info",
+    "node_id": "c1a",
+    "message": "节点「模型层」只有一个子节点，可考虑展开或合并"
+   },
+   {
+    "code": "SINGLE_CHILD",
+    "level": "info",
+    "node_id": "c1a1",
+    "message": "节点「推理成本」只有一个子节点，可考虑展开或合并"
+   },
+   {
+    "code": "DUPLICATE_LABEL",
+    "level": "warn",
+    "node_id": "a2",
+    "message": "同级节点「成本控制」与 a1 文字相同，请确认是否重复"
+   },
+   {
+    "code": "NEAR_DUPLICATE_LABEL",
+    "level": "info",
+    "node_id": "b2",
+    "message": "同级节点「供应链风险的管理」与「供应链风险管理」只多了「的」这 1 个字，请确认是否指的是同一件事"
+   },
+   {
+    "code": "SHALLOW_BRANCH",
+    "level": "info",
+    "node_id": "a1",
+    "message": "「成本控制」这一支还没展开：它是「缺陷样本」下的叶子，而同级最深的一支往下还有 4 层"
+   },
+   {
+    "code": "SHALLOW_BRANCH",
+    "level": "info",
+    "node_id": "a2",
+    "message": "「成本控制」这一支还没展开：它是「缺陷样本」下的叶子，而同级最深的一支往下还有 4 层"
+   },
+   {
+    "code": "SHALLOW_BRANCH",
+    "level": "info",
+    "node_id": "b1",
+    "message": "「供应链风险管理」这一支还没展开：它是「缺陷样本」下的叶子，而同级最深的一支往下还有 4 层"
+   },
+   {
+    "code": "SHALLOW_BRANCH",
+    "level": "info",
+    "node_id": "b2",
+    "message": "「供应链风险的管理」这一支还没展开：它是「缺陷样本」下的叶子，而同级最深的一支往下还有 4 层"
+   },
+   {
+    "code": "SHALLOW_BRANCH",
+    "level": "info",
+    "node_id": "d1",
+    "message": "「组织保障」这一支还没展开：它是「缺陷样本」下的叶子，而同级最深的一支往下还有 4 层"
+   },
+   {
+    "code": "MISSING_DETAIL",
+    "level": "info",
+    "node_id": null,
+    "message": "这 5 个叶子节点没有说明（如 「成本控制」、「成本控制」、「供应链风险管理」），读者看不出它们各自要做什么"
+   }
+  ]
+ },
+ "check:fishbone": {
+  "status": 422,
+  "count": 0,
+  "codes": {},
+  "levels": {},
+  "items": [],
+  "detail": "结构体检只支持树型导图（鱼骨与流程的判据不同，暂不支持）"
+ },
+ "check:flow": {
+  "status": 422,
+  "count": 0,
+  "codes": {},
+  "levels": {},
+  "items": [],
+  "detail": [
+   {
+    "type": "missing",
+    "loc": [
+     "body",
+     "content",
+     "function-after[validate_tree(), MindMapContent]",
+     "root"
+    ],
+    "msg": "Field required",
+    "input": {
+     "title": "报销流程",
+     "diagram_type": "flowchart",
+     "stages": [
+      {
+       "id": "s1",
+       "name": "提交",
+       "root": {
+        "id": "s1r",
+        "label": "提交",
+        "children": [
+         {
+          "id": "s1a",
+          "label": "填单",
+          "children": []
+         }
+        ]
+       }
+      },
+      {
+       "id": "s2",
+       "name": "审查",
+       "root": {
+        "id": "s2r",
+        "label": "审查",
+        "children": [
+         {
+          "id": "s2a",
+          "label": "核对发票",
+          "children": []
+         }
+        ]
+       }
+      }
+     ],
+     "edges": [
+      {
+       "id": "e1",
+       "source": "s1",
+       "target": "s2"
+      }
+     ]
+    }
+   },
+   {
+    "type": "extra_forbidden",
+    "loc": [
+     "body",
+     "content",
+     "function-after[validate_tree(), MindMapContent]",
+     "stages"
+    ],
+    "msg": "Extra inputs are not permitted",
+    "input": [
+     {
+      "id": "s1",
+      "name": "提交",
+      "root": {
+       "id": "s1r",
+       "label": "提交",
+       "children": [
+        {
+         "id": "s1a",
+         "label": "填单",
+         "children": []
+        }
+       ]
+      }
+     },
+     {
+      "id": "s2",
+      "name": "审查",
+      "root": {
+       "id": "s2r",
+       "label": "审查",
+       "children": [
+        {
+         "id": "s2a",
+         "label": "核对发票",
+         "children": []
+        }
+       ]
+      }
+     }
+    ]
+   },
+   {
+    "type": "literal_error",
+    "loc": [
+     "body",
+     "content",
+     "function-after[validate_fishbone(), FishboneContent]",
+     "diagram_type"
+    ],
+    "msg": "Input should be 'fishbone'",
+    "input": "flowchart",
+    "ctx": {
+     "expected": "'fishbone'"
+    }
+   },
+   {
+    "type": "missing",
+    "loc": [
+     "body",
+     "content",
+     "function-after[validate_fishbone(), FishboneContent]",
+     "problem"
+    ],
+    "msg": "Field required",
+    "input": {
+     "title": "报销流程",
+     "diagram_type": "flowchart",
+     "stages": [
+      {
+       "id": "s1",
+       "name": "提交",
+       "root": {
+        "id": "s1r",
+        "label": "提交",
+        "children": [
+         {
+          "id": "s1a",
+          "label": "填单",
+          "children": []
+         }
+        ]
+       }
+      },
+      {
+       "id": "s2",
+       "name": "审查",
+       "root": {
+        "id": "s2r",
+        "label": "审查",
+        "children": [
+         {
+          "id": "s2a",
+          "label": "核对发票",
+          "children": []
+         }
+        ]
+       }
+      }
+     ],
+     "edges": [
+      {
+       "id": "e1",
+       "source": "s1",
+       "target": "s2"
+      }
+     ]
+    }
+   },
+   {
+    "type": "extra_forbidden",
+    "loc": [
+     "body",
+     "content",
+     "function-after[validate_fishbone(), FishboneContent]",
+     "stages"
+    ],
+    "msg": "Extra inputs are not permitted",
+    "input": [
+     {
+      "id": "s1",
+      "name": "提交",
+      "root": {
+       "id": "s1r",
+       "label": "提交",
+       "children": [
+        {
+         "id": "s1a",
+         "label": "填单",
+         "children": []
+        }
+       ]
+      }
+     },
+     {
+      "id": "s2",
+      "name": "审查",
+      "root": {
+       "id": "s2r",
+       "label": "审查",
+       "children": [
+        {
+         "id": "s2a",
+         "label": "核对发票",
+         "children": []
+        }
+       ]
+      }
+     }
+    ]
+   },
+   {
+    "type": "extra_forbidden",
+    "loc": [
+     "body",
+     "content",
+     "function-after[validate_fishbone(), FishboneContent]",
+     "edges"
+    ],
+    "msg": "Extra inputs are not permitted",
+    "input": [
+     {
+      "id": "e1",
+      "source": "s1",
+      "target": "s2"
+     }
+    ]
+   },
+   {
+    "type": "extra_forbidden",
+    "loc": [
+     "body",
+     "content",
+     "function-after[validate_flow(), FlowContent]",
+     "stages",
+     0,
+     "name"
+    ],
+    "msg": "Extra inputs are not permitted",
+    "input": "提交"
+   },
+   {
+    "type": "extra_forbidden",
+    "loc": [
+     "body",
+     "content",
+     "function-after[validate_flow(), FlowContent]",
+     "stages",
+     1,
+     "name"
+    ],
+    "msg": "Extra inputs are not permitted",
+    "input": "审查"
+   }
+  ]
+ },
+ "suggest:tree_flawed": {
+  "status": 200,
+  "count": 11,
+  "kinds": {
+   "expand": 8,
+   "dedupe": 2,
+   "add_detail": 1
+  },
+  "items": [
+   {
+    "kind": "expand",
+    "node_id": "c1",
+    "message": "把这一支再展开一层，或者并进相邻节点：节点「技术选型」只有一个子节点，可考虑展开或合并"
+   },
+   {
+    "kind": "expand",
+    "node_id": "c1a",
+    "message": "把这一支再展开一层，或者并进相邻节点：节点「模型层」只有一个子节点，可考虑展开或合并"
+   },
+   {
+    "kind": "expand",
+    "node_id": "c1a1",
+    "message": "把这一支再展开一层，或者并进相邻节点：节点「推理成本」只有一个子节点，可考虑展开或合并"
+   },
+   {
+    "kind": "dedupe",
+    "node_id": "a2",
+    "message": "合并这两个同级节点，保留一个：同级节点「成本控制」与 a1 文字相同，请确认是否重复"
+   },
+   {
+    "kind": "dedupe",
+    "node_id": "b2",
+    "message": "确认是不是同一件事：是就合并，不是就把说法区分开：同级节点「供应链风险的管理」与「供应链风险管理」只多了「的」这 1 个字，请确认是否指的是同一件事"
+   },
+   {
+    "kind": "expand",
+    "node_id": "a1",
+    "message": "把这一支补到与其他分支相近的深度：「成本控制」这一支还没展开：它是「缺陷样本」下的叶子，而同级最深的一支往下还有 4 层"
+   },
+   {
+    "kind": "expand",
+    "node_id": "a2",
+    "message": "把这一支补到与其他分支相近的深度：「成本控制」这一支还没展开：它是「缺陷样本」下的叶子，而同级最深的一支往下还有 4 层"
+   },
+   {
+    "kind": "expand",
+    "node_id": "b1",
+    "message": "把这一支补到与其他分支相近的深度：「供应链风险管理」这一支还没展开：它是「缺陷样本」下的叶子，而同级最深的一支往下还有 4 层"
+   },
+   {
+    "kind": "expand",
+    "node_id": "b2",
+    "message": "把这一支补到与其他分支相近的深度：「供应链风险的管理」这一支还没展开：它是「缺陷样本」下的叶子，而同级最深的一支往下还有 4 层"
+   },
+   {
+    "kind": "expand",
+    "node_id": "d1",
+    "message": "把这一支补到与其他分支相近的深度：「组织保障」这一支还没展开：它是「缺陷样本」下的叶子，而同级最深的一支往下还有 4 层"
+   },
+   {
+    "kind": "add_detail",
+    "node_id": null,
+    "message": "给这些叶子节点各补一句说明：这 5 个叶子节点没有说明（如 「成本控制」、「成本控制」、「供应链风险管理」），读者看不出它们各自要做什么"
+   }
+  ]
+ },
+ "suggest:tree_relations": {
+  "status": 200,
+  "count": 11,
+  "kinds": {
+   "expand": 8,
+   "dedupe": 2,
+   "add_detail": 1
+  },
+  "items": [
+   {
+    "kind": "expand",
+    "node_id": "c1",
+    "message": "把这一支再展开一层，或者并进相邻节点：节点「技术选型」只有一个子节点，可考虑展开或合并"
+   },
+   {
+    "kind": "expand",
+    "node_id": "c1a",
+    "message": "把这一支再展开一层，或者并进相邻节点：节点「模型层」只有一个子节点，可考虑展开或合并"
+   },
+   {
+    "kind": "expand",
+    "node_id": "c1a1",
+    "message": "把这一支再展开一层，或者并进相邻节点：节点「推理成本」只有一个子节点，可考虑展开或合并"
+   },
+   {
+    "kind": "dedupe",
+    "node_id": "a2",
+    "message": "合并这两个同级节点，保留一个：同级节点「成本控制」与 a1 文字相同，请确认是否重复"
+   },
+   {
+    "kind": "dedupe",
+    "node_id": "b2",
+    "message": "确认是不是同一件事：是就合并，不是就把说法区分开：同级节点「供应链风险的管理」与「供应链风险管理」只多了「的」这 1 个字，请确认是否指的是同一件事"
+   },
+   {
+    "kind": "expand",
+    "node_id": "a1",
+    "message": "把这一支补到与其他分支相近的深度：「成本控制」这一支还没展开：它是「缺陷样本」下的叶子，而同级最深的一支往下还有 4 层"
+   },
+   {
+    "kind": "expand",
+    "node_id": "a2",
+    "message": "把这一支补到与其他分支相近的深度：「成本控制」这一支还没展开：它是「缺陷样本」下的叶子，而同级最深的一支往下还有 4 层"
+   },
+   {
+    "kind": "expand",
+    "node_id": "b1",
+    "message": "把这一支补到与其他分支相近的深度：「供应链风险管理」这一支还没展开：它是「缺陷样本」下的叶子，而同级最深的一支往下还有 4 层"
+   },
+   {
+    "kind": "expand",
+    "node_id": "b2",
+    "message": "把这一支补到与其他分支相近的深度：「供应链风险的管理」这一支还没展开：它是「缺陷样本」下的叶子，而同级最深的一支往下还有 4 层"
+   },
+   {
+    "kind": "expand",
+    "node_id": "d1",
+    "message": "把这一支补到与其他分支相近的深度：「组织保障」这一支还没展开：它是「缺陷样本」下的叶子，而同级最深的一支往下还有 4 层"
+   },
+   {
+    "kind": "add_detail",
+    "node_id": null,
+    "message": "给这些叶子节点各补一句说明：这 5 个叶子节点没有说明（如 「成本控制」、「成本控制」、「供应链风险管理」），读者看不出它们各自要做什么"
+   }
+  ]
+ },
+ "refs:sources_aligned": {
+  "status": 200,
+  "count": 4,
+  "codes": {
+   "UNSOURCED_NODE": 4
+  },
+  "levels": {
+   "warn": 4
+  },
+  "items": [
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "root",
+    "message": "节点「产品评审 PPT」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s2",
+    "message": "节点「市场分析」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s3",
+    "message": "节点「功能设计」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s4",
+    "message": "节点「技术难点与风险」没有可核验的原文引用；不代表节点内容错误"
+   }
+  ]
+ },
+ "refs:sources_raw_id": {
+  "status": 200,
+  "count": 70,
+  "codes": {
+   "UNSOURCED_NODE": 37,
+   "SOURCE_TEXT_UNAVAILABLE": 33
+  },
+  "levels": {
+   "warn": 70
+  },
+  "items": [
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "root",
+    "message": "节点「产品评审 PPT」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s1-1",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s1-1",
+    "message": "节点「智能家居产品设计评审 / 评审时间与主题」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s1-1-1",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s1-1-1",
+    "message": "节点「2026年11月评审」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s1-1-2",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s1-1-2",
+    "message": "节点「产品与硬件联合评审」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s2",
+    "message": "节点「市场分析」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s2-1",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s2-1",
+    "message": "节点「目标人群定位」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s2-1-1",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s2-1-1",
+    "message": "节点「一线城市有孩家庭」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s2-1-2",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s2-1-2",
+    "message": "节点「年龄 25-40 岁」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s2-2",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s2-2",
+    "message": "节点「竞品格局」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s2-2-1",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s2-2-1",
+    "message": "节点「小米华为涂鸦占中低端」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s2-2-2",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s2-2-2",
+    "message": "节点「高端市场存在缺位」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s2-3",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s2-3",
+    "message": "节点「价格带与敏感度」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s2-3-1",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s2-3-1",
+    "message": "节点「整套方案 8000-20000」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s2-3-2",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s2-3-2",
+    "message": "节点「15000 元以上用户敏感」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s2-4-1",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s2-4-1",
+    "message": "节点「增长点 / 适老化改造需求年增 25%」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s2-5",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s2-5",
+    "message": "节点「渠道效率」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s2-5-1",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s2-5-1",
+    "message": "节点「线下体验店转化率更高」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s2-5-2",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s2-5-2",
+    "message": "节点「线下为线上的 3.2 倍」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s3",
+    "message": "节点「功能设计」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s3-1",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s3-1",
+    "message": "节点「中枢网关」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s3-1-1",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s3-1-1",
+    "message": "节点「本地语音唤醒，断网可用」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s3-1-2",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s3-1-2",
+    "message": "节点「支持 Matter 与 Zigb」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s3-2",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s3-2",
+    "message": "节点「场景引擎」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s3-2-1",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s3-2-1",
+    "message": "节点「离家 / 回家 / 睡眠三类内置」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s3-2-2",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s3-2-2",
+    "message": "节点「场景支持自定义」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s4",
+    "message": "节点「技术难点与风险」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s4-1",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s4-1",
+    "message": "节点「多协议共存信道拥塞」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s4-1-1",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s4-1-1",
+    "message": "节点「2.4G 信道拥塞」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s4-1-2",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s4-1-2",
+    "message": "节点「网关侧信道调度」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s4-1-3",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s4-1-3",
+    "message": "节点「5G 回传分流」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s4-2",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s4-2",
+    "message": "节点「本地语音模型体积过大」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s4-2-1",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s4-2-1",
+    "message": "节点「模型体积过大」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s4-2-2",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s4-2-2",
+    "message": "节点「蒸馏到 12MB 唤醒词模型」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s4-3",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s4-3",
+    "message": "节点「摄像头数据隐私合规」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s4-3-1",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s4-3-1",
+    "message": "节点「摄像头数据隐私合规」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s4-3-2",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s4-3-2",
+    "message": "节点「端侧脱敏」没有可核验的原文引用；不代表节点内容错误"
+   },
+   {
+    "code": "SOURCE_TEXT_UNAVAILABLE",
+    "level": "warn",
+    "node_id": "s4-3-3",
+    "message": "来源 8007363c-1f0f-478e-9c01-98fb4df2766d：未提供已解析的来源原文，无法核验引用"
+   },
+   {
+    "code": "UNSOURCED_NODE",
+    "level": "warn",
+    "node_id": "s4-3-3",
+    "message": "节点「默认不上云」没有可核验的原文引用；不代表节点内容错误"
+   }
+  ]
+ }
+}

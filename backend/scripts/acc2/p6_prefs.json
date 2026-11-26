@@ -1,0 +1,41 @@
+{
+ "prefs_before": {
+  "status": 200,
+  "payload": []
+ },
+ "suggestions_before": {
+  "status": 200,
+  "payload": []
+ },
+ "write_1": {
+  "status": 400,
+  "payload": {
+   "code": "pref_key_unknown",
+   "message": "不认识的偏好键 'layout.depth'。可写的是 diagram_type.default, external_search.enabled, icon.enabled, thinking_model.default，以及 note.* 开头的自由文本备注。",
+   "detail": null,
+   "request_id": "4f7ceaab"
+  }
+ },
+ "write_2": {
+  "status": 400,
+  "payload": {
+   "code": "pref_key_unknown",
+   "message": "不认识的偏好键 'layout.depth'。可写的是 diagram_type.default, external_search.enabled, icon.enabled, thinking_model.default，以及 note.* 开头的自由文本备注。",
+   "detail": null,
+   "request_id": "8b331179"
+  }
+ },
+ "write_3": {
+  "status": 400,
+  "payload": {
+   "code": "pref_key_unknown",
+   "message": "不认识的偏好键 'layout.depth'。可写的是 diagram_type.default, external_search.enabled, icon.enabled, thinking_model.default，以及 note.* 开头的自由文本备注。",
+   "detail": null,
+   "request_id": "f2500465"
+  }
+ },
+ "suggestions_after": {
+  "status": 200,
+  "payload": []
+ }
+}

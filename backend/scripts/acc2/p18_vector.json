@@ -1,0 +1,78 @@
+{
+ "db": {
+  "tables": {
+   "chunk_vectors": 4913,
+   "edit_events": 565,
+   "external_cache": 8,
+   "free_quota": 0,
+   "library_chunks": 3513,
+   "library_sources": 155,
+   "login_attempts": 0,
+   "memory_items": 13,
+   "memory_observations": 110,
+   "memory_proposition_observations": 100,
+   "memory_propositions": 13,
+   "memory_sessions": 13,
+   "mindmaps": 24,
+   "model_settings": 0,
+   "profile_vectors": 4,
+   "runs": 152,
+   "sessions": 0,
+   "sqlite_sequence": 2,
+   "style_profile": 8,
+   "user_prefs": 2,
+   "users": 0
+  },
+  "detail": {
+   "chunk_vectors": {
+    "columns": [
+     "text_hash",
+     "model",
+     "dim",
+     "vector",
+     "created_at"
+    ],
+    "by_model": [
+     {
+      "model": "text-embedding-v3",
+      "rows": 4913,
+      "vector_bytes": 20123648
+     }
+    ]
+   }
+  }
+ },
+ "search": {
+  "缓存命中率对查询延迟的影响": {
+   "status": 200,
+   "ms": 25.3,
+   "keys": [
+    "hits",
+    "implemented"
+   ],
+   "hit_count": 0,
+   "first_hits": []
+  },
+  "订单查询接口超时": {
+   "status": 200,
+   "ms": 8.7,
+   "keys": [
+    "hits",
+    "implemented"
+   ],
+   "hit_count": 0,
+   "first_hits": []
+  }
+ },
+ "algorithm": {
+  "cross_map_matrix_lines": [
+   {
+    "line": 349,
+    "text": "sims = queries @ base.T"
+   }
+  ],
+  "sqlite_in_vector_cache": true,
+  "numpy_in_vector_cache": false,
+  "float32": true
+ }
+}

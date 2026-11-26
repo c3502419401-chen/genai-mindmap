@@ -1,0 +1,19 @@
+{
+ "target": {
+  "base": "https://api.deepseek.com",
+  "model": "deepseek-chat"
+ },
+ "status": 200,
+ "served_model": "deepseek-flash",
+ "answer": "城市内涝治理方案",
+ "usage": {
+  "prompt_tokens": 433,
+  "completion_tokens": 5,
+  "total_tokens": 438,
+  "prompt_tokens_details": {
+   "cached_tokens": 0
+  },
+  "prompt_cache_hit_tokens": 0,
+  "prompt_cache_miss_tokens": 433
+ }
+}

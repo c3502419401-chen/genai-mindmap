@@ -1,0 +1,28 @@
+{
+ "source": {
+  "id": "11cc0e2c-559d-4095-ba16-006d8f1132a9",
+  "kind": "text",
+  "filename": null,
+  "text": "周一例会随手记：\n问题：订单查询接口 P99 已经 2.8 秒，客服投诉集中在下午三点以后。\n问题：灰度机器只有两台，压测结论不可信。\n方案：给热点商品加一级缓存，TTL 五分钟。\n方案：灰度扩到八台，按 5% 流量分段放。\n待验证：缓存命中率能不能到 60% 以上，如果只有 30% 那 QPS 仍然顶不住。\n待验证：把查询拆成读模型之后，跨表 join 会不会反而变慢。\n另外老王说他下周出差，评审往后挪。",
+  "span": null,
+  "status": "parsed",
+  "error": null,
+  "parsed_pages": null,
+  "truncated": false,
+  "failed_pages": [],
+  "duration_seconds": null,
+  "sentences": [],
+  "metadata": {
+   "author": null,
+   "created_at": null,
+   "modified_at": null,
+   "category": null,
+   "tags": [],
+   "url": null,
+   "raw_chars": null,
+   "authority": null,
+   "rerank_score": null
+  },
+  "content_hash": null
+ }
+}

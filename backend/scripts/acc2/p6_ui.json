@@ -1,0 +1,24 @@
+{
+ "url": "http://127.0.0.1:5173",
+ "title": "生成式 AI 思维导图",
+ "has_canvas": 1,
+ "nodes": 0,
+ "console": [
+  "debug: [vite] connecting...",
+  "debug: [vite] connected.",
+  "error: Failed to load resource: the server responded with a status of 404 (Not Found)"
+ ],
+ "theme_probe": {
+  "dataTheme": null,
+  "bodyFont": "system-ui, \"Microsoft YaHei\", sans-serif",
+  "vars": {
+   "--mind-color-0": "",
+   "--mind-color-1": "",
+   "--mind-font": "",
+   "--mind-accent": ""
+  }
+ },
+ "store_probe": {
+  "storeLoaded": true
+ }
+}

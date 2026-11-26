@@ -1,0 +1,385 @@
+{
+ "tree": {
+  "kind": "tree",
+  "nodeCount": 7,
+  "edgeCount": 6,
+  "nodes": [
+   {
+    "id": "root",
+    "label": "碳中和路径−",
+    "x": -90,
+    "y": -24
+   },
+   {
+    "id": "a",
+    "label": "能源结构调整−",
+    "x": 146,
+    "y": -92
+   },
+   {
+    "id": "a1",
+    "label": "风电与光伏",
+    "x": 382,
+    "y": -126
+   },
+   {
+    "id": "a2",
+    "label": "煤电灵活性改造",
+    "x": 382,
+    "y": -58
+   },
+   {
+    "id": "b",
+    "label": "工业过程减排−",
+    "x": 146,
+    "y": 10
+   },
+   {
+    "id": "b1",
+    "label": "水泥熟料替代",
+    "x": 382,
+    "y": 10
+   },
+   {
+    "id": "c",
+    "label": "碳汇与碳捕集",
+    "x": 146,
+    "y": 78
+   }
+  ],
+  "edges": [
+   {
+    "id": "",
+    "type": "vue-flow__edge-smoothstep"
+   },
+   {
+    "id": "",
+    "type": "vue-flow__edge-smoothstep"
+   },
+   {
+    "id": "",
+    "type": "vue-flow__edge-smoothstep"
+   },
+   {
+    "id": "",
+    "type": "vue-flow__edge-smoothstep"
+   },
+   {
+    "id": "",
+    "type": "vue-flow__edge-smoothstep"
+   },
+   {
+    "id": "",
+    "type": "vue-flow__edge-smoothstep"
+   }
+  ],
+  "storeNodes": 7,
+  "storeEdges": 6,
+  "geometry": {
+   "bbox": {
+    "x": [
+     -90,
+     382
+    ],
+    "y": [
+     -126,
+     78
+    ]
+   },
+   "distinct_x": 3,
+   "distinct_y": 6,
+   "root": {
+    "id": "root",
+    "label": "碳中和路径−",
+    "x": -90,
+    "y": -24
+   },
+   "root_is_rightmost": false,
+   "root_is_leftmost": true,
+   "root_is_topmost": false
+  }
+ },
+ "fishbone": {
+  "kind": "fishbone",
+  "nodeCount": 19,
+  "edgeCount": 18,
+  "nodes": [
+   {
+    "id": "__canvas_root__",
+    "label": "为什么交付总是延期−",
+    "x": -90,
+    "y": -24
+   },
+   {
+    "id": "人",
+    "label": "人−",
+    "x": -336.542,
+    "y": -236
+   },
+   {
+    "id": "人1",
+    "label": "人原因一",
+    "x": -380.188,
+    "y": -104
+   },
+   {
+    "id": "人2",
+    "label": "人原因二",
+    "x": -417.138,
+    "y": -168
+   },
+   {
+    "id": "机",
+    "label": "机−",
+    "x": -600.542,
+    "y": -236
+   },
+   {
+    "id": "机1",
+    "label": "机原因一",
+    "x": -644.188,
+    "y": -104
+   },
+   {
+    "id": "机2",
+    "label": "机原因二",
+    "x": -681.138,
+    "y": -168
+   },
+   {
+    "id": "料",
+    "label": "料−",
+    "x": -864.542,
+    "y": -236
+   },
+   {
+    "id": "料1",
+    "label": "料原因一",
+    "x": -908.188,
+    "y": -104
+   },
+   {
+    "id": "料2",
+    "label": "料原因二",
+    "x": -945.138,
+    "y": -168
+   },
+   {
+    "id": "法",
+    "label": "法−",
+    "x": -468.542,
+    "y": 188
+   },
+   {
+    "id": "法1",
+    "label": "法原因一",
+    "x": -512.188,
+    "y": 56
+   },
+   {
+    "id": "法2",
+    "label": "法原因二",
+    "x": -549.138,
+    "y": 120
+   },
+   {
+    "id": "环",
+    "label": "环−",
+    "x": -732.542,
+    "y": 188
+   },
+   {
+    "id": "环1",
+    "label": "环原因一",
+    "x": -776.188,
+    "y": 56
+   },
+   {
+    "id": "环2",
+    "label": "环原因二",
+    "x": -813.138,
+    "y": 120
+   },
+   {
+    "id": "测",
+    "label": "测−",
+    "x": -996.542,
+    "y": 188
+   },
+   {
+    "id": "测1",
+    "label": "测原因一",
+    "x": -1040.19,
+    "y": 56
+   },
+   {
+    "id": "测2",
+    "label": "测原因二",
+    "x": -1077.14,
+    "y": 120
+   }
+  ],
+  "edges": [
+   {
+    "id": "",
+    "type": "vue-flow__edge-fishbone"
+   },
+   {
+    "id": "",
+    "type": "vue-flow__edge-fishbone"
+   },
+   {
+    "id": "",
+    "type": "vue-flow__edge-fishbone"
+   },
+   {
+    "id": "",
+    "type": "vue-flow__edge-fishbone"
+   },
+   {
+    "id": "",
+    "type": "vue-flow__edge-fishbone"
+   },
+   {
+    "id": "",
+    "type": "vue-flow__edge-fishbone"
+   },
+   {
+    "id": "",
+    "type": "vue-flow__edge-fishbone"
+   },
+   {
+    "id": "",
+    "type": "vue-flow__edge-fishbone"
+   },
+   {
+    "id": "",
+    "type": "vue-flow__edge-fishbone"
+   },
+   {
+    "id": "",
+    "type": "vue-flow__edge-fishbone"
+   },
+   {
+    "id": "",
+    "type": "vue-flow__edge-fishbone"
+   },
+   {
+    "id": "",
+    "type": "vue-flow__edge-fishbone"
+   }
+  ],
+  "storeNodes": 19,
+  "storeEdges": 18,
+  "geometry": {
+   "bbox": {
+    "x": [
+     -1077.1,
+     -90
+    ],
+    "y": [
+     -236,
+     188
+    ]
+   },
+   "distinct_x": 19,
+   "distinct_y": 7,
+   "root": null
+  }
+ },
+ "flow": {
+  "kind": "flow",
+  "nodeCount": 6,
+  "edgeCount": 8,
+  "nodes": [
+   {
+    "id": "__canvas_root__",
+    "label": "报销流程−",
+    "x": -90,
+    "y": -24
+   },
+   {
+    "id": "s1r",
+    "label": "提交−",
+    "x": 170,
+    "y": 96
+   },
+   {
+    "id": "s1a",
+    "label": "填单",
+    "x": 180,
+    "y": 216
+   },
+   {
+    "id": "s2r",
+    "label": "审查−",
+    "x": -32,
+    "y": 216
+   },
+   {
+    "id": "s2a",
+    "label": "核对发票",
+    "x": 16,
+    "y": 336
+   },
+   {
+    "id": "s3r",
+    "label": "付款",
+    "x": -196,
+    "y": 336
+   }
+  ],
+  "edges": [
+   {
+    "id": "",
+    "type": "vue-flow__edge-smoothstep"
+   },
+   {
+    "id": "",
+    "type": "vue-flow__edge-smoothstep"
+   },
+   {
+    "id": "",
+    "type": "vue-flow__edge-smoothstep"
+   },
+   {
+    "id": "",
+    "type": "vue-flow__edge-smoothstep"
+   },
+   {
+    "id": "",
+    "type": "vue-flow__edge-smoothstep"
+   },
+   {
+    "id": "",
+    "type": "vue-flow__edge-mindEdge"
+   },
+   {
+    "id": "",
+    "type": "vue-flow__edge-mindEdge"
+   },
+   {
+    "id": "",
+    "type": "vue-flow__edge-mindEdge"
+   }
+  ],
+  "storeNodes": 6,
+  "storeEdges": 8,
+  "geometry": {
+   "bbox": {
+    "x": [
+     -196,
+     180
+    ],
+    "y": [
+     -24,
+     336
+    ]
+   },
+   "distinct_x": 6,
+   "distinct_y": 4,
+   "root": null
+  }
+ },
+ "page_errors": []
+}
