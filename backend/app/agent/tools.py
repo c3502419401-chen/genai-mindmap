@@ -674,6 +674,97 @@ def branch_digest_enabled() -> bool:
             in LIBRARY_SEARCH_TRUTHY)
 
 
+# ---------------------------------------------------------------- 结构自检回路
+
+
+# 这条回路是"检查"那一步，不是"生成"那一步——`docs/SUBAGENT-VS-SELFCHECK.md`
+# 第六节那句话的落地：**该分的是检查，不是生成**。生成分片会失去全局视野
+# （跨支重复 31% vs 12%），检查分项不会（它本来就是在全局视野下做的）。
+#
+# 它买到的是现状唯一给自己定义过的缺陷：`CROSS_BRANCH_DUPLICATE` 那条诊断存在、
+# 15% 的图命中、且明写着"只报不删"，而**逐字判据看不见的那一类**（同义不同词的
+# 跨支重复）在七条规则里没有任何一条管。实测两张真图各 +1 次调用：跨支重复
+# 6→0 / 4→0（逐字召回 100%），另抓到 8 条语义重复与 2 条内容跑题；精度 22/25。
+#
+# **产出是清单，不是动作**：88% 的精度意味着自动改会伤到那 12%，而"可指认"正好
+# 对上用户真正要的东西（哪一支错了能定位）。所以这条回路一个节点都不删。
+SELF_CHECK_ENV = "MINDMAP_SELF_CHECK"
+
+# 一次审查调用的输出预算。一条 `{node_id, kind, problem, fix}` 约 60–90 字，实测
+# 两张真图报 15 / 10 条。给 4000 token 是给"问题多、每条要说清"留的余量，同时
+# 不让它有机会把清单写成一篇报告——`_detail_ask` 那边的教训同源。
+SELF_CHECK_MAX_TOKENS = 4_000
+
+# 一份清单最多留几条。真实产物 10–15 条，30 条已经过了"一屏看不过来"的线；
+# 超出的部分**丢掉尾部并记数**（`dropped`），不静默截断。
+SELF_CHECK_MAX_ISSUES = 30
+
+# 每条问题的两个自由文本各自的上限。它们要显示在诊断/面板上，不是文章：
+# `problem` 说清"是什么问题"，`fix` 说清"怎么改"，各 80 字足够。
+SELF_CHECK_TEXT_CHARS = 80
+
+#: 只认这四类。**值域写死而不是让模型自由发挥**：一个"其他问题"桶会让清单变成
+#: 谁都能往里丢东西的地方，而界面上要按 kind 分组计数（`data.self_check.counts`）。
+SELF_CHECK_KINDS = (
+    "cross_branch_duplicate",
+    "semantic_duplicate",
+    "off_topic",
+    "level_odd",
+)
+
+#: kind 的中文名（诊断文案用）。与 `_AUTO_REPAIR_RULE_NAMES` 同一条规矩：诊断里
+#: 说人话，`data` 里留机器值。
+_SELF_CHECK_KIND_NAMES = {
+    "cross_branch_duplicate": "跨支重复",
+    "semantic_duplicate": "语义重复",
+    "off_topic": "内容跑题",
+    "level_odd": "层级异常",
+}
+
+SELF_CHECK_PROMPT = """你是思维导图的审稿人。别人已经写好了一张导图，你要找出**结构性问题**。
+
+你只会看到**目录**：一级分支、缩进的下级节点、每个节点后面的 id。看不到说明文字，
+所以只报"靠标题与位置就能判定"的问题。
+
+只报下面四类，每条都要给出**清单里那个 id**（`(id=…)` 括号里的一串）：
+
+1. `cross_branch_duplicate` —— 同一个说法挂在**两条不同的一级分支**下，字面相同。
+2. `semantic_duplicate` —— 同一件事换了说法，在同一张图里出现不止一次（同父或跨支
+   都算）。例：「监督学习：依赖标注信号」与「监督学习：从标注数据学映射」。
+3. `off_topic` —— 这个节点与它所在的一级分支、以及整张图的主题都不是一回事。
+4. `level_odd` —— 层级异常：父子其实是同一层的两种说法（白占一层），或者节点挂错
+   了层（本该在别的分支下）。
+
+判据要严：**宁少不滥**。这份清单会原样交给用户去核对，报错一条的代价比漏掉一条大。
+拿不准就不报。
+
+不要报下面这几类（它们不是问题）：
+- 「某个节点只有一个孩子」——父子可能本来就是两层不同的内容；
+- 标题长短、用词风格、有没有编号前缀；
+- 缺失的细节（你看不到正文，判断不了）。
+
+只返回一个 JSON 对象，不要别的话：
+
+{"issues":[{"node_id":"a1","kind":"semantic_duplicate","problem":"一句话说清问题","fix":"一句话说清怎么改"}]}
+
+没有问题时返回 {"issues":[]}。"""
+
+
+def self_check_enabled() -> bool:
+    """是否在结构写完之后再跑一次自检。默认**关**，显式写 `1/on/true/yes` 才算开。
+
+    默认关的理由与这几天所有新增模型调用一致（`branch_digest_enabled` 同一套判定）：
+    它是 **+1 次调用、3–5 秒、约 1.2 k 输入 token**，而一次生成已经有 3–5 次要等。
+    收益是真的（上面对比度那一段），但"要不要为它多等五秒"该由数字决定，不由默认值
+    决定——这条默认值本身也是数字：实测一次调用买到 22/25 条站得住的问题。
+
+    `tests/test_agent_self_check.py::test_without_the_switch_there_is_no_self_check_call_and_no_key`
+    钉着"关着时产出与没有这个功能时逐字节相同"（连 `data` 的键集都不多一个）。
+    """
+    return (os.getenv(SELF_CHECK_ENV, "").strip().lower()
+            in GRAPH_SKELETON_TRUTHY)
+
+
 # ---------------------------------------------------------------- 收尾的确定性修复
 #
 # `optimization/service.check()` 报七种结构码，其中**三条的修法唯一**
@@ -6004,6 +6095,226 @@ async def _fill_branch_digests(
     return content.model_copy(update={"branch_digests": applied}), report
 
 
+# ---------------------------------------------------------------- 结构自检回路
+
+
+@dataclass
+class _SelfCheckReport:
+    """这一次自检调用的账（进 `data["self_check"]`）。
+
+    与 `_BranchDigestReport` 同一条规矩：一个会花掉秒级时间、会多一次模型调用的
+    步骤，必须留下决定——但这一份还多一个职责：**它是那份清单本身**。诊断只说一句
+    "发现 N 处"，可指认性（哪个节点、什么问题、怎么改）全在这里。
+    """
+
+    #: `None` = 真的调了；`"budget"` / `"error"` / `"no_outline"` = 没调成或没调。
+    skipped: str | None = None
+    failure: str = ""
+    #: 清单。每一条是 `{node_id, kind, problem, fix, path}`，`path` 是给人读的位置。
+    issues: list[dict[str, Any]] = field(default_factory=list)
+    #: 按 kind 计数（诊断文案与 `data` 都用它）。
+    counts: dict[str, int] = field(default_factory=dict)
+    #: 丢掉的条目：`unknown_kind`（模型自创了一类）、`unknown_id`（id 对不上号）、
+    #: `over_limit`（超出 `SELF_CHECK_MAX_ISSUES`）、`bad_item`（不是一个对象）。
+    #: **不能静默丢**：报 15 条、落地 8 条，而"少了 7 条"在产出上看不出来。
+    dropped: dict[str, int] = field(default_factory=dict)
+    #: 这一次喂进去的清单规模（节点数 / 行数 / 字数）。它是"输入很小"这句判断的证据。
+    nodes: int = 0
+    lines: int = 0
+    chars: int = 0
+    seconds: float = 0.0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+    def account(self) -> dict[str, Any]:
+        return {
+            "skipped": self.skipped,
+            "failure": self.failure,
+            "issues": list(self.issues),
+            "counts": dict(self.counts),
+            "dropped": dict(self.dropped),
+            "outline": {"nodes": self.nodes, "lines": self.lines, "chars": self.chars},
+            "seconds": self.seconds,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+        }
+
+
+def _self_check_outline(root: Node) -> tuple[str, dict[str, str]]:
+    """树 → 缩进清单 + `id → 位置路径`。**只给 label 与 id，不给 detail**。
+
+    不给 `detail` 是这条回路的核心取舍，三条理由都在实测里（报告 4.1）：
+
+      - 输入规模：一张 80 节点的图，目录约 1.0–1.2 k token；加上正文会翻三倍以
+        上，而这张图的全部收益（跨支重复 / 语义重复 / 跑题 / 层级异常）**没有一类
+        需要正文**——它们判的都是标题与位置；
+      - 判据纯度：给了正文，"标题与内容不符"会盖住"结构本身有问题"，而后者才是
+        这一轮要的那件事（前者归 `MINDMAP_VERIFY_AFTER_GENERATE` 那条路）；
+      - 时机：它跑在**说明那一次之前**，那时树上根本没有 detail（`_fill_details`
+        还没跑）。等写完再看，输入一个字都不会多。
+
+    一级分支单独一行带 `【一级分支】`，其余按深度缩进；**每一行都有 id**，因为
+    清单要按 id 指认。没有 id 的清单只能靠"第几个分支第几个节点"描述，而那个描述
+    在模型改了措辞之后就对不上了。
+    """
+    lines: list[str] = []
+    paths: dict[str, str] = {}
+
+    def walk(node: Node, depth: int, chain: tuple[str, ...]) -> None:
+        for child in node.children:
+            label = child.label.strip()
+            if depth == 0:
+                lines.append(f"【一级分支】{label}  (id={child.id})")
+                paths[child.id] = label
+                walk(child, depth + 1, (label,))
+                continue
+            lines.append(f"{'  ' * depth}- {label}  (id={child.id})")
+            paths[child.id] = " / ".join((*chain, label))
+            walk(child, depth + 1, (*chain, label))
+
+    walk(root, 0, ())
+    return "\n".join(lines), paths
+
+
+def _self_check_text(raw: Any) -> str:
+    """一条 `problem` / `fix` 的清洗：折空白、截断。空值返回空串（那条不显示）。"""
+    if not isinstance(raw, str):
+        return ""
+    return " ".join(raw.split())[:SELF_CHECK_TEXT_CHARS]
+
+
+def _self_check_issues(
+    raw: Any, paths: dict[str, str],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """模型返回 → `(清单, 丢掉的计数)`。
+
+    **只做结构清洗，不判真假**：类不在四类里就丢（自创一类说明它没按契约答，
+    留进来会让界面出现无法分组的条目）、id 不在树里就丢（用户看到"某条问题指向
+    一个不存在的节点"只会更困惑）、不是对象的条目丢。
+
+    一条都不"复核"是刻意的：`optimization` 那七条规则能复核的三类（逐字重复 /
+    同级重名 / 空链）这里**故意不比**——`repair()` 与 `check()` 已经在报它们了，
+    这条回路的价值恰恰在"逐字判据看不见的那一类"（报告：8 条 `unjudged` 里 7 条
+    成立）。在这里再判一次，等于用同一把尺子量它量不到的东西。
+    """
+    issued: list[dict[str, Any]] = []
+    dropped: dict[str, int] = {}
+    items = raw
+    if isinstance(items, dict):
+        items = items.get("issues")
+        # 模型偶尔套一层 `{"issues": {"items": [...]}}`：认一次，不多认。
+        if isinstance(items, dict):
+            items = items.get("issues") or items.get("items")
+    if not isinstance(items, list):
+        items = []
+
+    for item in items:
+        if not isinstance(item, dict):
+            dropped["bad_item"] = dropped.get("bad_item", 0) + 1
+            continue
+        kind = str(item.get("kind") or "").strip()
+        if kind not in SELF_CHECK_KINDS:
+            dropped["unknown_kind"] = dropped.get("unknown_kind", 0) + 1
+            continue
+        # `nodes` 是列表形状的宽容（实测两种都出现过）：一条报了两个节点就摊成两条，
+        # 每条各自带同一个 `problem` / `fix`——清单的消费方是"按节点核对"。
+        ids = item.get("node_id") or item.get("nodes") or []
+        if isinstance(ids, str):
+            ids = [ids]
+        if not isinstance(ids, list) or not ids:
+            dropped["unknown_id"] = dropped.get("unknown_id", 0) + 1
+            continue
+        for node_id in ids:
+            key = str(node_id or "").strip()
+            if key not in paths:
+                dropped["unknown_id"] = dropped.get("unknown_id", 0) + 1
+                continue
+            issued.append({
+                "node_id": key,
+                "kind": kind,
+                "path": paths[key],
+                "problem": _self_check_text(item.get("problem")) or _self_check_text(
+                    item.get("why")),
+                "fix": _self_check_text(item.get("fix")),
+            })
+    if len(issued) > SELF_CHECK_MAX_ISSUES:
+        dropped["over_limit"] = dropped.get("over_limit", 0) + (
+            len(issued) - SELF_CHECK_MAX_ISSUES)
+        issued = issued[:SELF_CHECK_MAX_ISSUES]
+    return issued, dropped
+
+
+async def _run_self_check(
+    content: MindMapContent, ctx: RunContext, *, topic: str,
+) -> _SelfCheckReport:
+    """一次审查调用：结构写完之后回头看一遍，报一份**可指认的问题清单**。
+
+    ## 位置：结构之后、说明之前
+
+    那一刻标签已经定稿（说明那一次只填 `detail`，不改任何 `label`），而清单要的
+    只有标签与 id——等说明写完再看，输入一个字都不会多，代价是多等十几秒。
+    往前挪到结构之前也不行：那时树上只有骨架，下位节点还没写。
+
+    ## 它不改树
+
+    `_generate` 拿到这份清单之后**一个节点都不动**（`content` 原样往下走）：
+    精度 22/25 = 88%，自动落地会伤到那 12%，而合并是不可逆的
+    （`docs/FOLD-RETIRED.md` 的教训）。产出是"哪一支、什么问题、怎么改"，落地交给
+    用户——这也正是"可指认"要的东西。
+
+    ## 失败一律降级
+
+    额度用完（`budget`）/ 调用抛错（`error`）/ 树上没有可审的东西（`no_outline`）
+    都只让这次没有自检，生成照常交付。为一份清单把一棵已经成型的树判成失败，是拿
+    确定的好换不确定的好——与 `_fill_branch_digests` 同一条方向。
+    """
+    report = _SelfCheckReport()
+    outline, paths = _self_check_outline(content.root)
+    report.nodes = len(paths)
+    report.lines = outline.count("\n") + 1 if outline else 0
+    report.chars = len(outline)
+    # 少于三条一级分支时不调：一张两三条分支的小图上"跨支重复"要么不存在，要么
+    # 一眼可见；而这条回路每次要花一次调用。判据与 `MIN_BRANCHES` 无关，是经济性。
+    if len(content.root.children) < 3:
+        report.skipped = "no_outline"
+        return report
+
+    user = (
+        f"主题：{content.title.strip()}\n\n"
+        f"这张图有 {len(content.root.children)} 条一级分支、共 {report.nodes} 个节点。"
+        f"目录如下（缩进表示层级，(id=…) 是该节点的 id）：\n\n{outline}\n\n"
+        "请按系统提示里的四类，报出你**确实能判定**的问题。"
+    )
+    # 额度在**发请求之前**占：与骨架、概括那两步同一规矩（请求一旦发出就是一次真实计费）。
+    if not ctx.reserve_model_call():
+        report.skipped = "budget"
+        return report
+    ctx.extra_model_calls += 1
+    report.prompt_tokens = (estimate_input_tokens(SELF_CHECK_PROMPT)
+                            + estimate_input_tokens(user))
+    started = time.perf_counter()
+    try:
+        raw = await _chat(
+            ctx, SELF_CHECK_PROMPT, user,
+            max_tokens=min(SELF_CHECK_MAX_TOKENS, _max_tokens(ctx)))
+    except GenerationError as exc:
+        report.skipped = "error"
+        report.failure = _reason_text(exc)
+        report.seconds = round(time.perf_counter() - started, 3)
+        return report
+    report.seconds = round(time.perf_counter() - started, 3)
+    issues, dropped = _self_check_issues(raw, paths)
+    report.issues = issues
+    report.dropped = dropped
+    counts: dict[str, int] = {}
+    for issue in issues:
+        counts[issue["kind"]] = counts.get(issue["kind"], 0) + 1
+    report.counts = counts
+    report.completion_tokens = estimate_input_tokens(
+        json.dumps(issues, ensure_ascii=False))
+    return report
+
+
 @dataclass(frozen=True)
 class _ExternalFetch:
     """一次外部检索的产物。
@@ -10738,6 +11049,55 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             snapshot, diagram_type=diagram_type,
             raw_plan=raw_plan, diagnostics=[]))
 
+    # ---- 结构自检回路（`MINDMAP_SELF_CHECK`，默认关，+1 次调用）-----------------
+    #
+    # **位置：结构那一次之后、说明那一次之前。** 三条理由：
+    #
+    #  1. 那一刻标签已经定稿：说明段只填 `detail`，它一个 `label` 都不会改，所以
+    #     再往后等，清单的输入一个字都不会多——只是把用户多按五秒；
+    #  2. 往前不行：结构之前树上只有骨架，下位节点还不存在，审出来的问题一半是
+    #     "这一支是空的"；
+    #  3. 它和说明段**串行**：说明段本身是两半并发，把它插在说明之后就是"并发跑完
+    #     再单独等一次"，插在之前则是"先把这一次等完、再并发写说明"。总耗时一样，
+    #     但前者的清单出来时用户已经在等最后一步了。
+    #
+    # **它不改树**（`content` 原样往下走）：精度 22/25 = 88%，自动落地会伤到那
+    # 12%，而合并不可逆。产出是清单 + 一条诊断，落地由用户决定——这也正是他要的
+    # "哪一支错了能定位"。
+    #
+    # **只在树上做**：鱼骨的一级是固定类别、流程的一级是阶段，`SELF_CHECK_PROMPT`
+    # 里那四类问题的措辞是按"分支"写的（与 `optimization` 的 tree-only 闸同一条理由）。
+    self_check_report: _SelfCheckReport | None = None
+    if diagram_type == "tree" and self_check_enabled():
+        self_check_report = await _run_self_check(content, ctx, topic=topic)
+        if self_check_report.skipped in ("error", "budget"):
+            reason = ("本次运行的模型调用额度已用完" if self_check_report.skipped == "budget"
+                      else f"调用{('失败：' + self_check_report.failure) if self_check_report.failure else '出错'}")
+            diagnostics.append(Diagnostic(
+                level=DiagnosticLevel.warn, code="SELF_CHECK_SKIPPED",
+                message=(f"这次没做结构自检（{reason}）；这张图本身不受影响，"
+                         "只是没有那份「模型自己回头看到的问题」清单。"),
+            ))
+        elif self_check_report.counts:
+            head = "、".join(
+                f"{_SELF_CHECK_KIND_NAMES.get(kind, kind)} {count} 处"
+                for kind, count in sorted(self_check_report.counts.items(),
+                                          key=lambda pair: -pair[1]))
+            sample = "；".join(
+                f"「{issue['path']}」（{_SELF_CHECK_KIND_NAMES.get(issue['kind'], issue['kind'])}"
+                + (f"：{issue['problem']}" if issue["problem"] else "") + "）"
+                for issue in self_check_report.issues[:3])
+            diagnostics.append(Diagnostic(
+                level=DiagnosticLevel.info, code="SELF_CHECK_ISSUES",
+                message=(
+                    f"模型自检发现 {len(self_check_report.issues)} 处可能的问题（{head}）："
+                    f"{sample}"
+                    + ("…" if len(self_check_report.issues) > 3 else "")
+                    + "。**没有自动改**——这份清单是给你核对的，"
+                    "改哪个由你决定（清单在这一次运行的读数里）。"
+                ),
+            ))
+
     # ---- 第四步（三段式的第三段）：只写 detail ---------------------------------
     #
     # 放在这里而不是更早：裁剪已经做完（被裁掉的节点不必为它付说明的 token），
@@ -11243,6 +11603,15 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         # 账放这里、产物放契约：`branch_digests` 是这张图的属性（要落库），而"这次
         # 调了几秒、输入输出多少 token、哪几支没写出来"是一次运行的读数。
         data["branch_digest"] = digest_report.account()
+    if self_check_report is not None:
+        # 开关开着、图型是树才有这个键（关着时 `data` 的键集与接线之前逐字节相同
+        # ——回归用例比的是键集，不只是值）。与 `data["branch_digest"]` 同一条规矩：
+        # 账进读数，产物留在这份 `data` 里而不是给契约加字段——"这次自检说了什么"
+        # 是一次运行的读数，不是这张图的属性（用户没改它，图不该因为它变脏）。
+        #
+        # **这也就是那份清单唯一的去处**：诊断只说一句"N 处"，可指认性（哪个节点、
+        # 什么问题、怎么改）在这里。前端与脚本读的都是这一份。
+        data["self_check"] = self_check_report.account()
     if auto_repair is not None:
         # 开关关着 / 非树图型时没有这个键（那时 `data` 的键集与接线之前逐字节相同
         # ——回归用例比的是键集，不只是值）。开关**默认开**，所以缺这个键等于
