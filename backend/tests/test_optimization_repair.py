@@ -507,15 +507,48 @@ def test_collapse_never_loses_the_outer_title():
     assert "CSS" in folded.detail
 
 
-def test_short_collapse_still_joins_both_titles():
-    """放得下两行时照旧拼接：信息最全，不必降级。"""
+def _repeating_collapse():
+    """真产物形状（`data/acc_trees/S06.json` 的 `b4-1-1`）：两段在说同一件事。
+
+    外层 10 字、内层 8 字，拼起来 21 字——**两行放得下**，所以旧判据（只比长度）
+    会照拼。但这两段说的是同一个事实的两种写法（一个是目标、一个是它的占比），
+    拼起来是重复而不是补充。
+    """
+    return _map(_node("r", "根", [
+        _node("a", "经典篇目背诵 20%", [_leaf("b", "背诵成绩占比两成")]),
+        _normal(),
+    ]))
+
+
+def test_collapse_does_not_join_two_titles_that_say_the_same_thing():
+    """"放得下"不等于"读得懂"：两段互相复述时不拼，走第三档。
+
+    这是"可读"这一维扣分的**单一系统性成因**（验收报告 §6.4 第 3 条）：只有长度
+    一个条件时，任何拼得下的父子标题都会被拼上，包括这种同一句话的两种说法。
+    """
+    content = _repeating_collapse()
+
+    folded = repair(content).content.root.children[0]
+    assert folded.label == "背诵成绩占比两成", folded.label
+    assert folded.detail is not None
+    assert folded.detail.startswith(DEFERRED_LABEL_PREFIX + "经典篇目背诵 20%"), \
+        "外层那句没进 detail 就是丢内容"
+
+
+def test_short_collapse_still_joins_a_dimension_and_its_value():
+    """两段讲的是**不同域**（维度名 + 它的取值）时照旧拼接：信息最全，不必降级。
+
+    与上一条成对：判据不是"放得下就拼"（会把复述拼成病句），也不是"必须是量化
+    补充"（会把这一类也赶进第三档），而是"两段有没有共享主题词"——共享就是在复述，
+    不共享才是补充。`服务器费用 / 300 元/月` 是 `S15/s6-2-1` 的真产物形状。
+    """
     content = _map(_node("r", "根", [
-        _node("a", "第一层", [_leaf("b", "第二层")]),
+        _node("a", "服务器费用", [_leaf("b", "300 元/月")]),
         _normal(),
     ]))
 
     folded = repair(content).content.root.children[0]
-    assert folded.label == f"第一层{' / '}第二层"
+    assert folded.label == f"服务器费用{' / '}300 元/月"
     assert folded.detail is None, "拼得下就不该往 detail 里塞东西"
 
 
