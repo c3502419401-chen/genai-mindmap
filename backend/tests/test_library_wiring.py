@@ -194,35 +194,51 @@ def test_missing_library_source_is_skipped_with_warning(caplog):
 
 
 
-def test_registry_offers_rag_query_when_only_the_library_has_material():
-    """库非空、请求无 sources 时也要注册 `rag_query`。
+def test_registry_offers_rag_query_only_to_the_paths_that_do_not_read_sources():
+    """库非空、请求无 sources 时：`expand` / `edit` 有 `rag_query`，`create` **没有**。
 
-    否则 system 里那句"先调用 rag_query 检索"指向一个不存在的工具：模型只能
-    凭标题编，并以 ok=True 交出一棵没有出处的树——它甚至不算说谎。
+    改这一条的理由是实测（2026-11-26，`docs/LATENCY-BREAKDOWN.md`）：旧行为把
+    `rag_query` 也给 `create`，配上 system 里那句"先调用 rag_query 检索"，模型在
+    外层先查了两次（3.52s + 3.32s），然后才调生成工具——而生成工具内部自己按章/
+    按支检索，外层查到的片段**进不了它的任何参数**。6.8 秒纯等待。
+
+    所以判据从"库里有料就给它"收窄成"**这条路读不读来源**"：
+      - `expand` / `edit` 不读（`_expand` 只在节点带 `source_refs` 时回查库，
+        `_edit` 根本不碰正文）→ 必须给，"按材料补充这一支"没有它无从下手；
+      - `create` 读（`_intake` 里全塞或按支检索）→ 不给，给了就是重复。
     """
     assert "rag_query" not in build_registry("create").names()
 
     library.ingest(_stored(filename="制度.md"))
-    names = build_registry("create").names()
 
-    assert "rag_query" in names
-    # 撤掉分片生成的**唯一**理由是"正文整份已经在 prompt 里"（`full` + 有来源）。
-    # 请求没带材料时那个前提不成立，所以它必须还在。
-    assert "mindmap_generate" in names
-    # expand / edit 下没有生成工具，库照样给检索入口。
+    # `create` 仍然不给：库里有料不改变"生成工具自己会检索"这件事。
+    assert "rag_query" not in build_registry("create").names()
+    assert "mindmap_generate" in build_registry("create").names()
+    # 两条不读来源的路照旧拿得到——否则"按材料补充这一支"就没有入口了。
     assert "rag_query" in build_registry("expand").names()
     assert "rag_query" in build_registry("edit").names()
 
 
 def test_intent_rule_switches_to_retrieval_when_the_library_has_material():
-    """system 里"先检索"这条指令的条件跟着**可检索的东西**走，不跟着请求走。"""
+    """system 里那段检索指令跟着**可检索的东西**走，而且三种意图说三种话。
+
+    库空 + 无材料：什么都不用查（"直接生成，不要先去检索资料"）。
+    库非空：换成检索版的措辞——但**不是**给三条意图同一句话：
+      - `create` 说明"生成工具自己会查，你别自己调"（旧文案是"先调用 rag_query"，
+        实测那正是那 6.8 秒的来源）；
+      - `edit` / `expand` 是**默认不要检索**，只在用户点名要材料时才查。
+    """
     from app.agent.service import _intent_rule
 
     request = _request([], intent="create")
     assert "直接生成，不要先去检索资料" in _intent_rule(request)
 
     library.ingest(_stored(filename="制度.md"))
-    assert "先调用 rag_query 检索" in _intent_rule(request)
+    create_rule = _intent_rule(request)
+    assert "不要再自己调检索工具" in create_rule
+    assert _intent_rule(_request([], intent="edit")).startswith("这次是精确修改")
+    assert "不要检索" in _intent_rule(_request([], intent="edit"))
+    assert "不要检索" in _intent_rule(_request([], intent="expand"))
 
 
 # ---------------------------------------------------------------- 3 三种空结果

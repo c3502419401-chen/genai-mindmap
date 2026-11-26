@@ -100,7 +100,14 @@ def _store_external_source() -> str:
 
 def _generate(monkeypatch, *, with_external_in_library: bool,
               with_own_in_library: bool = False) -> tuple[RunContext, object, list[str]]:
-    """走一遍真实注册表：`rag_query` → `mindmap_generate`，返回候选树。
+    """走一遍真实检索链：`_rag` → `mindmap_generate`，返回候选树。
+
+    **第一步不再经过注册表**（`build_registry("create")` 一次调用 `rag_query`）：
+    `create` 现在拿不到这个工具——理由见 `docs/LATENCY-BREAKDOWN.md` 与
+    `test_agent_guards.test_create_gets_no_rag_query_even_when_the_library_is_not_empty`
+    （外层查到的片段进不了生成工具的参数，实测白烧 6.8 秒）。这里要验的是
+    **检索侧的作用域**（`drop_external` 让不让人复用昨天抓的来源），所以直接调
+    `rag_query` 的实现体 `_rag`，判据与产物一个字节都不变。
 
     `search_external` 一律替换成"返回空"：这条链要验的不是"搜到了什么"，而是
     "库里已有的东西会不会自己冒出来"。真打网络会让用例依赖宿主机代理。
@@ -120,9 +127,7 @@ def _generate(monkeypatch, *, with_external_in_library: bool,
     registry = build_registry("create", has_sources=False, has_library=True)
     chat = _tree_chat()
     with patch("app.agent.tools.chat_async", new=chat):
-        asyncio.run(registry.execute(
-            ToolCall(call_id="c-rag", name="rag_query",
-                     arguments={"question": TOPIC}), ctx))
+        asyncio.run(tools_module._rag(tools_module.RagArgs(question=TOPIC), ctx))
         result = asyncio.run(registry.execute(
             ToolCall(call_id="c-gen", name="mindmap_generate",
                      arguments={"topic": TOPIC, "branches": 3}), ctx))
@@ -228,6 +233,9 @@ def test_closed_switch_leaves_no_rag_query_tool(monkeypatch):
 
     names = build_registry("create", has_sources=False).names()
     assert "rag_query" not in names
+    # `create` 恒不给（生成工具内部自己检索）；`expand` 才跟着库走——而关掉联网之后
+    # 库里只剩外部来源，剔空即视为没有库，它也不该拿到一个必然失败的工具。
+    assert "rag_query" not in build_registry("expand", has_sources=False).names()
 
 
 # ------------------------------------------------- 端到端：那一轮生成真的跑完

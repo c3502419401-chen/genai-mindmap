@@ -16103,8 +16103,10 @@ def build_registry(intent: str = "create", *, has_sources: bool = False,
         是反的——那时整树还不预检索，不给工具模型就只能凭标题编。补上预检索之后，
         再给工具就只剩**重复**：模型查到的片段进不了生成工具的任何参数，它只能
         自己在文字里复述，而每一支的检索用的是那支的标题。`max_tool_calls` 从 8
-        到 50 不改变这一点。
-      - **请求不带来源、但知识库非空**时，任何意图都加 `rag_query`（见下）。
+        到 50 不改变这一点。**"请求不带来源、但库非空"那条路也一样**（实测两次
+        `rag_query` 白烧 6.8 秒，见下面那个分支的注释）。
+      - **请求不带来源、但知识库非空**时，`expand` / `edit` 加 `rag_query`
+        （`create` 不加，理由同上——"库里有料"不改变"生成工具自己会检索"这件事）。
 
     **为什么生成只剩一条路**：分片好用的前提是**有材料**——它相对整树唯一的真
     优势是覆盖率（按支检索 30.5% vs 整树一次 top_k=5 的 5.1%，
@@ -16143,7 +16145,17 @@ def build_registry(intent: str = "create", *, has_sources: bool = False,
         # 自己在文字里复述一遍。`expand` / `edit` 仍需要：那两条路不读来源。
         if intent in _SOURCE_AWARE_INTENTS:
             allowed.add("rag_query")
-    if has_library and not has_sources:
+    if has_library and not has_sources and intent != "create":
+        # `create` **同样不补**，理由与上一段那个分支同一条，实测更硬：库里存着
+        # 81 份来源时，system 里那句"先调用 rag_query 检索"会让模型在外层先查两次
+        # （2026-11-26 实测 `tool_start rag_query` ×2：3.52s + 3.32s），然后才调
+        # `mindmap_generate`——而生成工具内部自己按章切分/按支各查一次，查到的
+        # 片段进不了它的任何参数。**这 6.8 秒是纯等待**，占那次 139.5 秒总耗时的 5%。
+        #
+        # `expand` / `edit` 仍然补：那两条路**不读**请求里的来源（`_expand` 只在
+        # 节点有 `source_refs` 时回查库，`_edit` 根本不碰正文），"按材料补充这一支"
+        # 这类要求没有 rag_query 就无从下手。是否真的查由指令层收窄
+        # （`service._RAG_INTENT_RULES` 的 `edit` / `expand` 两条）。
         allowed.add("rag_query")
 
     registry = ToolRegistry()
