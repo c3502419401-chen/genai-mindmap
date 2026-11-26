@@ -2,6 +2,7 @@ import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
 
 import thinkingOptions from '../api/thinking-options.json';
+import diagramLabels from '../api/diagram-labels.json';
 import type { DiagramType, DiagramTypeChoice } from '../api/types';
 import { DIAGRAM_PREF_KEY, THINKING_PREF_KEY } from './prefs';
 
@@ -14,16 +15,18 @@ import { DIAGRAM_PREF_KEY, THINKING_PREF_KEY } from './prefs';
  *
  * 两份选项的来源**不一样**，这一点必须分开说，否则下一个人会以为它们同一种做法：
  *
- * · 拆解方式：值**和**中文名都在后端（`THINKING_MODELS`），这里只 import 生成物；
- * · 图型：只有值域在后端（`AgentRunRequest.diagram_type` 的 Literal），中文名与
- *   `hint` 是纯表现层的东西，后端没有对应字段可抄。所以它仍写在这里。
+ * · 拆解方式：值**和**中文名都在后端（`THINKING_MODELS`），这里只 import 生成物
+ *   （`api/thinking-options.json`）；
+ * · 图型：只有值域在后端（`DiagramKind` 的 Literal），中文名与 `hint` 是纯表现层
+ *   的东西，后端没有对应字段可抄。但**值域也不再手写**：它走
+ *   `openapi.json → schema.d.ts → api/types.ts::DiagramType → 这里的文案表`，
+ *   这条链的最后一环是 `Record<DiagramType, …>`，少一个图型就是编译错误。
  *
  * 曾经两句都写成"写死在前端、两边不一致时后端会 422"。那句话**只对了半句**：
  * 422 挡得住拼错的值，挡不住"后端多了一种、前端这份没有"——那种情况前端不报错、
- * 用户也选不到，唯一的发现途径是有人去读后端那张表。拆解方式因此改成了生成物；
- * 图型的同一条风险**仍然敞着**（`api/types.ts` 的 `DiagramType` 是手写的，
- * 与 `schema.d.ts` 的 `diagram_type` union 之间没有任何用例连着），记在
- * `docs/WIRING-GAPS.md` 的残留风险里，没有在这一轮顺手改。
+ * 用户也选不到，唯一的发现途径是有人去读后端那张表。两句都修过了：拆解方式整个
+ * 改成生成物，图型让值域跟着生成物走、把"少一条"变成编译期红灯。细节见
+ * `docs/WIRING-GAPS.md` 第十一节。
  */
 
 /**
@@ -48,21 +51,48 @@ export const THINKING_MODEL_OPTIONS: readonly { value: string; label: string }[]
  * 图型。`auto` = 不传字段（后端 `None`，让模型自己判断）——它是默认值，也是
  * "用户没说"这件事在界面上唯一诚实的呈现：不选，就由生成那一次决定。
  *
- * 四个值与后端 `AgentRunRequest.diagram_type` 的 Literal 一一对应（`auto` 那一项
- * 不发出去）。
+ * ## 三样东西，三个来源，一个都不能混
+ *
+ * · **值域**：`api/types.ts::DiagramType`，从生成物 `schema.d.ts` 推导，
+ *   唯一真源是后端 `DiagramKind` 的 Literal；
+ * · **中文名**：生成物 `api/diagram-labels.json`，唯一真源是后端
+ *   `contracts/mindmap.py::DIAGRAM_LABELS`（导出文件头也在用它，所以它本来就得
+ *   在后端）；
+ * · **`hint`**：只在这里。后端没有对应字段，也不该有——`mindmap.py:154-157` 的
+ *   注释已经把这条判过了："**只放中文名，不放说明**——说明属于界面"。
+ *
+ * 为什么 hint 不跟着名字一起进后端表：`hint` 说的是"选了它，界面上会发生什么"，
+ * 只有写界面的人知道该说多少。搬到后端换不到"加图型零改动"——新图型的中文说明
+ * 总得有人写，差别只是写哪个文件，不是要不要写。
  *
  * `hint` 是**必须**的：图型不是自解释的选项。用户选「流程图」时，他期待的是
  * "一级分支按阶段排、判断节点分是/否"，而不是"换个颜色的思维导图"；选「鱼骨图」
  * 时更得先知道一级分支固定是那六个类别——否则他会以为模型没听懂他的主题。
+ *
+ * ## "少写一条"必须红，两种红都在编译期
+ *
+ * `Record<DiagramType, …>` 要求键集**恰好等于**值域；`diagramLabels[value]` 要求
+ * 生成物里**有**这个键。后端加一个图型、重跑 `npm run gen:api` 之后，少一项就是
+ * `npm run type-check` 的编译错误——不是"某个断言没通过"，是"这个表缺一项"。
  */
+const DIAGRAM_TYPE_COPY: Record<DiagramType, { hint: string }> = {
+  tree: { hint: '一级分支按话题分解，不画附加连线。' },
+  flowchart: { hint: '一级分支会按执行阶段排，判断节点带是/否分支' },
+  fishbone: { hint: '一级分支固定为人/机/料/法/环/测' },
+};
+
+/** 值域（不含 `auto`）：`DIAGRAM_TYPE_COPY` 的键，顺序即下拉顺序。 */
+const DIAGRAM_VALUES = Object.keys(DIAGRAM_TYPE_COPY) as DiagramType[];
+
+/** 下拉里的全部候选：`auto` 打头，其余按 `DIAGRAM_TYPE_COPY` 的书写顺序。 */
 export const DIAGRAM_TYPE_OPTIONS: { value: DiagramTypeChoice; label: string; hint: string }[] = [
   { value: 'auto', label: '自动判断', hint: '按你的描述判断图型；判断不出时按思维导图生成。' },
-  { value: 'tree', label: '思维导图', hint: '一级分支按话题分解，不画附加连线。' },
-  { value: 'flowchart', label: '流程图', hint: '一级分支会按执行阶段排，判断节点带是/否分支' },
-  { value: 'fishbone', label: '鱼骨图', hint: '一级分支固定为人/机/料/法/环/测' },
+  ...DIAGRAM_VALUES.map(value => ({
+    value,
+    label: diagramLabels[value],
+    hint: DIAGRAM_TYPE_COPY[value].hint,
+  })),
 ];
-
-const DIAGRAM_VALUES: DiagramType[] = ['tree', 'flowchart', 'fishbone'];
 
 function asChoice(value: string | undefined): DiagramType | null {
   return DIAGRAM_VALUES.find(item => item === value) ?? null;

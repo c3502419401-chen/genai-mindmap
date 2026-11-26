@@ -7,6 +7,8 @@
  *  `schema.d.ts` 已由 `openapi-typescript` 从 `backend/openapi.json` 生成，
  *  但本文件**决定保留**：手写镜像读起来比生成的类型省事，两者靠
  *  `contract-check.ts` 的编译期断言保持一致（见 `docs/CONTRACT_V2.md`）。 */
+import type { components } from './schema';
+
 export interface MindNode {
   id: string;
   /** 一句话标题（生成侧 ≤16 字）。画布上只画它；超长的旧图仍按 24 字截断显示。 */
@@ -655,12 +657,35 @@ export interface LibrarySource {
 // ---- agent 运行 ----
 
 /**
- * 图型（镜像后端 `AgentRunRequest.diagram_type` 的 Literal）。
+ * 图型。**值域不在这里定义**——它从生成物 `schema.d.ts` 推导。
  *
  * `tree` 思维导图 / `flowchart` 流程图 / `fishbone` 鱼骨图。三者共用同一条生成
  * 流水线，差别只在骨架那一次要哪份提示词、要不要解析附加边。
+ *
+ * 此前这里是手写的 `'tree' | 'flowchart' | 'fishbone'`，与 `schema.d.ts` 里那条
+ * union 之间**没有任何东西连着**：后端往 `contracts/mindmap.py::DiagramKind` 加一个
+ * 图型，这条手写 union 不会变、前端不报错、用户永远选不到——正是
+ * `docs/WIRING-GAPS.md` 记的那条残留。现在值域的唯一真源是
+ * `backend/openapi.json`（`DiagramKind` 的 Literal），链子是：
+ *
+ *     app/contracts/mindmap.py::DiagramKind
+ *         ↓ scripts/export_openapi.py（提交的快照，test_openapi_snapshot.py 守卫）
+ *     frontend/src/api/schema.d.ts     ← npm run gen:api 生成
+ *         ↓ NonNullable<…>
+ *     api/types.ts::DiagramType
+ *         ↓ Record<DiagramType, …>
+ *     stores/options.ts::DIAGRAM_TYPE_COPY
+ *
+ * 后端加一个图型时，`schema.d.ts` 的 union 变宽 → 这里的类型跟着变 →
+ * `stores/options.ts` 的文案表少一条 → **`npm run type-check` 直接红**。红的时机
+ * 比用例早、也比用例硬：不是"某个断言没通过"，而是"这个类型没有那一项"。
+ *
+ * `NonNullable` 同时去掉 `| null`（后端 `DiagramKind | None`，None = 让模型判断）
+ * 与字段可选带来的 `| undefined`。两者都不是**图型**，不该进这个类型。
  */
-export type DiagramType = 'tree' | 'flowchart' | 'fishbone';
+export type DiagramType = NonNullable<
+  components['schemas']['AgentRunRequest']['diagram_type']
+>;
 
 /**
  * 界面上下拉里可能出现的那四个值。
