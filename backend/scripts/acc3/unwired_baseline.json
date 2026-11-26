@@ -43,29 +43,14 @@
       "evidence": ["backend/scripts/measure_cross_map.py"]
     },
     "close_driver": {
-      "status": "todo",
-      "reason": "只在测试里被调（conftest 与几个图用例）。docstring 说『供测试与进程退出调用』，但产品里没有进程退出钩子——这条要么接上退出路径，要么把那半句删掉。",
+      "status": "accepted",
+      "reason": "测试隔离专用：驱动是模块级单例，产品里没有任何调用者，而且不该有——它随进程消失，uvicorn 不为它调钩子。原来 docstring 与模块 docstring 都写着『进程退出也调它』，那两处半句已经删掉（docs/WIRING-GAPS.md §12.4 判『删半句，不接退出钩子』）。",
       "evidence": ["backend/tests/conftest.py", "backend/tests/test_graph_neo4j.py"]
     },
     "add_edge": {
-      "status": "todo",
-      "reason": "只在图用例里被调，产品代码一次都没调（写边走 add_edges_bulk）。它是『写了接口、没人用』的候选，下一轮判：接上还是删。",
+      "status": "accepted",
+      "reason": "产品代码一次都不调它：抽取层按块攒边，落库走 add_edges_bulk（见 graph_ingest）。处置是把它改成 add_edges_bulk([EdgeInput(...)]) 的薄封装，并删掉那条独立的 CYPHER_ADD_EDGE——于是『单条 / 批量』只剩一份校验与一份 MERGE 语义，留着它不再意味着两份实现。§12.4 判『判完大概率删』，判完的结论是留（单条语义被用例钉了 33 处）。",
       "evidence": ["backend/tests/test_graph_rag.py", "backend/tests/test_graph_resolve.py"]
-    },
-    "clear_aliases": {
-      "status": "todo",
-      "reason": "只在 test_graph_resolve 里被调。别名一旦写错，产品里没有撤销入口。",
-      "evidence": ["backend/tests/test_graph_resolve.py"]
-    },
-    "resolve_entities": {
-      "status": "todo",
-      "reason": "只在 test_graph_resolve 里被调。产品路径走 graph_resolve 内部的批量入口。",
-      "evidence": ["backend/tests/test_graph_resolve.py"]
-    },
-    "forget": {
-      "status": "todo",
-      "reason": "library.forget（删一份材料）只在用例里被调：产品里没有『删掉这份材料』的入口，而 prune 有自己的回收路径。",
-      "evidence": ["backend/tests/test_library_wiring.py", "backend/tests/test_library.py"]
     }
   }
 }
