@@ -146,6 +146,26 @@ async function onPickFiles(event: Event) {
             <span v-if="item.source.parsed_pages != null"> · {{ item.source.parsed_pages }} 页</span>
             <span v-if="item.source.duration_seconds != null"> · {{ Math.round(item.source.duration_seconds) }} 秒</span>
           </p>
+          <!--
+            已进知识库的材料要能删干净。`移除` 只把它从这一轮生成里拿掉，库里那份还在
+            ——传错一份、生成过一次之后，用户在列表里点掉它，"我的材料"里消失的只是
+            这一行，知识库里还占着位置，下次传同一份文件还会被静默复用。
+          -->
+          <p v-if="sources.inLibrary(item)" class="mt-1 flex flex-wrap items-center gap-2 text-xs">
+            <span class="rounded bg-slate-100 px-1 py-0.5 text-slate-500">已在知识库</span>
+            <button
+              type="button"
+              class="underline decoration-slate-300 disabled:opacity-50"
+              :class="item.deleteState === 'armed' ? 'font-medium text-rose-700' : 'text-slate-600 hover:text-rose-600'"
+              :disabled="generating || item.deleteState === 'busy'"
+              @click="sources.forget(item.key)"
+            >{{ item.deleteState === 'busy' ? '删除中…'
+              : item.deleteState === 'armed' ? '确认删除（连知识库）' : '删除' }}</button>
+            <span v-if="item.deleteState !== 'armed'" class="text-slate-400">
+              移除只影响这一轮；删除会连知识库那份一起删掉。
+            </span>
+          </p>
+          <p v-if="item.error" role="alert" class="mt-1 whitespace-pre-wrap break-words text-xs leading-relaxed text-rose-700">{{ item.error }}</p>
           <p v-if="sourceWarning(item.source)" role="alert" class="mt-1 text-xs leading-relaxed text-amber-700">
             {{ sourceWarning(item.source) }}
           </p>

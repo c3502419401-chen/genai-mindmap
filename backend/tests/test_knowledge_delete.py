@@ -19,6 +19,7 @@ from conftest import guest_client
 from app.contracts.mindmap import MindMapContent, Node
 from app.contracts.source import Source, SourceKind, SourceRef, SourceUsage
 from app.knowledge import library, shelf
+from app.knowledge.remember import remember_sources
 from app.mindmaps import repository
 
 
@@ -137,3 +138,63 @@ def test_shelf_delete_reports_the_same_count_the_list_shows():
         assert refusal.cited_by == listed.cited_by == 1
     else:  # pragma: no cover - 走到这里说明拦截没了
         raise AssertionError("被引用的材料不该在没有 force 的情况下删掉")
+
+
+def test_parsing_a_material_does_not_put_it_in_the_library():
+    """解析（上传 / 粘贴）**不入库**——库的写入只有生成时那一次 `remember_sources`。
+
+    这条钉的是「上传了但没生成过的材料删不掉」这个报障的**前提**。前提不成立：
+    它从没进过库，所以没有"库里那份"要删；要删的只是会话里那一行，而那一行本来
+    就有出口（`SourceInputs.vue` 的「移除」与「清空来源」），未入库时那个动作也
+    不向后端发 DELETE（`stores/sources.ts` 的 `forget` 判的就是这一条）。
+
+    它同时钉住被否决的另一条路：**改入库时机**（上传即入库）。真改成那样，用户每
+    试传一次，库里就多一条 `last_used_at` 永远停在当时的记录——而 `prune` 的保留
+    依据正是 `last_used_at`，上限是硬性的 200 份。库会被"试过但没用"的文件填满，
+    `MINDMAP_LIBRARY_SEARCH` 的候选集也跟着被稀释（`knowledge/remember.py` 的
+    「为什么是"生成时入库"」讲了同一个判断）。
+
+    所以这条链路事实值得被用例钉住，而不是只写在 docstring 里：谁哪天把
+    `parse_bytes` 或 `/ingestion` 改成顺手入库，这里会红。
+    """
+    api = guest_client()
+    with api:
+        parsed = api.post(
+            "/api/ingestion/text",
+            json={"text": "一份传错的正文，还没有用它生成过。"},
+        )
+    assert parsed.status_code == 200, parsed.text
+    assert parsed.json()["source"]["text"]
+
+    # 解析走完，库里一条都没有：`/knowledge/library` 与 `library.list_sources`
+    # 读的是同一张表，两处一起断言，免得只有一层没写。
+    assert api.get("/api/knowledge/library").json()["total"] == 0
+    assert library.list_sources() == []
+
+
+def test_the_persistent_id_a_generation_hands_back_is_what_delete_takes():
+    """生成时换来的持久 id，就是删除接口认的那个 id。
+
+    把两条链拼起来的这一条：`remember_sources` 在首帧之前把临时 uuid 换成库里的
+    id 并通过 `sources` 帧回给前端（`mapping`），前端 `remap` 之后材料行上的 id
+    就是它；用户点「删除」时打的也是它。两处口径一旦漂开（比如某天 `ingest` 改成
+    拿 `content_hash` 当 id），用户删"自己刚生成过的那份"会删到 404——而那时界面上
+    它明明就在列表里，症状是"删除失败"，不是"找不到这份材料"。
+
+    未入库的那一半（上个用例）与已入库的这一半，合起来才是「传错了要能删干净」。
+    """
+    parsed = Source(kind=SourceKind.text, status="parsed",
+                    text="制度正文：预算审批由部门负责人签核。", filename="制度.md")
+    remembered = remember_sources([parsed])
+
+    library_id = remembered.sources[0].id
+    assert library_id != parsed.id
+    assert remembered.mapping == {parsed.id: library_id}
+
+    api = guest_client()
+    assert api.get("/api/knowledge/library").json()["total"] == 1
+    with api:
+        response = api.delete(f"/api/knowledge/library/{library_id}")
+
+    assert response.status_code == 200, response.text
+    assert api.get("/api/knowledge/library").json()["total"] == 0

@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia';
 import { computed, onScopeDispose, ref } from 'vue';
 
-import { fetchUrlSource, uploadDocument } from '../api/client';
+import { ApiError, deleteLibrarySource, fetchUrlSource, uploadDocument } from '../api/client';
 import type { Source, SourceKind } from '../api/types';
 import { fileKind, MAX_AUDIO_BYTES, MAX_SOURCES, MAX_UPLOAD_BYTES, newSourceId, sourceInputError, textSource } from '../sources/input';
 
@@ -21,6 +21,15 @@ export interface SourceItem {
   source: Source | null;
   error: string;
   seconds: number;
+  /**
+   * 「彻底删除」的两步状态（`forget`）。
+   *
+   * `armed` 是**已经看到引用后果、再点一次才真删**的那一步：材料被导图引用时后端
+   * 先回 409（`detail.cited_by`），那正是"删掉之后那几张图的引用会显示「来源原文
+   * 不可用」，且无法恢复"——这句代价必须落到某个按钮上，而不是弹一个与材料清单
+   * 脱节的确认框。缺省（`undefined`）与 `idle` 等价。
+   */
+  deleteState?: 'idle' | 'armed' | 'busy';
 }
 
 /** 解析泳道：文档在本地 CPU 上跑，图片/语音是网络往返。 */
@@ -408,6 +417,70 @@ export const useSourcesStore = defineStore('sources', () => {
     void drain();
   }
 
+  /**
+   * 这份材料**已经进过知识库**吗。
+   *
+   * 判据是"行身份没变、但材料 id 变过"：`remap` 只把入库成功的临时 id 换成库里的
+   * 持久 id，而行的 `key` 从头到尾不动。所以 `source.id !== key` 等价于
+   * "`remember_sources` 收过它"——这是前端唯一能拿到"在不在库里"的凭据，
+   * 不必为它多查一次 `/knowledge/library`。
+   *
+   * 未生成过的材料永远走不进这个分支：上传与粘贴只产出本次请求内有效的 uuid，
+   * 入库的唯一入口是生成时那次 `remember_sources`（`knowledge/remember.py` 的
+   * 「为什么是"生成时入库"」）。
+   */
+  function inLibrary(item: SourceItem): boolean {
+    return !!item.source && item.source.id !== item.key;
+  }
+
+  /**
+   * 彻底删除一份材料：库里有就连库一起删，然后从本次会话移出。
+   *
+   * **为什么还需要它，`remove` 不够吗**：`remove` 是"这一轮不用它"——材料仍留在
+   * 知识库里，那是它的本意。而"我传错了"是另一件事：用户要的是"它从我的世界里
+   * 消失"。这两件事界面上一度只有一个按钮（「移除」），后果是——传错一份、生成过
+   * 一次之后，用户在材料列表里点掉它，知识库里那份**还在**：占着 200 份上限的一个
+   * 位置，而且因为 `content_hash` 是唯一键，下次传同一份文件会被静默复用（连上一次
+   * 的标签一起，见 `library.py` 的「复用已有记录时只更新 `last_used_at`」）。
+   *
+   * **未生成过的材料走同一条路，但只有一个动作**：它从没入过库，没有 DELETE 可发，
+   * 直接从会话移出就是"删干净"。`inLibrary` 那道判断不是性能优化，是语义——
+   * 对一份库里根本没有的材料发删除请求，只会拿到 404，然后界面把"它早就不在"说成
+   * "删除失败"。
+   *
+   * **被导图引用时要两步**：409 不是失败，它带着可执行的下一步。第一次点把后端那句
+   * 代价（"还被 N 张导图引用，删掉之后那些节点会显示「来源原文不可用」"）写进
+   * `item.error` 并把按钮切成「确认删除」；第二次点才带 `force=true`。
+   */
+  async function forget(key: string): Promise<void> {
+    const item = rowOf(key);
+    if (!item || item.deleteState === 'busy') return;
+    const force = item.deleteState === 'armed';
+    item.deleteState = 'busy';
+    item.error = '';
+    const libraryId = inLibrary(item) && item.source ? item.source.id : '';
+    if (libraryId) {
+      try {
+        await deleteLibrarySource(libraryId, force);
+      } catch (cause) {
+        const cited = cause instanceof ApiError && cause.code === 'source_cited';
+        item.deleteState = cited ? 'armed' : 'idle';
+        item.error = cause instanceof Error ? cause.message : '删除没能完成，请重试。';
+        return;
+      }
+      // 两份内容相同的材料会被知识库收成同一条记录（见 `remap` 的 docstring），
+      // 所以删掉这一份的库记录，其他握同一个 id 的行也一起失效——把它们退回
+      // "未入库"，而不是留着一个指向已删记录的 id、继续在界面上标"已进知识库"。
+      for (const other of items.value) {
+        if (other.key !== key && other.source && other.source.id === libraryId) {
+          other.source = { ...other.source, id: other.key };
+          other.id = other.key;
+        }
+      }
+    }
+    remove(key);
+  }
+
   function remove(key: string): void {
     active.get(key)?.abort();
     files.delete(key);
@@ -433,6 +506,7 @@ export const useSourcesStore = defineStore('sources', () => {
     items, error, parsing, recording, readySources, problem, materialProblem,
     draftText,
     addText, addDraft, addPastedText, addFetchedUrl, addFiles, retry, remove, clear, remap,
+    inLibrary, forget,
     snapshot, restore,
   };
 });
