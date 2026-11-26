@@ -575,3 +575,231 @@ v1 看不见的那 6 条（它们 `text>0`、`refs=0`——名字**只出现在�
   但 `hint` 得先决定放在哪一侧，所以没顺手改。
 - `scripts/acc3/unwired_baseline.json` 里 5 条 `todo` 是**这一轮不判**的账，
   不是"判定它们可以零引用"。
+
+---
+
+# 第三轮：`DIAGRAM_TYPE_OPTIONS` 与"棘轮进 CI"
+
+> 起点 `main` = `3dc00b2`。这一轮只做两件事，都是上面留下的账：第十节最后那条
+> "同一条病还有一个没修的"，以及 9.3 里"该进 CI"却一直没进的那条。第三节是这份账本
+> 的自评。三件都不改生成逻辑，`app/agent/tools.py`、`generation/service.py`、
+> `optimization/repair.py` 一行没碰。
+
+## 十一、图型：三样东西，三个源，六处红灯
+
+### 11.1 修前：两侧**恰好一致**，而这正是最坏的状态
+
+| 东西 | 修前的位置 | 谁保证它跟着后端变 |
+|---|---|---|
+| 值域 | `api/types.ts:663` 手写 `'tree' \| 'flowchart' \| 'fishbone'` | **没有人** |
+| 中文名 | `stores/options.ts` 手写三个 label | **没有人** |
+| `hint` | `stores/options.ts` 手写三条 | 不适用（它没有后端对应物） |
+| 生成物 | `schema.d.ts:973` 的 `("tree" \| "flowchart" \| "fishbone") \| null` | `test_openapi_snapshot.py` + `npm run gen:api` |
+
+三份字面量**逐字相同、顺序相同**，所以没有任何一条用例会红——它们比的是各自那份副本。
+第七节那段话在这里逐字适用："它现在的状态是'恰好一致'"。加一个图型（"时间轴"）
+同样什么都不会发生。
+
+### 11.2 `hint` 放哪侧：**留界面**——依据不是偏好，是后端自己写下的边界
+
+`contracts/mindmap.py:154-157` 那段注释已经把这件事判过了：
+
+> 图型的中文名。导出文件头（`export.service.to_puml`）要用它……**只放中文名，不放
+> 说明**——说明属于界面（`SourceInputs.vue` 里那四个 hint）。
+
+（顺带一句文档漂移：那四个 hint 早就从 `SourceInputs.vue` 搬到了
+`stores/options.ts`，注释没跟上。不影响行为，没改。）
+
+所以分开判的两件事：
+
+- **中文名往后端走**。它不只属于界面——`export.service` 把它写进 PlantUML 文件头，
+  后端本来就**必须**有。前端再抄一份就是第十节那条病的原样：抄的那份不会跟着变。
+  这一轮把它接上生成物（`api/diagram-labels.json`）。
+- **`hint` 留在界面**。它说的是"选了它，界面上会发生什么"，后端没有对应字段、也没有
+  任何生成逻辑读它。而搬过去**换不到"加图型零改动"**：新图型的中文说明总得有人写，
+  差别只是写哪个文件，不是要不要写。写在后端还要过一遍 `export_openapi.py` 进
+  `schema.d.ts`——那份文件现在是纯技术文档。
+
+一句话收口：**值是契约，名是两处都要用的产物，说明是界面。**
+
+### 11.3 链路：两条生成路，一条手工
+
+```
+app/contracts/mindmap.py::DiagramKind          ← 值域的唯一真源
+    ↓ scripts/export_openapi.py（提交的快照，test_openapi_snapshot.py 守卫）
+backend/openapi.json
+    ↓ npm run gen:api（CI 里重生成后 git diff --exit-code）
+frontend/src/api/schema.d.ts
+    ↓ NonNullable<components['schemas']['AgentRunRequest']['diagram_type']>
+api/types.ts::DiagramType                       ← 不再是手写并集
+
+app/contracts/mindmap.py::DIAGRAM_LABELS        ← 中文名的唯一真源
+    ↓ scripts/export_diagram_labels.py（手跑，像 export_thinking_options.py）
+frontend/src/api/diagram-labels.json            ← 提交、可 review 的生成物
+    ↓ import
+stores/options.ts::DIAGRAM_TYPE_OPTIONS         ← 中文名不含任何字面量
+    ↓
+ChatDock.vue #diagram-type
+
+stores/options.ts::DIAGRAM_TYPE_COPY            ← hint 的唯一真源（只在这里）
+```
+
+值域**没有再导一份 JSON**。理由：它已经有一条比 JSON 更早生效的路（`gen:api`
+出类型、`vue-tsc` 直接用），再导一份等于同一件事有两条真源，改了一处忘了另一处时，
+红的是"两个生成物不一致"而不是"契约改了"。中文名不一样——它是普通 dict，不是
+pydantic 字段，`app.openapi()` 里根本没有它，唯一出口就是导出脚本。
+
+"少写一条"靠**类型**红，不靠断言：
+
+```ts
+const DIAGRAM_TYPE_COPY: Record<DiagramType, { hint: string }> = { … };
+//                        ^ 键集必须恰好等于值域
+...DIAGRAM_VALUES.map(value => ({ value, label: diagramLabels[value], … }));
+//                                        ^ 生成物里必须有这个键
+```
+
+### 11.4 ★ 造一次"后端多一个图型"（`timeline / 时间轴`）：六处红灯
+
+**只改 `mindmap.py`，什么都不重跑**——最常见的人为错误：
+
+```
+$ python -m pytest -q tests/test_diagram_options.py::test_schema_union_matches_diagram_kind
+E  AssertionError: frontend/src/api/schema.d.ts 的 diagram_type union 与后端 DiagramKind
+   不同步。往 `contracts/mindmap.py` 加了一种图型，却只改了一侧。重新生成：
+     cd backend && python scripts/export_diagram_labels.py
+     cd backend && python scripts/export_openapi.py
+     cd frontend && npm run gen:api
+FAILED …::test_schema_union_matches_diagram_kind
+```
+
+**补跑 `export_openapi.py` + `gen:api`，"忘了"重跑 `export_diagram_labels.py`**：
+
+```
+$ npx vue-tsc --noEmit
+src/stores/options.ts(78,7): error TS2741: Property 'timeline' is missing in type
+  '{ tree: { hint: string; }; flowchart: { hint: string; }; fishbone: { hint: string; }; }'
+  but required in type 'Record<DiagramType, { hint: string; }>'.
+src/stores/options.ts(92,12): error TS7053: Element implicitly has an 'any' type because
+  expression of type 'DiagramType' can't be used to index type
+  '{ tree: string; flowchart: string; fishbone: string; }'.
+[exit code: 2]
+
+$ npx vitest run tests/diagram-options-source.spec.ts
+× 生成物的请求侧与产物侧同宽（同一次导出，不该只有一侧变）
+  AssertionError: expected [ 'tree', 'flowchart', …(2) ] to deeply equal [ 'tree', 'flowchart', 'fishbone' ]
+× 每一项都在生成物的 union 里，并集也覆盖全部（少一条/多一条都红）
+  AssertionError: expected [ 'tree', 'flowchart', 'fishbone' ] to deeply equal [ 'tree', 'flowchart', …(2) ]
+Tests  2 failed | 3 passed (5)
+
+$ python -m pytest -q tests/test_diagram_options.py
+FAILED test_exported_snapshot_is_up_to_date
+  AssertionError: diagram-labels.json 过期了。重新生成：…
+FAILED test_export_has_one_entry_per_diagram_kind
+  assert {'tree': '思维导…hbone': '鱼骨图'} == {'tree': '思维导…eline': '时间轴'}
+2 failed, 2 passed
+```
+
+**六处红，两种性质**：`type-check` 那两条是**编译期**（"这个表缺一项"），比用例早、
+也比用例硬——`npm test` 走 esbuild、不做类型检查，所以真正拦住它的是 `type-check`；
+pytest 那两条是生成物过期。四条新用例的完整清单在
+`tests/test_diagram_options.py`（4 条，跨语言对账）与
+`tests/diagram-options-source.spec.ts`（5 条，前端内部）。
+
+探针已完整回滚：`contracts/mindmap.py`、`openapi.json`、`schema.d.ts` 三份与 HEAD
+逐字节相同（`git diff --stat` 里只剩本轮真正的两处改动）。
+
+### 11.5 残留（这一轮**不**动的两处，都有理由）
+
+1. **`mindmap/shape.ts::shapeLabel`**：这里还有一份三值映射
+   （`'鱼骨图' / '流程图' / '思维导图'`），注释自认"与后端 `DIAGRAM_LABELS`
+   **同一份字面量**"。不合并的理由：它的入参是 `ShapeKind`（走 `kindOf()` 的形状
+   判别），不是 `diagram_type` 字段——注释写得很清楚"那条文案只能来自形状，不能来自
+   `diagram_type`"。它的 fallback 是穷尽的 `return '思维导图'`，所以**加第四种图型时
+   它会静默返回错的名字**。这条要跟 `isFishbone` / `isFlow` 一起改（形状判别本身得先
+   认识新形状），不属于"让值域跟生成物走"这件事。
+2. **`contracts/mindmap.py:156` 的注释漂移**：它说 hint 在 `SourceInputs.vue`，实际
+   早在 `stores/options.ts`。
+
+## 十二、棘轮进 CI
+
+### 12.1 接线
+
+`.github/workflows/ci.yml` 的后端 job，`Test` 之后加一步：
+
+```yaml
+      - name: 零引用函数棘轮
+        run: python scripts/acc3/find_unwired.py --gate
+```
+
+**依赖：零额外。** 脚本只 import 标准库（`ast` / `json` / `pathlib` / `re` /
+`collections` / `dataclasses` / `argparse` / `sys`），`Install` 那步装的
+requirements + pytest 已经够；它**不** import `app` 里任何模块，所以也不需要
+`requirements.txt` 里那些东西真能跑起来。
+
+### 12.2 确定性：先在干净 worktree 里对过
+
+判据是**三棵源码树的文本**（`app/`、`tests/`、`scripts/`），不读运行中的服务、不读
+数据库、不读 git 状态或工作区差异；所有路径以 `__file__` 为锚
+（`BACKEND_DIR = Path(__file__).resolve().parents[2]`，`BASELINE` 相对脚本目录）。
+唯一一处跨目录读的是 `evidence` 的存在性检查，锚在 `BACKEND_DIR.parent`（仓库根）。
+
+实测：`git worktree add` 一个 detached HEAD=`3dc00b2` 的干净树，在那里跑
+`--gate`，四个读数与主工作区**逐行相同**（515 / 66 / 11 / 5），退出码 0。
+
+### 12.3 它红了会看到什么（干净 worktree 里演的两场）
+
+**新增一个零引用公开函数**（往 `app/` 加一个只有 docstring 的模块）：
+
+```
+$ python scripts/acc3/find_unwired.py --gate
+待判（5 条，它们是往年遗留、不在任何一轮的边界里）：
+  · close_driver：只在测试里被调（conftest 与几个图用例）……
+  · …（另 4 条）
+
+闸门：不通过
+  · 新增零引用公开函数：app/_probe_unwired.py:4 probe_orphan_function
+
+每条新增都要么接上，要么在 backend/scripts/acc3/unwired_baseline.json 里写清为什么
+它可以零引用。
+[exit code: 1]
+```
+
+**理由消失、结论留下**（删掉 `quote_in` 那条的 evidence 文件）：
+
+```
+闸门：不通过
+  · 基线条目 quote_in 的豁免理由已经不在了：backend/tests/test_verify_states.py
+[exit code: 1]
+```
+
+两种红的形状不同、话也不同：前者说"你新增了一条"，后者说"你删掉了一个理由"。
+
+### 12.4 ★ 五条 `todo` 逐条判：下一轮该不该动、动的话是什么活
+
+| 条目 | 下一轮 | 具体是什么活 |
+|---|---|---|
+| `graph_store.close_driver` | **该**（十分钟） | **删半句 docstring，不接退出钩子**。产品进程由 uvicorn 管，驱动随进程消失；为"让人手动调一个函数"加 shutdown 钩子，是把测试便利包装成生产必要。把"供测试与进程退出调用"改成"测试隔离专用"，`status` 转 `accepted`（与 `reset_graph_notices` 同类）。先确认它只是 `driver.close()` 的薄包装、没有 flush 语义。 |
+| `graph_store.add_edge` | **该**（判完大概率删） | 它被注释提到 **24 次、调用 0 次**——文档在描述一个不存在的调用。两条路选一条：把那些注释改指向 `add_edges_bulk`，或把它做成 `add_edges_bulk([x])` 的薄封装并让注释指向它。风险低（`knowledge/` 下的模块级函数，不是路由）。 |
+| `graph_store.clear_aliases` | **该**——五条里最像**真缺口**的一条 | 别名是模型解析实体时写进图库的**推断产物**，模型会猜错，而猜错之后**没有任何界面或接口能改**。这不是"没人用"，是"没人能做"。要么给 `DELETE /api/knowledge/aliases/{name}`，要么落库时就不写推断别名（那要改生成链）。先量：`graph_resolve` 一次跑写多少别名、错一次影响几张图。 |
+| `graph_resolve.resolve_entities` | **不该"接上"**（降级可见性） | 形状是"公开的单条入口，产品只用内部批量入口"——这是**可见性标错了**，不是接线缺口。改成 `_resolve_entity` 私有、用例改调批量入口，或确认它对第三方是 API 的一部分、写进 `__all__`。与基线里 `quote_in` 那条同一个判法（上一轮已判"不是接线缺口"）。 |
+| `library.forget` | **该**——与 `clear_aliases` 并列的真缺口 | 产品里没有"删掉这份材料"的入口，而 `prune` 有自己的回收路径。活是一条完整链路：repository 删除 → `source_refs` 悬空处理 → 材料列表的删除按钮。**设计前置**：删掉一份被 3 张图引用的材料，那 3 张图的 `source_refs` 怎么办？现在有 `SOURCE_TEXT_UNAVAILABLE` 这条诊断，"删了但引用还在"是**有表达方式**的——这条判完才知道是一小时的活还是一天的活。 |
+
+**为什么一直没人动？分两半，比例是 3:2。**
+
+- `close_driver` / `resolve_entities` / `add_edge`：**不影响用户**。产品行为完全正确，
+  它们是内部可见性标错与文档漂移。没人动不是不知道——是**知道但不值得**。
+- `clear_aliases` / `library.forget`：**没人知道它们存在**。它们的症状只有用户撞上
+  之后才会被想起（"模型把这个实体认错了，我能不能改回来"／"这份材料传错了，我能不能
+  删"），而**产品里没有那个按钮**——于是用户不会去搜"为什么删不掉"，他只会认为
+  "这个产品不支持"。**没有抱怨的功能缺失，比有抱怨的更难被发现。**
+
+**所以棘轮的价值要重新定位。** 它不主要在"以后不新增"——新增本来就会在 PR 里被
+看见。它的价值是**让存量可见**：上一轮之前，这 5 条躺在 `graph_store.py` /
+`library.py` 里，**没有人有一份清单**；现在每次 push 都会把"这些是还没判的账"连同
+理由重新说一遍。
+
+**一个每次都说一遍、说了不改也不会红的清单，恰好是这类账最合适的载体**：它不逼人往
+豁免名单里塞东西，但它让"我们欠着 5 件事"这件事无法被忘记。这也解释了它为什么必须
+是棘轮——绝对闸门会在这 5 条上立刻红，而其中 3 条的正确处置是"降级可见性或删半句
+注释"，和两条真缺口混在同一个红灯里，红几次之后就没人看了。
+
