@@ -851,4 +851,191 @@ describe('知识库入口', () => {
     await vi.waitFor(() => expect(wrapper.text()).toContain('还是空的'));
     expect(wrapper.text()).toContain('带着材料生成一次导图');
   });
+
+  /** 删除一条材料：`DELETE /knowledge/library/{id}`，列表随之刷新。 */
+  function stubDelete(list: LibraryList, after: LibraryList) {
+    let deleted = false;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith('/health')) {
+        return { ok: true, status: 200, json: async () => ({ status: 'ok', version: 'dev' }) } as unknown as Response;
+      }
+      if (init?.method === 'DELETE' && url.includes('/knowledge/library/')) {
+        deleted = true;
+        const cited = list.items[0]?.cited_by ?? 0;
+        return {
+          ok: true, status: 200,
+          json: async () => ({ source_id: 'src-1', deleted: true, cited_by: cited }),
+        } as unknown as Response;
+      }
+      if (url.includes('/knowledge/library')) {
+        return { ok: true, status: 200, json: async () => (deleted ? after : list) } as unknown as Response;
+      }
+      return { ok: true, status: 200, json: async () => ({}) } as unknown as Response;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  /** 列表里那个"删除"按钮（不是别名区的，也不是"清空全部"）。 */
+  function deleteButton(wrapper: VueWrapper) {
+    return wrapper.findAll('button').find(node => node.text() === '删除');
+  }
+
+  it('删未被引用的材料：不问直接删，删完刷新列表并说明结果', async () => {
+    const fetchMock = stubDelete(
+      { total: 1, items: [entry({ cited_by: 0 })] },
+      { total: 0, items: [] },
+    );
+    const confirm = vi.spyOn(window, 'confirm');
+    const wrapper = mountApp();
+    await flushPromises();
+
+    await buttonByText(wrapper, '知识库').trigger('click');
+    await vi.waitFor(() => expect(wrapper.text()).toContain('管理办法.pdf'));
+
+    const remove = deleteButton(wrapper);
+    expect(remove).toBeTruthy();
+    expect(remove!.attributes('title')).toContain('还没有被任何导图引用');
+    await remove!.trigger('click');
+    await vi.waitFor(() => expect(wrapper.text()).toContain('已删除'));
+
+    // 没被引用就没有"后果"要确认——弹一次只会训练用户闭眼点掉后面的确认框。
+    expect(confirm).not.toHaveBeenCalled();
+    const call = fetchMock.mock.calls.find(
+      ([, init]) => (init as RequestInit | undefined)?.method === 'DELETE');
+    expect(String(call?.[0])).not.toContain('force=true');
+    // 删完必须重新读列表：留着那一行会让人下次以为"没删掉"。
+    await vi.waitFor(() => expect(wrapper.text()).toContain('还是空的'));
+    confirm.mockRestore();
+  });
+
+  it('删被引用的材料：先确认，确认后带 force=true 才真删', async () => {
+    const fetchMock = stubDelete(
+      { total: 1, items: [entry({ cited_by: 2 })] },
+      { total: 0, items: [] },
+    );
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const wrapper = mountApp();
+    await flushPromises();
+
+    await buttonByText(wrapper, '知识库').trigger('click');
+    await vi.waitFor(() => expect(wrapper.text()).toContain('管理办法.pdf'));
+
+    await deleteButton(wrapper)!.trigger('click');
+    await vi.waitFor(() => expect(wrapper.text()).toContain('已删除'));
+
+    // 确认框里必须出现"几张图"与"不可恢复"：正文是证据的最终依据，删掉补不回来。
+    expect(confirm).toHaveBeenCalledTimes(1);
+    const asked = String(confirm.mock.calls[0]?.[0] ?? '');
+    expect(asked).toContain('2 张导图');
+    expect(asked).toContain('来源原文不可用');
+    const call = fetchMock.mock.calls.find(
+      ([, init]) => (init as RequestInit | undefined)?.method === 'DELETE');
+    expect(String(call?.[0])).toContain('force=true');
+    // 回执里的 cited_by 要出现在结论里：用户得知道哪几张图受了影响。
+    expect(wrapper.text()).toContain('2 张导图引用它');
+    confirm.mockRestore();
+  });
+
+  it('用户取消确认就一个请求都不发', async () => {
+    const fetchMock = stubDelete(
+      { total: 1, items: [entry({ cited_by: 3 })] },
+      { total: 0, items: [] },
+    );
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    const wrapper = mountApp();
+    await flushPromises();
+
+    await buttonByText(wrapper, '知识库').trigger('click');
+    await vi.waitFor(() => expect(wrapper.text()).toContain('管理办法.pdf'));
+
+    await deleteButton(wrapper)!.trigger('click');
+    await flushPromises();
+
+    expect(confirm).toHaveBeenCalledTimes(1);
+    // 关键：取消之后材料还在列表里，而且没有任何 DELETE 发出去。
+    expect(wrapper.text()).toContain('管理办法.pdf');
+    expect(fetchMock.mock.calls.some(
+      ([, init]) => (init as RequestInit | undefined)?.method === 'DELETE')).toBe(false);
+    confirm.mockRestore();
+  });
+});
+
+describe('实体别名入口', () => {
+  const edge = {
+    alias: '市场监管总局',
+    canonical: '国家市场监督管理总局',
+    source: 'substring',
+    similarity: 0.93,
+    created_at: '2026-11-16T10:00:00.000Z',
+  };
+
+  function stubAliases(items: (typeof edge)[], configured = true) {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith('/health')) {
+        return { ok: true, status: 200, json: async () => ({ status: 'ok', version: 'dev' }) } as unknown as Response;
+      }
+      if (init?.method === 'DELETE' && url.includes('/knowledge/aliases/')) {
+        return {
+          ok: true, status: 200,
+          json: async () => ({ alias: edge.alias, deleted: 1 }),
+        } as unknown as Response;
+      }
+      if (url.includes('/knowledge/aliases')) {
+        return {
+          ok: true, status: 200,
+          json: async () => ({ items, total: items.length, configured }),
+        } as unknown as Response;
+      }
+      if (url.includes('/knowledge/library')) {
+        return { ok: true, status: 200, json: async () => ({ items: [], total: 0 }) } as unknown as Response;
+      }
+      return { ok: true, status: 200, json: async () => ({}) } as unknown as Response;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  it('展开「实体别名」列出合并结果与依据，删掉那一条', async () => {
+    const fetchMock = stubAliases([edge]);
+    const wrapper = mountApp();
+    await flushPromises();
+
+    await buttonByText(wrapper, '知识库').trigger('click');
+    await flushPromises();
+    // 默认收起：进抽屉不该顺手多打一次图存储——那里可能连不上。
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/knowledge/aliases'))).toBe(false);
+
+    await buttonByText(wrapper, '查看').trigger('click');
+    await vi.waitFor(() => expect(wrapper.text()).toContain('市场监管总局'));
+
+    // 「别名 → 主名」与落库依据都要看得见：凭构词关系合的与凭向量兜底合的不是一回事。
+    expect(wrapper.text()).toContain('→');
+    expect(wrapper.text()).toContain('国家市场监督管理总局');
+    expect(wrapper.text()).toContain('构词关系');
+
+    const remove = wrapper.findAll('button').filter(node => node.text() === '删除').pop();
+    await remove!.trigger('click');
+    await vi.waitFor(() => expect(wrapper.text()).toContain('已删掉'));
+    const del = fetchMock.mock.calls.find(
+      ([, init]) => (init as RequestInit | undefined)?.method === 'DELETE');
+    // 别名含中文：必须编码，否则某些环境下路径会被截断。
+    expect(String(del?.[0])).toContain(encodeURIComponent('市场监管总局'));
+  });
+
+  it('图存储没开时说的是"这一层没启用"，不是"没有别名"', async () => {
+    stubAliases([], false);
+    const wrapper = mountApp();
+    await flushPromises();
+
+    await buttonByText(wrapper, '知识库').trigger('click');
+    await flushPromises();
+    await buttonByText(wrapper, '查看').trigger('click');
+    await vi.waitFor(() => expect(wrapper.text()).toContain('图存储没有启用'));
+
+    // 两条建议完全不同（去配 Neo4j vs 去跑实体消解），所以不能共用一句话。
+    expect(wrapper.text()).not.toContain('还没有别名');
+  });
 });

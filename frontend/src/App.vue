@@ -12,8 +12,8 @@ import SettingsPanel from './components/SettingsPanel.vue';
 import SourceContextDrawer from './components/SourceContextDrawer.vue';
 import StructureCheck from './components/StructureCheck.vue';
 import { SOURCE_LABELS } from './sources/input';
-import { ApiError, exportFilename, exportLabel, exportMindMap, getHealth, listLibrary, readLibrarySource, type ExportFormat } from './api/client';
-import type { LibraryEntry, LibrarySource } from './api/types';
+import { ApiError, clearAliases as clearAllAliasesRequest, deleteAlias as deleteAliasRequest, deleteLibrarySource, exportFilename, exportLabel, exportMindMap, getHealth, listAliases, listLibrary, readLibrarySource, type ExportFormat } from './api/client';
+import type { AliasEntry, LibraryEntry, LibrarySource } from './api/types';
 import type { SampleMap } from './dev/samples';
 import type { DemoPreset } from './demo/presets';
 import { displayBody, bodySource, useMindMapStore } from './stores/mindmap';
@@ -502,13 +502,13 @@ function loadDemoPreset(preset: DemoPreset): void {
   flash('ok', `已载入预置导图：${preset.label}`);
 }
 
-// ---- 知识库（只读） ----
+// ---- 知识库 ----
 /**
- * 库里有什么材料、每份被几张已保存导图引用、点开看正文预览。
+ * 库里有什么材料、每份被几张已保存导图引用、点开看正文预览、删掉传错的那份。
  *
- * 只读：不提供删除、不提供"从这里选材料去生成"。后者的开关是
- * `MINDMAP_LIBRARY_SEARCH`，与本面板无关——线上那个开关关着，这个入口照样能用。
- * 材料是在**生成时**入库的，所以刚上传还没生成过的文件不会出现在这里。
+ * 不提供"从这里选材料去生成"：那个开关是 `MINDMAP_LIBRARY_SEARCH`，与本面板无关
+ * ——线上那个开关关着，这个入口照样能用。材料是在**生成时**入库的，所以刚上传
+ * 还没生成过的文件不会出现在这里。
  */
 const libraryOpen = ref(false);
 const libraryEntries = ref<LibraryEntry[]>([]);
@@ -544,6 +544,13 @@ async function openLibrary(): Promise<void> {
   libraryPreview.value = null;
   libraryOpening.value = null;
   libraryPreviewError.value = '';
+  libraryDeleteNotice.value = '';
+  libraryDeleteError.value = '';
+  // 别名折叠区每次重开都回到收起状态、清掉上一次的提示：抽屉关掉之后那些话已经
+  // 不属于任何一次操作了，留在界面上只会让人以为刚发生了什么。
+  aliasesOpen.value = false;
+  aliasesError.value = '';
+  aliasNotice.value = '';
   await loadLibrary();
   await nextTick();
   libraryCloseButton.value?.focus();
@@ -632,6 +639,135 @@ function citationLabel(count: number): string {
 
 function librarySize(entry: LibraryEntry): string {
   return `${entry.chars} 字 · ${entry.chunks} 段`;
+}
+
+// ---- 删除材料（`library.forget` 的产品入口） ----
+
+/** 正在删的那一份；空串表示没有在删。按钮据此禁用，避免连点两次。 */
+const libraryDeleting = ref('');
+const libraryDeleteNotice = ref('');
+const libraryDeleteError = ref('');
+
+/**
+ * 删掉一份材料。
+ *
+ * `cited_by > 0` 时先问一次：正文是导图证据的**最终依据**，删掉之后那些节点的引用
+ * 只能显示「来源原文不可用」，而且不可逆——正文没了就再也没法回填。列表里本来就有
+ * 这个数，所以确认框里的 N 不必再请求一次才知道。
+ */
+async function removeLibrarySource(entry: LibraryEntry): Promise<void> {
+  if (entry.cited_by > 0 && !window.confirm(
+    `「${entry.filename || '未命名材料'}」被 ${entry.cited_by} 张导图引用。\n`
+    + '删掉之后那些节点会显示「来源原文不可用」，且无法恢复。确定删除？',
+  )) return;
+  await runLibraryDelete(entry, entry.cited_by > 0);
+}
+
+async function runLibraryDelete(entry: LibraryEntry, force: boolean): Promise<void> {
+  libraryDeleting.value = entry.source_id;
+  libraryDeleteError.value = '';
+  libraryDeleteNotice.value = '';
+  try {
+    const result = await deleteLibrarySource(entry.source_id, force);
+    // 正在预览的就是它：退回列表，否则会停在一份已经不存在的材料上。
+    if (libraryOpening.value?.source_id === entry.source_id) backToLibrary();
+    libraryDeleteNotice.value = result.cited_by > 0
+      ? `已删除「${entry.filename || '未命名材料'}」，原来有 ${result.cited_by} 张导图引用它——那些节点的引用现在显示「来源原文不可用」。`
+      : `已删除「${entry.filename || '未命名材料'}」。`;
+    await loadLibrary();
+  } catch (error) {
+    const failure = error as ApiError;
+    if (failure.code === 'source_cited') {
+      // 列表里的计数可能刚好被另一张新图超过（后端判的是这一刻的计数）。这时不让
+      // 用户对着"删除失败"发愣：把新的代价说清，再问一次。
+      if (window.confirm('这份材料刚被更多导图引用。删掉之后那些引用会失效，且无法恢复。仍然删除？')) {
+        await runLibraryDelete(entry, true);
+      }
+      return;
+    }
+    libraryDeleteError.value = `删除没能完成：${failure.message}`;
+  } finally {
+    libraryDeleting.value = '';
+  }
+}
+
+// ---- 实体别名（模型猜出来的"这两个名字是同一个东西"） ----
+
+/**
+ * 别名清单。**这是"模型把实体认错了、能不能改回来"唯一的界面入口**。
+ *
+ * 别名不参与证据：删掉一条只让这两个名字重新变成两个实体，挂在它们身上的证据边
+ * 一条不动。所以这里只有"删掉错的那条"，没有"合并两个实体"——合并要跨图搬引用，
+ * 是另一件事。
+ */
+const aliasesOpen = ref(false);
+const aliasEntries = ref<AliasEntry[]>([]);
+const aliasConfigured = ref(true);
+const aliasesBusy = ref(false);
+const aliasesError = ref('');
+const aliasNotice = ref('');
+/** 正在删的那一条，键是 `别名→主名`。 */
+const aliasDeleting = ref('');
+
+function aliasKey(edge: AliasEntry): string {
+  return `${edge.alias}→${edge.canonical}`;
+}
+
+/** 落库时的依据。凭子串进去的那批最该复查，所以把依据直接写在行上。 */
+function aliasReasonLabel(edge: AliasEntry): string {
+  const basis = edge.source === 'substring' ? '构词关系' : edge.source === 'embedding' ? '向量相似' : (edge.source || '未知依据');
+  return edge.similarity > 0 ? `${basis} ${Math.round(edge.similarity * 100) / 100}` : basis;
+}
+
+async function toggleAliases(): Promise<void> {
+  aliasesOpen.value = !aliasesOpen.value;
+  if (aliasesOpen.value) await loadAliases();
+}
+
+async function loadAliases(): Promise<void> {
+  aliasesBusy.value = true;
+  aliasesError.value = '';
+  try {
+    const payload = await listAliases();
+    aliasEntries.value = payload.items;
+    aliasConfigured.value = payload.configured;
+  } catch (error) {
+    aliasEntries.value = [];
+    aliasesError.value = `别名清单没能读取：${(error as Error).message}`;
+  } finally {
+    aliasesBusy.value = false;
+  }
+}
+
+async function removeAlias(edge: AliasEntry): Promise<void> {
+  aliasDeleting.value = aliasKey(edge);
+  aliasesError.value = '';
+  aliasNotice.value = '';
+  try {
+    await deleteAliasRequest(edge.alias, edge.canonical);
+    aliasNotice.value = `已删掉「${edge.alias} → ${edge.canonical}」：这两个名字重新是两个实体，证据边没动。`;
+    await loadAliases();
+  } catch (error) {
+    aliasesError.value = `这条别名没能删除：${(error as Error).message}`;
+  } finally {
+    aliasDeleting.value = '';
+  }
+}
+
+async function clearAliasTable(): Promise<void> {
+  if (!window.confirm('清空全部别名？实体与证据边不受影响，但合并结果会全部消失，只能重跑实体消解恢复（重跑会按同一批阈值重新猜一遍）。')) return;
+  aliasesBusy.value = true;
+  aliasesError.value = '';
+  aliasNotice.value = '';
+  try {
+    const result = await clearAllAliasesRequest();
+    aliasNotice.value = `已清空 ${result.deleted} 条别名。`;
+    await loadAliases();
+  } catch (error) {
+    aliasesError.value = `别名没能清空：${(error as Error).message}`;
+  } finally {
+    aliasesBusy.value = false;
+  }
 }
 
 function formatStamp(value: string): string {
@@ -1820,10 +1956,10 @@ const agentHasDetail = computed(() => agentDetailVisible(store));
             还是空的。带着材料生成一次导图，用到的材料就会出现在这里。
           </p>
           <ul v-else class="mt-3 divide-y divide-slate-100">
-            <li v-for="entry in libraryEntries" :key="entry.source_id" class="py-2">
+            <li v-for="entry in libraryEntries" :key="entry.source_id" class="flex items-start gap-2 py-2">
               <button
                 type="button"
-                class="flex w-full items-start justify-between gap-3 text-left hover:bg-slate-50"
+                class="flex min-w-0 flex-1 items-start justify-between gap-3 text-left hover:bg-slate-50"
                 @click="openLibrarySource(entry)"
               >
                 <span class="min-w-0">
@@ -1842,11 +1978,90 @@ const agentHasDetail = computed(() => agentDetailVisible(store));
                   {{ citationLabel(entry.cited_by) }}
                 </span>
               </button>
+              <!--
+                删除单独一个按钮：它是"传错了材料"唯一的出口。被引用时先弹一次确认
+                （正文是证据的最终依据，删掉不可逆），未引用则直接删。
+              -->
+              <button
+                type="button"
+                class="mt-0.5 shrink-0 rounded px-1.5 py-0.5 text-[11px] text-rose-600 hover:bg-rose-50 hover:text-rose-800 disabled:opacity-50"
+                :disabled="libraryDeleting === entry.source_id"
+                :title="entry.cited_by > 0 ? `被 ${entry.cited_by} 张导图引用：删除前会让你确认` : '这份材料还没有被任何导图引用'"
+                @click="removeLibrarySource(entry)"
+              >
+                {{ libraryDeleting === entry.source_id ? '删除中…' : '删除' }}
+              </button>
             </li>
           </ul>
-          <p v-if="!libraryBusy && !libraryListError" class="mt-4 text-xs leading-relaxed text-slate-400">
-            这里只是看：材料正文随库保存，删改请走运维脚本。上传后还没生成过的文件不会出现在这里。
+          <p v-if="libraryDeleteNotice" class="mt-3 rounded-md bg-emerald-50 p-3 text-xs leading-relaxed text-emerald-700">
+            {{ libraryDeleteNotice }}
           </p>
+          <p v-if="libraryDeleteError" class="mt-3 rounded-md bg-rose-50 p-3 text-xs leading-relaxed text-rose-700">
+            {{ libraryDeleteError }}
+          </p>
+          <p v-if="!libraryBusy && !libraryListError" class="mt-4 text-xs leading-relaxed text-slate-400">
+            材料正文随库保存；上一步生成时没用到的文件不会出现在这里。
+          </p>
+
+          <!--
+            实体别名：模型推断出来的"这两个名字是同一个东西"。猜错之后没有界面能改，
+            所以这一节的意义不在"便利"，在于它是唯一的修正入口。只做删除，不做合并
+            （合并要跨图搬引用，是另一件事）。
+          -->
+          <section class="mt-4 border-t border-slate-100 pt-3">
+            <div class="flex items-center justify-between gap-3">
+              <h3 class="text-xs font-semibold text-slate-700">实体别名</h3>
+              <button type="button" class="text-xs text-slate-500 hover:text-slate-900" @click="toggleAliases()">
+                {{ aliasesOpen ? '收起' : '查看' }}
+              </button>
+            </div>
+            <p class="mt-1 text-xs leading-relaxed text-slate-400">
+              生成时模型会猜「这两个名字指同一个东西」，猜完记成别名（左 → 右是"别名 → 主名"）。猜错了删掉那一条：实体与证据边都不受影响。
+            </p>
+            <template v-if="aliasesOpen">
+              <p v-if="aliasesBusy && aliasEntries.length === 0" class="mt-2 text-xs text-slate-400">正在读取…</p>
+              <p v-else-if="aliasesError" class="mt-2 rounded-md bg-rose-50 p-3 text-xs leading-relaxed text-rose-700">
+                {{ aliasesError }}
+              </p>
+              <p v-else-if="!aliasConfigured" class="mt-2 text-xs leading-relaxed text-slate-400">
+                图存储没有启用（缺 MINDMAP_NEO4J_PASSWORD），这一层暂时不可用。
+              </p>
+              <p v-else-if="aliasEntries.length === 0" class="mt-2 text-xs leading-relaxed text-slate-400">
+                还没有别名。实体消解跑过一轮之后，合并结果会出现在这里。
+              </p>
+              <template v-else>
+                <ul class="mt-2 divide-y divide-slate-100">
+                  <li
+                    v-for="edge in aliasEntries"
+                    :key="aliasKey(edge)"
+                    class="flex items-center justify-between gap-3 py-1.5"
+                  >
+                    <span class="min-w-0 break-words text-xs text-slate-700">
+                      {{ edge.alias }} → {{ edge.canonical }}
+                      <span class="text-slate-400">（{{ aliasReasonLabel(edge) }}）</span>
+                    </span>
+                    <button
+                      type="button"
+                      class="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-rose-600 hover:bg-rose-50 hover:text-rose-800 disabled:opacity-50"
+                      :disabled="aliasDeleting === aliasKey(edge)"
+                      @click="removeAlias(edge)"
+                    >
+                      {{ aliasDeleting === aliasKey(edge) ? '删除中…' : '删除' }}
+                    </button>
+                  </li>
+                </ul>
+                <p v-if="aliasNotice" class="mt-2 text-xs leading-relaxed text-emerald-700">{{ aliasNotice }}</p>
+                <button
+                  type="button"
+                  class="mt-2 text-xs text-slate-500 underline decoration-slate-300 hover:text-slate-900 disabled:opacity-50"
+                  :disabled="aliasesBusy"
+                  @click="clearAliasTable()"
+                >
+                  清空全部别名
+                </button>
+              </template>
+            </template>
+          </section>
         </template>
       </div>
     </aside>

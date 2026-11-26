@@ -805,7 +805,25 @@ export interface paths {
         get: operations["read_library_source_api_knowledge_library__source_id__get"];
         put?: never;
         post?: never;
-        delete?: never;
+        /**
+         * Delete Library Source
+         * @description 删掉库里的一份材料。**这是"传错了材料"唯一的出口**。
+         *
+         *     三件事分开说，因为用户的下一步不同：
+         *
+         *       - 没这份材料（404）：它已经被删了，刷新列表即可；
+         *       - 还被 N 张导图引用（409，`detail.cited_by=N`）：先看这句话再决定。删掉之后
+         *         那几张图**不会坏**，但引用那些材料的节点打开时是"来源原文不可用"——
+         *         `source_refs` 是值对象，没有外键，删材料不会把它们清掉，也没法再回填原文。
+         *         确认要删就带 `force=true` 再来一次；
+         *       - 删掉了（200）：`cited_by` 说的是删除前的引用数，界面用它可以如实告诉用户
+         *         "有 N 张图受影响"。
+         *
+         *     为什么不静默硬删：材料正文是导图证据的最终依据，而这个删除不可逆。为什么不
+         *     "软删"（留墓碑 + 清正文）：那是拿一次 schema 迁移和一遍读路径过滤，换一句更好
+         *     的诊断措辞——`SOURCE_TEXT_UNAVAILABLE` 已经把"删了但引用还在"表达清楚了。
+         */
+        delete: operations["delete_library_source_api_knowledge_library__source_id__delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -837,6 +855,71 @@ export interface paths {
          */
         post: operations["fetch_url_source_api_knowledge_fetch_post"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/knowledge/aliases": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Aliases
+         * @description 库里的实体别名（`alias → canonical`）。**"模型把两个名字认成一个"唯一看得见的地方**。
+         *
+         *     别名是模型推断出来的：实体消解按构词关系与向量相似度猜"这两个名字指同一个
+         *     东西"，猜完直接写进图库。猜错的时候，`neighbors` 会给出几条**有证据、有位置、
+         *     还通得过校验**的假路径——比少一条路难发现得多。所以这一层必须有可读的清单，
+         *     也必须有删掉错的那一条的入口（`DELETE /api/knowledge/aliases/{alias}`）。
+         *
+         *     读不到图（没配密码 / 连不上）时返回空列表 + `configured=false`，不抛 5xx：
+         *     知识库面板不该因为图存储没开就打不开。
+         */
+        get: operations["list_aliases_api_knowledge_aliases_get"];
+        put?: never;
+        post?: never;
+        /**
+         * Clear Aliases
+         * @description 清空全部别名边——**"这一批合并全错了"的退路**，不是常规修正手段。
+         *
+         *     只错一两条时用 `DELETE /api/knowledge/aliases/{alias}`。整体清空之后想恢复只能
+         *     重跑实体消解，而重跑会按同一批阈值重新猜一遍：删掉的那些猜错的会一起回来。
+         *     实体与 `REL` 一条不碰，所以清空之后图就是"从没合并过"的样子。
+         */
+        delete: operations["clear_aliases_api_knowledge_aliases_delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/knowledge/aliases/{alias}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete Alias
+         * @description 删掉一条别名边（`alias → canonical`），实体与证据边一条不碰。
+         *
+         *     删完之后这两个名字重新是两个实体：挂在它们身上的 `REL` 原样留着，路径从"被合并
+         *     后的一条"回到各自的原样——所以这个动作是可逆的语义修正，不需要备份。
+         *
+         *     `canonical` 可选：同名不同类型的节点上，一个别名可能指向两个主名，给上它只删
+         *     这一对。不给就把这个别名的全部指向都删掉（界面按"这一对"删，见
+         *     `GET /api/knowledge/aliases` 的返回项）。
+         *
+         *     **不要用重跑实体消解来"修正"猜错**：它按同一批阈值重新算，删掉的那条会一起回来。
+         */
+        delete: operations["delete_alias_api_knowledge_aliases__alias__delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -990,6 +1073,46 @@ export interface components {
         AgentTaskRequest: {
             /** Goal */
             goal: string;
+        };
+        /**
+         * AliasClearance
+         * @description 清空别名的结果。与 `AliasDeletion` 分开：清空没有"哪一条"这个字段。
+         */
+        AliasClearance: {
+            /** Deleted */
+            deleted: number;
+        };
+        /** AliasDeletion */
+        AliasDeletion: {
+            /** Alias */
+            alias: string;
+            /** Deleted */
+            deleted: number;
+        };
+        /**
+         * AliasEntry
+         * @description 一条已落库的实体别名：`alias` 是 `canonical` 的另一个叫法。
+         */
+        AliasEntry: {
+            /** Alias */
+            alias: string;
+            /** Canonical */
+            canonical: string;
+            /** Source */
+            source: string;
+            /** Similarity */
+            similarity: number;
+            /** Created At */
+            created_at: string;
+        };
+        /** AliasListing */
+        AliasListing: {
+            /** Items */
+            items?: components["schemas"]["AliasEntry"][];
+            /** Total */
+            total: number;
+            /** Configured */
+            configured: boolean;
         };
         /**
          * AudioSentence
@@ -1752,6 +1875,22 @@ export interface components {
          * @enum {string}
          */
         LayoutKind: "tree" | "vertical" | "logic" | "timeline" | "fishbone" | "manual";
+        /**
+         * LibraryDeletion
+         * @description 删一份材料的结果。`cited_by` 是**删除前**引用它的已保存导图数。
+         *
+         *     带上这个数是为了让界面能说清发生了什么："删掉了，原来有 2 张导图引用它，
+         *     那些引用现在显示「来源原文不可用」"。只回一个 `deleted: true` 的话，用户就
+         *     只能在下次打开那张图时自己发现。
+         */
+        LibraryDeletion: {
+            /** Source Id */
+            source_id: string;
+            /** Deleted */
+            deleted: boolean;
+            /** Cited By */
+            cited_by: number;
+        };
         /**
          * LibraryEntry
          * @description 列表里的一份材料。**不含正文**，与 `library.list_sources` 同口径。
@@ -4004,6 +4143,61 @@ export interface operations {
             };
         };
     };
+    delete_library_source_api_knowledge_library__source_id__delete: {
+        parameters: {
+            query?: {
+                /** @description 已经看到引用后果，仍然删掉（那几张图里的引用会变成「来源原文不可用」） */
+                force?: boolean;
+            };
+            header?: never;
+            path: {
+                source_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LibraryDeletion"];
+                };
+            };
+            /** @description 库里没有这份材料（`code=not_found`） */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description 这份材料还被导图引用（`code=source_cited`，`detail.cited_by` 是被几张图引用）——加 `?force=true` 才真删 */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description 知识库暂时读不出来（`code=library_unavailable`） */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     fetch_url_source_api_knowledge_fetch_post: {
         parameters: {
             query?: never;
@@ -4044,6 +4238,111 @@ export interface operations {
             };
             /** @description 抓取失败：地址打不开、正文为空（`code=fetch_failed`） */
             502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_aliases_api_knowledge_aliases_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AliasListing"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    clear_aliases_api_knowledge_aliases_delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AliasClearance"];
+                };
+            };
+            /** @description 图谱存储暂时不可用（`code=graph_unavailable`） */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_alias_api_knowledge_aliases__alias__delete: {
+        parameters: {
+            query?: {
+                canonical?: string | null;
+            };
+            header?: never;
+            path: {
+                alias: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AliasDeletion"];
+                };
+            };
+            /** @description 库里没有这条别名（`code=not_found`） */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description 图谱存储暂时不可用（`code=graph_unavailable`） */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

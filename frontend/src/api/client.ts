@@ -1,4 +1,7 @@
 import type {
+  AliasClearance,
+  AliasDeletion,
+  AliasListing,
   AgentEvent,
   AgentRunRequest,
   AuthUser,
@@ -12,6 +15,7 @@ import type {
   EditHealth,
   EditSummary,
   ImportResult,
+  LibraryDeletion,
   LibraryList,
   LibrarySource,
   MapRecord,
@@ -708,6 +712,51 @@ export function listLibrary(limit = 50): Promise<LibraryList> {
 export function readLibrarySource(id: string, limit?: number): Promise<LibrarySource> {
   const query = limit == null ? '' : `?limit=${Math.floor(limit)}`;
   return request<LibrarySource>(`/knowledge/library/${encodeURIComponent(id)}${query}`);
+}
+
+/**
+ * 删掉库里的一份材料。**被导图引用时会先被拦一次**（409 `source_cited`，`detail.cited_by`
+ * 是被几张图引用）：那几张图不会坏，但引用这些材料的节点打开时是"来源原文不可用"，
+ * 且正文没了就再也没法回填。确认之后带 `force=true` 再调一次才真删。
+ *
+ * 409 不是错误分支里最难写的那种——它带着可执行的下一步（"带 force 再来一次"），
+ * 所以界面要能读到 `detail.cited_by` 并把代价写清楚，而不是显示一句"删除失败"。
+ */
+export function deleteLibrarySource(id: string, force = false): Promise<LibraryDeletion> {
+  const query = force ? '?force=true' : '';
+  return request<LibraryDeletion>(
+    `/knowledge/library/${encodeURIComponent(id)}${query}`,
+    { method: 'DELETE' },
+  );
+}
+
+/**
+ * 库里现存的实体别名（`alias → canonical`）。`configured=false` 是"图存储没开"，
+ * 与"没有别名"必须分开显示：前者要去配 Neo4j，后者要去跑实体消解。
+ */
+export function listAliases(limit = 500): Promise<AliasListing> {
+  return request<AliasListing>(`/knowledge/aliases?limit=${Math.floor(limit)}`);
+}
+
+/**
+ * 删掉一条别名。`canonical` 只用于"同一别名指向两个主名"的情形（同名不同类型的
+ * 节点），给上它只删这一对。
+ *
+ * 别名不参与证据：删掉之后这两个名字重新是两个实体，挂在它们身上的证据边一条不动。
+ * 所以"删错别名"是可逆的语义修正，不需要备份——但**不要用重跑实体消解来改**，
+ * 那会按同一批阈值把它重新猜回来。
+ */
+export function deleteAlias(alias: string, canonical?: string): Promise<AliasDeletion> {
+  const query = canonical ? `?canonical=${encodeURIComponent(canonical)}` : '';
+  return request<AliasDeletion>(
+    `/knowledge/aliases/${encodeURIComponent(alias)}${query}`,
+    { method: 'DELETE' },
+  );
+}
+
+/** 清空全部别名（"这一批合并全错了"的退路，别拿它当常规修正手段）。 */
+export function clearAliases(): Promise<AliasClearance> {
+  return request<AliasClearance>('/knowledge/aliases', { method: 'DELETE' });
 }
 
 // ---- 导出 ----

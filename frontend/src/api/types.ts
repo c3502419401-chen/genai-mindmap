@@ -654,6 +654,53 @@ export interface LibrarySource {
   total_chars: number;
 }
 
+/**
+ * 删一份材料的结果。`cited_by` 是**删除前**引用它的已保存导图数。
+ *
+ * 界面用这个数说清后果："删掉了，原来有 2 张导图引用它——那些节点现在显示
+ * 「来源原文不可用」"。只回 `deleted` 的话，用户只能下次打开那张图时自己发现。
+ */
+export interface LibraryDeletion {
+  source_id: string;
+  deleted: boolean;
+  cited_by: number;
+}
+
+/**
+ * 一条已落库的实体别名：`alias` 是 `canonical` 的另一个叫法。
+ *
+ * `source` 是落库时的判定依据（`substring` 构词关系 / `embedding` 余弦兜底），
+ * `similarity` 是当时的相似度。凭子串进去的那批通常最该复查。
+ */
+export interface AliasEntry {
+  alias: string;
+  canonical: string;
+  source: string;
+  similarity: number;
+  created_at: string;
+}
+
+/**
+ * 别名清单。`configured=false` 表示图存储这一层没开——**必须与"没有别名"分开**：
+ * 两条完全不同的建议（去配 Neo4j / 去跑实体消解）。
+ */
+export interface AliasListing {
+  items: AliasEntry[];
+  total: number;
+  configured: boolean;
+}
+
+/** 删一条别名的结果；`deleted` 为 0 时后端其实是 404，界面按"已经不在了"处理。 */
+export interface AliasDeletion {
+  alias: string;
+  deleted: number;
+}
+
+/** 清空别名的结果。与 `AliasDeletion` 分开：清空没有"哪一条"这个字段。 */
+export interface AliasClearance {
+  deleted: number;
+}
+
 // ---- agent 运行 ----
 
 /**

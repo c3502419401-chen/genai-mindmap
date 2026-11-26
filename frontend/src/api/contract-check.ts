@@ -32,11 +32,16 @@
  */
 import type { components } from './schema';
 import type {
+  AliasClearance,
+  AliasDeletion,
+  AliasEntry,
+  AliasListing,
   AuthUser,
   ChangePasswordRequest,
   Credentials,
   ImportResult,
   ImportWarning,
+  LibraryDeletion,
   LibraryEntry,
   LibraryList,
   LibrarySource,
@@ -106,6 +111,14 @@ export const checks = {
   libraryEntryKeys: true satisfies SameKeys<LibraryEntry, Schemas['LibraryEntry']>,
   libraryListKeys: true satisfies SameKeys<LibraryList, Schemas['LibraryList']>,
   librarySourceKeys: true satisfies SameKeys<LibrarySource, Schemas['LibrarySource']>,
+  // 删除的回执：`cited_by` 不能漏。它是"删了之后有几张图受影响"的唯一来源，
+  // 漏掉它界面就只能说一句"删掉了"，而用户下次打开那张图才会发现证据没了。
+  libraryDeletionKeys: true satisfies
+    SameKeys<LibraryDeletion, Schemas['LibraryDeletion']>,
+  aliasEntryKeys: true satisfies SameKeys<AliasEntry, Schemas['AliasEntry']>,
+  aliasListingKeys: true satisfies SameKeys<AliasListing, Schemas['AliasListing']>,
+  aliasDeletionKeys: true satisfies SameKeys<AliasDeletion, Schemas['AliasDeletion']>,
+  aliasClearanceKeys: true satisfies SameKeys<AliasClearance, Schemas['AliasClearance']>,
   // 模型设置：这五条是密钥保护契约的编译期一半。`ModelSettings` 里若出现任何
   // 明文字段（`api_key` 而不是 `api_key_masked`），这里会红——比 code review 可靠，
   // 因为加字段的人往往只是想"顺手把值也带出来"。
@@ -159,6 +172,12 @@ export const checks = {
   libraryEntryShape: true satisfies SameShape<LibraryEntry, Schemas['LibraryEntry']>,
   libraryListShape: true satisfies SameShape<LibraryList, Schemas['LibraryList']>,
   librarySourceShape: true satisfies SameShape<LibrarySource, Schemas['LibrarySource']>,
+  libraryDeletionShape: true satisfies
+    SameShape<LibraryDeletion, Schemas['LibraryDeletion']>,
+  aliasEntryShape: true satisfies SameShape<AliasEntry, Schemas['AliasEntry']>,
+  aliasListingShape: true satisfies SameShape<AliasListing, Schemas['AliasListing']>,
+  aliasDeletionShape: true satisfies SameShape<AliasDeletion, Schemas['AliasDeletion']>,
+  aliasClearanceShape: true satisfies SameShape<AliasClearance, Schemas['AliasClearance']>,
   modelSettingsShape: true satisfies SameShape<ModelSettings, Schemas['ModelSettings']>,
   instanceSettingsShape: true satisfies
     SameShape<InstanceSettings, Schemas['InstanceSettings']>,
