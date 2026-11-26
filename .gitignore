@@ -87,3 +87,6 @@ run-backend.bat
 # "提交一次就把口令发给所有能读仓库的人"。
 .htpasswd
 **/.htpasswd
+
+# 验收测量用的图片/语音样本：由 backend/scripts/make_acc_media.py 重建
+backend/scripts/acc_media/
