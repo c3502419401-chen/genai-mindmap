@@ -90,3 +90,20 @@ run-backend.bat
 
 # 验收测量用的图片/语音样本：由 backend/scripts/make_acc_media.py 重建
 backend/scripts/acc_media/
+
+# 探针 / 测量脚本的产物：`measure_*.py` 的默认输出（`DEFAULT_OUT = "scripts/_xxx.json"`），
+# 属于一次性产物，不该进版本库。
+#
+# 例外两条，它们被 docs 当"留档的实测结果"引用（docs/SUBAGENT-VS-SELFCHECK.md：两份
+# 结果留在 `_selfcheck_sliced.json` 与 `_selfcheck_once.json`）——删了就没有复算依据了。
+#
+# 这条规则不是"记得清"而是被检查的：`backend/scripts/check_script_hygiene.py` 的
+# artifacts 一档要求"已进版本库的产物必须被 docs 引用"，反过来说未跟踪的产物必须被
+# 这里覆盖住，否则它报"游离产物"。
+backend/scripts/_*.json
+!backend/scripts/_selfcheck_once.json
+!backend/scripts/_selfcheck_sliced.json
+
+# ruff 的缓存目录（`python -m ruff check .` 在 backend/ 下生成）
+.ruff_cache/
+

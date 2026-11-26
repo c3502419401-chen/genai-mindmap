@@ -21,7 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.optimization.repair import LABEL_JOINER, READABLE_LABEL_CHARS  # noqa: E402
+from app.optimization.repair import LABEL_JOINER  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1] / "data" / "acc_trees"
 HAN = re.compile(r"[\u4e00-\u9fff]")

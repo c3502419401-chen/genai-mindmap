@@ -45,6 +45,30 @@ jobs:
           pip install -r requirements.txt
           pip install pytest pytest-cov
 
+      # ruff 一直没有进 CI，代价是三类 lint 漏了三次，每次都是一行、每次都让
+      # `ruff check .` 红过一段时间（`tests/test_few_branches.py` 的 F401、
+      # `scripts/_blind_pack.py:83` 的 F541、`scripts/_probe_join_rule.py` 的 F401）。
+      # n 次里没有一次是难改，全是"没人跑"。
+      #
+      # 版本必须钉死：ruff 的默认规则集随版本变宽，浮动版本会让一次无关的升级把
+      # 历史代码判红，然后人们学会无视这条检查。升级版本应当是独立的一次提交，
+      # 顺带把新增的告警清干净。本地同样是 0.9.10（`python -m ruff --version`）。
+      - name: Lint（ruff）
+        run: |
+          pip install "ruff==0.9.10"
+          python -m ruff check .
+
+      # 探针脚本的另一半保护。`ruff` 管"文件名内"的问题（未使用的导入、空 f-string），
+      # 但它不核对 `from app.x import 名字` 里那个名字还在不在——那是探针脚本跟着
+      # `app/**` 重构漂掉的主要形态。这里补上"能不能加载"与"import 目标还在不在"，
+      # 外加"docs 引用的脚本是否存在"与"临时产物有没有悄悄落库"。
+      # 机制与为什么是这四条，都在 `scripts/check_script_hygiene.py` 的 docstring 里。
+      #
+      # 确定性与上面那条棘轮同一标准：判据是 `scripts/` 与 `docs/` 的树形内容，
+      # 只有 artifacts 一档读 `git check-ignore`（用来确认产物被忽略而不是游离）。
+      - name: 探针脚本卫生
+        run: python scripts/check_script_hygiene.py --gate
+
       - name: Test
         run: pytest -q --cov=app --cov-report=term-missing --cov-fail-under=0
 
