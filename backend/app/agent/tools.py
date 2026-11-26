@@ -3177,6 +3177,32 @@ PLAN_PROMPT = (
     "（icon 塞了两个 emoji，而且骨架不要写子节点）"
 )
 
+# 材料是**要整理的对象**，不是"这类文档怎么写"的范例。**只在有材料时**拼在
+# `plan_system` 末尾（`_generate` 与 `_generate_deep` 同一处，见 `AGENTS.md` 的
+# "骨架被两条生成路共用"）。
+#
+# 为什么必须显式写这一句：骨架那一次看不到材料正文（`_generate` 的"全塞"成本口径那一段
+# 解释了为什么不看），它只拿到主题 + 目录 + 清单。**主题是一份文档的名字时**
+# （"产品需求评审会""研发周例会""某某周报"），模型的默认读法是"用户想了解这类文档"，
+# 于是把一级分支写成「定义与作用 / 内容要素 / 写作要求 / 格式规范 / 整理与发布」——
+# 那不是整理，那是把材料当范文讲写作课。实测（`docs/OFF-TOPIC-AND-FEW-BRANCHES.md`）：
+# 7 条会议纪要里 4 条整棵树的骨架都是这一套，而材料里的三个需求、故障根因、候选人定级
+# 全被压进 detail 当举例。
+#
+# 判据写成"两种意图"而不是"会议纪要要怎样"：这是**通用失效**，不是某一类文档的
+# bug。任何"材料本身是一份产出物、用户想整理它"的场景都中招——课程大纲、周报、
+# 立项书、访谈记录、复盘的形状完全不同，但"材料 = 待整理对象 vs 材料 = 这类文档的
+# 示例"这个岔口对它们每一个都存在。针对某一类文档打补丁等于把这条判据埋掉。
+# 与它配对的那另一半在提取器：目录抽不出来时模型连"材料有什么块"都看不到，
+# 判据再好也只能凭先验猜（`knowledge.service.STRUCTURAL_KINDS`）。
+MATERIAL_AS_OBJECT_RULES = (
+    "\n这次的**材料是要整理的对象，不是「这类文档怎么写」的范例**。"
+    "一级分支写材料里**讲了哪几件事**（有哪些议题、结论、待办、风险、指标、分歧），"
+    "不要把材料归成「定义与作用 / 内容要素 / 写作要求 / 格式规范 / 整理与发布」"
+    "这类通用知识；只有材料本身就在讨论「怎么写这类文档」时，才写这些。"
+)
+
+
 # 流程图骨架。与 `PLAN_PROMPT` 共用同一套 JSON 骨架（`branches` 的形状一字不差），
 # 只多两个东西：**一级分支必须是阶段**，以及**一个 edges 数组**。
 #
@@ -3443,6 +3469,11 @@ def _outline_entries(sources: list[Source]) -> list:
     门槛（覆盖率 ≥ `OUTLINE_MIN_COVERAGE`）放在这里而不是只放在渲染处，是因为
     两级骨架也要读它：那一次要先知道"这份材料大概有多少个方面"才能决定要不要分组、
     分几组。用**裁剪后**的目录判覆盖率，理由见 `_skeleton_outline`。
+
+    **少于 `MIN_BRANCHES` 条的目录仍然算"有目录"**（它确实抽出了章节），只是拼给骨架时
+    会多一句"这块偏少、可以更细"（`OUTLINE_FEW_BLOCKS_NOTE`，见 `_render_outline`）。
+    这个区分是必要的：下游有几处问的是"这份材料有没有可用结构"（`_ingest_external_graph`
+    的第五道闸、两级骨架的规模判据），把它们一起判成"没有目录"会让入图那 17.5 秒白付。
     """
     entries = heading_outline(sources)
     if not entries:
@@ -3472,12 +3503,18 @@ def _skeleton_outline(sources: list[Source]) -> str:
     return _render_outline(entries, sources)
 
 
-def _render_outline(entries: Sequence[Any], sources: list[Source]) -> str:
+def _render_outline(
+    entries: Sequence[Any], sources: list[Source], *, note: str = "",
+) -> str:
     """把目录行渲染成骨架提示词里那一段；`entries` 为空时返回空串。
 
     与 `_outline_entries` 分开，是为了让调用方**只解析一次**：两级骨架要用"有多少行"
     决定分组，也要那一段文字，两件事读同一份 `entries`（`heading_outline` 是对整份
     材料跑正则，跑两遍在大材料上不是零成本）。
+
+    `note` 拼在目录行**之后**（默认空串 → 与改动之前逐字节相同）。它唯一的用处是
+    `OUTLINE_FEW_BLOCKS_NOTE`：目录只有 1–2 条时，`OUTLINE_HEADER` 那句"请优先按它
+    划分一级分支"会变成一条**结构上限**，而 `MIN_BRANCHES = 3` 会立刻判废整次生成。
     """
     if not entries:
         return ""
@@ -3486,7 +3523,20 @@ def _render_outline(entries: Sequence[Any], sources: list[Source]) -> str:
     for index, entry in enumerate(entries, start=1):
         share = round(entry.coverage / total * 100) if total else 0
         lines.append(f"{index}. {entry.title}（约占 {max(1, share)}%）")
+    if note:
+        lines.append(note)
     return "\n".join(lines)
+
+
+# 目录行数少于 `MIN_BRANCHES` 时补的那一句。**它取消的是"优先采用"这个锁，不是目录本身**：
+# 材料真只有两块时，模型照着写两块，`MIN_BRANCHES = 3` 当场判废，用户拿到错误卡片
+# （实测那三条项目立项材料的错误码就是 `too_few_branches` → 重试 → `too_many_failures`）。
+# 而把目录整段丢掉又太贵：它是骨架唯一能看到的"材料有什么块"。所以留着目录、
+# 把"条数跟着它"改成"块名的方向是对的，条数按材料讲到的事另定"。
+OUTLINE_FEW_BLOCKS_NOTE = (
+    "（这条目录只分出 {count} 块，比一张图需要的少：一级分支按材料里**讲到的事**划分，"
+    "不少于 {minimum} 条——可以比上面这些块更细，也可以合并，但不要只给 {count} 条。）"
+)
 
 
 # 骨架那一次的**第四种**结构线索（前三种见 `_material_inputs` 的 docstring）：材料清单。
@@ -10381,7 +10431,14 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         mixed = _mixed_outline(sources)
         outline_entries = (
             list(mixed.chapters) if mixed is not None else _outline_entries(sources))
-        outline = _render_outline(outline_entries, sources)
+        # 目录少于 `MIN_BRANCHES` 条时补一句"这条目录偏窄"（`OUTLINE_FEW_BLOCKS_NOTE`）：
+        # `OUTLINE_HEADER` 说的是"优先按它划分一级分支"，模型照做，于是两块的材料
+        # 长出两条一级分支，被判废。修法不是丢掉目录（那是骨架唯一能看到的材料结构），
+        # 而是取消"条数跟着块数走"这个锁。
+        outline_note = (
+            OUTLINE_FEW_BLOCKS_NOTE.format(count=len(outline_entries), minimum=MIN_BRANCHES)
+            if 0 < len(outline_entries) < MIN_BRANCHES else "")
+        outline = _render_outline(outline_entries, sources, note=outline_note)
         if mixed is not None and mixed.supplement.block:
             # 章节在前、图谱在后（顺序的理由见那一大段注释里的①）。
             outline = outline + "\n\n" + mixed.supplement.block
@@ -10479,6 +10536,12 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
                 _mixed_plan_rules(mixed.supplement.items)
                 if mixed.supplement.block
                 else _mixed_plain_rules(mixed.plain))
+        # 材料是**要整理的对象**，不是"这类文档怎么写"的范例（判据与实测见
+        # `MATERIAL_AS_OBJECT_RULES`）。只在这一批**有材料**时拼：纯主题那几档没有
+        # 材料，也就没有"把材料当范文"这个歧义，多一句只会把"按主题归纳"挤走，
+        # 还会让没有材料的那条路径与改动之前不再逐字节相同。
+        if sources:
+            plan_system += MATERIAL_AS_OBJECT_RULES
         # 没有可检索材料时补那两句纯文本契约（与 `_generate_deep` 的骨架段同一条
         # 判定）：它们不含输出格式，不会与 `PLAN_PROMPT` 的"只返回 branches"打架。
         #
@@ -12139,6 +12202,11 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
             _mixed_plan_rules(mixed.supplement.items)
             if mixed.supplement.block
             else _mixed_plain_rules(mixed.plain))
+    # 与整树那条逐字同一句、同一位置（`MATERIAL_AS_OBJECT_RULES`）：那条路拼了这条
+    # 判据而这条不拼时，两个入口对同一批材料给出的骨架不是同一个（这条分叉被
+    # `test_mixed_skeleton.py::test_both_generation_paths_compose_the_same_skeleton` 钉着）。
+    if sources:
+        plan_system += MATERIAL_AS_OBJECT_RULES
     try:
         raw_plan = await ask_model(
             plan_system,
