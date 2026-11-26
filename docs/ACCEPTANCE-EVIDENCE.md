@@ -11,6 +11,9 @@
 >
 > **边界**：本轮未改动 `backend/app/**` 与 `frontend/**` 任何一行。所有脚本与读数在
 > `backend/scripts/acc2/`（`*.py` 是跑法，`*.json` 是读数，`shots/*.png` 是截图）。
+>
+> **后续**（`94e30ed` 之后的另一轮）：本文 B1 / B3 / B4 三条已经修掉，根因、修法与
+> 真跑读数见 `docs/WIRING-GAPS.md`；"还有多少同类"的扫描方法与数字也在那一份里。
 
 ---
 
@@ -380,6 +383,9 @@ source_usage = 9 份：1 份 text（150 字）+ 1 份 paper + 7 份 web（合计
 
 ### B1 `link.suggest` 零产品调用 —— "代码在、用例绿、但产品里根本走不到"
 
+> **已修**：`docs/WIRING-GAPS.md` 第三节。接进 `/optimization/suggest`（`MAX_LINK_TARGETS=1`
+> 的成本闸 + `SuggestResponse.link` 状态），界面在 `StructureCheck.vue` 里显示。
+
 - **现象**：`/api/optimization/suggest` 只产规则层 3 类（expand/dedupe/add_detail），
   永远不产 `kind="link"`。P12 作为证据的那三件（父位置 / 历史放置 / 材料命中）在接口输出里不存在。
 - **定位**：`app/optimization/service.py::suggest()` 只调 `_model_suggestions()` 与
@@ -412,6 +418,9 @@ source_usage = 9 份：1 份 text（150 字）+ 1 份 paper + 7 份 web（合计
 
 ### B3 `sources` 的 id 在生成侧被换掉，纯 API 客户端必踩
 
+> **已修**：`docs/WIRING-GAPS.md` 第一节。换 id 是设计（跨会话可解析），修的是"只给
+> `mapping`"——SSE `sources` 帧现在同时带最终清单（`SourceIdentity`，不带正文）。
+
 - **现象**：ingestion 返回 `2fa76b62…`，生成时落库变 `8007363c…`；把原 id 的 source 传给
   `/check` 会得到 33 条 `SOURCE_TEXT_UNAVAILABLE` + 37 条 `UNSOURCED_NODE`（本该 4 条）。
 - **定位**：SSE `sources` 事件的 `mapping` 是唯一桥梁；前端 `stores/sources.ts:365 remap()`
@@ -421,6 +430,10 @@ source_usage = 9 份：1 份 text（150 字）+ 1 份 paper + 7 份 web（合计
   description，或让 `/check` 也接受 `mapping`。
 
 ### B4 `/api/knowledge/search` 是桩（`implemented:false`）
+
+> **已修**：`docs/WIRING-GAPS.md` 第二节。接的是生成链路同一套（`_library_sources` →
+> `search_parent` → `touch`），`implemented` 的语义收窄成"接上了没有"（恒真）。
+> 真库读数：5 条命中、`method=hybrid`、稳态 1.1–1.7 s（首次冷缓存 9.7 s）。
 
 - **现象**：返回 `{"hits": [], "implemented": false}`，而 `chunk_vectors` 里真有 4913 条向量。
 - **影响**：对外"知识库检索"这个能力不可用；内部的 `search_sources()`（生成链路用）是好的。

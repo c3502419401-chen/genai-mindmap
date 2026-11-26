@@ -63,7 +63,6 @@ def sketch_map(path: Path) -> None:
     image = Image.new("RGB", (1400, 1000), (253, 252, 248))
     draw = ImageDraw.Draw(image)
     node, small = _font(40), _font(30)
-    center = (700, 500)
     draw.ellipse([560, 440, 840, 560], outline=(40, 40, 40), width=4)
     draw.text((601, 468), "考研复习", font=node, fill=(30, 30, 30))
     branches = [

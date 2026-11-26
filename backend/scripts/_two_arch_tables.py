@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import statistics
-import sys
 from pathlib import Path
 
 DATA = Path(__file__).resolve().parents[1] / "data"
@@ -123,7 +122,6 @@ def table_pairs(rows: list[dict], judge: dict[str, int], key: dict) -> None:
     print("\n### 按组配对（同一组=同一主题+同一批材料）\n")
     print("| 组 | 主题 | 材料 | 整树 节点/人工重复/每百 | 逐支 节点/人工重复/每百 |")
     print("|---|---|---|---|---|")
-    groups = {row["group"]: row for row in rows if row.get("ok")}
     for group in ("S", "M", "L", "X", "P1", "P2"):
         block = [row for row in rows if row["group"] == group and row.get("ok")]
         if not block:
