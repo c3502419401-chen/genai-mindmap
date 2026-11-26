@@ -3203,6 +3203,78 @@ MATERIAL_AS_OBJECT_RULES = (
 )
 
 
+# 骨架少于 `MIN_BRANCHES` 条时的重问提示。**只在有材料时用**（纯主题没有"材料的
+# 其他内容"可指），拼在那一次 user 的末尾——位置即权重，它要压住前面所有关于
+# 条数的判据（`NO_BRANCH_CAP_RULE` 说"按内容定条数"，没说"至少几条"）。
+FEW_BRANCHES_RETRY_RULES = (
+    "上一次只给了 {count} 条一级分支，少于成图要求的 {minimum} 条——这张图会被判无效。"
+    "材料里不止讲了这些事：请按材料**实际讲到的不同事情**重新划分，至少 {minimum} 条，"
+    "每一支都要能在材料里找到依据；不要把一件事拆成两支来凑数，"
+    "也不要重复上一次已经给过的那几条。"
+)
+
+
+def _few_branches_evidence(
+    sources: list[Source], outline_entries: Sequence[Any],
+) -> str:
+    """重问时给模型的"材料里到底有什么"——目录优先，没有目录就给开头几百字。
+
+    为什么要有这一节：重问如果只是把同一段 user 再发一次，答案不会变（实测同材料
+    两次都是 2 条）。要让它能改，必须换**输入**，而不是加重语气。
+
+    目录（`_outline_entries`）是最便宜的证据：它是原文的子集、每条都短。而目录
+    抽不出来的材料（没有编号标题的散文、访谈记录）只剩"开头几段"这一条路——
+    那也正是骨架正常情况下完全看不到的东西。上限按"每份 300 字、最多 3 份"取：
+    重问是一次**补救**，不该按全塞的口径花 token。
+    """
+    titles = [getattr(entry, "title", "") for entry in outline_entries]
+    titles = [title for title in titles if title]
+    if titles:
+        return ("材料自带的章节（逐块至少一条一级分支）：\n"
+                + "\n".join(f"{index}. {title}" for index, title in enumerate(titles, start=1)))
+    heads: list[str] = []
+    for source in sources[:3]:
+        text = " ".join((source.text or "").split())
+        if not text:
+            continue
+        name = (source.filename or source.id or "材料").strip()
+        heads.append(f"{name}：{text[:300]}")
+    return ("材料开头（这份材料真实在讲的事，就在这里）：\n" + "\n".join(heads)) if heads else ""
+
+
+async def _retry_few_branches(
+    ctx: RunContext,
+    plan_system: str,
+    ask: str,
+    plan: "_SkeletonPlan",
+    *,
+    sources: list[Source],
+    outline_entries: Sequence[Any],
+) -> "_SkeletonPlan | None":
+    """一级分支少于 `MIN_BRANCHES` 时的**一次**带证据重问；问不动就返回 None。
+
+    为什么放在工具内部而不是交给模型自己再调一次工具：外层那条重试（`service.run`
+    的 `max_repairs`）发的是**同一段 user**，同材料同提示词，答案确定性相同——验收里
+    那三条 `too_few_branches` 就是这么死在第二次上的（"重试一次仍是 2 条"）。
+
+    这一次的差别只有两处，都在**输入**上：
+      - 末尾多一句"上一次只给了 N 条、这张图会被判无效"（`FEW_BRANCHES_RETRY_RULES`）；
+      - 附上材料里**真实存在的块**（`_few_branches_evidence`：目录，或没有目录时的开头）。
+
+    额度：这条补救要占一次模型调用，**占不到就不做**（返回 None，按原条数继续走
+    降级交付）。它不该因为一次补救把整次运行推到 `budget_exhausted`——那等于为了
+    "多一条分支"把已经花掉的骨架调用也废掉。
+    """
+    if not ctx.reserve_model_call():
+        return None
+    ctx.extra_model_calls += 1
+    hint = FEW_BRANCHES_RETRY_RULES.format(count=len(plan.flat), minimum=MIN_BRANCHES)
+    evidence = _few_branches_evidence(sources, outline_entries)
+    tail = "\n" + hint + ("\n" + evidence if evidence else "")
+    raw = await _chat(ctx, plan_system, ask + tail, max_tokens=_max_tokens(ctx))
+    return _cap_plan(_skeleton_plan(raw))
+
+
 # 流程图骨架。与 `PLAN_PROMPT` 共用同一套 JSON 骨架（`branches` 的形状一字不差），
 # 只多两个东西：**一级分支必须是阶段**，以及**一个 edges 数组**。
 #
@@ -10393,6 +10465,11 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     raw_plan: Any = None
     plan: _SkeletonPlan | None = None
     skeleton_seconds = 0.0
+    # 骨架两次都低于 `MIN_BRANCHES` 且这次有材料 → **按实际条数交付**（理由见下面
+    # 骨架那一段）。它同时决定收尾那道校验要不要守 `MIN_BRANCHES`：那道闸问的是
+    # "模型整图生成的一级分支够不够"，而这里已经明知只够两条并记了一条诊断，
+    # 再在出口判死一次等于把这条降级路径整个抵消掉。
+    branches_degraded = False
     if graph_mode:
         # `scope` 是**本次材料**的 source_id 集合：图是跨材料共享的，不限定范围时
         # "上一次放过的那批报销材料"的实体会混进这一次的主题（图里没人知道哪个实体
@@ -10604,12 +10681,47 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             # 否则 `_apply_groups` 会把 12 条章摆到 5 个组下面，章内就只剩一层
             # ——而这一章里明明有 `###` 子节可写。
             plan = _SkeletonPlan(flat=plan.flat)
+        # ---- 一级分支太少：先带证据重问一次，再决定是交树还是判死 ------------------
+        #
+        # 分三种情形，判据与修法见 `docs/OFF-TOPIC-AND-FEW-BRANCHES.md`：
+        #
+        #   ① **纯主题**（没有材料）：2 条就是模型没话说，直接判失败。与改动之前逐字相同。
+        #   ② **有材料、第一次少于 3 条**：先重问一次。重问必须换**输入**（材料自带的
+        #      章节，或材料开头几百字，见 `_few_branches_evidence`）——同一段 user 再发
+        #      一次，答案是同一串（实测同材料两次都回 2 条，这也是验收里那三条
+        #      "重试仍失败"的由来）。**不改 `MIN_BRANCHES`**：那三条材料的正确分支数是
+        #      6（`一、背景 … 六、风险`），2 条是"没读到材料"，不是"材料只有两件事"。
+        #   ③ **重问之后仍少**：交树 + 一条 warn 诊断。这时它是一棵**有引用、能点开、
+        #      能继续编辑**的树，而判失败给用户的是一张错误卡片——`partial` 机制救不了
+        #      后者（它要求"至少长出过一棵树"）。质量门槛没有被拆掉：门槛守的是
+        #      "不要主动交两支架構"，而这里交出去的是"模型坚持只能给两条"的那棵树，
+        #      并且它带一条诊断，用户看得见差在哪。
         if len(plan.flat) < MIN_BRANCHES:
-            return _fail(
-                "too_few_branches",
-                f"模型只给了 {len(plan.flat)} 条一级分支，少于 {MIN_BRANCHES} 条，无法成图。",
-                branches=len(plan.flat),
-            )
+            if sources and not slice_chapters:
+                retry = await _retry_few_branches(
+                    ctx, plan_system, ask + hint_block, plan,
+                    sources=sources, outline_entries=outline_entries,
+                )
+                if retry is not None and len(retry.flat) > len(plan.flat):
+                    plan = retry
+                    # 骨架这一段的时间包含重问那次：不然"骨架 3 秒"会把一次多花的
+                    # 调用藏起来，而它正是"为什么这次慢了"的答案。
+                    skeleton_seconds = time.perf_counter() - plan_started
+            if len(plan.flat) < MIN_BRANCHES and not sources:
+                return _fail(
+                    "too_few_branches",
+                    f"模型只给了 {len(plan.flat)} 条一级分支，少于 {MIN_BRANCHES} 条，无法成图。",
+                    branches=len(plan.flat),
+                )
+            if len(plan.flat) < MIN_BRANCHES:
+                branches_degraded = True
+                diagnostics.append(Diagnostic(
+                    level=DiagnosticLevel.warn, code="BRANCHES_BELOW_MIN",
+                    message=(
+                        f"模型两次都只给了 {len(plan.flat)} 条一级分支（少于 {MIN_BRANCHES} 条），"
+                        "这张图按实际条数交付：结构偏窄，请展开节点补充或重新生成。"
+                    ),
+                ))
         # 配色在截断（`_cap_plan`）之后：只给真的要上画布的那几条分配颜色，否则
         # "第 4 支拿到第 4 个颜色"这种事会因为一条被截掉的尾巴而错位。两级时补的是
         # **分组**的色（一级颜色只属于分组）。
@@ -10960,9 +11072,19 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     evidence = tuple(ctx.evidence) if ctx.evidence else None
     try:
         content, validated = validate_generated_content(
-            raw, sources=verify_sources or None, evidence=evidence)
+            raw, sources=verify_sources or None, evidence=evidence,
+            # 骨架那一步已经判过"这次只有 N 条"并记了 `BRANCHES_BELOW_MIN`：
+            # 再在出口用同一条下限判死，等于让那条降级路径一步也走不到（实测：
+            # `invalid_map` 与 `too_few_branches` 是同一条判据的两个出口）。
+            enforce_min_branches=not branches_degraded)
     except Exception as exc:  # noqa: BLE001 — 校验失败的原因就是要回给模型的文本
         return _fail("invalid_map", f"模型返回的导图不合法：{exc}")
+    if branches_degraded and not content.root.children:
+        # 放开的只是"少"，不是"没有"：一个光杆根节点没有任何可读内容，
+        # 那种图交给用户不如给一句明确的失败。
+        return _fail(
+            "too_few_branches",
+            "模型没给出任何一级分支（只有一个根节点），无法成图。", branches=0)
     diagnostics.extend(validated)
     truncated = _note_truncation(diagnostics, raw)
 
