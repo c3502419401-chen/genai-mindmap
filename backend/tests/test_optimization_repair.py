@@ -30,8 +30,11 @@ import pytest
 from app.contracts.mindmap import MindMapContent, Node
 from app.optimization.repair import (
     AUTO_REPAIRABLE_CODES,
+    DEFERRED_LABEL_PREFIX,
     MANUAL_ONLY,
     MAX_SOURCE_REFS,
+    READABLE_LABEL_CHARS,
+    overlong_labels,
     repair,
     repair_summary,
     revert,
@@ -449,6 +452,206 @@ def test_repair_never_adds_a_warn_level_problem():
     before = [item for item in check(content) if item.level != "info"]
     after = [item for item in repair(content).remaining if item.level != "info"]
     assert len(after) <= len(before)
+
+
+# ------------------------------------------------- 5.5 压链的标题预算（两行盒子）
+#
+# 这一节守的是**修复自己造出来的**那一种缺陷：两层标题合成一层时拼成一句长话，
+# 画布上是一个两行盒子（`stores/mindmap.ts` 的 `TRUNCATE_CHARS = 24`），超出就截成
+# 半句。真产物里量到 13 个（`data/acc_trees`），全部形如
+# 「基础：CSS 布局与事件循环清楚 / 浏览器渲染流程回答不完整」（31 字）。
+#
+# 下面第一条用**真产物的形状**：旧写法在这个输入上会产出 31 字，用例必红。
+
+
+def _two_line_violation():
+    """真产物形状：外层 16 字、内层 12 字，拼起来 31 字。"""
+    return _map(_node("r", "候选人 B（前端方向，本科）", [
+        _node("base", "基础：CSS 布局与事件循环清楚", [
+            _leaf("render", "浏览器渲染流程回答不完整"),
+        ]),
+        _normal(),
+    ]))
+
+
+def test_collapse_label_stays_inside_two_lines():
+    """压链的标题不得超出画布两行能放下的长度。
+
+    旧写法（两段一直拼到契约上限 200）在这个输入上产出
+    「基础：CSS 布局与事件循环清楚 / 浏览器渲染流程回答不完整」（31 字），
+    画布上被截成「… / 浏览器渲染流程…」——用户看到的是一个半句。
+    """
+    content = _two_line_violation()
+
+    result = repair(content)
+    folded = result.content.root.children[0]
+    assert folded.id == "render", "压链保留内层（内容层）"
+    assert len(folded.label) <= READABLE_LABEL_CHARS, folded.label
+    assert overlong_labels(result.content) == []
+    # 契约上限（200）本来就没被违反过，所以"合规"不能拿来当这条的判据。
+    assert "SINGLE_CHILD" not in _codes(result.remaining)
+
+
+def test_collapse_never_loses_the_outer_title():
+    """放不下两行时外层标题进 `detail` 的第一行——不丢，只是换了个位置。
+
+    这是"不把两句话合成一句"的代价，必须被钉住：换位置可以，丢字不行。
+    """
+    content = _two_line_violation()
+
+    folded = repair(content).content.root.children[0]
+    assert folded.label == "浏览器渲染流程回答不完整"
+    assert folded.detail is not None
+    assert folded.detail.startswith(DEFERRED_LABEL_PREFIX + "基础：CSS 布局与事件循环清楚")
+    # 两边的原 detail 都还在（降级只在前面加一行，不覆盖）。
+    assert "CSS" in folded.detail
+
+
+def test_short_collapse_still_joins_both_titles():
+    """放得下两行时照旧拼接：信息最全，不必降级。"""
+    content = _map(_node("r", "根", [
+        _node("a", "第一层", [_leaf("b", "第二层")]),
+        _normal(),
+    ]))
+
+    folded = repair(content).content.root.children[0]
+    assert folded.label == f"第一层{' / '}第二层"
+    assert folded.detail is None, "拼得下就不该往 detail 里塞东西"
+
+
+def test_containment_does_not_double_the_title():
+    """包含关系（「监督学习」/「有监督学习」）取长的那个，不拼、也不进 detail。"""
+    content = _map(_node("r", "根", [
+        _node("a", "监督学习", [_leaf("b", "有监督学习")]),
+        _normal(),
+    ]))
+
+    folded = repair(content).content.root.children[0]
+    assert folded.label == "有监督学习"
+    assert folded.detail is None
+
+
+def test_three_level_chain_keeps_every_outer_title():
+    """三层单子链压两次：两次的外层标题都在，label 仍是内层那个。
+
+    数据取自 `data/acc_trees/S02.json`（压出过 33 字的
+    「教材与参考资源 / 指定教材 / Silberschatz《操作系」）。
+    """
+    content = _map(_node("r", "课程资源", [
+        _node("books", "教材与参考资源", [
+            _node("picked", "指定教材", [
+                _leaf("book", "Silberschatz《操作系统概念》"),
+            ]),
+        ]),
+        _normal(),
+    ]))
+
+    result = repair(content)
+    folded = result.content.root.children[0]
+    assert folded.id == "book"
+    assert folded.label == "Silberschatz《操作系统概念》"
+    assert len(folded.label) <= READABLE_LABEL_CHARS
+    assert folded.detail is not None
+    # 两个外层标题都没丢：第一次压链拼进 label、第二次压链把它整段降级进 detail。
+    assert "教材与参考资源" in folded.detail
+    assert "指定教材" in folded.detail
+
+
+def test_deferring_does_not_stack_on_a_second_run():
+    """降级过的树再跑一次不会多出一行 `原上级：`（幂等）。"""
+    content = _two_line_violation()
+
+    first = repair(content)
+    second = repair(first.content)
+    assert second.applied == []
+    assert _dump(second.content) == _dump(first.content)
+    assert first.content.root.children[0].detail.count(DEFERRED_LABEL_PREFIX) == 1
+
+
+def test_long_inner_label_is_not_shortened_by_the_collapse():
+    """内层本来就超两行：压链不加剧它，也不改用外层（那会把内容藏起来）。
+
+    这一条与"可读"看似冲突，其实不是：`_joined_label` 管的是**压链不许把标题变长**，
+    不管"标题本来多长"。旧图（生成侧 16 字上限之前）里 20–30 字的标题必须照原样活着
+    ——`stores/mindmap.ts` 的 `displayTitle` 是给它留的兜底。
+    """
+    inner = "这个节点的内层标题本来就超过两行盒子的长度"
+    content = _map(_node("r", "根", [
+        _node("a", "外层", [_leaf("b", inner)]),
+        _normal(),
+    ]))
+
+    folded = repair(content).content.root.children[0]
+    assert folded.label == inner
+    assert folded.detail is not None and "外层" in folded.detail
+
+
+def test_collapse_unions_refs_and_keeps_both_details():
+    """压链不只是并 label：引用取并集、说明拼接，两边都不丢。
+
+    与 `test_refs_union_*`（合并那条）分开写，因为这是**另一个函数**
+    （`_absorb` 与 `_merge_siblings`）——同一条不变量写在两处，只有一处有用例时
+    另一处改坏了没人知道。
+    """
+    content = _map(_node("r", "根", [
+        _node("a", "外层", [
+            _leaf("b", "内层", source_refs=[_ref("s2", 5, 9)]),
+        ], source_refs=[_ref("s1", 0, 4)], detail="外层说明"),
+        _normal(),
+    ]))
+
+    folded = repair(content).content.root.children[0]
+    assert folded.id == "b"
+    keys = [(ref.source_id, ref.start, ref.end) for ref in folded.source_refs]
+    assert keys == [("s1", 0, 4), ("s2", 5, 9)], "外层引用在前、内层在后，且去重"
+    assert "外层说明" in (folded.detail or "")
+
+
+def test_repair_never_increases_depth():
+    """深度只可能变小：压链减层、合并不加层。
+
+    "修完 depth 会超上限"是**查过并否掉**的那一类风险（用户点名要逐条查）：修复
+    没有一条动作会新增层级，所以这里钉的是不变量，而不是加一道运行时闸。
+    """
+    content = _map(_node("r", "根", [
+        _node("a", "重复", [_node("a1", "甲层", [_leaf("a1x", "甲孙")])]),
+        _node("b", "重复", [_leaf("b1", "乙叶")]),
+        _node("c", "单子", [_leaf("c1", "唯一")]),
+        _normal(),
+    ]))
+
+    before = _depth(content.root)
+    after = _depth(repair(content).content.root)
+    assert after <= before
+    assert repair(content).steps >= 2, "前提：这条数据要真的修过东西"
+
+
+def _depth(node: Node) -> int:
+    return 1 + max((_depth(child) for child in node.children), default=0)
+
+
+def test_collapse_undo_restores_the_deferred_title():
+    """降级过的那一步撤回之后，label 与 detail 双双还原。"""
+    content = _two_line_violation()
+
+    result = repair(content)
+    assert result.applied, _codes(check(content))
+    assert _dump(revert(result.content, result.applied)) == _dump(content)
+
+
+def test_overlong_labels_matches_the_renderer_limit():
+    """口径与渲染层同源：24 字过、25 字报出来，报的是 `(id, label)`。"""
+    at_limit = "字" * READABLE_LABEL_CHARS
+    content = _map(_node("r", "根", [
+        _leaf("ok", at_limit),
+        _leaf("bad", at_limit + "字"),
+        _normal(),
+    ]))
+
+    assert overlong_labels(content) == [("bad", at_limit + "字")]
+    # 首尾空白不计长度：与 `displayTitle` 的 `label.trim()` 同一口径。
+    padded = _map(_node("r", "根", [_leaf("pad", "  " + at_limit + "  "), _normal()]))
+    assert overlong_labels(padded) == []
 
 
 # ---------------------------------------------------------------- 6. 摘要与序列化
