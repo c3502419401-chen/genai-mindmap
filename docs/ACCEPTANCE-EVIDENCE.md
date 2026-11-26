@@ -3,8 +3,8 @@
 > 目标：把 `docs/PLAN-VS-IMPLEMENTATION.md` 里"只有代码、未验收"的那 11 项，能跑的都真跑一遍，
 > 让申报材料里的"已实现"有运行级证据支撑；跑不动的，写清差什么条件。
 >
-> 基线：`main`，从 `e5c0ae0` 起跑，证据提交为 `e477cab`（期间 `e694da1` 只改了
-> `docs/ACCEPTANCE-METRICS.md` 三行，不涉及代码）。后端 pid 20820
+> 基线：`main`，从 `e5c0ae0` 起跑，证据提交为**本文所在的那一次提交**（期间 `e694da1`
+> 只改了 `docs/ACCEPTANCE-METRICS.md` 三行，不涉及代码）。后端 pid 20820
 > （`run-backend.bat`，`MINDMAP_LLM_MODEL=deepseek-chat`），
 > 前端 5173（vite dev），本地库 `backend/data/mindmaps.db`。
 > 本机没有 `docker`、没有 `wsl`；有 LibreOffice（后面这一条改变了一个结论）。
