@@ -80,7 +80,7 @@ def card(code: str, text: str, must: list[str], content: dict) -> str:
     lines = [
         f"### {code}",
         f"【材料】{text.strip()}",
-        f"【必须出现的内容要素（must）】" + " ｜ ".join(must),
+        "【必须出现的内容要素（must）】" + " ｜ ".join(must),
         f"【树】中心「{(root.get('label') or '').strip()}」　共 {len(pairs)} 节点　"
         f"最大深度 {max(d for _, d in pairs)}　一级分支 {len(top)} 条（每支扇出 {fan}）",
         "【label 大纲】",

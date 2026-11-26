@@ -17,7 +17,6 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import patch
 
-from app.agent import tools as tools_module
 from app.agent.contracts import AgentRunRequest, RunBudget, RunContext, ToolCall
 from app.agent.tools import (
     DETAIL_ONLY_PROMPT,
