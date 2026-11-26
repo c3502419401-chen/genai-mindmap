@@ -235,6 +235,9 @@ python scripts\measure_two_arch.py --offline-repair          # 零模型：修�
 python scripts\_two_arch_tables.py                           # 报告那几张表
 python scripts\_two_arch_stats.py                            # bootstrap / 按组配对 / 规模效应
 python scripts\_two_arch_numbers.py                          # 派生数字（token/节点、修复步数…）
+python scripts\_two_arch_coverage.py                         # 覆盖率两个分母（有材料 8 张 / 全 12 张）
+python scripts\_two_arch_check.py                            # 修复步数、自检条数、partial、检索命中
+python scripts\_two_arch_judge_write.py                      # 把四份盲评结果落成 JSON（数字的唯一出处）
 ```
 
 产物：`data/two_arch.json`（24 行原始读数）、`data/two-arch-trees/`（24 棵树的 JSON）、
