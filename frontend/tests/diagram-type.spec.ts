@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../src/App.vue';
 import type { DiagramTypeChoice, MindMapContent, Source } from '../src/api/types';
 import { useMindMapStore } from '../src/stores/mindmap';
+import { THINKING_MODEL_OPTIONS } from '../src/stores/options';
 import { isPrefsRequest, prefsReply } from './helpers/prefs-stub';
 
 /**
@@ -129,16 +130,20 @@ describe('图型选择器', () => {
 });
 
 describe('拆解方式选择器', () => {
-  it('五个选项与后端标识一致，默认选中通用，并说明它改了什么', () => {
+  it('下拉照原样列出后端那张表，默认选中通用，并说明它改了什么', () => {
     const wrapper = mountApp();
     const select = wrapper.get('#thinking-model');
     const options = select.findAll('option');
-    expect(options.map(option => option.attributes('value'))).toEqual([
-      'default', 'first-principles', 'feynman', 'systematic', 'critical',
-    ]);
-    expect(options.map(option => option.text())).toEqual([
-      '通用', '第一性原理', '费曼', '5W1H', '批判性',
-    ]);
+    // 期望值**不写在这里**：候选来自 `api/thinking-options.json`（后端生成物）。
+    // 这里钉的是"组件把整张表一条不漏、按顺序渲染出来"，不是表的第二份副本——
+    // 副本正是这一轮修掉的病（后端加一种思考方式、界面不报错也不变）。
+    expect(options.map(option => option.attributes('value'))).toEqual(
+      THINKING_MODEL_OPTIONS.map(item => item.value),
+    );
+    expect(options.map(option => option.text())).toEqual(
+      THINKING_MODEL_OPTIONS.map(item => item.label),
+    );
+    expect(options.length).toBe(THINKING_MODEL_OPTIONS.length);
     expect((select.element as HTMLSelectElement).value).toBe('default');
     // 旁边那一行短说明：用户得知道选了它会影响什么
     expect(wrapper.get('[data-test="intent-box"]').text()).toContain('按这种方式拆解主题');

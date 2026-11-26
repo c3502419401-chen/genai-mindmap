@@ -1,0 +1,22 @@
+[
+  {
+    "value": "default",
+    "label": "通用"
+  },
+  {
+    "value": "first-principles",
+    "label": "第一性原理"
+  },
+  {
+    "value": "feynman",
+    "label": "费曼"
+  },
+  {
+    "value": "systematic",
+    "label": "5W1H"
+  },
+  {
+    "value": "critical",
+    "label": "批判性"
+  }
+]
