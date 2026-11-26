@@ -48,6 +48,22 @@ jobs:
       - name: Test
         run: pytest -q --cov=app --cov-report=term-missing --cov-fail-under=0
 
+      # 「用例测了函数、没测接线」这一类的静态闸门，机制与理由都在
+      # `scripts/acc3/find_unwired.py` 的 docstring 里。它是**棘轮**不是绝对零：
+      # 基线（`scripts/acc3/unwired_baseline.json`）之外的零引用公开函数才红，
+      # 每条基线都要写理由与 `evidence`，凭据文件被删而条目还在也红。
+      #
+      # 为什么这里不需要额外依赖：脚本只 import 标准库（`ast` / `json` /
+      # `pathlib` / `re` / `collections` / `dataclasses`），上面那条 Install 装的
+      # 东西已经够了。
+      #
+      # 为什么它在这里是确定性的：判据是**三棵源码树的文本**（`app/`、`tests/`、
+      # `scripts/`），不读运行中的服务、不读数据库、不读 git 状态或工作区差异；
+      # 路径一律以 `__file__` 为锚。所以在 CI 的干净 checkout 上与本地逐行一致
+      # （已用一个干净 worktree 对过：515 / 66 / 11 / 5 四个读数相同）。
+      - name: 零引用函数棘轮
+        run: python scripts/acc3/find_unwired.py --gate
+
       # 前端的契约类型由这份快照生成。忘了重新导出时，本地那条 pytest
       # （tests/test_openapi_snapshot.py）会红；这里再多一层：即便快照更新了，
       # 也要确认提交上去的就是重新生成过的结果，而不是手改的。
