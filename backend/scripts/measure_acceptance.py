@@ -30,6 +30,7 @@ import argparse
 import http.cookiejar
 import json
 import mimetypes
+import os
 import statistics
 import sys
 import time
@@ -42,7 +43,10 @@ BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
-BASE = "http://127.0.0.1:8000"
+# 基址可覆盖（`MINDMAP_ACC_BASE`）：换一份代码复算时要先起第二条后端实例，
+# 而 8000 那条可能正被别人的运行占着——为了量一次数去重启它，等于把别人的
+# 在途请求掐掉。默认值与改动之前逐字相同。
+BASE = os.getenv("MINDMAP_ACC_BASE", "http://127.0.0.1:8000").rstrip("/")
 DATA = BACKEND / "data"
 SAMPLES = Path(__file__).with_name("acc_samples.json")
 STREAM = f"{BASE}/api/agent/runs/stream"
