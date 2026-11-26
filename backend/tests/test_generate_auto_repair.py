@@ -160,7 +160,11 @@ def test_the_repair_reports_what_it_did_into_data_and_diagnostics():
     assert report["codes"].get("SINGLE_CHILD", 0) >= 2      # b0 与 b0-0 各一次
     assert report["codes"].get("DUPLICATE_LABEL", 0) == 1
     assert report["nodes_before"] > report["nodes_after"]
-    assert report["skipped"] == 0
+    assert report["skipped"] == []
+    # 每一步做了什么都在 `items` 里：诊断只说一句"N 处"，能查清改了哪些靠这一份。
+    assert len(report["items"]) == report["steps"]
+    assert "并进" in report["items"][0]["message"] or "合成一层" in report["items"][0]["message"]
+    assert report["items_truncated"] == 0
 
     repaired = [item for item in result.data["diagnostics"]
                 if item["code"] == "STRUCTURE_AUTO_REPAIRED"]
@@ -227,7 +231,8 @@ def test_a_merge_that_would_break_the_contract_is_skipped_and_reported():
     result = _run(ctx, _chat(tree))
 
     report = result.data["auto_repair"]
-    assert report["skipped"] >= 1
+    assert len(report["skipped"]) >= 1
+    assert report["skipped"][0]["reason"], "跳过了却不说为什么，等于静默跳过"
     assert report["codes"].get("DUPLICATE_LABEL", 0) == 0
     # 没修成的那一处仍在结构体检里：用户点「一键修复」时会再看到它一次。
     assert "DUPLICATE_LABEL" in _codes(result)
@@ -272,6 +277,43 @@ def test_cross_branch_duplicates_are_judged_before_the_repair():
     labels = [child.label for child in ctx.candidate.root.children]
     assert "监督学习 / 迁移学习" in labels
     assert "无监督学习 / 迁移学习" in labels
+
+
+def test_a_collapsed_branch_keeps_the_inner_title_when_it_contains_the_outer():
+    """压链之后一级分支的标题：**包含关系时只留内层**，否则拼成「外层 / 内层」。
+
+    这条规则在 `optimization/repair.py::_joined_label` 里（父子标题互相包含是真实图里
+    最常见的形状：「机器学习」/「机器学习：从数据中学习」），但它在生成收尾这条路上
+    是**用户能看见的改名**，所以在这里钉一次：
+
+      - `甲` + `甲基` → `甲基`（外层三个字在内层里，拼起来会让人以为是两层不同的东西）
+      - `费用` + `办公用品` → `费用 / 办公用品`（不包含，两层的字面都要留住）
+
+    顺带说明一个 fixture 陷阱：想断言"分支标题原样保留"的用例，树上不能是"一条分支
+    只有一个孩子"——那个形状现在会被压掉（`tests/test_graph_ingest.py::_tree` 的
+    注释记着同一条）。
+    """
+    tree = {"title": TOPIC, "root": {
+        "id": "root", "label": TOPIC, "detail": "中心主题",
+        "children": [
+            {"id": "b0", "label": "甲", "children": [
+                {"id": "b0-0", "label": "甲基", "detail": "一句具体的说明。"},
+            ]},
+            {"id": "b1", "label": "费用", "children": [
+                {"id": "b1-0", "label": "办公用品", "detail": "一句具体的说明。"},
+            ]},
+            {"id": "b2", "label": "丙", "children": [
+                {"id": "b2-0", "label": "丙一", "detail": "一句具体的说明。"},
+                {"id": "b2-1", "label": "丙二", "detail": "一句具体的说明。"},
+            ]},
+        ]}}
+    ctx = _ctx()
+    _run(ctx, _chat(tree))
+
+    labels = [child.label for child in ctx.candidate.root.children]
+    assert "甲基" in labels
+    assert "甲 / 甲基" not in labels
+    assert "费用 / 办公用品" in labels
 
 
 def test_switching_it_off_gives_the_pre_wiring_shape(monkeypatch):

@@ -805,6 +805,11 @@ _AUTO_REPAIR_RULE_NAMES = {
     "HEADING_ONLY_BRANCH": "把只是标题的一级分支并进它唯一的子节点",
 }
 
+#: `data["auto_repair"]["items"]` 最多列几条。实测真实产物单张最多 74 步（190 节点
+#: 那张「碳中和的主要方面」），30 条已经覆盖了"一张正常的图会被改多少"的量级；
+#: 超出的报 `items_truncated`，不静默截断。
+AUTO_REPAIR_MAX_ITEMS = 30
+
 
 # 用户**自己把联网检索关掉**时的那句话。单独提成常量有两个理由：
 #
@@ -11071,8 +11076,11 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     if diagram_type == "tree" and self_check_enabled():
         self_check_report = await _run_self_check(content, ctx, topic=topic)
         if self_check_report.skipped in ("error", "budget"):
-            reason = ("本次运行的模型调用额度已用完" if self_check_report.skipped == "budget"
-                      else f"调用{('失败：' + self_check_report.failure) if self_check_report.failure else '出错'}")
+            if self_check_report.skipped == "budget":
+                reason = "本次运行的模型调用额度已用完"
+            else:
+                reason = (f"调用失败：{self_check_report.failure}"
+                          if self_check_report.failure else "调用出错")
             diagnostics.append(Diagnostic(
                 level=DiagnosticLevel.warn, code="SELF_CHECK_SKIPPED",
                 message=(f"这次没做结构自检（{reason}）；这张图本身不受影响，"
@@ -11223,13 +11231,29 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         per_code: dict[str, int] = {}
         for item in outcome.applied:
             per_code[item.code] = per_code.get(item.code, 0) + 1
+        # 每一步做了什么：**这是"不悄悄改"的可查证据**。
+        #
+        # 诊断只说一句"N 处"，用户能接受"收尾帮我修了"的前提是**能查清改了哪些**
+        # ——每条都带 `RepairItem.message`（「把「甲」并进了同级同名节点「乙」：子树
+        # 取并集（2 + 1 个），引用取并集（0 条）」）与被动过的节点 id。上限 30 条：
+        # 实测真实产物单张最多 74 步（190 节点那张），全量塞进 `data` 会把一次运行的
+        # 读数变成一份日志；超出部分报数（`items_truncated`），不静默截断。
+        listed = [
+            {"code": item.code, "node_id": item.node_id, "message": item.message}
+            for item in outcome.applied[:AUTO_REPAIR_MAX_ITEMS]
+        ]
         auto_repair = {
             "steps": outcome.steps,
             "codes": per_code,
             # 看到了但没修的（引用并集超过契约上限、或被合并后子节点超过 50 个）。
             # **必须报出来**：静默跳过会让"这棵树怎么还有一处重名"变成一个只在
             # 用户那里发生、查不出来的问题。
-            "skipped": len(outcome.skipped),
+            "skipped": [
+                {"code": item.code, "node_id": item.node_id, "reason": item.reason}
+                for item in outcome.skipped
+            ],
+            "items": listed,
+            "items_truncated": max(0, outcome.steps - len(listed)),
             "nodes_before": nodes_before,
             "nodes_after": shapes.count_nodes(content),
         }

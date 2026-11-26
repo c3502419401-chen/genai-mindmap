@@ -393,10 +393,21 @@ def _walk(node: dict):
 
 
 def _tree(labels: list[str]) -> dict:
+    """每条一级分支挂**两个**要点。
+
+    为什么是两个而不是一个（2026-11-26 改）：收尾现在会跑确定性修复
+    （`MINDMAP_AUTO_REPAIR`，默认开），而"一条分支只有一个孩子"正是它要压掉的形状
+    （`SINGLE_CHILD`，真实产物 26/65 张命中）。一份单孩子的树被压链之后，一级分支的
+    标题会变成「外层 / 内层」（包含关系时只留内层），于是下面那条"分支名能在摘要原文
+    里逐字找到"的断言测到的就不再是骨架忠实度，而是压链的拼接规则——那不是这条用例
+    要盯的东西。两个要点是真实形状，也让标题原样留下。
+    """
     return {"title": TOPIC, "root": {
         "id": "root", "label": TOPIC, "detail": "", "children": [
             {"id": f"b{index}", "label": label, "children": [
-                {"id": f"b{index}-1", "label": f"{label}·要点", "detail": "",
+                {"id": f"b{index}-1", "label": f"{label}·背景", "detail": "",
+                 "children": []},
+                {"id": f"b{index}-2", "label": f"{label}·要点", "detail": "",
                  "children": []},
             ]}
             for index, label in enumerate(labels)
