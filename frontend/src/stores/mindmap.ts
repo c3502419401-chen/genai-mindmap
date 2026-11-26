@@ -998,6 +998,22 @@ export const useMindMapStore = defineStore('mindmap', () => {
   const viewAdjusted = ref(false);
 
   /**
+   * 上一次 `edit` / `expand` 落地时，视口该**留在谁周围**（节点 id）。
+   *
+   * 为什么需要这一位：这两类意图是"就地改"，而画布的自动适配（`scheduleFit` →
+   * `applyView`）是按**整张图**算缩放的。展开一支之后节点数从 7 变 10、改短一个
+   * 标题之后整棵树重排，`content` 换了引用就会触发一次全图适配——用户眼前的
+   * 那一支被缩到看不清，屏幕中央换成根节点，这就是"每次展开都回到主节点"。
+   *
+   * 消费方只有画布（`MindMapCanvas` 的 `content` 侦听）：它拿到 id 就先按这个节点
+   * 摆一屏（保持当前缩放，只平移），然后**清空**——一次落地只该锚一次，留着它会让
+   * 之后每一次内容变化（手动加节点、撤销）都往这个旧节点上跳。
+   *
+   * `create` 不设（新图本来就该按可读性重新铺满），视口的锚点为 `null`。
+   */
+  const viewAnchor = ref<string | null>(null);
+
+  /**
    * 画布上**最多画几个节点**（`0` / 负数 = 不限制，见 `canvas/view-collapse.ts`）。
    *
    * **这是视图状态，不是内容。** 它不进 `content`、不进撤销栈、不进导出文件：
@@ -3541,6 +3557,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
     setPrimary(null);
     editingId.value = null;
     viewAdjusted.value = false;
+    // 上一张图的锚点属于上一棵树，留着它下一次内容变化会按一个不存在的 id 去锚。
+    viewAnchor.value = null;
     resetHistory();
     status.value = `已打开导图，版本 ${record.version}。`;
   }
@@ -3564,6 +3582,8 @@ export const useMindMapStore = defineStore('mindmap', () => {
     dirty.value = false;
     setPrimary(null);
     editingId.value = null;
+    // 画布空了，锚点也就没有意义（同 `loadMap`）。
+    viewAnchor.value = null;
     resetHistory();
     status.value = '新建导图：输入主题生成，或直接在画布上手动编辑。';
   }
@@ -3949,12 +3969,17 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * `none` 那一档是刻意的：**预算本来就够**的节点看起来没有任何"更多"，用户点它是
    * 为了看它、选它（右侧详情区块）；让它的子节点突然塌掉是纯粹的伤害。想收这种节点
    * 有两条明确的路——它头上的「−」（悬停/选中时出现）与顶部的「收起到上限」。
+   *
+   * 返回值是**刚做的那一下**，不是"现在的状态"：画布要按它决定视口怎么动——展开
+   * 之后把这一支留在视野里（`viewAnchor` 那一段注释），收起之后整张图变小、需要
+   * 重新铺满。两边共用同一个判据（`foldActionOf`），所以不会出现"视图以为收起了、
+   * 内容其实摊开了"。
    */
-  function toggleFoldInView(id: string): void {
+  function toggleFoldInView(id: string): 'expand' | 'collapse' | 'none' {
     const current = content.value;
-    if (!current || !isTree(current)) return;
+    if (!current || !isTree(current)) return 'none';
     const node = findIn(current, id);
-    if (!node || !node.children.length) return;
+    if (!node || !node.children.length) return 'none';
     const view = {
       folded: renderSource.value?.folded ?? NO_FOLDS,
       open: renderSource.value?.foldOpen ?? NO_FOLD_OPEN,
@@ -3962,6 +3987,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     const action = foldActionOf(id, view);
     if (action === 'expand') expandNodeInView(id);
     else if (action === 'collapse') collapseNodeInView(id);
+    return action;
   }
 
   /**
@@ -4095,8 +4121,10 @@ export const useMindMapStore = defineStore('mindmap', () => {
     }
     if (direction.value === next) return;
     if (!applyContent(withDirection(content.value, next), true)) return;
-    // 换方向后整体重排，视图必须重新适配，否则可能停在空白处。
+    // 换方向后整体重排，视图必须重新适配，否则可能停在空白处。锚点同样作废：
+    // 它记的是**旧朝向**下那一支的位置，锚过去只会把视图拽到一片空白。
     viewAdjusted.value = false;
+    viewAnchor.value = null;
   }
 
   /**
@@ -4125,6 +4153,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     setPrimary(null);
     editingId.value = null;
     viewAdjusted.value = false;
+    viewAnchor.value = null;
     // 示例只是用来看布局的，不算用户的作品，别让它挂上"未保存"的包袱。
     mapId.value = null;
     version.value = 0;
@@ -4840,6 +4869,15 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 告警**不清**：它说的是"这棵树缺了什么"，而树已经在画布上了——用户正需要知道
     // 这件事。清掉就只剩一句"已落到画布"，而某几支是空的。
     ensureSelection();
+    // 落地之后视口该留在谁周围（见 `viewAnchor` 的注释）。`edit` / `expand` 是就地改，
+    // 用户正看着的那一处必须还在眼前；`create` 是换了一张图，按可读性重新铺满。
+    //
+    // 取落地**之后**的 `selectedId`：`ensureSelection()` 可能因为原节点被删而换了一个，
+    // 锚在那个上比锚在已消失的 id 上正确——画布找不到 id 时会安静地不锚，那也不等于
+    // 跳走（它退回"什么都不动"），但跟着用户视线走更近于意图。
+    viewAnchor.value = meta.intent === 'create'
+      ? null
+      : (selectedId.value ?? generationSelection.value[0] ?? null);
     status.value = finishStatus(mode.value === 'demo'
       ? '已落到画布（演示导图，固定结构，不是 AI 生成）'
       : '模型的结果已落到画布');
@@ -4965,6 +5003,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     clearSelection,
     direction,
     viewAdjusted,
+    viewAnchor,
     // 视图层收起：这一屏最多画几个节点、哪些被点开/收起过、这一屏少画了多少个节点。
     // 全都不进 content（见 `docs/VIEW-COLLAPSE.md` §三）。
     visibleNodeLimit,

@@ -196,3 +196,60 @@ export function coverage(
     height: bounds.height > 0 ? visibleH / bounds.height : 1,
   };
 }
+
+/**
+ * "展开之后"这个动作的贴边容忍度（CSS 像素）。
+ *
+ * 24 取的是节点内边距那一档的两倍：贴边的节点看起来像被裁了一半，而它旁边新长出来
+ * 的子节点一定在视野外——展开之后要看的就是那几个。
+ */
+export const KEEP_MARGIN = 24;
+
+export interface KeepInput {
+  /** 目标节点的外接框（画布坐标）。 */
+  rect: Bounds;
+  viewport: Size;
+  /** 当前 transform。**缩放要原样保留**，见 `keepTarget` 的说明。 */
+  current: Transform;
+  margin?: number;
+}
+
+/**
+ * 展开某一支之后该怎么摆视口：**保持当前缩放，必要时才平移**。
+ *
+ * 为什么不是 `planView`：那个函数按**整张图**的外接框算缩放。展开一支之后图变大，
+ * `fit-all` 就缩到看不清、`fit-width` 又锚回根节点——两种都不是用户点的那个位置。
+ * "展开"的语义是**就地长出新节点**：那一支还在原来的像素位置，只是多了几个孩子。
+ *
+ * 返回 `null` 表示**一个像素都别动**：目标节点完整落在视口里、四周留白都够
+ * `margin`。已经是要看的东西了，再摆一次只是制造一次没有意义的动画（而动画期间
+ * `getViewport()` 还是旧值，会和下一次读数打架）。
+ *
+ * 否则按**当前 zoom** 把目标挪到视口正中。正中而不是"刚好露出来"：露一角的节点与
+ * "没看见"在用户那里是同一件事，而他要接着看的是它周围新长出来的孩子——中心是
+ * 那些孩子都进来的唯一位置。
+ */
+export function keepTarget(input: KeepInput): Transform | null {
+  const margin = input.margin ?? KEEP_MARGIN;
+  const { rect, viewport, current } = input;
+  // 容器还没量出来，或 transform 还没初始化：什么都不做比搬到一个错的 (0,0) 好。
+  if (viewport.width <= 0 || viewport.height <= 0) return null;
+  if (!(current.zoom > 0) || !Number.isFinite(current.zoom)) return null;
+  const left = rect.x * current.zoom + current.x;
+  const top = rect.y * current.zoom + current.y;
+  const right = left + rect.width * current.zoom;
+  const bottom = top + rect.height * current.zoom;
+  if (
+    left >= margin && top >= margin
+    && right <= viewport.width - margin && bottom <= viewport.height - margin
+  ) {
+    return null;
+  }
+  const cx = rect.x + rect.width / 2;
+  const cy = rect.y + rect.height / 2;
+  return {
+    x: viewport.width / 2 - cx * current.zoom,
+    y: viewport.height / 2 - cy * current.zoom,
+    zoom: current.zoom,
+  };
+}

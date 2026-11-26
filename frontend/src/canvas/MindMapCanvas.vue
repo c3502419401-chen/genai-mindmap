@@ -26,6 +26,7 @@ import {
   MIN_ZOOM,
   contentBounds,
   coverage,
+  keepTarget,
   planView,
   type Point,
   type ViewMode,
@@ -393,6 +394,37 @@ function applyView(mode: ViewMode, animate = false): void {
     .then(updateClippedHint);
 }
 
+/**
+ * **把某个节点留在视野里**：保持当前缩放，只平移，必要时才动。算术在
+ * `viewport.keepTarget`（那是纯函数，用例直接钉它）。
+ *
+ * 为什么不是 `applyView`：那个函数按**整张图**的外接框算缩放，展开一支之后图变大，
+ * `fit-all` 就缩到看不清，`fit-width` 又锚回根节点——两种档位都不是用户点的那个
+ * 位置。而"展开"这个动作的预期是**就地长出新节点**：那一支还在原来的像素位置，
+ * 只是多了几个孩子。同类产品（XMind / 幕布）的默认也是"把新长出来的部分带进视野，
+ * 缩放不动"。
+ *
+ * `animate` 只在"真的动了"时才生效；`false` 用在一批节点刚落地那一帧（内容已经换
+ * 了，动画会让它看起来像"被推走"）。
+ */
+function keepAround(id: string, animate = true): void {
+  const view = dimensions.value;
+  if (!view?.width || !view?.height) return;
+  const target = store.nodes.find(node => node.id === id);
+  if (!target) return;
+  const next = keepTarget({
+    rect: nodeRectOf(target),
+    viewport: view,
+    current: getViewport(),
+  });
+  // `null` = 已经在视野里（且留白够）：一个像素都不动，只顺手核对一下"看不全"那句。
+  if (!next) {
+    updateClippedHint();
+    return;
+  }
+  void setViewport(next, { duration: animate ? 250 : 0 }).then(updateClippedHint);
+}
+
 function setView(next: ViewMode): void {
   if (next === viewMode.value) return;
   // 用户表态了：此后内容变化不再自动改档（换图时才复位）。
@@ -456,8 +488,12 @@ const capHint = computed(() => (
  * 点角标是**明确表态**，点节点本体可能只是想选中它。
  */
 function toggleFold(id: string): void {
-  store.toggleFoldInView(id);
-  void nextTick(() => applyView(viewMode.value, true));
+  const action = store.toggleFoldInView(id);
+  // 展开：把这一处留在视野里（同 `expandBranch` 的理由，不重算全图）。
+  // 收起：整张图变小了，这时不重新铺满会留下一屏空处——那是另一个方向的动作，
+  // 用户要的就是"少看一点、看清一点"，所以照旧走适配。
+  if (action === 'expand') void nextTick(() => keepAround(id));
+  else if (action === 'collapse') void nextTick(() => applyView(viewMode.value, true));
 }
 
 /** 点「−」：明确把这一支叠起来（预算给的也照收——那是"清爽"这条要求本身）。 */
@@ -475,7 +511,11 @@ function collapseFold(id: string): void {
  */
 function expandBranch(id: string): void {
   store.expandBranchInView(id);
-  void nextTick(() => applyView(viewMode.value, true));
+  // **不重算整张图的适配**：`applyView` 按全图外接框算缩放并锚回根节点，于是
+  // "点开这一支"的结果是那一支被缩到看不清、屏幕中央换成主节点——用户报的
+  // 「每次展开都会回到主节点」就是这一步。这里只把这个节点留在视野里（缩放不动），
+  // 新长出来的子节点贴着它出现，正是点开时想看的东西。
+  void nextTick(() => keepAround(id));
 }
 
 /**
@@ -500,6 +540,16 @@ function scheduleFit() {
   clearTimeout(fitTimer);
   // 增量节点到达很密，节流一下，避免每帧都重新适配。
   fitTimer = setTimeout(() => {
+    // **正在展开某一支**：跟着那个节点走，不换档、不缩全图。
+    //
+    // 这条路的来由是 `nodeCount` 变了（模型把子节点一条条推到画布上）。`create`
+    // 时整棵树都在长，按全图适配是对的；`expand` 时用户点的是一处，屏幕上该发生
+    // 的是"那几个新节点在它旁边长出来"，而不是每长一个就把全图重缩一遍。
+    if (store.expanding && store.selectedId) {
+      autoModePending = false;
+      keepAround(store.selectedId);
+      return;
+    }
     if (autoModePending) {
       autoModePending = false;
       const choice = chooseViewMode({ boxes: canvasBoxes(), viewport: dimensions.value });
@@ -530,6 +580,20 @@ watch([() => store.mode, () => store.mapId, () => store.generatedSummary], () =>
 watch(() => store.content, () => {
   if (contentChangedByDrag) {
     contentChangedByDrag = false;
+    return;
+  }
+  // 一次 `edit` / `expand` 落地：**视口留在被改的那一处**，不重新适配。
+  //
+  // 这是缺陷一那条报道的另一半：点"展开这一支"时节点是一个一个流进来的
+  // （`scheduleFit` 那条路管着），而真正落地那一刻 `content` 换了一个新引用，
+  // 于是这里会再触发一次全图适配——用户看到的是"等了十几秒，图突然缩成一张全图，
+  // 中央是根节点"。锚点由 store 在落地时写（`viewAnchor`），这里消费一次就清掉。
+  const anchor = store.viewAnchor;
+  if (anchor) {
+    store.viewAnchor = null;
+    // 等布局 computed 把新坐标交给 Vue Flow 再摆：此时读到的 `store.nodes`
+    // 才是**新树**的位置，否则会把旧位置的那一屏算出来。
+    void nextTick(() => keepAround(anchor, false));
     return;
   }
   if (!userPickedMode) requestAutoMode();
