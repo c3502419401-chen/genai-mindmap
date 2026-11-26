@@ -166,6 +166,47 @@ def test_list_item_without_blank_line_after_is_filtered_out():
     assert _titles(entries) == ["实验环境", "实验步骤"]
 
 
+def test_numbered_heading_right_above_its_body_is_still_a_heading():
+    """`一、背景` 的下一行就是正文（**没有空行**）也是标题。
+
+    "标题后面空一行"是**排版**习惯（markdown、docx 导出都是这样），不是文档结构；
+    而中文手写材料十有八九是紧贴的。这条原来一律被挡掉，实测后果是
+    `backend/scripts/acc_samples.json` 那 20 条真实材料**一条目录都抽不出来**——
+    骨架那一次只剩"主题 + 文件名"，一级分支只能按模型对这类文档的先验走
+    （`docs/OFF-TOPIC-AND-FEW-BRANCHES.md`）。
+    """
+    text = (
+        "一、背景\n现有做法是人工 fork 仓库翻译，译文分散、术语不统一。\n\n"
+        "二、目标\n1. 同步延迟 7 天内。\n2. 术语表覆盖率 90%。\n\n"
+        "三、风险\n1. 上游改结构会导致指纹失效。\n"
+    )
+    entries = heading_outline([_source(text)])
+    assert _titles(entries) == ["背景", "目标", "风险"]
+
+
+def test_sentence_tail_marks_a_prose_line_not_a_heading():
+    """以句末标点收尾的候选是**一句话**，不是章节名。
+
+    实测那三条（S17/S19/S20 项目立项）的"目录"就是
+    `3. 半年内支持 20 个热门项目、100 位贡献者。` 这种正文列表项：它们满足
+    "大写编号 + 后面跟空行"两条版式证据，于是成了目录里仅有的两条，把骨架钉在
+    2 条一级分支上 → `MIN_BRANCHES = 3` 判废。句末标点是这批假阳性唯一共有的、
+    与版式无关的特征。
+    """
+    text = (
+        "一、目标\n"
+        "1. 同步延迟 7 天内。\n"
+        "2. 术语表覆盖率 90%。\n"
+        "3. 半年内支持 20 个热门项目、100 位贡献者。\n\n"
+        "二、风险\n"
+        "1. 上游改结构会导致指纹大面积失效。\n"
+        "2. 机译成本随项目数线性增长。\n"
+        "3. 志愿者流失，需要贡献榜与荣誉机制。\n"
+    )
+    entries = heading_outline([_source(text)])
+    assert _titles(entries) == ["目标", "风险"]
+
+
 def test_repeated_header_is_deduplicated_keeping_first_position():
     """PDF 页眉会把同一行印在每页顶上：按文本去重，留第一次出现的位置。"""
     text = (
