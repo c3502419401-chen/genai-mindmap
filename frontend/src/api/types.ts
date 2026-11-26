@@ -1255,9 +1255,35 @@ export interface CheckResponse {
   diagnostics: Diagnostic[];
 }
 
+/**
+ * `kind="link"` 那一层这一趟的结果（`POST /optimization/suggest` 的 `link`）。
+ *
+ * 为什么它不是可选的"附加信息"：link 是唯一**可能一条都不给**的建议类型——
+ * 不花钱的规则层几乎总有三五条，而 link 要先挑目标、再逐目标调一次模型，任何一环
+ * 不成立结果就是空列表。空列表与"这个功能没接上"在界面上长得一模一样，所以原因
+ * 单独带出来给用户看。
+ *
+ * `status` 的取值：`ok`（至少一条）/ `already_best`（问过，模型认为现在挂得对）/
+ * `no_targets`（没有可问的节点）/ `disabled`（部署方关了）/ `no_choices` /
+ * `no_candidates` / `model_failed` / `failed`。
+ */
+export interface LinkStatus {
+  status: string;
+  /** 被问过"该挂哪儿"的节点 id，按实际调用顺序。 */
+  targets: string[];
+  /** 真的发出去了几次模型调用。0 = 这一层没花钱。 */
+  calls: number;
+  /** 模型说"现在这样最好"因此没有产出建议的条数。 */
+  dropped: number;
+  /** 一句给用户看的话（空串表示不必说）。 */
+  detail: string;
+}
+
 export interface SuggestResponse {
   suggestions: Suggestion[];
   diagnostics: Diagnostic[];
+  /** `null` 表示这次请求**没跑** link 那一层（`link: false` 或自动路径）。 */
+  link?: LinkStatus | null;
 }
 
 /**

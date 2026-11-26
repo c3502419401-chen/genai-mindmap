@@ -360,13 +360,11 @@ export function markRunSaved(runId: string): Promise<void> {
 function optimizationBody(
   content: DiagramContent,
   sources?: Source[],
-): { content: DiagramContent; sources?: Source[] } {
-  const body: { content: DiagramContent; sources?: Source[] } = { content };
+): { content: DiagramContent; sources?: Source[]; link?: boolean } {
+  const body: { content: DiagramContent; sources?: Source[]; link?: boolean } = { content };
   if (sources && sources.length) body.sources = sources;
   return body;
-}
-
-/**
+}/**
  * 只读诊断：单子节点 / 深度上限 / 同级重名，给了 `sources` 时还会按原文核验引用。
  *
  * **它不改任何东西**（后端 docstring：“只读诊断”）：不落库、不写回树、不调模型。
@@ -390,21 +388,30 @@ export async function checkOptimization(
 /**
  * 候选修改（**用户确认后才应用**；后端目前没有自动应用接口）。
  *
- * 与 `checkOptimization` 分成两个函数，不是把两者合并成一次往返：`suggest` 现在还是
- * 纯规则（把 `DUPLICATE_LABEL` 翻成 `dedupe`），但后端正在给它加模型层——那时它就有
- * 成本了。分开之后"免费的自动体检"与"点了才发的建议"各走各的路径。
+ * 与 `checkOptimization` 分成两个函数，不是把两者合并成一次往返：`check` 是免费的
+ * 只读诊断，`suggest` 现在有两处会花钱——模型层（近义判定）与 link 层（"这个节点
+ * 该挂在谁下面"）。分开之后"免费的自动体检"与"点了才发的建议"各走各的路径。
+ *
+ * `options.link` 明确传 `false` 时这一层一次调用都不发（后端 `link` 字段）；
+ * 不传 = 由后端按部署开关决定（缺省开，见 `optimization/router.py` 的注释）。
+ * 这里**不主动传 true**：默认值只有一处（服务端），前端再写一份就会在两边漂。
  */
 export async function suggestOptimization(
   content: DiagramContent,
   sources?: Source[],
+  options: { link?: boolean } = {},
 ): Promise<SuggestResponse> {
+  const payload = optimizationBody(content, sources);
+  if (options.link !== undefined) payload.link = options.link;
   const body = await request<Partial<SuggestResponse>>('/optimization/suggest', {
     method: 'POST',
-    body: JSON.stringify(optimizationBody(content, sources)),
+    body: JSON.stringify(payload),
   });
   return {
     suggestions: Array.isArray(body?.suggestions) ? body.suggestions : [],
     diagnostics: Array.isArray(body?.diagnostics) ? body.diagnostics : [],
+    // `null` 与"没这个字段"都表示这次没跑 link 那一层，界面据此不加那一段话。
+    link: body?.link ?? null,
   };
 }
 

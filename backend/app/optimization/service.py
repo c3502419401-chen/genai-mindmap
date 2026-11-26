@@ -72,8 +72,10 @@ check() 检查单子节点、达到深度上限及同一父节点下的重复标
 from __future__ import annotations
 
 import json
+import logging
 import os
 import unicodedata
+from dataclasses import dataclass, field
 from typing import Iterator
 
 import httpx
@@ -81,12 +83,15 @@ import httpx
 from app.contracts.diagnostic import (
     Diagnostic,
     DiagnosticLevel,
+    LinkStatus,
     Suggestion,
     SuggestionKind,
 )
 from app.contracts.mindmap import MindMapContent, Node
 from app.contracts.source import Source
 from app.optimization.source_refs import verify_source_refs
+
+logger = logging.getLogger(__name__)
 
 # 与契约保持一致的硬限制，诊断时复用
 MAX_DEPTH = 8
@@ -742,3 +747,296 @@ def _not_converted_reason(code: str) -> str | None:
     if code.startswith(_REFERENCE_CODE_PREFIXES):
         return "引用类诊断：只说明文献是否可核验，动作是补证据而不是合并/展开"
     return None
+
+
+# ---------------------------------------------------------------- link 层（补关系）
+#
+# 这一层把 `optimization/link.py` 接进产品。它在此之前**一个调用者都没有**：
+# 算法、8 条用例、一个能跑通的度量脚本都在，而 `/suggest` 的产出里从来没有
+# `kind="link"`——用户点「检查结构」得到的永远只有规则层的 expand/dedupe/add_detail。
+# 这不是逻辑写错，是接线没做，所以没有任何用例会变红（用例测的是
+# `link.suggest(...)`，不是"它会不会出现在用户面前"）。
+#
+# 三条设计约束，每条都对着一个具体坏结果：
+
+LINK_TARGET_CODES = ("SINGLE_CHILD", "SHALLOW_BRANCH", "HEADING_ONLY_BRANCH")
+"""哪几类诊断说明"这个节点的位置值得问一句"。
+
+选这三类而不是全树逐节点：`link.suggest` **每个目标一次模型调用**（实测
+1.4–1.8 s / 次），全树问一遍会把这个按钮变成分钟级操作。而这三类诊断本身说的
+就是"这一支的挂法/展开有问题"——正好是"它该挂在谁下面"这个问题的适用面。
+"""
+
+MAX_LINK_TARGETS = 1
+"""一次 `/suggest` 最多问几个节点。
+
+**1**，不是 2 也不更多。实测（真后端、deepseek-chat、这张库里 80 节点的图）：
+一个目标从挑候选到拿到候选约 10 秒，其中大半是那次模型往返。用户点「检查结构」
+本来只等几毫秒（规则层是纯函数），把这一层加到上十秒已经接近"比没有这条建议更糟"；
+两个目标就是 20 秒，实测过一次 `20906 ms`——那不是一个按钮该有的延迟。
+所以要更多建议就多点几次（每次的目标会随诊断变化），而不是让一次点击等更久。
+"""
+
+LINK_CONTEXT_ENV = "MINDMAP_OPTIMIZATION_LINK_CONTEXT"
+"""link 这一层要不要查"跨图历史"与"库里的材料原文"。
+
+**默认关**，依据是实测而不是省事：`docs/LINK-SUGGESTIONS.md` 的消融把那两样输入
+全剥掉之后，藏节点再猜的准确率从 14/16 掉到 13/16——**在噪声里**。而它们各自要
+先扫库（`history_placements` 读全部导图 + 一次 embedding；`material_hits` 扫最近
+20 份材料 + 一次检索），是这一层里最贵的两段。
+
+所以默认只让模型看"这棵树本身"（真父的标题 + 它的子节点清单 + 分类常识，实测就是
+撑住 88% 的那部分）。要复现论文那套完整输入时设 `=1`，读数是同一份文档。
+"""
+
+
+@dataclass(frozen=True)
+class LinkRound:
+    """link 那一层这一趟的结果（`SuggestResponse.link` 就是它）。"""
+
+    suggestions: list[Suggestion] = field(default_factory=list)
+    status: str = "ok"
+    targets: list[str] = field(default_factory=list)
+    calls: int = 0
+    dropped: int = 0
+
+
+def _link_on(on: bool | None) -> bool:
+    """这一层跑不跑。
+
+    **缺省开**，与环境变量 `MINDMAP_OPTIMIZATION_LINK` 的默认值（在
+    `link.enabled()` 里是关）故意相反，理由是入口不同：那边的默认值管的是
+    "没人要求也自动跑"（生成收尾那种场景，跑一次就是一次真金白银的调用）；
+    而这里的唯一入口是用户点了「检查结构」——那一下已经表达了"帮我看这张图"。
+    显式设成 `MINDMAP_OPTIMIZATION_LINK=0` 仍然能关掉它（部署方要省这笔钱时）。
+    """
+    if on is not None:
+        return on
+    from app.optimization import link
+
+    raw = os.getenv(link.ENV)
+    if raw is None or not raw.strip():
+        return True
+    return raw.strip().lower() in _TRUTHY
+
+
+def _link_context_on(on: bool | None) -> bool:
+    """这一层要不要查跨图历史与材料原文（`LINK_CONTEXT_ENV`，默认关）。"""
+    if on is not None:
+        return on
+    raw = os.getenv(LINK_CONTEXT_ENV)
+    return bool(raw) and raw.strip().lower() in _TRUTHY
+
+
+def _only_child_id(root: Node, node_id: str) -> str | None:
+    """`node_id` 唯一的那个孩子。`SINGLE_CHILD` 的落点是父节点，而"该挂哪"问的是孩子。"""
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.id == node_id:
+            return node.children[0].id if len(node.children) == 1 else None
+        stack.extend(node.children)
+    return None
+
+
+def link_targets(
+    content: MindMapContent, diagnostics: list[Diagnostic] | None = None,
+    *, limit: int = MAX_LINK_TARGETS,
+) -> list[str]:
+    """这次该问哪几个节点"它该挂在谁下面"。
+
+    两级取值，顺序就是优先级：
+
+      1. **形态诊断指向的节点**。这些节点的挂法已经可疑，问一句最有价值。注意落点
+         要往下挪一层：`SINGLE_CHILD` 说的是"这个父节点只有一个孩子"，而 link 问的
+         是**那个孩子**该挂哪——拿父节点去问，回答"它就该在这儿"是必然的。
+         `HEADING_ONLY_BRANCH` 的 `evidence` 本来就是那个子节点的 id，直接用。
+      2. **一级分支下的第一个叶子**。这一级是兜底，而且不能省：真实生成的图
+         多半**一条形态诊断都没有**（实测一棵 37 节点的干净树是 0 条），只靠第 1
+         级的话"补关系"在正常图上永远不出现——那又回到了"产品里看不到"。
+
+    根节点不进来：`link.parent_choices` 对根返回零个候选，问它必然 `no_choices`，
+    白花一次调用。
+    """
+    report = check(content) if diagnostics is None else diagnostics
+    ordered: list[str] = []
+    for diag in report:
+        if diag.code not in LINK_TARGET_CODES or not diag.node_id:
+            continue
+        picked_id = diag.evidence or _only_child_id(content.root, diag.node_id)
+        if picked_id:
+            ordered.append(picked_id)
+    if not ordered:
+        for branch in content.root.children:
+            for node, _ in _iter_nodes(branch):
+                if not node.children:
+                    ordered.append(node.id)
+                    break
+    picked: list[str] = []
+    seen: set[str] = set()
+    for node_id in ordered:
+        if node_id in seen or node_id == content.root.id:
+            continue
+        seen.add(node_id)
+        picked.append(node_id)
+        if len(picked) >= limit:
+            break
+    return picked
+
+
+def _current_parent_id(root: Node, node_id: str) -> str | None:
+    """`node_id` 现在挂在谁下面；不在树上（或它就是根）返回 None。"""
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if any(child.id == node_id for child in node.children):
+            return node.id
+        stack.extend(node.children)
+    return None
+
+
+def _first_candidate_parent(suggestion: Suggestion) -> str | None:
+    """一条 link 建议里模型的**首选父**。
+
+    `evidence` 装的是 `link.suggest` 打好的 JSON（见那边的 docstring：`Suggestion`
+    是 `extra="forbid"`，加字段就要重导契约）。解不开就当"没有首选"，不猜。
+    """
+    raw = suggestion.evidence
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        return None
+    first = candidates[0]
+    if not isinstance(first, dict):
+        return None
+    parent_id = first.get("parent_id")
+    return parent_id if isinstance(parent_id, str) and parent_id else None
+
+
+_LINK_DETAIL: dict[str, str] = {
+    "no_targets": "这张图没有可问的节点（还没有分点），补关系这一层没跑。",
+    "disabled": "补关系这一层关掉了（MINDMAP_OPTIMIZATION_LINK=0）。",
+    "already_best": "补关系这一层问过了：模型认为这几处现在挂得都对。",
+    "no_choices": "目标节点只有一个可挂的位置，没有别的挂法可建议。",
+    "no_candidates": "模型这次没给出可用的挂法候选。",
+    "model_failed": "补关系这一层没能拿到模型结果，稍后再检查一次。",
+    "failed": "补关系这一层出错了，其余建议不受影响。",
+}
+
+
+async def suggest_link(
+    content: MindMapContent,
+    *,
+    map_id: str | None = None,
+    targets: list[str] | None = None,
+    chat=None,
+    on: bool | None = None,
+    context: bool | None = None,
+) -> LinkRound:
+    """对少数几个节点跑 `link.suggest`，把结果整成一层建议。
+
+    **丢"模型说现在挺好"的那些**：`link.parent_choices` 把当前父排在候选表第一位，
+    所以"首选父 == 当前父"就是模型在说"不用动"。不丢的话，一张本来没问题的图会
+    收到两三条"可以挂到它现在待的地方"的建议——那种建议比没有更糟，用户点一次
+    就会开始不信这个面板。
+
+    失败一律降级：`link.suggest` 自己已经兜住模型异常（返回空报告），这里再兜一层
+    是给"注入缝之外的意外"（历史库读炸、向量表坏了）留后路——建议是附加信息，
+    判不出来不等于这张图坏了。
+    """
+    from app.optimization import link
+
+    if not _link_on(on):
+        return LinkRound(status="disabled")
+    picked = list(targets) if targets is not None else link_targets(content)
+    if not picked:
+        return LinkRound(status="no_targets")
+
+    suggestions: list[Suggestion] = []
+    calls = 0
+    dropped = 0
+    reason = ""
+    # 不查跨图历史与材料原文时，直接把两个注入缝传空列表：`link.suggest` 见到
+    # 非 None 就**不**去扫库（那是这一层最贵的两段，见 `LINK_CONTEXT_ENV`）。
+    blank = {} if _link_context_on(context) else {"history": [], "material": []}
+    for node_id in picked:
+        try:
+            report = await link.suggest(content, node_id, map_id=map_id, chat=chat,
+                                        on=True, **blank)
+        except Exception:  # noqa: BLE001 — 见 docstring 最后一段
+            logger.warning("补关系这一层在节点 %s 上失败", node_id, exc_info=True)
+            reason = reason or "failed"
+            continue
+        calls += report.calls
+        if not report.suggestions:
+            reason = reason or (report.skipped or "no_candidates")
+            continue
+        current = _current_parent_id(content.root, node_id)
+        best = _first_candidate_parent(report.suggestions[0])
+        if current is not None and best == current:
+            dropped += 1
+            reason = reason or "already_best"
+            continue
+        suggestions.extend(report.suggestions)
+
+    if suggestions:
+        status = "ok"
+    elif dropped:
+        status = "already_best"
+    else:
+        status = reason or "no_candidates"
+    return LinkRound(suggestions=suggestions, status=status, targets=picked,
+                     calls=calls, dropped=dropped)
+
+
+@dataclass(frozen=True)
+class SuggestOutcome:
+    """`/optimization/suggest` 的完整产出：建议 + link 那一层的状态。"""
+
+    suggestions: list[Suggestion]
+    link: LinkStatus | None
+
+
+async def suggest_all(
+    content: MindMapContent,
+    *,
+    use_model: bool | None = None,
+    use_cross_map: bool | None = None,
+    map_id: str | None = None,
+    use_link: bool | None = None,
+    link_chat=None,
+    link_context: bool | None = None,
+) -> SuggestOutcome:
+    """`suggest()` + link 层。路由只调这一个。
+
+    为什么不是把 `suggest()` 直接改成 `async`：它是**同步契约**，被生成收尾
+    （`agent/tools.py`）与十几个测试直接调用；为一个要模型往返的层把它改成
+    协程，等于让所有调用方跟着改一遍，而它们既不需要也不能等模型。所以同步的
+    那一层原样保留，异步的这一层在外面加——`link` 是唯一需要 await 的部分。
+    """
+    base = suggest(content, use_model=use_model, use_cross_map=use_cross_map,
+                   map_id=map_id)
+    # 调用方明确说"这次不要"→ `link` 为 None（"没跑它"）；部署开关关掉时仍然报
+    # `disabled`（"跑了，被闸住了"）。两者在界面上要说的话不同：前者不说，后者要
+    # 告诉用户这一层被部署方关了。
+    if use_link is False:
+        return SuggestOutcome(suggestions=base, link=None)
+    round_ = await suggest_link(content, map_id=map_id, chat=link_chat, on=use_link,
+                                context=link_context)
+    detail = "" if round_.status == "ok" else _LINK_DETAIL.get(
+        round_.status, "补关系这一层这次没有产出。")
+    status = LinkStatus(
+        status=round_.status,
+        targets=list(round_.targets),
+        calls=round_.calls,
+        dropped=round_.dropped,
+        detail=detail,
+    )
+    return SuggestOutcome(suggestions=[*base, *round_.suggestions], link=status)

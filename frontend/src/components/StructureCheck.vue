@@ -148,6 +148,23 @@ function dismiss(key: string): void {
   check.dismiss(key);
 }
 
+/**
+ * 「补关系」这一层的一句话（`kind="link"`，计划书 3.3.2 那类"这两个分支有因果关系、
+ * 建议连一条线"）。
+ *
+ * 只在**真的跑过但没给建议**时说：有建议时用户看到的是建议本身，再说一句"补关系跑了"
+ * 是纯噪音；这次没跑它（`linkStatus === null`，自动路径从不跑）时也什么都不说。
+ *
+ * 它存在的唯一理由是把"一条都没有"与"根本没跑"分开——link 是唯一可能一条建议都不给
+ * 的类型（要挑目标、逐目标一次模型调用），没有这句话时，用户看到空列表面板会以为功能
+ * 又没接上。
+ */
+const linkNote = computed(() => {
+  const status = check.linkStatus;
+  if (!status || status.status === 'ok') return '';
+  return status.detail || '补关系这一层这次没有产出。';
+});
+
 /** 有没有任何可显示的东西。空面板不渲染——抽屉里多一块"什么都没有"只是噪音。 */
 const visible = computed(
   () => check.busy || check.neverRun || check.ran || !!check.error || attention.value.length > 0
@@ -377,6 +394,13 @@ function repair(): void {
       :aria-expanded="suggestionsOpen"
       @click="suggestionsOpen = !suggestionsOpen"
     >{{ suggestionsOpen ? '收起建议' : `展开全部 ${check.visibleSuggestions.length} 条建议（还有 ${hiddenSuggestions} 条）` }}</button>
+
+    <!-- 「补关系」这一层：跑了但没给建议时，说清是哪一环停的（见 `linkNote`）。 -->
+    <p
+      v-if="linkNote"
+      data-test="link-note"
+      class="rounded border border-slate-200 bg-slate-50 px-2 py-1 text-[11px] leading-relaxed text-slate-500"
+    >补关系：{{ linkNote }}</p>
 
     <!-- 诊断：warn / error 直接铺开（默认上限 6 条，其余给一条出路）。 -->
     <ul v-if="shownAttention.length" data-test="diagnostic-list" class="flex flex-col gap-1">

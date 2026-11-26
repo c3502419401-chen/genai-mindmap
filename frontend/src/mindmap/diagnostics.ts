@@ -117,6 +117,11 @@ export const MANUAL_KINDS: Record<string, string> = {
   expand: '这一类要按需展开：选中那个节点，点工具条上的「展开」',
   add_detail: '这一类要走 AI 生成：选中节点后用「改这个节点」让它补说明',
   cross_map: '依据来自你库里别的图：点开那张图，看它是怎么展开这一节的',
+  // `link` 的动作是**改层级**（把这个节点挂到另一个父下面）。它现在只显示、
+  // 不给按钮：撤销只救回这一次会话，而"应用它到底改成什么"还没有样本可以定义
+  // （`optimization/link.py` 的 docstring 写过这一条）。所以这里不说"后端没定义"
+  // ——它定义了候选，缺的是触发它的那一按；说清手动怎么改。
+  link: '这一类要手动挪：选中节点拖动，或者剪切后粘到候选父下面',
 };
 
 export function suggestionKindLabel(kind: string): string {

@@ -278,6 +278,15 @@ export interface paths {
         /**
          * Suggest For Map
          * @description 给出候选修改列表。用户确认后才能应用（当前无自动应用接口）。
+         *
+         *     **`async` 是因为 link 那一层要等模型**：它产出计划书 3.3.2 举例的那类建议
+         *     （"这两个分支有因果关系，建议连一条线"）。规则层（expand / dedupe /
+         *     add_detail）照旧同步算完，等模型的只有最后这一步，产出顺序也是
+         *     "规则在前、link 在后"——用户先看到不用等的那些。
+         *
+         *     一条建议都没给时 `link.status` 会说明是哪一环停的（`no_targets` /
+         *     `already_best` / `model_failed`…）。没有这个字段的话，"补关系没结果"与
+         *     "补关系没接上"在响应里长得一模一样。
          */
         post: operations["suggest_for_map_api_optimization_suggest_post"];
         delete?: never;
@@ -732,10 +741,16 @@ export interface paths {
         put?: never;
         /**
          * Search Knowledge
-         * @description 知识库检索（F12/F13）。
+         * @description 知识库检索（F12/F13）：在**用户自己的知识库**里找相关片段。
          *
-         *     当前实现返回空结果且 `implemented=false`，前端应据此禁用相关入口，
-         *     不要把它当成"已经接好了知识库"。
+         *     返回的 `source_id` 是库里的**持久 id**，可以拿它去
+         *     `GET /api/knowledge/library/{source_id}` 取全文（`start` / `end` 是片段在该份
+         *     原文里的码点偏移，用来看"为什么是这段"）。
+         *
+         *     空结果有两种原因，界面必须分开说：`hits` 为空而库里有材料 → "没检索到"；
+         *     库本身是空的 → "先去用一份材料生成一张图"（入库发生在生成时，见
+         *     `knowledge/remember.py`）。接口不能替调用方猜，所以 `implemented` 只说
+         *     "这条路接上了没有"，恒为 true。
          */
         post: operations["search_knowledge_api_knowledge_search_post"];
         delete?: never;
@@ -1023,10 +1038,18 @@ export interface components {
              * @default 0
              */
             truncated: number;
-            /** Sources */
+            /**
+             * Sources
+             * @description 按原文核验节点引用时用的来源清单（最多 50 份）。`id` 必须是**生成侧落库之后的持久 id**——生成时材料会入库并换 id，换算结果在 SSE `sources` 帧的 `mapping`（旧→新）与 `sources`（最终清单）里。拿上传应答里的请求内 uuid 传进来，会得到满屏 SOURCE_TEXT_UNAVAILABLE。
+             */
             sources?: components["schemas"]["Source"][] | null;
             /** Map Id */
             map_id?: string | null;
+            /**
+             * Link
+             * @description 是否跑「补关系」层（每个目标一次模型调用，最多 2 个目标）。缺省按 MINDMAP_OPTIMIZATION_LINK，未设时为开。
+             */
+            link?: boolean | null;
         };
         /** CheckResponse */
         CheckResponse: {
@@ -1652,10 +1675,31 @@ export interface components {
             /** Updated At */
             updated_at?: string | null;
         };
-        /** KnowledgeHit */
+        /**
+         * KnowledgeHit
+         * @description 一条**库内**检索命中：来源身份 + 原文区间 + 片段。
+         *
+         *     形状与 `EvidenceHit` 刻意分开，不要合并：那个回答"在这次请求带来的材料里
+         *     哪一段最相关"，候选集由调用方给定、`source_id` 是请求内 uuid；这个回答
+         *     "我的知识库里有什么"，候选集是库、`source_id` 是**持久 id**——拿它可以
+         *     `library.load()` 回查原文，也可以 `GET /api/knowledge/library/{id}` 点开。
+         *
+         *     `start` / `end` 是 `snippet` 在那份来源全文里的**码点**偏移（与 `SourceRef`
+         *     同口径），前端要定位高亮就靠它，别用 UTF-16 下标。
+         *
+         *     分数三列与 `EvidenceHit` 同一个意思（`score` 是融合分、只在本次检索内可比；
+         *     `score_bm25` / `score_vector` 是两路原始分，没走那一路时是 None 而不是 0）。
+         */
         KnowledgeHit: {
             /** Source Id */
-            source_id?: string | null;
+            source_id: string;
+            /** Filename */
+            filename?: string | null;
+            kind?: components["schemas"]["SourceKind"] | null;
+            /** Start */
+            start: number;
+            /** End */
+            end: number;
             /**
              * Snippet
              * @default
@@ -1666,6 +1710,18 @@ export interface components {
              * @default 0
              */
             score: number;
+            /** Score Bm25 */
+            score_bm25?: number | null;
+            /** Score Vector */
+            score_vector?: number | null;
+            /**
+             * Method
+             * @default lexical
+             * @enum {string}
+             */
+            method: "lexical" | "hybrid";
+            /** Rerank Score */
+            rerank_score?: number | null;
         };
         /**
          * LabelShrunk
@@ -1743,6 +1799,43 @@ export interface components {
             truncated: boolean;
             /** Total Chars */
             total_chars: number;
+        };
+        /**
+         * LinkStatus
+         * @description `kind="link"` 这一层**这一趟到底跑没跑、跑出了什么**。
+         *
+         *     为什么它必须出现在响应里：link 是唯一"有可能一条都不给"的建议类型——不花钱
+         *     的规则层几乎总有三五条，而 link 要先挑目标、再逐目标调一次模型，任何一环不
+         *     成立结果都是空列表。空列表与"这个功能没接上"在界面上长得一模一样，所以把
+         *     原因单独带出来：`status` 说清是哪一环停的，`targets` 说清问的是哪几个节点。
+         *
+         *     值域（`no_targets` / `disabled` / `no_choices` / `model_failed` /
+         *     `no_candidates` / `already_best` / `ok`）与 `service.suggest_link` 的判定一一
+         *     对应，新增值时必须同时更新那句话，否则用户会看到"原因：unknown"。
+         */
+        LinkStatus: {
+            /**
+             * Status
+             * @default ok
+             */
+            status: string;
+            /** Targets */
+            targets?: string[];
+            /**
+             * Calls
+             * @default 0
+             */
+            calls: number;
+            /**
+             * Dropped
+             * @default 0
+             */
+            dropped: number;
+            /**
+             * Detail
+             * @default
+             */
+            detail: string;
         };
         /**
          * MapRecord
@@ -2396,7 +2489,7 @@ export interface components {
             hits?: components["schemas"]["KnowledgeHit"][];
             /**
              * Implemented
-             * @default false
+             * @default true
              */
             implemented: boolean;
         };
@@ -2562,6 +2655,7 @@ export interface components {
             suggestions?: components["schemas"]["app__contracts__diagnostic__Suggestion"][];
             /** Diagnostics */
             diagnostics?: components["schemas"]["Diagnostic"][];
+            link?: components["schemas"]["LinkStatus"] | null;
         };
         /**
          * SuggestionKind

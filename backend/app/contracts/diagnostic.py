@@ -63,6 +63,36 @@ class Suggestion(BaseModel):
     confidence: float | None = Field(default=None, ge=0, le=1)
 
 
+class LinkStatus(BaseModel):
+    """`kind="link"` 这一层**这一趟到底跑没跑、跑出了什么**。
+
+    为什么它必须出现在响应里：link 是唯一"有可能一条都不给"的建议类型——不花钱
+    的规则层几乎总有三五条，而 link 要先挑目标、再逐目标调一次模型，任何一环不
+    成立结果都是空列表。空列表与"这个功能没接上"在界面上长得一模一样，所以把
+    原因单独带出来：`status` 说清是哪一环停的，`targets` 说清问的是哪几个节点。
+
+    值域（`no_targets` / `disabled` / `no_choices` / `model_failed` /
+    `no_candidates` / `already_best` / `ok`）与 `service.suggest_link` 的判定一一
+    对应，新增值时必须同时更新那句话，否则用户会看到"原因：unknown"。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    #: 这一趟的结论。`ok` = 至少产出一条；`already_best` = 问过，模型认为现在挂得对。
+    status: str = "ok"
+    #: 被问过"该挂哪儿"的节点 id，按实际调用顺序。
+    targets: list[str] = Field(default_factory=list)
+    #: 真的发出去了几次模型调用。0 说明这一层根本没花钱。
+    calls: int = Field(default=0, ge=0)
+    #: 模型说"现在这样最好"因此**没有**产出建议的条数。它是"图上没问题"的证据，
+    #: 不是"算法没结果"。
+    dropped: int = Field(default=0, ge=0)
+    #: 一句给用户看的话（空串表示不必说）。界面在建议列表底下显示它。
+    detail: str = ""
+
+
 class SuggestResponse(BaseModel):
     suggestions: list[Suggestion] = Field(default_factory=list)
     diagnostics: list[Diagnostic] = Field(default_factory=list)
+    #: link 那一层的结果。`None` 表示这次请求没跑它（`link=false`），与"跑了但
+    #: 一条都没给"（`status="already_best"` / `"no_targets"`）不是一回事。
+    link: LinkStatus | None = None

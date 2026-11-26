@@ -2,7 +2,7 @@ import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
 
 import { checkOptimization, repairOptimization, suggestOptimization } from '../api/client';
-import type { DiagramContent, Source } from '../api/types';
+import type { DiagramContent, LinkStatus, Source } from '../api/types';
 import {
   diagnosticLabel,
   normalizeDiagnostics,
@@ -86,6 +86,17 @@ export const useStructureStore = defineStore('structure', () => {
 
   /** 这次报告里包不包含 `suggest`（手动路径才包含）。界面据此说清"应用"为什么不在。 */
   const withSuggestions = ref(false);
+
+  /**
+   * 「补关系」那一段这次跑没跑、跑出了什么（`SuggestResponse.link`）。
+   *
+   * 它是"空"与"没接上"的分界线：link 是唯一可能一条建议都不给的类型（要挑目标、
+   * 逐目标一次模型调用），没有这个字段时，界面上"补关系一条都没有"既可能是
+   * "模型认为现在挂得都对"，也可能是"这一层根本没跑"。
+   *
+   * `null` = 这次没跑它（自动路径从不跑、或调用方显式关掉了）。
+   */
+  const linkStatus = ref<LinkStatus | null>(null);
 
   /** 请求令牌：花名册外的响应（用户已经又点了一次 / 换了图）一律丢弃。 */
   let token = 0;
@@ -190,6 +201,7 @@ export const useStructureStore = defineStore('structure', () => {
     if (!isTree(content)) {
       diagnostics.value = [];
       suggestions.value = [];
+      linkStatus.value = null;
       ran.value = true;
       checkedContent.value = content;
       withSuggestions.value = false;
@@ -207,12 +219,16 @@ export const useStructureStore = defineStore('structure', () => {
         if (mine !== token) return 'ok';
         diagnostics.value = normalizeDiagnostics(result.diagnostics);
         suggestions.value = normalizeSuggestions(result.suggestions);
+        // 「补关系」的结果与建议分开放：它不参与 `counts`（一条都没有时不该显示
+        // "0 条建议"），只在面板底部说一句"这一层怎么了"。
+        linkStatus.value = result.link ?? null;
       } else {
         const result = await checkOptimization(content, options.sources);
         if (mine !== token) return 'ok';
         diagnostics.value = normalizeDiagnostics(result.diagnostics);
         // 自动路径不清建议：用户手动看过的那批候选还在，下一次生成落地时它们才作废
         // （见 `reset`）。这里清掉会让"刚看完的建议"被任意一次自动检查抹去。
+        // link 的状态同理留着：它描述的是上一次手动检查，不该被免费诊断抹掉。
       }
       if (mine !== token) return 'ok';
       withSuggestions.value = withSuggest || withSuggestions.value;
@@ -437,6 +453,7 @@ export const useStructureStore = defineStore('structure', () => {
     token += 1;
     diagnostics.value = [];
     suggestions.value = [];
+    linkStatus.value = null;
     dismissed.value = new Set();
     error.value = '';
     ran.value = false;
@@ -462,6 +479,8 @@ export const useStructureStore = defineStore('structure', () => {
     withSuggestions,
     counts,
     hasFindings,
+    // 「补关系」这一层这一次的结论（`null` = 这次没跑它）
+    linkStatus,
     // 「有 warn 或 error 吗」：抽屉里 info 折叠区的标题用它决定怎么说
     attentionCount: computed(() => counts.value.attention),
     run,
