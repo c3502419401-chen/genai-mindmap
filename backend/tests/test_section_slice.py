@@ -584,11 +584,17 @@ def test_growth_frames_mount_under_the_right_branch(monkeypatch):
 
 
 def test_growth_frames_do_not_exceed_the_final_tree(monkeypatch):
-    """预览与最终树**同形**：帧里的节点数不超过落树之后的节点数。
+    """预览与最终树**同形**：帧里的节点数不超过落树之前的节点数。
 
     "长出来又消失"比"晚出来"更糟——用户会以为那几个节点没了。所以预览按
     `_slice_nodes` 的两把尺子截：`quota`（这支能写几个）与 `max_level`（分支下
     最多几层）。
+
+    **分母是"修复之前"的节点数**（`data["auto_repair"]["nodes_before"]`）：收尾的
+    确定性修复会压掉单子链、合并同级重名（`MINDMAP_AUTO_REPAIR`，默认开），于是
+    最终树比帧里长出来的少几个——那不是预览多报了，是最后一步把它们并进了保留者
+    （标题变成「外层 / 内层」）。这条用例要守的是"预览不超出模型实际写下的规模"，
+    所以拿修复前的那一份比；关掉修复时它就是 `node_count`。
     """
     monkeypatch.setenv("MINDMAP_SECTION_SLICE", "1")
     # 模型多写一层：`_slice_nodes` 会在 level > SECTION_SLICE_DEPTH 处停手
@@ -601,8 +607,9 @@ def test_growth_frames_do_not_exceed_the_final_tree(monkeypatch):
     assert result.ok, result.content
     grows = _grows(frames)
     assert "再深一层" not in {frame["label"] for frame in grows}
-    # 与落树之后的节点数对齐：预览多报一个就会"长出来又消失"
-    assert len(grows) <= result.data["node_count"]
+    written = result.data.get("auto_repair", {}).get("nodes_before",
+                                                    result.data["node_count"])
+    assert len(grows) <= written
 
 
 def test_growth_frames_stay_off_when_the_channel_is_none(monkeypatch):

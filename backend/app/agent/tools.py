@@ -137,6 +137,8 @@ from app.knowledge.service import (
 )
 from app.optimization import nli
 from app.optimization import verify as verify_step
+from app.optimization.repair import AUTO_REPAIRABLE_CODES
+from app.optimization.repair import repair as repair_structure
 from app.optimization.service import check
 from app.prefs import profile as profile_rank
 from app.prefs import service as prefs
@@ -670,6 +672,48 @@ def branch_digest_enabled() -> bool:
     """
     return (os.getenv(BRANCH_DIGEST_ENV, "0").strip().lower()
             in LIBRARY_SEARCH_TRUTHY)
+
+
+# ---------------------------------------------------------------- 收尾的确定性修复
+#
+# `optimization/service.check()` 报七种结构码，其中**三条的修法唯一**
+# （`optimization/repair.AUTO_REPAIRABLE_CODES`）：合并同级重名永远并进第一个、
+# 压单子链永远外层并进内层，结果与"分段跑还是一趟跑"无关。那三条可以在生成收尾
+# 顺手做掉，**零模型调用**。
+#
+# 收益是实测的（`docs/SUBAGENT-VS-SELFCHECK.md` 第五节）：79 张真实产物里 37 张
+# 存在"一个节点只有一个孩子"的冗余层，共命中 116 次——那是模型一口气写完整棵树
+# 时的典型形状。这些图今天要用户自己点一次「一键修复」才拿到同样的结果。
+AUTO_REPAIR_ENV = "MINDMAP_AUTO_REPAIR"
+
+#: 关掉它的三个写法。用 `_FALSY` 而不用 `_TRUTHY`：这条**默认开**，与
+#: `graph_outline_enabled` / `mixed_skeleton_enabled` 同一套判定。
+_AUTO_REPAIR_FALSY = frozenset({"0", "off", "false", "no"})
+
+
+def auto_repair_enabled() -> bool:
+    """生成收尾是否顺手跑一遍确定性修复。默认**开**。
+
+    默认开而其余新功能默认关，唯一理由是这笔账的方向相反：它一次模型调用都不花
+    （`optimization/repair.py` 里没有任何网络调用），买到的是 37/79 张图的冗余层。
+    一个零成本、结果可撤销、只动"修法唯一"那三条的动作，默认关等于让它永远不发生。
+
+    留着开关不是为了"要不要省这次调用"（没有调用可省），是为了**能复现接线之前
+    的产物**：那份报告里所有数字都取自那条路，而"这棵树被自动修过"与"模型本来就
+    这么写"在产出上必须分得开——分得开的唯一办法是能把它关掉重跑。
+    """
+    return (os.getenv(AUTO_REPAIR_ENV, "1").strip().lower()
+            not in _AUTO_REPAIR_FALSY)
+
+
+#: 修复动作的中文名（诊断里用）。与 `RepairKind` 是两个值域：这里按**规则**说，
+#: 因为用户读诊断时问的是"哪条规则动手了"。
+_AUTO_REPAIR_RULE_NAMES = {
+    "DUPLICATE_LABEL": "合并同级重名",
+    "SINGLE_CHILD": "压掉单子链",
+    "HEADING_ONLY_BRANCH": "把只是标题的一级分支并进它唯一的子节点",
+}
+
 
 # 用户**自己把联网检索关掉**时的那句话。单独提成常量有两个理由：
 #
@@ -10767,6 +10811,87 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
                 ),
             ))
 
+    # ---- 收尾的确定性修复（零模型调用，`MINDMAP_AUTO_REPAIR`）-------------------
+    #
+    # **位置就在"七条结构规则"这一带，而且必须排在 `check()` 之前**：`check()` 是
+    # 复核、`repair()` 是动作。反过来（先报后修）的结果是诊断里躺着一批刚刚被修掉
+    # 的码，用户点开面板看到 116 条 `SINGLE_CHILD`、而树上一个都没有——一个"报的
+    # 和看到的不一致"的面板比没有面板更糟。
+    #
+    # **为什么要在这里修、而不是留给用户点「一键修复」**：修复的输入是模型这一次
+    # 写下的树，输出是同一棵树的去冗余版本，中间没有任何决策需要用户做——它就是
+    # "这一次生成"的一部分。放到界面上让用户点，等于让他为一段自己没看见过的中间态
+    # 付账（前端 `replaceContent` 的注释记着同一件事：撤销粒度按"用户按了几次扳机"
+    # 分）。在这里修完再 `publish_tree`，撤销栈里仍然是**一条**（这一次生成），
+    # 用户按一次 Ctrl+Z 回到生成之前——而不是"第 1 处修复之前"。
+    #
+    # **只修三条**（`AUTO_REPAIRABLE_CODES`）不是保守，是判据：剩下四条各自的不唯一
+    # 性是具体的——`NEAR_DUPLICATE_LABEL` 要人判（字面像不等于语义同，实测 40 对里
+    # 0 对真近义）、`SHALLOW_BRANCH` / `MISSING_DETAIL` 要模型写内容、`DEPTH_LIMIT`
+    # 没有可执行动作。把它们自动落地等于替用户做一次不可逆的决定。
+    #
+    # **只在树上做**：鱼骨的六根骨是并列类别、流程的阶段是各自独立命名空间，
+    # `check()` 那七条判据是按树的形状写的（与 `optimization/router.py::_TREE_ONLY`
+    # 同一条理由）。诊断在别的图型上照旧会响，但**动手改**是另一件事。
+    #
+    # **一个副作用要交代**：压链保留内层的 id，所以一级分支可能换 id，而概括
+    # （`branch_digests`）是按外层的 id 写的。那几条概括的键在树上已经不存在了——
+    # **不搬给内层**：那句话说的是"外层那支讲什么"，挂到另一个标题底下是错的归属。
+    # 契约不校验这张表的键（`MindMapContent.branch_digests` 的注释），渲染层按 id
+    # 查不到就不画，角标退回只显示数字。这里顺手把死键删掉，免得落库一份指向不存在
+    # 节点的表。
+    #
+    # **跨支重复的判据要跑在这次修复之前**（`duplicates` 在下面几行就取好了）：
+    # 压链会改 label（`外层 / 内层`），而 `_cross_branch_duplicates` 只比逐字。
+    # 先修后判的话，"两个一级分支下各写了一个「迁移学习」、而两支都只有这一个孩子"
+    # 这种形状会在修完之后变成「甲 / 迁移学习」与「乙 / 迁移学习」，判据就再也看不见
+    # 它了——**而那是模型真的写了两遍**。诊断说的是"模型写了什么"，不是"修完之后
+    # 还剩什么"，所以取修复之前的那一份（节点 id 在压链后仍然有效：压链保留内层 id）。
+    duplicates = _cross_branch_duplicates(content.root)
+    auto_repair: dict[str, Any] | None = None
+    if diagram_type == "tree" and auto_repair_enabled():
+        nodes_before = shapes.count_nodes(content)
+        outcome = repair_structure(content, codes=AUTO_REPAIRABLE_CODES)
+        if outcome.steps:
+            content = outcome.content
+            if isinstance(content, MindMapContent) and content.branch_digests:
+                top_level = {node.id for node in content.root.children}
+                kept = {key: text for key, text in content.branch_digests.items()
+                        if key in top_level}
+                if len(kept) != len(content.branch_digests):
+                    content = content.model_copy(update={"branch_digests": kept})
+        per_code: dict[str, int] = {}
+        for item in outcome.applied:
+            per_code[item.code] = per_code.get(item.code, 0) + 1
+        auto_repair = {
+            "steps": outcome.steps,
+            "codes": per_code,
+            # 看到了但没修的（引用并集超过契约上限、或被合并后子节点超过 50 个）。
+            # **必须报出来**：静默跳过会让"这棵树怎么还有一处重名"变成一个只在
+            # 用户那里发生、查不出来的问题。
+            "skipped": len(outcome.skipped),
+            "nodes_before": nodes_before,
+            "nodes_after": shapes.count_nodes(content),
+        }
+        if outcome.steps or outcome.skipped:
+            detail = "、".join(
+                f"{_AUTO_REPAIR_RULE_NAMES.get(code, code)} {count} 处"
+                for code, count in sorted(per_code.items(), key=lambda pair: -pair[1]))
+            diagnostics.append(Diagnostic(
+                level=DiagnosticLevel.info, code="STRUCTURE_AUTO_REPAIRED",
+                message=(
+                    f"生成收尾顺手修了 {outcome.steps} 处结构冗余"
+                    + (f"（{detail}）" if detail else "")
+                    + f"，节点 {nodes_before} → {auto_repair['nodes_after']}。"
+                    "只动了「修法唯一」的那几条：被并掉节点的子树、引用、说明都并进了"
+                    "保留者，没有删掉任何内容"
+                    + (f"；另有 {len(outcome.skipped)} 处没修（合并后超出契约上限或诊断"
+                       "过期），它们在结构体检里仍然看得到"
+                       if outcome.skipped else "")
+                    + "。"
+                ),
+            ))
+
     # 结构与语义两层复核（与 `_generate_deep` 的收尾同一份）：诊断只是提示，
     # 不影响这棵树能不能用——契约校验在上一步就决定过了。
     diagnostics.extend(check(content))
@@ -10776,7 +10901,9 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     # 跨支重复：分片那条路的结构性缺陷，也是这次回到一次生成要说清的那条收益。
     # **只报不删**（判据与理由见 `_cross_branch_duplicates`）。放在 `check()` 之后：
     # 它比同级重名更"远"，读诊断的人应该先看到结构问题、再看到内容重复。
-    duplicates = _cross_branch_duplicates(content.root)
+    #
+    # 判据本身跑在**修复之前**（见上面那一段最后一条注释）：这里只负责把它说出来，
+    # 所以这一行不再是计算，`duplicates` 早就取好了。
     if duplicates:
         diagnostics.append(Diagnostic(
             level=DiagnosticLevel.warn, code="CROSS_BRANCH_DUPLICATE",
@@ -11116,6 +11243,14 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         # 账放这里、产物放契约：`branch_digests` 是这张图的属性（要落库），而"这次
         # 调了几秒、输入输出多少 token、哪几支没写出来"是一次运行的读数。
         data["branch_digest"] = digest_report.account()
+    if auto_repair is not None:
+        # 开关关着 / 非树图型时没有这个键（那时 `data` 的键集与接线之前逐字节相同
+        # ——回归用例比的是键集，不只是值）。开关**默认开**，所以缺这个键等于
+        # "这次收尾没做确定性修复"，是一个需要能读出来的状态。
+        #
+        # 报的是读数而不是产物：树上已经没有那些冗余了（`check()` 也报不出来），
+        # 而"修了几处、哪几条规则动手、少修了几处"只能从这里读。
+        data["auto_repair"] = auto_repair
     if shape.skip != "off":
         # 开关开着才有这个键（关着时 `data` 的键集与改动之前逐字节相同——回归用例比的
         # 是键集，不只是值）。放进 `data` 而不是给 `Node` / 契约加字段：`data` 是
