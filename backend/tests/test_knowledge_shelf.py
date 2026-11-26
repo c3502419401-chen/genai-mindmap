@@ -29,8 +29,15 @@ import sqlite3
 import pytest
 from conftest import guest_client
 
-from app.contracts.mindmap import MindMapContent
-from app.contracts.source import Source, SourceKind
+from app.contracts.mindmap import (
+    FishboneBone,
+    FishboneContent,
+    FlowContent,
+    FlowStage,
+    MindMapContent,
+    Node,
+)
+from app.contracts.source import Source, SourceKind, SourceUsage
 from app.knowledge import library, shelf
 from app.mindmaps import repository
 
@@ -165,6 +172,95 @@ def test_citation_in_both_usage_and_refs_counts_as_one_map(client):
     item = client.get("/api/knowledge/library").json()["items"][0]
 
     assert item["cited_by"] == 1
+
+
+# ------------------------------------------- 2a 引用计数要认三种 content 形状
+
+
+def _save_flow_map(*, refs: list[str], title: str = "流程") -> str:
+    """存一张**流程图**，引用只挂在第二个阶段内部的孙节点上。
+
+    挂得这么深是刻意的：`FlowContent` 没有 `.root`，节点藏在 `stages[i].root`
+    里。一个"只取 `stages[0].root`"或者"只读阶段根"的半吊子实现都会漏掉这条引用，
+    于是这条用例能同时钉住"不崩"和"真的遍历进去了"。
+
+    `source_usage` 里也要带上同一份来源：契约硬拒"节点引用了没写进 `source_usage`
+    的来源"，而真实流程图两者都有。
+    """
+    content = FlowContent(
+        title=title,
+        source_usage=[_usage(ref) for ref in refs],
+        stages=[
+            FlowStage(id="s_1", root=Node(id="f_a", label="提交", children=[
+                Node(id="f_a1", label="填表"),
+            ])),
+            FlowStage(id="s_2", root=Node(id="f_b", label="审核", children=[
+                Node(id="f_b1", label="核验", children=[
+                    Node(id="f_b11", label="对账",
+                         source_refs=[{"source_id": ref} for ref in refs]),
+                ]),
+            ])),
+        ],
+    )
+    return repository.create_map(content).id
+
+
+def _save_fishbone_map(*, refs: list[str], title: str = "鱼骨") -> str:
+    """存一张**鱼骨图**，引用只挂在第二根骨内部的孙节点上（理由同上）。"""
+    content = FishboneContent(
+        title=title,
+        problem="为什么报销要 11 天",
+        source_usage=[_usage(ref) for ref in refs],
+        bones=[
+            FishboneBone(category="人", root=Node(id="h_1", label="人", children=[
+                Node(id="h_11", label="审批人休假"),
+            ])),
+            FishboneBone(category="法", root=Node(id="l_1", label="法", children=[
+                Node(id="l_11", label="制度含糊", children=[
+                    Node(id="l_111", label="没写额度",
+                         source_refs=[{"source_id": ref} for ref in refs]),
+                ]),
+            ])),
+        ],
+    )
+    return repository.create_map(content).id
+
+
+def _usage(source_id: str) -> SourceUsage:
+    return SourceUsage(source_id=source_id, kind=SourceKind.text, char_count=10)
+
+
+def test_listing_survives_flow_and_fishbone_maps(client):
+    """库里存着一张流程图 + 一张鱼骨图时，`GET /api/knowledge/library` 必须 200。
+
+    **这条用例钉的正是"扫描只认一种形状"这个 500**：`_scan_cited_counts` 原先直接
+    读 `content.root`，而 `FlowContent`（阶段在 `stages[i].root`）与 `FishboneContent`
+    （骨在 `bones[i].root`）都没有这个属性——一张流程图躺在库里就足以让整个知识库
+    列表抛 `AttributeError`，而"被几张图引用"本来只是**旁路展示**，它不该把入口
+    打挂（`shelf` 的模块注释里那一条承诺）。
+
+    断言分三半：
+      - 200（形状不认识也只是计数错，不能 500）；
+      - 读回来的形状**真的是**流程图/鱼骨图，否则这条用例测的是一个不存在的形状
+        （判别一变，它就静默变成"两张树"然后永远绿）；
+      - 两份材料的 `cited_by` 都是 1，引用挂在阶段/骨的深处——证明遍历真的走进了
+        `stages[i]` / `bones[i]` 内部，而不是"没崩但一个节点都没数"。
+    """
+    in_flow = _ingest(_material(1))
+    in_bone = _ingest(_material(2))
+    flow_id = _save_flow_map(refs=[in_flow])
+    bone_id = _save_fishbone_map(refs=[in_bone])
+    assert isinstance(repository.get_map(flow_id).content, FlowContent)
+    assert isinstance(repository.get_map(bone_id).content, FishboneContent)
+
+    response = client.get("/api/knowledge/library")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["total"] == 2
+    items = {item["source_id"]: item for item in body["items"]}
+    assert items[in_flow]["cited_by"] == 1
+    assert items[in_bone]["cited_by"] == 1
 
 # ------------------------------------------------- 2b 引用计数的缓存
 
