@@ -803,3 +803,85 @@ $ python scripts/acc3/find_unwired.py --gate
 是棘轮——绝对闸门会在这 5 条上立刻红，而其中 3 条的正确处置是"降级可见性或删半句
 注释"，和两条真缺口混在同一个红灯里，红几次之后就没人看了。
 
+## 十三、五条 `todo` 的处置（已落地）
+
+读数变化：`515 / 66 / 11 / 5` → **`522 / 65 / 8 / 0`**（顶层公开函数 / 零引用 / 可疑 /
+待判）。新增的 7 个公开函数全部被产品接线或由路由装饰器豁免，所以「真正可疑」从 11 掉
+到 8，`todo` 清零，`--gate` 仍然通过。基线里那五条：三条删掉（它们已经不在零引用清单里
+了），两条改 `accepted`。
+
+| 条目 | 处置 | 落在哪儿 |
+|---|---|---|
+| `graph_store.close_driver` | 删掉"进程退出也调它"那半句（函数 docstring + 模块 docstring「驱动是模块级惰性单例」那段）；**不接退出钩子**。`status=accepted`，与 `reset_graph_notices` 同类 | `app/knowledge/graph_store.py` |
+| `graph_store.add_edge` | 改成 `add_edges_bulk([EdgeInput(...)]) > 0` 的薄封装，**删掉独立的 `CYPHER_ADD_EDGE`**；模块 docstring 里三处提及改成"两者共用一份校验"。`status=accepted` | 同上 |
+| `graph_resolve.resolve_entities` | 写进新的 `__all__`（`resolve_entities` / `find_merge_candidates` / `MergeCandidate`），docstring 写清"产品没有触发点，这是设计" | `app/knowledge/graph_resolve.py` |
+| `graph_store.clear_aliases` | 接线成 `DELETE /api/knowledge/aliases`；同一族加了 `GET /api/knowledge/aliases`（清单）与 `DELETE /api/knowledge/aliases/{alias}`（删一条，`graph_store.delete_alias` 是新的）。前端在知识库抽屉里加「实体别名」折叠区 | `app/knowledge/graph_store.py`、`app/knowledge/router.py`、`frontend/src/App.vue` |
+| `library.forget` | 接线成 `DELETE /api/knowledge/library/{source_id}`（`shelf.delete_entry`），被引用时先回 409、`?force=true` 才真删；前端列表项加删除按钮 | `app/knowledge/{library,shelf,router}.py`、`frontend/src/App.vue` |
+
+### 13.1 两处 §12.4 的判断与代码不符（照原样做会做错）
+
+**一、`add_edge`「被注释提到 24 次」——那 24 次里 19 次不是它。**
+
+`find_unwired.py` 的 `text` 列数的是 `\badd_edge\b` 在 `app/` 下的字面出现次数（减掉
+定义行），确实是 24。但逐处读一遍：`agent/ops.py` 的 `Literal["add_edge"]`、
+`_EDGE_ID_OPS`、`tools.py` 的 `ToolSpec(name="add_edge")`、`15461`/`16506`/`16535` 那几处
+"边 op 分流"的注释——它们说的是**生成层的边 op 名**，与 `graph_store.add_edge` 是两个
+东西。真正指这个函数的只有 6 处（`graph_store.py` 的模块 docstring 3 处 + `EdgeInput` /
+`_prepare_edge` / `add_edges_bulk` 的 docstring，`graph_ingest.py:109` 1 处）。
+
+所以 §12.4 给的两条路里，"把那些注释改指向 `add_edges_bulk`"在 19 处上是**改错**：改完
+之后 `ops.py` 与 `tools.py` 的注释会指向一个与 op 语义无关的函数。第二条路（做成薄封装）
+是对的，而且顺带把那条独立的 `CYPHER_ADD_EDGE` 删掉了——现在"单条"与"批量"只有一份
+`_prepare_edge`、一份 `MERGE`，"单条写得进去、批量写不进去"在结构上不再可能。
+
+**二、`resolve_entities`「产品路径走 `graph_resolve` 内部的批量入口」——不成立。**
+
+`find_merge_candidates` 的引用者只有 `resolve_entities`（`graph_resolve.py:632`），而
+`resolve_entities` 的调用者只有用例。也就是说产品里**没有任何一层**走过别名生成：不是
+"公开单条入口、内部用批量"，而是整条编排没有触发点。§12.4 把"不该接上"这个结论判对了
+（理由另外成立：它要 Neo4j + embedding 额度，`dry_run=False` 还是不可逆写），但归因写
+错了。处置按"可见性"做：在 `__all__` 里声明它是外部/运维入口，docstring 写清产品不调用。
+
+### 13.2 `forget` 的 a/b/c：选 **a（硬删）+ 引用前置确认**
+
+§12.4 的设计前置是"删掉被 3 张图引用的材料，那 3 张图怎么办"。三个选项逐一过：
+
+- **b 软删**（标记删除、清正文、留 `source_refs`）：它买的只有一句更好的诊断措辞（"这份
+  材料被删了"而不是"来源不存在"）。代价是一次 schema 迁移、一遍读路径过滤、外加"重新
+  上传同一份 `content_hash` 撞上墓碑"的复活规则——而 `SOURCE_TEXT_UNAVAILABLE` 已经把
+  "删了但引用还在"表达清楚了。为措辞加一条链路，不划算。
+- **c 拒删**（被引用就不许删）：在没有"解除引用"入口的世界里等于"永远删不掉被引用的
+  材料"，是死路；用户撞上的形态会是"我要删它，它说先解除引用，而解除引用的按钮不存在"。
+- **a 硬删**：与"删除"的语义一致、可逆性由用户承担、零迁移。缺的那一块是"用户不知道
+  后果"——所以补的不是软删，是**把代价提前说清**：未引用直接删；有引用先回 409
+  （`detail.cited_by`），确认框里写明"那 N 张图的引用会显示「来源原文不可用」，且无法
+  恢复"，确认后才 `?force=true`。
+
+**数据完整性 vs 用户预期，这里用户预期赢**，依据是删除动机的分布：绝大多数删除是"传错
+了 / 重复了 / 不该传"，这类材料通常 `cited_by == 0`（直接删）；真有引用的那一批，用户
+已经在确认框里看到了代价，而且**请求删除是显式意志**。硬删之后导图不坏：`source_refs`
+是值对象、没有外键，节点与边一条不少，只是那条引用查不到原文——`tests/test_knowledge_delete.py`
+用一张真存的图钉着这一点（`force` 删完，图里 `source_refs` 仍在，`GET` 原文 404）。
+
+### 13.3 用同一把尺子重新判：还剩几条"用户撞上才发现"
+
+§12.4 的尺子是"3 条不影响用户、2 条没人知道存在"。销账之后重新量，**还剩两条，而且
+第一条比原来那五条都重**：
+
+1. **实体消解没有产品入口——"合并"这个能力在产品里等于不存在。** 这一轮把"删错别名"
+   补上了，但别名**只由 `resolve_entities` 产生**，而它没有路由、没有脚本、没有自动
+   触发。现在的状态是：删除入口有、清单入口有、产生入口没有。用户撞上的形态不是"我改
+   不了别名"，而是 **"跨材料同名不同写法永远合不起来"**——`neighbors("市场监管总局")`
+   返回空，与"这两份材料确实无关"逐字节相同。这是本文件第一节到第十一节反复在说的同一
+   类哑失败，只是换到了合并这一层。做它比"接线"重：一次要 Neo4j + embedding 额度、要
+   长任务的进度反馈、还要一个"候选预览 → 确认"的两步界面。**下一轮第一顺位。**
+2. **"上传了但没生成过"的材料不在库里，删不掉。** 入库发生在生成时，所以用户"刚传错
+   一份材料、还没生成"时，它既不在知识库列表里，也没有删除入口——而这类材料恰好是删除
+   动机最强的一类。修法要么改入库时机（上传即入库，但那时还没有 `source_id` 契约），
+   要么给"本次会话的来源"一个清空入口。它比第 1 条轻，但症状一样：**没有按钮，于是用户
+   认为"这个产品不支持"。**
+
+另有两处**不算缺口**、记一笔：`library.prune`（"不自动调用"，库会一直涨——不过现在有
+手动删除，最坏情况可控）；`chunk_vectors` 删材料后不清（按 `content_hash` 缓存，重传
+命中是收益，膨胀不可见）。
+

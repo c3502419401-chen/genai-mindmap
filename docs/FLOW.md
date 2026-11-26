@@ -79,7 +79,7 @@ flowchart TD
 | 诊断面板（待接入） | `POST /api/optimization/check` / `/suggest` | 接口已实现，界面还没渲染 `diagnostics`；建议需用户确认后再改 |
 | 引用展示 | 无请求（读 `node.source_refs`） | **已接入**：`src/mindmap/refs.ts` 负责定位与截断，节点右上角显示引用条数，选中后在详情面板列出来源与位置，点一条在右侧抽屉里看原文并高亮命中句；左侧来源行反向显示"被 N 个节点引用"，点节点名跳转（`buildRefIndex`）；原文只在本次会话可回查 |
 | 正文编辑 | 随保存一起发（`note`） | **已接入**：详情面板的 textarea 编辑 `node.note`（≤2000 字，Esc 放弃），失焦或 Ctrl+S 提交；画布与导出都取 `note or label`，朝向（`layout` / `theme.direction`）也随保存与打开往返 |
-| 知识库入口 | `GET /api/knowledge/library` / `.../{source_id}` | **已接入**：顶栏"知识库"抽屉列出库里材料、每份"被几张导图引用"、点开看正文前 4000 字；材料在**生成时**才入库，入库后的持久 id 由 `sources` 帧回传、前端就地换（`sources.remap`），所以保存的导图与节点引用重开仍对得上 |
+| 知识库入口 | `GET /api/knowledge/library` / `.../{source_id}`、`DELETE .../{source_id}`、`GET/DELETE /api/knowledge/aliases*` | **已接入**：顶栏"知识库"抽屉列出库里材料、每份"被几张导图引用"、点开看正文前 4000 字，**并能在列表上直接删掉传错的那份**（被引用时先确认，删掉之后那些节点的引用显示「来源原文不可用」）；抽屉里还有一节「实体别名」，列出模型"把两个名字认成一个"的合并结果并可删掉错的那条（实体与证据边不受影响）。材料在**生成时**才入库，入库后的持久 id 由 `sources` 帧回传、前端就地换（`sources.remap`），所以保存的导图与节点引用重开仍对得上 |
 | 运行台账 | `GET /api/agent/runs` 系列、`POST /api/agent/runs/{id}/applied` | **已接入**：`stores/chat.ts` + `ChatDock.vue` 的「上次的结果」块，启动时 `main.ts` 调 `probeResumableRun()` 找回未收尾的运行，点「载入」调 `resumeRun()`；采纳后标 applied |
 | 对话与节点工具条 | `POST /api/agent/runs/stream` | **已接入**：`ChatDock.vue`（右下对话）、`MessageFab.vue`、`NodeToolbar.vue`（选中节点后的快捷操作）、`VoicePress.vue`（按住说话） |
 | 用户偏好 | `GET/PUT/DELETE /api/prefs`、`GET /api/prefs/suggestions` | **已接入**：`stores/prefs.ts` + `PrefsPanel.vue`，图型与思考模型的选择会记住 |
