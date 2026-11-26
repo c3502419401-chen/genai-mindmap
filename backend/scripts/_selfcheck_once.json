@@ -1,0 +1,137 @@
+{
+  "run_id": "3d71b0ab5ace4a5d9587b599929b455f",
+  "created_at": "2026-11-21T04:41:09.912Z",
+  "before": {
+    "nodes": 80,
+    "duplicates": 2,
+    "codes": {
+      "SINGLE_CHILD": 1
+    }
+  },
+  "repair": {
+    "applied": 1,
+    "skipped": 0,
+    "nodes": 79,
+    "duplicates": 2
+  },
+  "review": {
+    "seconds": 3.0,
+    "issues": 10,
+    "verdicts": {
+      "unjudged": 3,
+      "near": 2,
+      "strict": 2,
+      "none": 1,
+      "unverified": 2
+    },
+    "recall": "2/2"
+  },
+  "after_fix": {
+    "nodes": 77,
+    "merged": 3,
+    "duplicates": 0,
+    "codes": {
+      "SINGLE_CHILD": 1
+    }
+  },
+  "rows": [
+    {
+      "kind": "cross_branch_duplicate",
+      "nodes": [
+        "c1-2-3",
+        "c5-1-2"
+      ],
+      "verdict": "unjudged",
+      "note": "字面判据判不了，需人看",
+      "why": "「深度学习」在核心概念分支作为学习范式，又在实验教学分支作为课程内容重复出现，属同一概念跨一级分支重复。"
+    },
+    {
+      "kind": "cross_branch_duplicate",
+      "nodes": [
+        "c1-3-1",
+        "c2-3-1"
+      ],
+      "verdict": "near",
+      "note": "",
+      "why": "支持向量机在核心概念模型谱系与电力负荷预测典型模型中重复出现。"
+    },
+    {
+      "kind": "cross_branch_duplicate",
+      "nodes": [
+        "c1-3-2",
+        "c2-3-1"
+      ],
+      "verdict": "near",
+      "note": "",
+      "why": "随机森林在核心概念模型谱系与电力负荷预测典型模型中重复出现。"
+    },
+    {
+      "kind": "cross_branch_duplicate",
+      "nodes": [
+        "c1-3-3",
+        "c2-3-3"
+      ],
+      "verdict": "strict",
+      "note": "",
+      "why": "梯度提升树在核心概念模型谱系与电力负荷预测典型模型中重复出现。"
+    },
+    {
+      "kind": "cross_branch_duplicate",
+      "nodes": [
+        "c1-3-4",
+        "c2-3-2"
+      ],
+      "verdict": "strict",
+      "note": "",
+      "why": "长短期记忆网络在核心概念模型谱系与电力负荷预测典型模型中重复出现。"
+    },
+    {
+      "kind": "cross_branch_duplicate",
+      "nodes": [
+        "c1-5-2",
+        "c2-4-1"
+      ],
+      "verdict": "unjudged",
+      "note": "字面判据判不了，需人看",
+      "why": "多源异构数据融合在核心概念数据特点与电力负荷预测框架中重复出现。"
+    },
+    {
+      "kind": "sibling_duplicate",
+      "nodes": [
+        "c2-5-1",
+        "c2-5-2"
+      ],
+      "verdict": "unjudged",
+      "note": "字面判据判不了，需人看",
+      "why": "「误差降低15%以上」与「融合型深度学习表现最优」同属预测效果，前者是后者的量化结果，讲同一件事。"
+    },
+    {
+      "kind": "chain",
+      "nodes": [
+        "c3-3",
+        "c3-3-1"
+      ],
+      "verdict": "none",
+      "note": "父有 2 个孩子，被点的也不同义",
+      "why": "「机器学习与深度学习方法」下仅挂「提供高效预测方案」，父子为同一件事的两层说法。"
+    },
+    {
+      "kind": "label_detail_mismatch",
+      "nodes": [
+        "c4-1-1"
+      ],
+      "verdict": "unverified",
+      "note": "",
+      "why": "节点标题为「营改增下的纳税管理」，子节点却讲「2013年8月起试点改革」，是时间背景而非纳税管理本身。"
+    },
+    {
+      "kind": "orphan",
+      "nodes": [
+        "c4-1"
+      ],
+      "verdict": "unverified",
+      "note": "",
+      "why": "「营改增下的纳税管理」属财税政策内容，与「财务报销流程优化」主题关联弱，且其子节点讲税改试点与税负，偏离流程优化。"
+    }
+  ]
+}

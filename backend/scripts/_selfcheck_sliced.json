@@ -1,0 +1,188 @@
+{
+  "run_id": "410ba3d050b64f15b0f166783cf1e4c7",
+  "created_at": "2026-11-17T12:17:58.024Z",
+  "before": {
+    "nodes": 57,
+    "duplicates": 3,
+    "codes": {}
+  },
+  "repair": {
+    "applied": 0,
+    "skipped": 0,
+    "nodes": 57,
+    "duplicates": 3
+  },
+  "review": {
+    "seconds": 4.7,
+    "issues": 15,
+    "verdicts": {
+      "strict": 3,
+      "unjudged": 5,
+      "near": 3,
+      "cross_subtree": 1,
+      "none": 2,
+      "unverified": 1
+    },
+    "recall": "3/3"
+  },
+  "after_fix": {
+    "nodes": 51,
+    "merged": 6,
+    "duplicates": 0,
+    "codes": {
+      "NEAR_DUPLICATE_LABEL": 2,
+      "SHALLOW_BRANCH": 1
+    }
+  },
+  "rows": [
+    {
+      "kind": "cross_branch_duplicate",
+      "nodes": [
+        "n_7511a4b299a946c383127c94d24be5f8",
+        "n_ed66c6b929eb4db3b7bda64928794857"
+      ],
+      "verdict": "strict",
+      "note": "",
+      "why": "「无监督学习：无标注找结构」在分类体系的两条子分支下字面重复出现。"
+    },
+    {
+      "kind": "cross_branch_duplicate",
+      "nodes": [
+        "n_8d6d2f8411c74b36a5ae6b6d23769e77",
+        "n_d6a3b40189754988bfc9ccf833c67ccc"
+      ],
+      "verdict": "unjudged",
+      "note": "字面判据判不了，需人看",
+      "why": "监督学习在「按学习范式」与「按任务目标」两条分支下重复出现，只是措辞略异。"
+    },
+    {
+      "kind": "cross_branch_duplicate",
+      "nodes": [
+        "n_c38baffafd4648a298df3a98fe0fcf09",
+        "n_885d802177364edbb6f10d791caef585"
+      ],
+      "verdict": "strict",
+      "note": "",
+      "why": "「半监督与强化学习」在分类体系与模型与方法两条一级分支下重复。"
+    },
+    {
+      "kind": "cross_branch_duplicate",
+      "nodes": [
+        "n_bbd7a1e6a1044aa9b6cfaa263a3a23b7",
+        "n_12bb59f944c4410fa62541e8b1946e83"
+      ],
+      "verdict": "near",
+      "note": "",
+      "why": "「按学习范式划分」在分类体系与模型与方法两条一级分支下重复。"
+    },
+    {
+      "kind": "cross_branch_duplicate",
+      "nodes": [
+        "n_8e5be062214a4b9b9981ecf4070e8460",
+        "n_cfdb94f851b04b3390b574ccc8181e9e"
+      ],
+      "verdict": "unjudged",
+      "note": "字面判据判不了，需人看",
+      "why": "线性模型与核方法在分类体系与模型与方法两条分支下重复。"
+    },
+    {
+      "kind": "cross_branch_duplicate",
+      "nodes": [
+        "n_c532971bba1f49508f706adb4436f91e",
+        "n_17f37513d4b74cd79ea428660d8efc5e"
+      ],
+      "verdict": "near",
+      "note": "",
+      "why": "树模型与集成方法在两条一级分支下重复。"
+    },
+    {
+      "kind": "cross_branch_duplicate",
+      "nodes": [
+        "n_341ce620523a403c9ee424231b243af6",
+        "n_23bbe75abbe7493bae2c2d8ceb9b6650"
+      ],
+      "verdict": "unjudged",
+      "note": "字面判据判不了，需人看",
+      "why": "神经网络与深度/概率图模型家族在两条一级分支下重复。"
+    },
+    {
+      "kind": "cross_branch_duplicate",
+      "nodes": [
+        "n_bda6999a14904e68825d261716c183b8",
+        "n_9debdeb1c2874755a2bb44d39d701164"
+      ],
+      "verdict": "strict",
+      "note": "",
+      "why": "「Python 库与框架」在软件与参考分支下既作子节点又作一级子分支，重复。"
+    },
+    {
+      "kind": "sibling_duplicate",
+      "nodes": [
+        "n_5c133014449244ea81267b44dbb625c8",
+        "n_9debdeb1c2874755a2bb44d39d701164"
+      ],
+      "verdict": "unjudged",
+      "note": "字面判据判不了，需人看",
+      "why": "「开源机器学习软件套件」与「Python 库与框架」同属软件与参考，内容高度重叠。"
+    },
+    {
+      "kind": "sibling_duplicate",
+      "nodes": [
+        "n_d0ed8aaf8035451dab8e040ba6caa97e",
+        "n_bda6999a14904e68825d261716c183b8"
+      ],
+      "verdict": "unjudged",
+      "note": "字面判据判不了，需人看",
+      "why": "「自由开源软件套件」与「Python 库与框架」在同一父节点下讲同一件事。"
+    },
+    {
+      "kind": "sibling_duplicate",
+      "nodes": [
+        "n_f348cb7a77614756bc2aeefb073d4fcb",
+        "n_e60acd3d4b8445f2bf9bf73b2e030771"
+      ],
+      "verdict": "near",
+      "note": "不在同一父下（跨子树）",
+      "why": "「偏差-方差分解」在理论基础的两条子分支下重复出现。"
+    },
+    {
+      "kind": "sibling_duplicate",
+      "nodes": [
+        "n_8a4097d5fef043cebaf4eb9787bb11dc",
+        "n_78821a6d7e914610b95e2e1a9751c48b"
+      ],
+      "verdict": "cross_subtree",
+      "note": "不在同一父下（跨子树）",
+      "why": "「复杂度与过拟合欠拟合」与「欠拟合与过拟合两端」讲同一件事。"
+    },
+    {
+      "kind": "chain",
+      "nodes": [
+        "n_9a82cb40662a4353ac91c7b15292e10e",
+        "n_809c1d073e534967903c9691a67054b8"
+      ],
+      "verdict": "none",
+      "note": "父有 3 个孩子，被点的也不同义",
+      "why": "「源自人工智能的探索」只是父节点「机器学习是人工智能的子领域」的同义展开，白占一层。"
+    },
+    {
+      "kind": "chain",
+      "nodes": [
+        "n_a604667649c940af8ea87fe636325d33",
+        "n_4ea20ae61fc3477ebfb59ae7a1a076aa"
+      ],
+      "verdict": "none",
+      "note": "父有 3 个孩子，被点的也不同义",
+      "why": "「三要素：T、P、E」只是父节点「以Mitchell三要素界定学习」的复述。"
+    },
+    {
+      "kind": "label_detail_mismatch",
+      "nodes": [
+        "n_9a82cb40662a4353ac91c7b15292e10e"
+      ],
+      "verdict": "unverified",
+      "note": "",
+      "why": "标题讲「是人工智能的子领域」，子节点却在讲历史来源、数据优化、与符号主义并存，与标题不是一回事。"
+    }
+  ]
+}
