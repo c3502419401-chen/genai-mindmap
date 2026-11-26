@@ -14,7 +14,6 @@ from app.generation.service import (
     GenerationError,
     _demo_content,
     chat_async,
-    diagnose_density,
     ensure_input_within_context,
     estimate_input_tokens,
     parse_model_json,
@@ -457,41 +456,6 @@ class ThinkingModelTest(unittest.TestCase):
         labels = [entry["label"] for entry in THINKING_MODELS.values()]
         self.assertEqual(len(labels), len(set(labels)))
         self.assertEqual(labels, ["通用", "第一性原理", "费曼", "5W1H", "批判性"])
-
-
-class DensityDiagnosticTest(unittest.TestCase):
-    """`diagnose_density()` 的规则：只出 warn 提示，不构成失败。"""
-
-    @staticmethod
-    def _content(sparse_children: int, dense_children: int) -> MindMapContent:
-        return MindMapContent.model_validate({
-            "title": "测试",
-            "root": {"id": "r", "label": "根", "children": [
-                {"id": "sparse", "label": "稀疏分支", "children": [
-                    {"id": f"s{index}", "label": f"要点{index}", "children": []}
-                    for index in range(1, sparse_children + 1)]},
-                {"id": "dense", "label": "充实分支", "children": [
-                    {"id": f"d{index}", "label": f"要点{index}", "children": []}
-                    for index in range(1, dense_children + 1)]},
-            ]},
-        })
-
-    def test_sparse_branch_is_reported_with_its_count(self):
-        diagnostics = diagnose_density(self._content(0, 2))
-        self.assertEqual(len(diagnostics), 1)
-        item = diagnostics[0]
-        self.assertEqual(item.code, "SPARSE_BRANCH")
-        self.assertEqual(item.level.value, "warn")
-        self.assertEqual(item.node_id, "sparse")
-        self.assertIn("稀疏分支", item.message)
-        self.assertIn("0 个要点", item.message)
-
-    def test_minimum_is_configurable(self):
-        diagnostics = diagnose_density(self._content(0, 2), minimum=3)
-        self.assertEqual([item.node_id for item in diagnostics], ["sparse", "dense"])
-
-    def test_dense_tree_has_no_diagnostic(self):
-        self.assertEqual(diagnose_density(self._content(2, 3)), [])
 
 
 if __name__ == "__main__":

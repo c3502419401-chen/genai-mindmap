@@ -1620,20 +1620,21 @@ def validate_generated_content(
     return content, diagnostics
 
 
-def diagnose_density(content: MindMapContent, *, minimum: int = 2) -> list[Diagnostic]:
-    """标出要点过少的分支。
+# 这里曾经还有一个 `diagnose_density(content, minimum=2) -> list[Diagnostic]`：
+# 按"一级分支的子节点数少于 minimum"产出 `SPARSE_BRANCH`，零调用方，已于本轮删除。
+#
+# 删它不是因为那个码没用，而是因为它**是同一件事的第二份、更弱的实现**：
+# `agent/tools.py::_generate_deep` 的分片路径在同一次生成里已经按"这一支要求几个
+# 要点、实际拿到几个"产出 `SPARSE_BRANCH`（`_audit_branches` + `need`），而且比这里
+# 多两件东西——它知道**要求**是多少（不是一个固定的 2），也说得清**为什么不足**
+# （补调过一次仍不够 / 额度不够），并把"从没展开过"和"展开失败"的分支排除掉，
+# 不重复告警（见 tools.py 里那段 `skipped_set` / `failed_set` 的注释）。
+#
+# 至于"要不要把它接进 `optimization.service.check()` 的规则层"：不接。`check()` 是
+# **已落库的图**的事后体检，判据必须是相对的、与生成过程无关的（`SHALLOW_BRANCH`
+# 就是"和同级比太浅"）；而密度是**生成期**的交付判据（模型被要求写 N 个要点，没写够）。
+# 把"这次没按量交"搬进事后体检，会在每一张导入图、每一张手改图上误报。
+# 也没有为它加前端 `DIAGNOSTIC_LABELS` 条目：生成链上的诊断在 `AgentPanel` 只渲染
+# `message`（后端给的中文整句），码本身不上屏，加标签是装饰。理由写在
+# `docs/WIRING-GAPS.md` 的第七节。
 
-    只作为提示，不构成失败：材料本身稀疏时，某个分支只有一个要点是合理的，
-    强行要求补写会逼模型编造。所以它产出 warn 级诊断，由调用方决定怎么用。
-    """
-    diagnostics: list[Diagnostic] = []
-    for branch in content.root.children:
-        count = len(branch.children)
-        if count >= minimum:
-            continue
-        diagnostics.append(Diagnostic(
-            level=DiagnosticLevel.warn, code="SPARSE_BRANCH", node_id=branch.id,
-            message=(f"分支「{branch.label}」只有 {count} 个要点，"
-                     f"少于建议的 {minimum} 个；材料稀疏时可以保留，不必强行补写"),
-        ))
-    return diagnostics
