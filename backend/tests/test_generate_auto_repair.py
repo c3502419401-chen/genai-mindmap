@@ -30,7 +30,8 @@ from app.agent.tools import (
     build_registry,
 )
 from app.contracts.mindmap import MAX_NODE_CHILDREN
-from app.optimization.repair import repair
+from app.generation.service import MIN_BRANCHES
+from app.optimization.repair import READABLE_LABEL_CHARS, repair
 
 TOPIC = "报销制度"
 BRANCHES = ["费用报销", "差旅报销", "审批流程"]
@@ -239,6 +240,65 @@ def test_a_merge_that_would_break_the_contract_is_skipped_and_reported():
     summary = [item for item in result.data["diagnostics"]
                if item["code"] == "STRUCTURE_AUTO_REPAIRED"][0]["message"]
     assert "没修" in summary
+
+
+# ------------------------------------------------- 2.5 修完之后也要有东西量
+#
+# 这一节的存在理由是一个真实的回归：压链把两层的标题拼成一句长话（31 字），
+# 契约（200）不管、`check()` 七条码里也没有"标题太长"，于是它一路交付到画布上，
+# 被 `line-clamp-2` 截成半句。**判据改了不等于以后不会再漏**——这两条钉的是闸。
+#
+# 分工：判据本身在 `test_optimization_repair.py`（`overlong_labels` 的 24/25 边界），
+# 这里钉的是**接线**——诊断真的发出来了、码名与级别对、话说清了是什么问题。
+
+
+def test_a_delivered_long_label_is_reported_after_the_repair():
+    """交付的树上还有超长标题时，必须有一条诊断说出来。
+
+    为什么要 monkeypatch：所有**写入口**现在都把 label 截到 16
+    （`GENERATED_LABEL_MAX_CHARS`），所以这条闸在正常路径上已经打不着东西了——
+    它防的是下一次有人改 `_joined_label` 时再拼出长句。判据用真函数、只是把一个
+    节点喂进去，接线走完整条 `_generate`。
+    """
+    overlong = [("b2-0", "字" * (READABLE_LABEL_CHARS + 6))]
+    ctx = _ctx()
+    with patch("app.agent.tools.overlong_labels", return_value=overlong):
+        result = _run(ctx, _chat(_tree()))
+    assert result.ok, result.content
+
+    reported = [item for item in result.data["diagnostics"]
+                if item["code"] == "LABEL_OVERLONG_IN_DELIVERY"]
+    assert len(reported) == 1, "一条说清，不许逐节点刷屏"
+    assert reported[0]["level"] == "warn"
+    assert str(READABLE_LABEL_CHARS) in reported[0]["message"]
+    assert "截成半句" in reported[0]["message"]
+
+
+def test_repair_that_drops_branches_below_the_floor_is_reported():
+    """修复把一级分支并到 `MIN_BRANCHES` 以下时要说出来。
+
+    生成入口那道 `enforce_min_branches` 判的是**修复之前**的树：3 条分支合法，通过；
+    而"合并两个同名一级分支"这条唯一能让它再掉一档的动作发生在它之后，所以修完
+    必须再量一次——否则用户拿到的是一张 2 支的图，而所有校验都说它合规。
+    """
+    tree = _tree()
+    # 两条一级分支同名 → 修复前 3 条（合法），合并后 2 条（低于下限）。
+    tree["root"]["children"][1]["label"] = tree["root"]["children"][0]["label"]
+
+    ctx = _ctx()
+    result = _run(ctx, _chat(tree))
+    assert result.ok, result.content
+
+    branches = len(ctx.candidate.root.children)
+    assert branches < MIN_BRANCHES, "这条用例的前提没成立：合并没压到下限以下"
+    reported = [item for item in result.data["diagnostics"]
+                if item["code"] == "STRUCTURE_FEW_BRANCHES_AFTER_REPAIR"]
+    assert len(reported) == 1
+    assert reported[0]["level"] == "warn"
+    assert f"少于 {MIN_BRANCHES} 条" in reported[0]["message"]
+    # 内容没丢：被并掉那一支的子树还在树上（合并是同名并一，不是删除）。
+    ids = _ids(ctx.candidate.model_dump())
+    assert {"b0", "b0-0-0", "b1-0", "b2"} <= ids
 
 
 # ---------------------------------------------------------------- 3. 不该动的没动

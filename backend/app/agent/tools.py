@@ -138,6 +138,7 @@ from app.knowledge.service import (
 from app.optimization import nli
 from app.optimization import verify as verify_step
 from app.optimization.repair import AUTO_REPAIRABLE_CODES
+from app.optimization.repair import READABLE_LABEL_CHARS, overlong_labels
 from app.optimization.repair import repair as repair_structure
 from app.optimization.service import check
 from app.prefs import profile as profile_rank
@@ -11402,6 +11403,10 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     # 还剩什么"，所以取修复之前的那一份（节点 id 在压链后仍然有效：压链保留内层 id）。
     duplicates = _cross_branch_duplicates(content.root)
     auto_repair: dict[str, Any] | None = None
+    #: 修复前的一级分支数。修复**能**把它压到 `MIN_BRANCHES` 以下（合并两个同名的一级
+    #: 分支就是 5 条变 4 条），而生成入口那道 `enforce_min_branches` 在修复**之前**就
+    #: 判完了——不留这个数，"修复把一张合规的图改成分支不足"这件事没人能量到。
+    branches_before = len(content.root.children)
     if diagram_type == "tree" and auto_repair_enabled():
         nodes_before = shapes.count_nodes(content)
         outcome = repair_structure(content, codes=AUTO_REPAIRABLE_CODES)
@@ -11458,6 +11463,43 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
                        "过期），它们在结构体检里仍然看得到"
                        if outcome.skipped else "")
                     + "。"
+                ),
+            ))
+
+    # ---- 修完之后再量一遍：修复自己也可能造出"没人量"的缺陷 --------------------
+    #
+    # 这一段的来历是一个真实的回归：压链把两层的标题拼成一句长话（31 字的
+    # 「基础：CSS 布局与事件循环清楚 / 浏览器渲染流程回答不完整」），契约（200 字）不
+    # 管它、`check()` 七条码里也没有"标题太长"这一条，于是它一路交付到画布上才被
+    # `line-clamp-2` 截成半句。修法已经改了（`repair._joined_label`），但**"改对了"
+    # 与"以后不会再错"是两件事**：没有这一道闸，下一次改动会以同样的方式再漏一遍。
+    #
+    # 两处都跑、分别报，而不是把生成入口那条挪到后面：
+    #   生成入口那条（`LABEL_CLIPPED_TO_GENERATED`）说的是"**模型**写了超过 16 字的
+    #   标题，已截短"；这一条说的是"**交付的这棵树上**有节点会被截成半句"。合成一条
+    #   就再也分不开"模型写长了"与"修复拼长了"这两种失效。
+    if isinstance(content, MindMapContent):
+        overlong = overlong_labels(content)
+        if overlong:
+            preview = "、".join(f"「{label}」" for _, label in overlong[:3])
+            diagnostics.append(Diagnostic(
+                level=DiagnosticLevel.warn, code="LABEL_OVERLONG_IN_DELIVERY",
+                message=(
+                    f"{len(overlong)} 个节点的标题超过 {READABLE_LABEL_CHARS} 字，画布上"
+                    f"会被截成半句（{preview}{'…' if len(overlong) > 3 else ''}）；"
+                    "完整标题在悬停提示里，长内容应该在 detail 里"
+                ),
+            ))
+        # 修复把一级分支压到下限以下：生成入口那道闸判的是修复**之前**的树，所以
+        # "合并两个同名一级分支"这条唯一能让它再掉一档的动作，修完没人复核。
+        branches_after = len(content.root.children)
+        if branches_before >= MIN_BRANCHES > branches_after:
+            diagnostics.append(Diagnostic(
+                level=DiagnosticLevel.warn, code="STRUCTURE_FEW_BRANCHES_AFTER_REPAIR",
+                message=(
+                    f"收尾修复把一级分支从 {branches_before} 条并成了 {branches_after} 条"
+                    f"（少于 {MIN_BRANCHES} 条），这棵树只剩 {branches_after} 支；"
+                    "合并的是同名分支，内容并进了保留者，要拆开可以撤销这一步"
                 ),
             ))
 
