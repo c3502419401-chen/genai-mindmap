@@ -529,3 +529,59 @@ def test_expand_intent_keeps_its_tools():
     """
     assert build_registry("expand", has_library=False).names() == [
         "audit_tree", "node_expand"]
+
+
+# ------------------------------------------------- 7. 检索该不该发（实测：白等几秒）
+
+
+def test_create_gets_no_rag_query_even_when_the_library_is_not_empty():
+    """`create` + 请求不带来源 + 库非空，同样拿不到 `rag_query`。
+
+    **这条是实测出来的，不是推的**（2026-11-26，86 份库来源的那个库）：
+    一次性生成的端到端 139.5 秒里，开头有两次 `tool_start rag_query`
+    （3520ms + 3318ms = 6.8 秒）——system 里那句"先调用 rag_query 检索"让模型先
+    查了两遍，然后才调 `mindmap_generate`；而生成工具内部本来就按章切分/按支各查
+    一次（`_intake` → `_retrieve_branches`）。外层查到的片段**进不了生成工具的任何
+    参数**，模型只能在文字里复述一遍。
+
+    改之前这里返回的是含 `rag_query` 的注册表：那句 system 下的工具列表里真有它，
+    于是"白等 6.8 秒"是必然会发生的，不是概率事件。
+    """
+    names = build_registry("create", has_sources=False, has_library=True).names()
+    assert "rag_query" not in names
+    # `expand` / `edit` 仍然要有：那两条路不读来源，"按材料补充这一支"没有它无从下手。
+    assert "rag_query" in build_registry("edit", has_sources=False,
+                                         has_library=True).names()
+    assert "rag_query" in build_registry("expand", has_sources=False,
+                                         has_library=True).names()
+
+
+def test_edit_and_expand_tell_the_model_when_not_to_retrieve(monkeypatch):
+    """`edit` / `expand` 的检索指令是**收窄**，不是禁止。
+
+    改之前 `_RAG_INTENT_RULES` 只有 `create` 一条，`edit` 拿到的是
+    `_INTENT_RULES` 里那句"精确修改已有导图"——**一个字都没提检索**，而注册表在有
+    库时把 `rag_query` 摆在模型面前。于是查不查取决于模型的临场判断：实测同一份
+    代码下，"把「工业过程减排」改短一点"4.2 秒（没查），"把这一支按材料补充一下"
+    15.1 秒（其中 7.3 秒是 `rag_query`）。
+
+    所以这里钉两件事，缺一条就退回现状：
+      1. 两个意图都有自己那句"默认不要检索"；
+      2. 仍然是**默认**——"按材料"这个合法场景必须留着口子。一刀切禁止会挡掉
+         "把这一支按材料补充一下""引文要和原文对上"这两类真实用法。
+    """
+    from app.agent import service
+
+    for intent in ("edit", "expand"):
+        rule = service._RAG_INTENT_RULES.get(intent)
+        assert rule, f"{intent} 没有检索指令，模型只能凭默认习惯决定查不查"
+        assert "不要检索" in rule
+        assert "按材料" in rule, f"{intent} 把合法场景也堵死了"
+    # `create` 那条不再叫模型自己查（生成工具内部会查），见上一条用例。
+    assert "不要再自己调检索工具" in service._RAG_INTENT_RULES["create"]
+
+    # 走真实选择器：有库时 edit 拿到的是**收窄过**的那一句，不是 `_INTENT_RULES`。
+    monkeypatch.setattr(service, "library_available", lambda: True)
+    request = AgentRunRequest(goal="把标题改短一点", intent="edit")
+    assert "不要检索" in service._intent_rule(request)
+
