@@ -77,6 +77,29 @@ def _user_env(name: str) -> str:
     return str(value)
 
 
+def _proxy_alive(url: str, timeout: float = 1.0) -> bool:
+    """代理端口通不通。**1 秒、只发 TCP 连接**，不发请求。
+
+    为什么要测：这个脚本原来把 `HTTP_PROXY` 写死成 `127.0.0.1:7897`（注释里那句
+    "实测走它 200"是当时的事实）。而代理是**人来开关的**——它一关，httpx 里每一个
+    请求（包括 DeepSeek 的）都会撞上 `ConnectError`，整批 10 轮在 4.8 秒内全红，
+    报错还长得像"模型服务不可用"。实测踩过一次：两臂各 10 轮 20 次全失败、
+    每轮 4.5–4.9 秒、`failure_kind=no_call`（一次响应都没回来）。
+    """
+    import socket
+    import urllib.parse
+
+    parsed = urllib.parse.urlparse(url)
+    host, port = parsed.hostname, parsed.port or 80
+    if not host:
+        return False
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def _prepare() -> None:
     for name in CREDENTIALS:
         if not os.environ.get(name):
@@ -92,11 +115,19 @@ def _prepare() -> None:
         "MINDMAP_OPTIMIZATION_CROSS_MAP", "MINDMAP_EXTERNAL_DEEPSEEK_SEARCH",
     ):
         os.environ[name] = "1"
-    # 本机代理（用户实测：走它 维基 200 / openalex 200 / crossref 200，直连超时）。
-    # 纯主题那一批的核对（`MINDMAP_VERIFY_AFTER_GENERATE`）与外部检索都要外网，
-    # 直连会静默降级成"搜到 0 篇"，那样 B+C 里的 C 看起来就像没生效。
-    for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
-        os.environ[name] = PROXY
+    # 本机代理：**通才设**。它只对外部检索（维基 / openalex / crossref）有用，而
+    # `thick`/`thin` 两批材料都在库里、不搜外网——代理一关还被写死进环境，就把
+    # DeepSeek 与 embedding 一起带进 ConnectError（见 `_proxy_alive` 的 docstring）。
+    proxy_names = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
+    if _proxy_alive(PROXY):
+        for name in proxy_names:
+            os.environ[name] = PROXY
+        print(f"代理 {PROXY} 可用，已设", flush=True)
+    else:
+        for name in proxy_names:
+            os.environ.pop(name, None)
+        print(f"代理 {PROXY} 不可用（端口通不了）→ 本批直连，外部检索会失效",
+              flush=True)
 
 
 def _snapshot_library(db_path: Path) -> None:
@@ -309,13 +340,23 @@ def _run_once(batch: str, index: int) -> dict:
         "seconds": seconds,
         "material_chars": sum(len(item.text or "") for item in sources),
         "sources": len(sources),
-        "calls": list(_CALLS),
+        # 只留响应记录 + prompt 的最大字数：一次生成有 5–27 次调用，把两类原始记录
+        # 全存进去会让 10 轮的 JSON 涨到几 MB，而判读只需要这几列。
+        "calls": [call for call in _CALLS if call.get("kind") == "response"],
+        "prompt_chars_max": max((call.get("prompt_chars", 0)
+                                 for call in _CALLS
+                                 if call.get("kind") == "prompt"), default=0),
     }
+    responses = row["calls"]
+    # 每一轮都记 token 峰值与 finish 集合——**成功轮也要**：用户要的是"失败那几轮
+    # 是不是顶满"与"成功那几轮长什么样"的对照，只记失败就无从对照。
+    row["completion_max"] = max((call.get("completion_tokens") or 0
+                                 for call in responses), default=0)
+    row["finish_set"] = sorted({str(call.get("finish")) for call in responses})
     if not result.ok:
         row["error"] = result.content[:300]
         # 失败分类（`docs/RETRIEVAL-KEEP.md` §4.2）：`length` = 输出被 max_tokens
         # 截断；`stop` + content 不是 JSON = 输出完整但跑了格式。两者修法不同。
-        responses = [call for call in _CALLS if call.get("kind") == "response"]
         truncated = any(call.get("finish") == "length" for call in responses)
         row["failure_kind"] = ("truncated" if truncated
                               else "format" if responses else "no_call")
@@ -366,6 +407,10 @@ def main() -> int:
     parser.add_argument("--batch", default="all",
                         choices=("thin", "thick", "topic", "all"))
     parser.add_argument("--repeat", type=int, default=2)
+    parser.add_argument(
+        "--resume", action="store_true",
+        help=("沿用同名的明细文件，跳过已经跑过的 (批次, 轮次)。10 轮是一次 100 分钟的"
+              "长跑，中途被中断后不该从第 1 轮重来——每一轮都落盘，这一项就是接着往下跑"))
     parser.add_argument("--topic", default="", help="覆盖纯主题那一批的主题")
     parser.add_argument(
         "--keep", default="on", choices=("on", "off"),
@@ -396,9 +441,24 @@ def main() -> int:
     print(f"材料快照 {len(_LIBRARY)} 份；库 {db_path.name}", flush=True)
 
     batches = ("thin", "thick", "topic") if args.batch == "all" else (args.batch,)
+    out = BACKEND / "data" / f"generation-strategy-keep-{args.keep}-{args.batch}.json"
     rows: list[dict] = []
+    done: set[tuple[str, int]] = set()
+    if args.resume and out.exists():
+        rows = json.loads(out.read_text(encoding="utf-8"))
+        done = {(row.get("batch"), row.get("run")) for row in rows}
+        print(f"续跑：已有 {len(rows)} 轮（{sorted(done)}）", flush=True)
+
+    def save() -> None:
+        """**每一轮都落盘**。10 轮 × 10 分钟是一次长跑，中途被挂掉不能再白跑一遍
+        （实测过一次：整段跑完前被中断，产物一个字都没有）。"""
+        out.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+
     for batch in batches:
         for index in range(1, args.repeat + 1):
+            if (batch, index) in done:
+                print(f"… {batch} #{index} 已有，跳过", flush=True)
+                continue
             print(f"… {batch} #{index}", flush=True)
             try:
                 row = _run_once(batch, index)
@@ -406,13 +466,12 @@ def main() -> int:
                 row = {"batch": batch, "run": index, "ok": False,
                        "error": f"{type(exc).__name__}: {exc}"}
             rows.append(row)
+            save()
             print(json.dumps({key: row.get(key) for key in (
                 "ok", "seconds", "node_count", "branches", "ref_coverage",
-                "citable", "citable_coverage", "failure_kind", "error")},
-                ensure_ascii=False), flush=True)
+                "citable", "citable_coverage", "completion_max", "failure_kind",
+                "error")}, ensure_ascii=False), flush=True)
 
-    out = BACKEND / "data" / f"generation-strategy-keep-{args.keep}-{args.batch}.json"
-    out.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n明细：{out}")
 
     print("\n批次    次  节点  分支  有引用/总   覆盖率  可引用  可引用覆盖率  裁剪  耗时")
@@ -449,24 +508,39 @@ def _report_aggregate(rows: list[dict], keep: str) -> None:
         return
     print(f"\n汇总（keep={keep}，共 {len(rows)} 次尝试）")
     print(f"{'批次':<8}{'成功':>5}{'失败':>5}{'失败率':>8}{'截断':>6}{'格式':>6}"
-          f"{'可引用覆盖率 均值':>18}{'极差':>10}{'节点数 均值':>12}{'极差':>8}")
+          f"{'可引用覆盖率 均值':>18}{'极差':>10}{'节点数 均值':>12}{'极差':>8}"
+          f"{'耗时 均值':>10}{'极差':>8}{'completion 均值':>16}{'最大':>8}")
     batches = sorted({row["batch"] for row in rows})
     for batch in batches:
         group = [row for row in rows if row["batch"] == batch]
         ok = [row for row in group if row.get("ok")]
-        truncated = sum(1 for row in group if row.get("failure_kind") == "truncated")
-        fmt = sum(1 for row in group if row.get("failure_kind") == "format")
+        fail = [row for row in group if not row.get("ok")]
+        truncated = sum(1 for row in fail if row.get("failure_kind") == "truncated")
+        fmt = sum(1 for row in fail if row.get("failure_kind") == "format")
         cite = [row.get("citable_coverage", 0.0) for row in ok]
         nodes = [row.get("node_count", 0) for row in ok]
+        times = [row.get("seconds", 0.0) for row in ok]
+        completions = [row.get("completion_max", 0) for row in group]
         mean_cite = statistics.mean(cite) if cite else 0.0
         spread_cite = (max(cite) - min(cite)) if cite else 0.0
         mean_nodes = statistics.mean(nodes) if nodes else 0.0
         spread_nodes = (max(nodes) - min(nodes)) if nodes else 0
-        print(f"{batch:<8}{len(ok):>5}{len(group) - len(ok):>5}"
-              f"{(len(group) - len(ok)) / len(group):>8.1%}"
+        mean_time = statistics.mean(times) if times else 0.0
+        spread_time = (max(times) - min(times)) if times else 0.0
+        print(f"{batch:<8}{len(ok):>5}{len(fail):>5}"
+              f"{(len(fail) / len(group)):>8.1%}"
               f"{truncated:>6}{fmt:>6}"
               f"{mean_cite:>17.1%}{spread_cite:>10.1%}"
-              f"{mean_nodes:>12.0f}{spread_nodes:>8}")
+              f"{mean_nodes:>12.0f}{spread_nodes:>8}"
+              f"{mean_time:>9.0f}s{spread_time:>7.0f}s"
+              f"{statistics.mean(completions):>16.0f}{max(completions):>8}")
+    # 失败轮与成功轮的 completion 峰值对照：这是"顶满了吗"的唯一直接证据。
+    ok_c = [row.get("completion_max", 0) for row in rows if row.get("ok")]
+    bad_c = [row.get("completion_max", 0) for row in rows if not row.get("ok")]
+    if ok_c and bad_c:
+        print(f"\ncompletion 峰值：成功轮 均值 {statistics.mean(ok_c):.0f} / "
+              f"最大 {max(ok_c)}；失败轮 均值 {statistics.mean(bad_c):.0f} / "
+              f"最大 {max(bad_c)}（max_tokens 天花板 32768）")
     failures = [row for row in rows if not row.get("ok")]
     if failures:
         print("\n失败明细（`finish` 里有没有 length = 是不是被截断）")
