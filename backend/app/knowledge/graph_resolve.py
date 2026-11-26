@@ -144,6 +144,16 @@ from app.knowledge.embedding import model_name as embedding_model
 
 logger = logging.getLogger(__name__)
 
+# 这一层对外的东西只有三个：候选（`MergeCandidate`）、只看不算的 `find_merge_candidates`、
+# 和"算 + 可选落库"的 `resolve_entities`。
+#
+# **`resolve_entities` 在产品里没有调用者，这是设计不是遗漏**：它一次要 Neo4j +
+# embedding 额度，而且 `dry_run=False` 是不可逆的写（落成别名边之后，`neighbors`
+# 的路径会变）。生成链路里没有任何一处该在用户请求的线程上做这件事，所以它只有
+# 手工/运维这一种触发方式。写进 `__all__` 是为了让"它是外部入口"这件事有唯一
+# 一处声明——而不是让零引用闸门把它误记成一条待接的线。
+__all__ = ["MergeCandidate", "find_merge_candidates", "resolve_entities"]
+
 # 余弦兜底阈值。**它不再是唯一判据**：子串关系走另一条路，不看分数。
 # 0.95 的下界由实测定：这次的错合「市场监管总局|市场监管部门」是 0.9241，兜底必须
 # 高于它才可能真的"只收近乎相同的"。宁可一个都不收，也不收一个错的。
@@ -628,6 +638,13 @@ async def resolve_entities(
 
     `aliases == 0` 且 `groups > 0` 且非 dry-run，说明这一遍是重跑（边早就在了）——
     幂等，不是失败。
+
+    **产品里没有触发点，而且不该有**：这条编排要 Neo4j + embedding 额度，
+    `dry_run=False` 又是一次不可逆的写。它只有手工/运维这一种跑法（`__all__` 里
+    声明了这一点）。落库之后要改一条猜错的别名，走
+    `DELETE /api/knowledge/aliases/{alias}`（`graph_store.delete_alias`），**不要
+    重跑这里**——重跑会按同一批阈值把删掉的那条重新猜一遍，而"猜错"正是阈值管不到
+    的那部分。
     """
     candidates = await find_merge_candidates(threshold=threshold)
     listing = _describe(candidates)

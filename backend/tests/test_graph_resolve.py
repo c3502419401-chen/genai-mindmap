@@ -38,6 +38,8 @@ from app.knowledge.graph_store import (
     add_edge,
     clear_aliases,
     close_driver,
+    delete_alias,
+    list_aliases,
     neighbors,
     resolve,
     stats,
@@ -434,6 +436,14 @@ class FakeAliasStore:
     def run(self, query: str, params=None, **_kwargs):
         params = dict(params or {})
         self.calls.append((query, params))
+        # 列清单要排在 `load_alias_map` 之前：两条语句都以 `RETURN a.name AS alias`
+        # 开头，只有带 `r.source AS source` 的那条是清单。
+        if "r.source AS source" in query:
+            return FakeResult([
+                {"alias": a, "canonical": c, "source": "embedding",
+                 "similarity": 0.97, "created_at": "2026-01-01T00:00:00.000Z"}
+                for a, c in sorted(self.aliases)
+            ])
         if "RETURN a.name AS alias" in query:
             return FakeResult([{"alias": a, "canonical": c}
                                for a, c in sorted(self.aliases)])
@@ -452,7 +462,14 @@ class FakeAliasStore:
                     self.aliases.add(pair)
                     created += 1
             return FakeResult(created=created)
-        if "DELETE r" in query:
+        # 删一条：`$canonical` 为 None 表示这个别名的全部指向都删。
+        if "WHERE a.name = $alias" in query:
+            target = params.get("canonical")
+            doomed = {(a, c) for a, c in self.aliases
+                      if a == params["alias"] and (target is None or c == target)}
+            self.aliases -= doomed
+            return FakeResult(deleted=len(doomed))
+        if "MATCH ()-[r:" in query and "DELETE r" in query:
             deleted = len(self.aliases)
             self.aliases.clear()
             return FakeResult(deleted=deleted)
@@ -551,6 +568,77 @@ def test_clear_aliases_returns_deleted_count(monkeypatch):
         monkeypatch, FakeAliasStore(nodes={"甲", "乙"}, aliases={("甲", "乙")}))
     assert clear_aliases() == 1
     assert store.aliases == set()
+
+
+# ------------------------------------------------- 3b. 别名的清单与单条删除
+#
+# 这两条是"模型猜错了能不能改回来"的全部后端形状：一条读得出全部别名（带落库依据），
+# 一条只删指定的那一对。它们都不碰 `REL`，所以"删别名"永远不会让证据消失。
+
+
+def test_list_aliases_reports_the_basis_for_each_edge(monkeypatch):
+    """清单要带上落库依据：`source` / `similarity` 是"这条凭什么加的"唯一线索。"""
+    install_alias_store(monkeypatch, FakeAliasStore(
+        nodes={"甲", "甲全称", "乙"}, aliases={("甲", "甲全称"), ("乙", "甲全称")}))
+
+    edges = list_aliases()
+
+    assert [(edge.alias, edge.canonical) for edge in edges] == [
+        ("乙", "甲全称"), ("甲", "甲全称")]
+    assert {edge.source for edge in edges} == {"embedding"}
+    assert {edge.similarity for edge in edges} == {0.97}
+
+
+def test_list_aliases_is_empty_when_the_store_is_unreachable(monkeypatch):
+    """读不到库返回 `[]`，与 `entity_degrees` / `stats` 的降级口径一致。"""
+    class Broken:
+        def run(self, *_args, **_kwargs):
+            raise graph_store.GraphStoreError("连不上")
+
+    monkeypatch.setattr(graph_store, "_transaction",
+                        lambda read_only=False: _pass_through(Broken()))
+
+    assert list_aliases() == []
+
+
+def test_delete_alias_removes_only_the_named_pair(monkeypatch):
+    """给了主名就只删那一对：同名不同类型的节点上，别名可能指向两个主名。"""
+    store = install_alias_store(monkeypatch, FakeAliasStore(
+        nodes={"甲", "乙", "丙"}, aliases={("甲", "乙"), ("甲", "丙")}))
+
+    assert delete_alias("甲", "乙") == 1
+    assert store.aliases == {("甲", "丙")}
+
+
+def test_delete_alias_without_canonical_removes_every_target(monkeypatch):
+    """不给主名就删这个别名的全部指向——界面按"这一对"删，API 留了更宽的形态。"""
+    store = install_alias_store(monkeypatch, FakeAliasStore(
+        nodes={"甲", "乙", "丙"}, aliases={("甲", "乙"), ("甲", "丙"), ("乙", "丙")}))
+
+    assert delete_alias("甲") == 2
+    assert store.aliases == {("乙", "丙")}
+
+
+def test_delete_alias_normalises_the_name_and_ignores_blank(monkeypatch):
+    """空白别名是一个**不存在的**东西：返回 0，不查库、不抛错。
+
+    路由层拿 0 翻成 404；这里若抛 ValueError，"删一个手滑的空输入"会变成 500。
+    """
+    store = install_alias_store(monkeypatch, FakeAliasStore(
+        nodes={"甲", "乙"}, aliases={("甲", "乙")}))
+
+    assert delete_alias("   ") == 0
+    assert store.calls == []  # 一条语句都没发
+    assert store.aliases == {("甲", "乙")}
+
+
+def test_delete_alias_is_a_no_op_for_an_unknown_name(monkeypatch):
+    """删一条本来就不在的别名返回 0（路由据此回 404），而不是抛错。"""
+    store = install_alias_store(monkeypatch, FakeAliasStore(
+        nodes={"甲", "乙"}, aliases={("甲", "乙")}))
+
+    assert delete_alias("丙") == 0
+    assert store.aliases == {("甲", "乙")}
 
 
 # ------------------------------------------------------------ 4. resolve 与防环

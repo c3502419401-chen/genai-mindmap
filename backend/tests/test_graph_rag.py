@@ -860,7 +860,11 @@ def test_labels_are_module_constants_used_by_every_statement():
                if name.startswith("CYPHER_") and isinstance(value, str)]
     assert len(queries) >= 9, "CYPHER_* 常量少了几条？"
     assert f":{graph_store.ENTITY_LABEL}" in graph_store.CYPHER_WALK
-    assert f":{graph_store.EDGE_TYPE}" in graph_store.CYPHER_ADD_EDGE
+    # 写边只有一条语句（单条入口 `add_edge` 委托给 `add_edges_bulk`，原来那条
+    # `CYPHER_ADD_EDGE` 已经删了）。名字变了，断言守的东西没变：关系类型必须从常量取。
+    assert f":{graph_store.EDGE_TYPE}" in graph_store.CYPHER_ADD_EDGES_BULK
+    assert not hasattr(graph_store, "CYPHER_ADD_EDGE"), (
+        "单条写边的那条 Cypher 不该回来：它会让『单条 / 批量』重新变成两份 MERGE 语义")
     assert graph_store.CONSTRAINT_NAME in graph_store.CYPHER_CONSTRAINT
     for query in queries:
         # 旧 SQLite 版的表名不该以任何形式残留。

@@ -446,6 +446,16 @@ def forget(source_id: str) -> bool:
     切块走 `ON DELETE CASCADE`，不在 Python 里补一条 DELETE：两处各删一次时，
     任何一处漏改都会留下孤儿行，而孤儿行只会在下一次 `prune` 之后表现为"表越来越
     大、查出来的块数对不上"。
+
+    **已保存导图里的 `source_refs` 不在这里处理，也不需要处理**：那是导图表里的
+    值对象（`{source_id, start, end, quote}`），与这份材料没有外键。删掉之后，引用
+    它的节点打开时查不到原文 → 那条引用就是 `SOURCE_TEXT_UNAVAILABLE`（"来源原文
+    不可用"），这是**已经有表达方式**的状态；图本身不会坏，也不会因此少一个节点。
+    真正的取舍是"用户要删"对"证据链要留"，产品侧的选择见 `shelf.delete_entry`
+    （有引用时要求显式确认，不静默毁掉引用）。
+
+    `chunk_vectors` 不删，与 `prune` 一致：向量按 `content_hash` 缓存，同一份正文
+    重新入库时直接命中，省掉一次 embedding 额度。
     """
     with closing(_connect()) as conn, conn:
         cursor = conn.execute(

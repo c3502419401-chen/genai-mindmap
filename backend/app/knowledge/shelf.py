@@ -81,6 +81,20 @@ class LibrarySource(BaseModel):
     total_chars: int = Field(ge=0)
 
 
+class LibraryDeletion(BaseModel):
+    """删一份材料的结果。`cited_by` 是**删除前**引用它的已保存导图数。
+
+    带上这个数是为了让界面能说清发生了什么："删掉了，原来有 2 张导图引用它，
+    那些引用现在显示「来源原文不可用」"。只回一个 `deleted: true` 的话，用户就
+    只能在下次打开那张图时自己发现。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    source_id: str
+    deleted: bool
+    cited_by: int = Field(ge=0)
+
+
 
 class SourceNotFound(LookupError):
     """库里没有这个 id。路由层翻成 404，与"导图不存在"同一套措辞。"""
@@ -92,6 +106,19 @@ class LibraryUnavailable(RuntimeError):
     两者必须分开：404 告诉用户"这份材料没了，重试也没用"，503 才是"稍后再看"。
     混成 404 会让人以为材料被删了，而这恰恰是排查时最误导的一条反馈。
     """
+
+
+class SourceCited(RuntimeError):
+    """这份材料还被已保存导图引用着，而调用方没确认"引用会一起坏掉"。
+
+    `cited_by` 带出去给界面用：它要能写出"被 3 张导图引用，删掉之后那些引用会显示
+    「来源原文不可用」"，再由用户决定要不要删。
+    """
+
+    def __init__(self, source_id: str, cited_by: int) -> None:
+        super().__init__(source_id)
+        self.source_id = source_id
+        self.cited_by = cited_by
 
 
 # "被几张导图引用"是展示值，精度要求很低；算它却要把每一张已保存导图的正文全量
@@ -245,15 +272,66 @@ def read_entry(source_id: str, *, limit: int = PREVIEW_CHARS) -> LibrarySource:
     )
 
 
+def _drop_cited_cache() -> None:
+    """删完材料后把引用计数缓存作废。
+
+    缓存指纹只看导图表（条数 + 最后更新时间），删材料不改导图表——不作废的话，
+    列表会拿删之前算出来的计数继续显示"被 1 张导图引用"，而那份材料已经不在列表里。
+    """
+    global _cited_cache
+    _cited_cache = None
+
+
+def delete_entry(source_id: str, *, force: bool = False) -> LibraryDeletion:
+    """删掉一份材料。不存在抛 `SourceNotFound`；被引用且 `force=False` 抛 `SourceCited`。
+
+    **为什么"被引用"要单独拦一道**：材料正文是导图证据的最终依据。删掉之后那些节点
+    的 `source_refs` 仍然在（导图表里是值对象，没有外键），但它们打开时只能拿到
+    `SOURCE_TEXT_UNAVAILABLE`——证据从"可核验"退回"不可核验"，而这次退回**不可逆**：
+    正文没了，谁也没法再回填。所以代价必须先说清、由用户确认，而不是删完之后让他
+    自己去发现。
+
+    `force=True` 之后就是硬删：不搬动任何一张导图、不写"墓碑"记录。三条理由：
+
+      1. "删除"在用户的语义里就是东西不在了。留一行正文被清空的墓碑，收益只是让
+         诊断能说"这份材料被删了"而不是"来源不存在"——一句措辞换一次 schema 迁移、
+         一遍读路径过滤、外加"重新上传同一份内容撞上墓碑"的复活规则，不划算；
+      2. 那些引用的坏状态**本来就有表达方式**（`SOURCE_TEXT_UNAVAILABLE`），用户
+         看到的是"来源原文不可用"，而不是一条错乱的高亮；
+      3. 删材料最常见的动机是"传错了 / 重复了 / 不该传"，这类材料往往还没被任何
+         导图引用（`cited_by == 0` 直接删）；真有引用的那一批，用户已经在确认框里
+         看到了代价。
+    """
+    try:
+        source = knowledge_library.load(source_id)
+    except (sqlite3.Error, OSError) as exc:
+        raise LibraryUnavailable(source_id) from exc
+    if source is None:
+        raise SourceNotFound(source_id)
+    # `refresh=True`：确认框里那个 N 必须是这一刻的 N。缓存 30 秒，正好够"刚存完
+    # 一张图就来删材料"这个顺序踩空，而踩空的后果是用户在没被警告的情况下删掉引用。
+    cited_by = _cited_counts(refresh=True).get(source_id, 0)
+    if cited_by and not force:
+        raise SourceCited(source_id, cited_by)
+    deleted = knowledge_library.forget(source_id)
+    _drop_cited_cache()
+    if deleted:
+        logger.info("知识库删除一份材料（删除前被 %d 张导图引用）", cited_by)
+    return LibraryDeletion(source_id=source_id, deleted=deleted, cited_by=cited_by)
+
+
 __all__ = [
     "DEFAULT_LIMIT",
     "MAX_READ_CHARS",
     "PREVIEW_CHARS",
+    "LibraryDeletion",
     "LibraryEntry",
     "LibraryList",
     "LibrarySource",
     "LibraryUnavailable",
+    "SourceCited",
     "SourceNotFound",
+    "delete_entry",
     "list_entries",
     "read_entry",
 ]

@@ -4,7 +4,8 @@
 `docs/RAG-DECISIONS.md` 第 8 节（那一节是历史记录，不随实现改动）。这一层要的
 是三样 SQLite 得自己攒的东西：变长路径（`neighbors` 里一条 `[*1..n]` 替掉整段
 递归 CTE）、关系唯一性保证（同一条关系不会在一条路径里重复出现）、以及一个
-天生带连接的存储（`add_edge` 的"两端 + 边"在一个事务里，不需要手写 upsert 顺序）。
+天生带连接的存储（`add_edges_bulk` 的"两端 + 边"在一个事务里，不需要手写 upsert
+顺序）。
 
 **数据模型**：一个标签、一种关系类型，名字都写在常量里（`ENTITY_LABEL` /
 `EDGE_TYPE`），因为它们会出现在每一条 Cypher 里，改一处就该改全部。
@@ -25,8 +26,8 @@ NULL)` 认为两个 NULL 互不相等），解法也一样：`None` → `''`（`
 
 **写与读的降级不对称**：读接口（`neighbors` / `stats` / `resolve` / `entity_degrees`）
 在库不可用或没配置时返回空值——"查不到"与"库坏了"在检索层是同一种结果，为一次查询
-崩掉整条链路没有收益。写接口（`upsert_entity` / `add_edge` / `add_edges_bulk` /
-`add_aliases` / `clear_aliases`）**照常抛错**——把"没写进去"说成"写好了"会让材料入库
+崩掉整条链路没有收益。写接口（`upsert_entity` / `add_edges_bulk` / `add_aliases` /
+`delete_alias` / `clear_aliases`）**照常抛错**——把"没写进去"说成"写好了"会让材料入库
 静默缺边，而这种缺失没有任何信号能发现：图不会报错，它只是少了一条路。
 
 **异常类型是 `OSError` 的子类**（`GraphStoreError`）。理由换过一次，两次都成立：
@@ -39,10 +40,11 @@ ValueError)` 并加上了失败熔断，直接依赖这里的类型——`OSErro
 因为换引擎而失守。`GraphStoreNotConfigured` 是它的子类，表示"密码没配"，与
 unconfigured 语义一致。
 
-**驱动是模块级惰性单例**：`Driver` 自己就是连接池，官方推荐进程内长期持有、退出时
-`close()`。`close_driver()` 供测试（每个用例换一套环境变量）与进程退出调用。惰性
-的意思是"第一次真正要连库时才建"，所以没配 Neo4j 的部署里 `import graph_store`
-不会尝试连接。
+**驱动是模块级惰性单例**：`Driver` 自己就是连接池，官方推荐进程内长期持有。它
+**不需要显式关闭**：驱动随进程消失，内核收回连接池，uvicorn 也不会为它调任何钩子。
+`close_driver()` 只服务一件事——测试里每个用例换一套环境变量（见
+`tests/conftest.py` 的 `reset_graph_driver`）。惰性的意思是"第一次真正要连库时才
+建"，所以没配 Neo4j 的部署里 `import graph_store` 不会尝试连接。
 
 **连接与查询都要有上限**：一次不可达的 7687 不能让整个请求挂住。连接超时
 `CONNECT_TIMEOUT_SECONDS`、池等待 `ACQUISITION_TIMEOUT_SECONDS`、事务超时
@@ -51,7 +53,9 @@ unconfigured 语义一致。
 
 ## 空类型实体的复用（`_pick_existing`）
 
-`add_edge` 的 `src_type` / `dst_type` 是可选的，调用方（尤其是只关心"谁连着谁"
+`add_edge` 的 `src_type` / `dst_type` 是可选的（`add_edges_bulk` 的 `EdgeInput`
+同口径——两者共用 `_prepare_edge` 与 `_pick_existing`，所以"单条"与"批量"在空类型
+上不会分叉），调用方（尤其是只关心"谁连着谁"
 的下游）不会为了写一条边先去查类型。若直接把空类型当键去 `MERGE`，同一个"甲公司"
 会在库里变成两个节点——一个 `type='组织'`（抽取时建的）、一个 `type=''`（写边时
 建的），边全挂在后者上，前者成了孤立实体。实测 3000 个实体按 3 条边连完，`stats()`
@@ -258,18 +262,10 @@ CYPHER_ENTITY_CANDIDATES = (
     "ORDER BY name, created_at, id"
 )
 
-# 一条语句写完两端与边：`MERGE` 两端保证"边写进去了、实体没写进去"这种中间态
-# 不存在。返回新建条数靠 `summary.counters.relationships_created`——比在边上打
-# 时间戳标记可靠（同一毫秒内重复写不会误判），也不会在边上留下一次性属性。
-CYPHER_ADD_EDGE = (
-    f"MERGE (a:{ENTITY_LABEL} {{name: $src, type: $src_type}})\n"
-    "ON CREATE SET a.created_at = $now\n"
-    f"MERGE (b:{ENTITY_LABEL} {{name: $dst, type: $dst_type}})\n"
-    "ON CREATE SET b.created_at = $now\n"
-    f"MERGE (a)-[r:{EDGE_TYPE} {{relation: $relation, source_id: $source_id, "
-    "chunk_start: $chunk_start}]->(b)\n"
-    "ON CREATE SET r.chunk_end = $chunk_end, r.created_at = $now"
-)
+# 一条语句写完两端与边的那条 Cypher **已经不在了**：单条入口 `add_edge` 现在委托
+# 给 `add_edges_bulk`，所以落库只有一套 MERGE 语义（`CYPHER_ADD_EDGES_BULK`）。
+# 留着两份的代价是"同一批边单条写得进去、批量写不进去"，而这类不一致只在生产
+# 形状的数据上才显形。
 
 # 批量建实体。一次 UNWIND，不循环发语句——这是 Neo4j 的批量模式。
 CYPHER_UPSERT_ENTITIES_BULK = (
@@ -345,6 +341,25 @@ CYPHER_ADD_ALIASES = (
 # 清空别名表。条数走 `relationships_deleted`（服务端计数），不是先 COUNT 再 DEL——
 # 两次往返之间别人可能又写了一条，那样返回的数就不等于真删掉的数。
 CYPHER_CLEAR_ALIASES = f"MATCH ()-[r:{ALIAS_TYPE}]->() DELETE r"
+
+# 列别名表（带落库时记下的依据）。顺序按 `alias, canonical` 定死：界面上的行不会
+# 随每次刷新重排，而 `source` / `similarity` 是"这条别名凭什么加的"唯一线索——
+# 要删一条猜错的别名，先得看见它凭什么被加进来。
+CYPHER_LIST_ALIASES = (
+    f"MATCH (a:{ENTITY_LABEL})-[r:{ALIAS_TYPE}]->(b:{ENTITY_LABEL})\n"
+    "RETURN a.name AS alias, b.name AS canonical, r.source AS source, "
+    "r.similarity AS similarity, r.created_at AS created_at\n"
+    "ORDER BY alias, canonical"
+)
+
+# 删一条别名。`$canonical` 为 null 表示"这个别名的全部指向都删"：理论上同一个别名
+# 可以指向两个主名（同名不同类型的两个节点），界面按 `别名 → 主名` 这一对来删，
+# 才不会连带删掉另一对。
+CYPHER_DELETE_ALIAS = (
+    f"MATCH (a:{ENTITY_LABEL})-[r:{ALIAS_TYPE}]->(b:{ENTITY_LABEL})\n"
+    "WHERE a.name = $alias AND ($canonical IS NULL OR b.name = $canonical)\n"
+    "DELETE r"
+)
 
 CYPHER_COUNT_ALIASES = f"MATCH ()-[r:{ALIAS_TYPE}]->() RETURN count(r) AS n"
 # 有别名指向它的实体数：主名的个数。"合并了几个实体"与"写了几条别名边"是两个
@@ -668,7 +683,12 @@ def _driver() -> Driver:
 
 
 def close_driver() -> None:
-    """关掉单例并允许下次重建。测试用它切换环境变量，进程退出也调它。"""
+    """**测试隔离专用**：关掉单例并允许下次重建（每个用例换一套环境变量）。
+
+    产品里没有任何调用者，也**不该有**：驱动随进程消失（连接池由内核收回），
+    uvicorn 不为它调钩子。为"让人在退出时手动调一个函数"加一条 shutdown 路径，
+    是把测试便利包装成生产必要——它还顺手欠下一次"钩子没注册上"的静默故障。
+    """
     global _DRIVER, _CONSTRAINT_READY, _FAILURES, _FAILED_AT
     with _DRIVER_LOCK:
         driver, _DRIVER = _DRIVER, None
@@ -797,6 +817,15 @@ def add_edge(
 ) -> bool:
     """写一条边；**没有落库就返回 `False`**（已在库里，或这条边本身没意义）。
 
+    **它是 `add_edges_bulk([...])` 的单条外壳，不是第二份实现**：校验（空名 / 自环 /
+    区间倒置）与落库都走那一片代码，所以"单条写得进去、批量写不进去"这类不一致
+    没有立足之处。
+
+    **产品代码一次都不调它**：抽取层按块攒边，落库走 `add_edges_bulk`（见
+    `graph_ingest`）。留着它的理由只有两个——调用方只需要一条边时不必自己包
+    `EdgeInput`；用例能单独钉一条边的语义。因此它在零引用闸门里是 `accepted`，
+    不是待接线项。
+
     两种 `False` 都不是错误：同一份材料重跑入库、相邻块因重叠再抽到同一条边，
     都是正常情况，重复写不该让整次入库算失败。真正的错误（库不可写、连不上）照常
     抛 `GraphStoreError`（`OSError` 子类），让调用方计入 `failed`。
@@ -805,38 +834,22 @@ def add_edge(
     就被过滤掉了），落库只会让"边数"虚高，而边数是判断图建得怎么样的唯一总量指标。
 
     `src` / `dst` 是**实体名**而不是 id：调用方（抽取层）手上只有名字，逼它先查
-    id 只会把一次事务拆成两次。两端 `MERGE` 与边的 `MERGE` 在同一条语句、同一个
-    事务里完成，不会出现"边写进去了、实体没写进去"的中间态。
+    id 只会把一次事务拆成两次。两端与边在同一个事务里完成，不会出现"边写进去了、
+    实体没写进去"的中间态。
 
     `chunk_start` / `chunk_end` 原样落库——它们是下一轮回填证据高亮的唯一依据，
     在这里做任何"修正"（比如把 end 拉到句末）都会让高亮标错字。
     """
-    src_name, dst_name = normalize_name(src), normalize_name(dst)
-    phrase = normalize_name(relation)
-    if not (src_name and dst_name and phrase) or src_name == dst_name:
-        # 不是错误，是"这条边没有内容"：模型给了空字段或把一个东西连向自己，
-        # 丢掉比落一条走不通的边好。
-        return False
-    if int(chunk_end) < int(chunk_start):
-        raise ValueError("证据区间倒置：chunk_end < chunk_start")
-    now = _now()
-    with _transaction() as transaction:
-        params = {
-            "src": src_name,
-            "dst": dst_name,
-            # 空类型要先解析成实际类型，否则会造出一个空类型分身。
-            "src_type": _resolve_kind(transaction, src_name, _fold_type(src_type)),
-            "dst_type": _resolve_kind(transaction, dst_name, _fold_type(dst_type)),
-            "relation": phrase,
-            "source_id": str(source_id),
-            "chunk_start": int(chunk_start),
-            "chunk_end": int(chunk_end),
-            "now": now,
-        }
-        summary = transaction.run(CYPHER_ADD_EDGE, params).consume()
-    # 新建条数是 driver 从服务端计数拿的：比"在边上打标记"可靠，重复写时不会
-    # 因为标记残留而误报 True，也不会在边上留下一次性属性。
-    return summary.counters.relationships_created > 0
+    return add_edges_bulk([EdgeInput(
+        src=src,
+        dst=dst,
+        relation=relation,
+        source_id=str(source_id),
+        chunk_start=int(chunk_start),
+        chunk_end=int(chunk_end),
+        src_type=src_type,
+        dst_type=dst_type,
+    )]) > 0
 
 
 @dataclass(frozen=True)
@@ -862,8 +875,8 @@ def _prepare_edge(item: EdgeInput) -> tuple[str, str, str, str, int, int, str, s
     """归一化 + 校验一条边；无意义（空名 / 自环 / 空关系）返回 `None`。
 
     返回的 8 元组顺序固定：`(src, dst, relation, source_id, start, end, src_type,
-    dst_type)`。与 `add_edge` 走同一套判断。两处不一致的结局是"单条写得进去、
-    批量写不进去"或者反过来——这是排查成本最高的一类不一致。
+    dst_type)`。**这是唯一一份边的校验**：单条入口 `add_edge` 也把参数包成
+    `EdgeInput` 再交给它，所以"单条写得进去、批量写不进去"这个问题在结构上不存在。
     """
     src_name, dst_name = normalize_name(item.src), normalize_name(item.dst)
     phrase = normalize_name(item.relation)
@@ -906,10 +919,10 @@ def add_edges_bulk(edges: list[EdgeInput]) -> int:
     "这一批"为界，不以"整份材料"为界——调用方（`graph_ingest`）按块调用，所以
     失败粒度仍是块。
 
-    返回值与 `add_edge` 同口径：重复的边（`MERGE` 命中的）不计入，但它们**不是
-    错误**（重跑入库、相邻块重叠都会产生重复）。条数来自
-    `summary.counters.relationships_created`，与 SQLite 版 `executemany` 的
-    `rowcount` 语义一致。
+    返回值是**真正新建**的条数，与 `add_edge` 的 `bool` 同一个来源：重复的边
+    （`MERGE` 命中的）不计入，但它们**不是错误**（重跑入库、相邻块重叠都会产生
+    重复）。条数来自 `summary.counters.relationships_created`，与 SQLite 版
+    `executemany` 的 `rowcount` 语义一致。
     """
     if not edges:
         return 0
@@ -1125,11 +1138,85 @@ def add_aliases(candidates: list[MergeCandidate], *, source: str = "embedding") 
 def clear_aliases() -> int:
     """删掉全部别名边，返回删除条数。**只动 `ALIAS_OF`**，实体与 `REL` 一条不碰。
 
-    供"合并错了要退回去"用：别名边是这一层唯一一处"表示两个名字是同一个东西"的
-    断言，清掉它，图就回到合并之前的样子（原始边从来没有被搬动过）。
+    供"合并做错了要整体退回去"用：别名边是这一层唯一一处"表示两个名字是同一个
+    东西"的断言，清掉它，图就回到合并之前的样子（原始边从来没有被搬动过）。
+
+    接线：`DELETE /api/knowledge/aliases` 是它的入口。只错一两条时用
+    `delete_alias`，别用这个——清空之后想恢复只能重跑实体消解，而重跑会按同一批
+    阈值重新猜一遍，猜错的那些会一起回来。
     """
     with _transaction() as transaction:
         summary = transaction.run(CYPHER_CLEAR_ALIASES).consume()
+    return int(summary.counters.relationships_deleted)
+
+
+@dataclass(frozen=True)
+class AliasEdge:
+    """一条已落库的别名：`alias` 是主名 `canonical` 的另一个叫法。
+
+    `source` / `similarity` 原样来自落库那一刻（`substring` / `embedding` 与阈值）：
+    用户判断"这条该不该留"靠的正是这两个值——凭子串进去的那批通常最该复查。
+    """
+
+    alias: str
+    canonical: str
+    source: str
+    similarity: float
+    created_at: str
+
+
+def list_aliases(*, limit: int = 500) -> list[AliasEdge]:
+    """列出库里现存的别名边，按 `(别名, 主名)` 排序。
+
+    **为什么需要读接口**：别名是推断产物，写入它的只有实体消解（`graph_resolve`），
+    而那条路的默认行为是"算出来就落库"。没有一份可读的清单时，用户连"模型把这两个
+    名字当成同一个东西了"都无从知道，更谈不上删掉错的那条。
+
+    `limit` 只是封顶（默认 500 条，一次别名清理不会涉及更多）；读不到库时返回 `[]`，
+    与 `entity_degrees` / `stats` 的降级口径一致——"图没配"与"没有别名"在这一层
+    同形，都不该让调用方多一个分支。
+    """
+    cap = max(int(limit), 1)
+    try:
+        with _transaction(read_only=True) as transaction:
+            records = list(transaction.run(CYPHER_LIST_ALIASES))
+    except (GraphStoreError, OSError) as exc:
+        logger.warning("图谱别名列表不可用：%s", type(exc).__name__)
+        return []
+    found: list[AliasEdge] = []
+    for record in records[:cap]:
+        found.append(AliasEdge(
+            alias=str(record["alias"]),
+            canonical=str(record["canonical"]),
+            source=str(record["source"] or ""),
+            similarity=float(record["similarity"] or 0.0),
+            created_at=str(record["created_at"] or ""),
+        ))
+    return found
+
+
+def delete_alias(alias: str, canonical: str | None = None) -> int:
+    """删掉一条别名边，返回删除条数（0 表示本来就没有这一条）。
+
+    **这是"别名猜错了"的唯一修正手段**：别名边不参与证据，删掉它只让这两个名字
+    重新变成两个实体——挂在它们身上的 `REL` 一条都不动，路径从"被合并后的一条"
+    回到"各自的原样"。所以删除是可逆的语义动作，不需要备份。
+
+    两种调用形态：给 `canonical` 只删这一对（同名不同类型的节点上，别名可能指向
+    两个主名）；不给就删掉这个别名的全部指向。
+
+    `alias` 归一化后为空时返回 0 而不抛：空名字在库里本来就不该有一条别名，
+    这里抛错只会把"删一个空输入"变成 500。
+    """
+    name = normalize_name(alias)
+    if not name:
+        return 0
+    target = normalize_name(canonical) if canonical else None
+    with _transaction() as transaction:
+        summary = transaction.run(
+            CYPHER_DELETE_ALIAS,
+            {"alias": name, "canonical": target or None},
+        ).consume()
     return int(summary.counters.relationships_deleted)
 
 
