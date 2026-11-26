@@ -1,71 +1,123 @@
-import { mount } from '@vue/test-utils';
+import { flushPromises, mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { REAL_TREES } from './fixtures/real-trees';
-import type { MindMapContent } from '../src/api/types';
-import SourceInputs from '../src/components/SourceInputs.vue';
+import type { MapRecord } from '../src/api/types';
+import HistoryDrawer from '../src/components/HistoryDrawer.vue';
 import { useMindMapStore } from '../src/stores/mindmap';
-import { useSourcesStore } from '../src/stores/sources';
 
 /**
- * **三个缺陷的现状**（写用户手册时撞到的，2026-11-26）。
+ * **写用户手册时撞到的缺陷，逐条变成回归。**
  *
- * 这个文件的每一条都是 `it.fails`：它断言的是"用户本来应该能做到的事"，而在修复
- * 之前三条全都不成立。修完之后把 `.fails` 摘掉，它们就变成正式用例——
- * `it.fails` 在"其实已经好了"时会报错，所以忘记摘也会被测试自己喊住。
+ * 三条共同的成因是"测试测的是函数、不是用户路径"：删导图这个动作在测试里从来没出现
+ * 过（所以 `DELETE /api/mindmaps/{id}` 405 了很久也没人知道），于是它们不产生任何
+ * 红灯形态，只有照着界面走一遍才会撞到。
  *
- * 为什么要有这个文件，而不是分散进各自的 spec：这三条的共同点是**3311 条后端用例与
- * 1376 条前端用例一条都没抓到它们**。它们不是"某个函数写错了"，而是"整条用户路径上
- * 少了一节"——`previewMove` 的每条用例都在一棵没被收缩的树上跑；材料的两个按钮从来
- * 没有人从"用户看着这两个字会怎么理解"这一侧断言过；删除导图这个动作在测试里根本
- * 没有出现过（所以它 405 了很久也没人知道）。
+ * 这个文件按缺陷分块，一块对应一笔修复：本文件先只有第一块。
  */
+
+const record = (id: string, title = '示例'): MapRecord => ({
+  id,
+  version: 1,
+  content: { title, root: { id: 'root', label: title, children: [] } },
+  updated_at: '2026-11-26T10:00:00Z',
+});
+
+interface Call {
+  url: string;
+  method: string;
+}
+
+let calls: Call[] = [];
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => body,
+  } as unknown as Response;
+}
+
+function stubFetch(handler: (call: Call) => Response | Promise<Response>) {
+  calls = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: string, init?: RequestInit) => {
+      const call: Call = { url: String(input), method: init?.method ?? 'GET' };
+      calls.push(call);
+      return handler(call);
+    }),
+  );
+}
+
+function mountDrawer() {
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  return mount(HistoryDrawer, {
+    props: {
+      open: true,
+      confirmDiscard: () => true,
+      exporting: false,
+      exportChoice: '',
+      saveHint: '',
+      versionLabel: '',
+      modeLabel: '',
+      modeTone: '',
+      nodeCount: 0,
+      sideOpen: false,
+      samples: [],
+    },
+    // 三个子组件各自会发请求；这一块只关心历史列表那一截。
+    global: {
+      plugins: [pinia],
+      stubs: { AuthPanel: true, PrefsPanel: true, ImportMindmap: true },
+    },
+  });
+}
 
 beforeEach(() => {
   setActivePinia(createPinia());
 });
 
-describe('缺陷一：删除导图', () => {
-  it.fails('前端有删除导图的客户端函数（后端接口 405 时它无从谈起）', async () => {
-    const client = await import('../src/api/client');
-    expect(typeof (client as Record<string, unknown>).deleteMindMap).toBe('function');
-  });
+afterEach(() => {
+  vi.unstubAllGlobals();
 });
 
-describe('缺陷二：移除与删除并排', () => {
-  it.fails('两个按钮的文案一眼能分清（现在是「移除」与「删除」）', async () => {
-    const pinia = createPinia();
-    setActivePinia(pinia);
-    const sources = useSourcesStore();
-    const wrapper = mount(SourceInputs, { global: { plugins: [pinia] } });
-
-    sources.addText('一份传错的正文');
-    const key = sources.items[0].key;
-    // 生成过一次 → 后端把临时 id 换成库里的持久 id，从此这一行才有"彻底删除"。
-    sources.remap({ [key]: 'lib-1' });
+describe('缺陷一：删除导图', () => {
+  it('抽屉列表里两段式删除：第一下只进确认态，第二下才发 DELETE', async () => {
+    const wrapper = mountDrawer();
+    const store = useMindMapStore();
+    store.maps = [record('m1', '校园垃圾分类推行方案')];
+    stubFetch(() => jsonResponse(undefined, 204));
     await wrapper.vm.$nextTick();
 
-    const labels = wrapper.findAll('button').map(button => button.text());
-    expect(labels).toContain('从本轮移除');
-    expect(labels).toContain('彻底删除');
+    await wrapper.find('[data-test="drawer-map-delete"]').trigger('click');
+
+    // 第一下只是个状态：不发请求，且理由写在行内（不可恢复）。
+    expect(calls).toHaveLength(0);
+    expect(wrapper.find('[data-test="drawer-map-delete-hint"]').text()).toContain('不可恢复');
+
+    await wrapper.find('[data-test="drawer-map-delete-confirm"]').trigger('click');
+    await flushPromises();
+
+    expect(calls).toEqual([{ url: '/api/mindmaps/m1', method: 'DELETE' }]);
+    expect(store.maps).toHaveLength(0);
+    expect(wrapper.text()).not.toContain('校园垃圾分类推行方案');
   });
-});
 
-describe('缺陷三：拖到第 2 层节点下面', () => {
-  it.fails('在预算截断的树上，落点算得出来（现在是「算不出落点」）', () => {
+  it('取消之后什么都没发生', async () => {
+    const wrapper = mountDrawer();
     const store = useMindMapStore();
-    store.preview(REAL_TREES.tree136 as MindMapContent, 'right');
-    // 默认预算 40 / 136 个节点：画布只画前 40 个，被拖节点与目标都在这一屏里。
-    expect(store.visibleNodeLimit).toBe(40);
+    store.maps = [record('m1')];
+    stubFetch(() => jsonResponse(undefined, 204));
+    await wrapper.vm.$nextTick();
 
-    const preview = store.previewMove({
-      draggedId: 'n_20728442566641c399a2edb53c1d5494',
-      targetId: 'n_11280aea69a4485c9db2fbfc9e61f4d1',
-      zone: 'child',
-    });
+    await wrapper.find('[data-test="drawer-map-delete"]').trigger('click');
+    await wrapper.find('[data-test="drawer-map-delete-cancel"]').trigger('click');
 
-    expect(preview.code).not.toBe('missing');
-    expect(preview.ok).toBe(true);
+    expect(calls).toHaveLength(0);
+    expect(store.maps).toHaveLength(1);
+    // 回到"可以再删"的状态，而不是停在一个再也点不到的确认态。
+    expect(wrapper.find('[data-test="drawer-map-delete"]').exists()).toBe(true);
   });
 });

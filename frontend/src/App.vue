@@ -831,6 +831,28 @@ async function openSaved(id: string) {
   await store.openMap(id);
 }
 
+/**
+ * **删除一张已保存的导图**。列表里点「删除」只是进入确认态，真正发请求的是这里。
+ *
+ * 为什么不用 `window.confirm`（`confirmDiscard` 那一套）：这个动作不可恢复，而
+ * 系统模态在 Electron / PWA 里样式不受控、在测试里要 stub、并且**说不出"会连什么
+ * 一起删"**。两段式按钮能把理由写在按钮旁边，而且"点了第一次"这件事本身是可见的
+ * 状态（材料列表里的「彻底删除」用的是同一套交互）。
+ */
+const pendingDeleteId = ref<string | null>(null);
+
+async function deleteSaved(id: string) {
+  const ok = await store.deleteMap(id);
+  // 失败时保留确认态？不——`store.deleteMap` 已经把原因写进 `status`，再留着一个
+  // 红色按钮等于催他再点一次同样的失败。
+  if (ok) pendingDeleteId.value = null;
+}
+
+/** 这一行是不是"当前打开的那张图"：删除时会连它上面的未保存修改一起丢掉。 */
+function isOpenMap(id: string): boolean {
+  return store.mapId === id;
+}
+
 function formatTime(iso: string): string {
   const date = new Date(iso);
   return Number.isNaN(date.getTime()) ? iso : date.toLocaleString('zh-CN', { hour12: false });
@@ -2137,14 +2159,58 @@ const agentHasDetail = computed(() => agentDetailVisible(store));
                 版本 {{ item.version }} · {{ mapShapeLine(item.content) }} ·
                 {{ formatTime(item.updated_at) }}
               </p>
+              <!-- 确认态的行内说明：说清"会连什么一起删"，而不是只说"确定吗"。 -->
+              <p
+                v-if="pendingDeleteId === item.id"
+                data-test="map-delete-hint"
+                class="mt-1 text-xs leading-relaxed text-rose-700"
+              >
+                彻底删除「{{ item.content.title }}」，连同它的改动记录。不可恢复。
+                <span v-if="isOpenMap(item.id) && store.dirty">
+                  这张图上有未保存的修改，删掉也一起没了。
+                </span>
+              </p>
             </div>
-            <button
-              type="button"
-              class="shrink-0 rounded-md border border-slate-300 px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
-              @click="openSaved(item.id)"
-            >
-              打开
-            </button>
+            <div class="flex shrink-0 items-center gap-1">
+              <template v-if="pendingDeleteId === item.id">
+                <button
+                  type="button"
+                  data-test="map-delete-confirm"
+                  class="rounded-md bg-rose-600 px-3 py-1 text-xs text-white hover:bg-rose-700 disabled:opacity-50"
+                  :disabled="store.deleting === item.id"
+                  @click="deleteSaved(item.id)"
+                >
+                  {{ store.deleting === item.id ? '删除中…' : '确认删除' }}
+                </button>
+                <button
+                  type="button"
+                  data-test="map-delete-cancel"
+                  class="rounded-md px-2 py-1 text-xs text-slate-500 hover:bg-slate-50"
+                  @click="pendingDeleteId = null"
+                >
+                  取消
+                </button>
+              </template>
+              <template v-else>
+                <button
+                  type="button"
+                  class="shrink-0 rounded-md border border-slate-300 px-3 py-1 text-xs text-slate-700 hover:bg-slate-50"
+                  @click="openSaved(item.id)"
+                >
+                  打开
+                </button>
+                <button
+                  type="button"
+                  data-test="map-delete"
+                  class="shrink-0 rounded-md px-2 py-1 text-xs text-slate-400 hover:text-rose-600"
+                  :title="`彻底删除「${item.content.title}」（不可恢复）`"
+                  :aria-label="`彻底删除 ${item.content.title}`"
+                  @click="pendingDeleteId = item.id"
+                >
+                  删除
+                </button>
+              </template>
+            </div>
           </li>
         </ul>
       </div>

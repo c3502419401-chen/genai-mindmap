@@ -122,6 +122,32 @@ def update_map(map_id: str, body: UpdateRequest):
     return repository.get_map(map_id)
 
 
+@router.delete("/{map_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_map(map_id: str):
+    """删掉一张导图。**不可恢复**，所以界面必须二次确认（`HistoryDrawer`）。
+
+    为什么现在才有：写手册时实测 `DELETE /api/mindmaps/{id}` 返回 405，而库里有
+    24 张图是"试几个主题"留下的。没有删除按钮的列表等于让用户攒垃圾数据，而他
+    连自己攒了都不知道——列表里没有任何一处提示"这些删得掉"。
+
+    账本（`edit_events`）跟着一起删，判据在 `repository.delete_map` 的注释里。
+    """
+    result = repository.delete_map(map_id, allow_unowned=_deployer())
+    if result == "missing":
+        raise HTTPException(status_code=404, detail="导图不存在")
+    if result == "forbidden":
+        # 403 而不是 404，与 `update_map` 逐字同一条理由：这张图你**看得见**（读是
+        # 共享的），所以"假装它不存在"只会让人以为自己的图丢了。
+        raise AppError(
+            code="map_forbidden",
+            message="这张导图不是你创建的，只有创建者能删。想留住它的内容，"
+                    "可以先「导出」或「另存为」一份再离开。",
+            status=403,
+        )
+    # 204 不写 body：删掉的东西没有可回报的形状，返回 `{"deleted": true}` 只会让
+    # 前端多一种"成功但字段为假"的可能。
+
+
 # `/{map_id}/edits/summary` 必须排在 `/{map_id}/edits` **之前**：两条路径段数不同，
 # 现在的匹配不受顺序影响；把它写对是因为下一个人加 `/{map_id}/edits/xxx` 时不会
 # 记得回头调换，而那时 `summary` 会被当成一个 `limit` 值或另一条子路径。

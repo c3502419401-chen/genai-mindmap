@@ -127,6 +127,21 @@ export function getMindMap(id: string): Promise<MapRecord> {
   return request<MapRecord>(`/mindmaps/${encodeURIComponent(id)}`);
 }
 
+/**
+ * **删掉一张导图。不可恢复**（连带它的改动账本）。
+ *
+ * 204 没有 body，`request` 对 204 返回 `undefined`，所以返回类型是 `void`——给一个
+ * `{deleted: true}` 只会让调用方多一种"成功但字段为假"的可能，而删掉的东西没有
+ * 可回报的形状。
+ *
+ * 界面**必须先二次确认**（`HistoryDrawer` 与 `App` 的列表都是两段式）：这个仓库里
+ * 唯一其它"彻底删除"是知识库的材料，那次在 409 上还能被引用计数拦一下；删导图没有
+ * 任何东西会拦它。
+ */
+export function deleteMindMap(id: string): Promise<void> {
+  return request<void>(`/mindmaps/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
 /** 编辑日志的事件 → 请求体里的形状（前端的 camelCase 只活在内存里）。 */
 function toEventPayload(event: EditEvent): EditEventPayload {
   return {

@@ -58,6 +58,20 @@ const prefs = usePrefsStore();
 const prefsOpen = ref(false);
 const prefsWrap = ref<HTMLElement | null>(null);
 
+/**
+ * 正在确认删除的那张图。
+ *
+ * 两段式而不是 `window.confirm`：这个动作**不可恢复**，而系统模态既不受控又说不清
+ * "会连什么一起删"。两段式的第一下是可见状态——用户能看见自己点到了哪一行、
+ * 旁边写着会失去什么，而且它和材料列表里的「彻底删除」是同一套交互。
+ */
+const pendingDelete = ref<string | null>(null);
+
+async function deleteMap(id: string): Promise<void> {
+  const ok = await store.deleteMap(id);
+  if (ok) pendingDelete.value = null;
+}
+
 const prefsSuggestCount = computed(() => prefs.suggestions.length);
 
 const prefsTitle = computed(() => {
@@ -125,7 +139,7 @@ function onExportChange(event: Event): void {
         还没有保存过任何导图。生成之后点「保存」，它就会出现在这里。
       </p>
       <ul v-else class="flex flex-col divide-y divide-slate-100">
-        <li v-for="item in store.maps" :key="item.id" class="flex items-center gap-2 py-1.5">
+        <li v-for="item in store.maps" :key="item.id" class="flex items-start gap-2 py-1.5">
           <button
             type="button"
             class="min-w-0 flex-1 text-left"
@@ -137,6 +151,41 @@ function onExportChange(event: Event): void {
               版本 {{ item.version }} · {{ item.updated_at.slice(0, 10) }}
             </span>
           </button>
+          <template v-if="pendingDelete === item.id">
+            <div class="flex shrink-0 flex-col items-end gap-1">
+              <button
+                type="button"
+                data-test="drawer-map-delete-confirm"
+                class="rounded bg-rose-600 px-2 py-0.5 text-[11px] text-white hover:bg-rose-700 disabled:opacity-50"
+                :disabled="store.deleting === item.id"
+                @click="deleteMap(item.id)"
+              >{{ store.deleting === item.id ? '删除中…' : '确认删除' }}</button>
+              <button
+                type="button"
+                data-test="drawer-map-delete-cancel"
+                class="text-[11px] text-slate-500 hover:text-slate-900"
+                @click="pendingDelete = null"
+              >取消</button>
+            </div>
+          </template>
+          <button
+            v-else
+            type="button"
+            data-test="drawer-map-delete"
+            class="shrink-0 text-[11px] text-slate-400 hover:text-rose-600"
+            :title="`彻底删除「${item.content?.title ?? '未命名'}」（不可恢复）`"
+            :aria-label="`彻底删除 ${item.content?.title ?? '未命名'}`"
+            @click="pendingDelete = item.id"
+          >删除</button>
+          <!-- 确认态的说明写在下一行（整行宽度），而不是挤在按钮边上：这句话是
+               "删了会失去什么"，读的人正在决定要不要点第二个按钮。 -->
+          <p
+            v-if="pendingDelete === item.id"
+            data-test="drawer-map-delete-hint"
+            class="w-full text-[11px] leading-relaxed text-rose-700"
+          >
+            彻底删除这张导图，连同它的改动记录。不可恢复。
+          </p>
         </li>
       </ul>
       <button

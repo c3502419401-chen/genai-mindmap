@@ -490,6 +490,27 @@ def create_map(content: DiagramContent, *, owner: str | None = None) -> MapRecor
     return get_map(map_id)  # type: ignore[return-value]
 
 
+def _write_verdict(
+    conn: sqlite3.Connection, map_id: str, owner: str, allow_unowned: bool,
+) -> str:
+    """这张图能不能被 `owner` 写：`"mine"` / `"missing"` / `"forbidden"`。
+
+    **判据顺序是刻意的**：先看存在、再看归属。反过来会出现"不是你的"与"这张图不存在"
+    混在一起，而前者不该向非创建者透露"这个 id 存在"——那本身就是一条信息。
+
+    抽成一处是因为**写路径现在有两条**（`update_map` 改内容、`delete_map` 删整张）。
+    两份各写一遍的话，某一天给保存加一条豁免（比如协作编辑）就会漏掉删除，于是
+    "改不了但删得掉"——那个方向的失配比两条都拒掉糟糕得多。
+    """
+    row = conn.execute("SELECT owner FROM mindmaps WHERE id = ?", (map_id,)).fetchone()
+    if row is None:
+        return "missing"
+    holder = row["owner"] or ""
+    if holder != owner and not (allow_unowned and holder == ""):
+        return "forbidden"
+    return "mine"
+
+
 def update_map(
     map_id: str,
     version: int,
@@ -500,9 +521,8 @@ def update_map(
 ) -> str:
     """保存。返回值多了一个 `"forbidden"`：这张图不是你的。
 
-    **判据顺序是刻意的**：先看存在、再看归属、最后才比版本。反过来会出现"版本不符"
-    与"不是你的"两种拒绝混在一起，而后者不该向非创建者透露这张图现在是什么版本——
-    那本身就是一条信息。
+    归属判据在 `_write_verdict`（与删除共用），版本比较在它之后：非创建者连"这张图
+    现在是什么版本"都不该知道。
 
     `allow_unowned` 只给部署方：`owner = ''` 是迁移前的老行（那时还没有账号这件事），
     把无主的历史内容交给这台机器上第一个注册的人，是唯一能自洽的归属答案。
@@ -513,13 +533,67 @@ def update_map(
 
         owner = owner_of(current_identity())
     with closing(connect()) as conn, conn:
-        row = conn.execute("SELECT owner FROM mindmaps WHERE id = ?", (map_id,)).fetchone()
-        if row is None:
-            return "missing"
-        holder = row["owner"] or ""
-        if holder != owner and not (allow_unowned and holder == ""):
-            return "forbidden"
+        verdict = _write_verdict(conn, map_id, owner, allow_unowned)
+        if verdict != "mine":
+            return verdict
         result = conn.execute("""UPDATE mindmaps SET content = ?, version = version + 1,
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
             WHERE id = ? AND version = ?""", (content.model_dump_json(), map_id, version))
         return "updated" if result.rowcount else "conflict"
+
+
+def delete_map(
+    map_id: str,
+    *,
+    owner: str | None = None,
+    allow_unowned: bool = False,
+) -> str:
+    """删掉一张图，**连同它那一份编辑账本**。返回 `"deleted"` / `"missing"` / `"forbidden"`。
+
+    ## 账本一起删（`edit_events` 里 `map_id` 的那些行）
+
+    这一条不是"顺手清干净"，是三个判据都指向同一个方向：
+
+    1. **账本里没有一件事能独立成立**。`edit_events` 的每一列都是"那张图上某个位置
+       发生了什么"——`node_id` 是那张图里的 id、`depth` 是那张图的层号、`subtree_size`
+       量的是那张图的一棵子树。图没了，这些坐标全部指向一棵不存在的树，
+       `edits.parent_ids()` 取出来的样本会教 `optimization/link.py` 往一个不存在的
+       父节点下面挂东西。
+    2. **"昨日编辑过的图数"走的就是这张表**（`edits.health()` 的 `COUNT(DISTINCT
+       map_id)`）。留着孤儿行，那个数会把一张已经删掉的图算进去，而它本来是用来回答
+       "这张表还在工作吗"的——一个被删除污染的分母会让那个探测器说谎。
+    3. **"删了图还想看改了什么"这个场景救不回来**。`before` / `after` 是**摘要**不是
+       内容（`"1800字"`，见建表注释），拿它拼不回那棵树；而唯一的读路径
+       `GET /mindmaps/{id}/edits` 在 `map_id` 不存在时就是 404（`router.list_edits`
+       先查 `get_map`）。保留下来只会是一批永远读不到的行。
+
+    第四条理由是关于**不删什么**的：`memory_observations.map_id` / `profile_vectors`
+    的 `map_id` 都不跟着删。前者是已经从事件里提炼出来的"这个人怎么做事"，那个事实
+    不因为图被删就变成假的；后者那一列存的是**池键**（`run:<run_id>`），根本不是导图
+    主键。两者都不在这张表的意义范围内。
+
+    ## 权限
+
+    与保存同一条判据（`_write_verdict`）：`owner` 不是创建者 → `"forbidden"`。
+    **路由层把它翻成 403 而不是 404**——读是共享的，非创建者看得见这张图，假装它
+    不存在只会让他以为自己的图丢了。
+
+    删除是不可逆的：没有软删、没有回收站。理由与"不提供回收站"这件事一致——
+    需要留住的东西应该先"另存为"或导出（`POST /mindmaps/export`），而不是靠库里
+    躺着一份用户以为已经删掉的副本。
+    """
+    if owner is None:
+        from app.auth.identity import current_identity
+        from app.settings.store import owner_of
+
+        owner = owner_of(current_identity())
+    with closing(connect()) as conn, conn:
+        verdict = _write_verdict(conn, map_id, owner, allow_unowned)
+        if verdict != "mine":
+            return verdict
+        conn.execute("DELETE FROM edit_events WHERE map_id = ?", (map_id,))
+        conn.execute("DELETE FROM mindmaps WHERE id = ?", (map_id,))
+    # 先删账本、再删图：两条在同一个事务里（`with conn` 提交），顺序本身不影响结果，
+    # 但反过来会让"图已删、账本还在"这个中间态在日志/断点里看起来像一次成功的删除。
+    logger.info("删除导图：id=%s（连带它的编辑账本）", map_id)
+    return "deleted"

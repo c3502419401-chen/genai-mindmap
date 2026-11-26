@@ -180,7 +180,17 @@ export interface paths {
         /** Update Map */
         put: operations["update_map_api_mindmaps__map_id__put"];
         post?: never;
-        delete?: never;
+        /**
+         * Delete Map
+         * @description 删掉一张导图。**不可恢复**，所以界面必须二次确认（`HistoryDrawer`）。
+         *
+         *     为什么现在才有：写手册时实测 `DELETE /api/mindmaps/{id}` 返回 405，而库里有
+         *     24 张图是"试几个主题"留下的。没有删除按钮的列表等于让用户攒垃圾数据，而他
+         *     连自己攒了都不知道——列表里没有任何一处提示"这些删得掉"。
+         *
+         *     账本（`edit_events`）跟着一起删，判据在 `repository.delete_map` 的注释里。
+         */
+        delete: operations["delete_map_api_mindmaps__map_id__delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -3225,6 +3235,35 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["MapRecord"];
                 };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_map_api_mindmaps__map_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                map_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {

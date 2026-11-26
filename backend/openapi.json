@@ -337,6 +337,40 @@
             }
           }
         }
+      },
+      "delete": {
+        "tags": [
+          "导图管理"
+        ],
+        "summary": "Delete Map",
+        "description": "删掉一张导图。**不可恢复**，所以界面必须二次确认（`HistoryDrawer`）。\n\n为什么现在才有：写手册时实测 `DELETE /api/mindmaps/{id}` 返回 405，而库里有\n24 张图是\"试几个主题\"留下的。没有删除按钮的列表等于让用户攒垃圾数据，而他\n连自己攒了都不知道——列表里没有任何一处提示\"这些删得掉\"。\n\n账本（`edit_events`）跟着一起删，判据在 `repository.delete_map` 的注释里。",
+        "operationId": "delete_map_api_mindmaps__map_id__delete",
+        "parameters": [
+          {
+            "name": "map_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Map Id"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/api/mindmaps/{map_id}/edits/summary": {

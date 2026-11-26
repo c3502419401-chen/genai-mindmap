@@ -2,7 +2,7 @@ import type { Edge as FlowEdge, Node as FlowNode } from '@vue-flow/core';
 import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
 
-import { ApiError, createMindMap, getMindMap, getRun, listMindMaps, listRuns, markRunSaved, runAgentStream, updateMindMap } from '../api/client';
+import { ApiError, createMindMap, deleteMindMap, getMindMap, getRun, listMindMaps, listRuns, markRunSaved, runAgentStream, updateMindMap } from '../api/client';
 import type { AgentEvent, AgentRunRequest, DiagramContent, DiagramTypeChoice, EdgeKind, MapRecord, MindEdge, MindMapContent, MindNode, MindRelation, NodeColor, OpBatch, RunSummary, Source, SourceRef } from '../api/types';
 import { directionOf, withDirection } from '../mindmap/direction';
 import {
@@ -1796,6 +1796,11 @@ export const useMindMapStore = defineStore('mindmap', () => {
   const maps = ref<MapRecord[]>([]);
   const listOpen = ref(false);
   const listBusy = ref(false);
+  /**
+   * 正在删的那张图的 id。删除是一次**不可恢复**的网络动作，在途时把按钮禁掉，
+   * 免得第二次点击拿到 404 却被界面当成"删失败"（那会让人以为图还在）。
+   */
+  const deleting = ref<string | null>(null);
 
   let controller: AbortController | null = null;
 
@@ -3789,6 +3794,42 @@ export const useMindMapStore = defineStore('mindmap', () => {
     listOpen.value = false;
   }
 
+  /**
+   * **删掉一张已保存的导图。不可恢复**（后端连它的改动账本一起删）。
+   *
+   * 三件事的顺序是有意的：
+   *
+   * 1. **先发请求**。失败了什么都不改——列表、画布、`mapId` 全部原样。反过来（先
+   *    从列表里拿掉再发）会让一次 500 之后那张图从界面上消失、刷新又回来。
+   * 2. **再改列表**：把这一项摘掉，不等下一次 `loadMaps()`。用户点完删除就看着那
+   *    一行，等一次网络往返才消失等于"点了没反应"。
+   * 3. **最后处理画布**：删的正好是当前打开的那张 → 走 `newMap()` 把画布清到空态。
+   *    它同时把 `mapSession` 递增，所以在途的保存回来时会认出"这是上一张图"，
+   *    不会把内容写回一条已经删掉的记录（那会以 404 结束，看起来像保存坏了）。
+   *
+   * 返回值只给界面判断"要不要关掉确认态"：`true` = 真删了。
+   */
+  async function deleteMap(id: string): Promise<boolean> {
+    if (deleting.value) return false;
+    const title = maps.value.find(item => item.id === id)?.content?.title ?? '';
+    deleting.value = id;
+    try {
+      await deleteMindMap(id);
+    } catch (error) {
+      status.value = error instanceof ApiError ? error.message : '删除失败，请重试。';
+      return false;
+    } finally {
+      deleting.value = null;
+    }
+
+    maps.value = maps.value.filter(item => item.id !== id);
+    const wasOpen = mapId.value === id;
+    if (wasOpen) newMap();
+    status.value = `已删除导图${title ? `「${title}」` : ''}，连同它的改动记录，不可恢复。`
+      + (wasOpen ? '画布已清空。' : '');
+    return true;
+  }
+
   async function openMap(id: string) {
     const session = mapSession;
     listBusy.value = true;
@@ -5134,6 +5175,9 @@ export const useMindMapStore = defineStore('mindmap', () => {
     loadMaps,
     closeList,
     openMap,
+    // 删除一张已保存的导图（不可恢复，界面负责二次确认）
+    deleteMap,
+    deleting,
     // agent 路径
     clientRevision,
     agentPreview,
