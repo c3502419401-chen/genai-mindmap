@@ -6,6 +6,7 @@ import {
   type SuggestionNote,
   type Tone,
 } from '../mindmap/diagnostics';
+import { CHANGE_LIMIT, repairPlanLine } from '../mindmap/repair';
 import { useMindMapStore } from '../stores/mindmap';
 import { useSourcesStore } from '../stores/sources';
 import { useStructureStore } from '../stores/structure';
@@ -152,6 +153,47 @@ const visible = computed(
   () => check.busy || check.neverRun || check.ran || !!check.error || attention.value.length > 0
     || hints.value.length > 0 || check.visibleSuggestions.length > 0,
 );
+
+// ---------------------------------------------------------------- 一键修复
+
+/**
+ * "可自动修复"那一行：`同级重名 2 处、单子节点 3 处`。
+ *
+ * 数字与分组来自 `stores/structure.ts::repairablePlan`（判据在 `mindmap/repair.ts`），
+ * 这里只负责排版——面板里一个字都不该判"哪个码能修"。
+ */
+const planLine = computed(() => repairPlanLine(check.repairablePlan));
+
+/** 改完之后逐条说"改了什么"时，默认铺开几条（超出的折起来，不是丢掉）。 */
+const changesOpen = ref(false);
+
+const report = computed(() => check.repairReport);
+const shownChanges = computed(() => {
+  const changes = report.value?.changes ?? [];
+  return changesOpen.value ? changes : changes.slice(0, CHANGE_LIMIT);
+});
+const hiddenChanges = computed(() => (report.value?.changes.length ?? 0) - shownChanges.value.length);
+
+/** 没修的那几条，同类合并成一句：504 条里跳过的 3 条不该铺成三行。 */
+const skipLine = computed(() => {
+  const groups = new Map<string, number>();
+  for (const item of report.value?.skipped ?? []) {
+    const label = item.label || '未知';
+    groups.set(label, (groups.get(label) ?? 0) + 1);
+  }
+  return [...groups].map(([label, count]) => `${label} ${count} 处`).join('、');
+});
+
+/**
+ * 「一键修复」。**只有这里会改图**，而且改完是**一步**撤销。
+ *
+ * 不自动跑：这份面板在生成落地后会自动出现（那是免费的 `check`），但修复会改用户的
+ * 作品。后端也没有自动应用接口——`/optimization/repair` 只交回修好的树。
+ */
+function repair(): void {
+  void check.applyRepair();
+}
+
 </script>
 
 <template>
@@ -199,6 +241,88 @@ const visible = computed(
       class="rounded border border-amber-200 bg-amber-50 px-2 py-1 text-[11px] leading-relaxed text-amber-800">
       {{ check.error }}
     </p>
+
+    <!--
+      可自动修复：后端那三条"修法唯一"的规则（同级重名 / 单子链 / 只有标题的分支）。
+
+      **与下面那串建议是两条路**：建议是"一条建议 → 一个节点的动作"，这里是"三条规则
+      跑到不动点 → 整棵树整体替换"。所以它有自己的按钮，不走 `APPLIERS` 那套白名单。
+      只有点了才改图；改完按一次 Ctrl+Z 整体退回（粒度是"点了一次"，不是"改了几处"）。
+    -->
+    <div
+      v-if="check.repairableCount > 0"
+      data-test="repair-block"
+      class="flex flex-col gap-1 rounded border border-emerald-200 bg-emerald-50/60 px-2 py-1.5"
+    >
+      <p class="flex items-center gap-1.5">
+        <span class="rounded bg-emerald-100 px-1 text-[10px] text-emerald-700">可自动修复</span>
+        <span data-test="repair-plan" class="min-w-0 flex-1 break-words leading-relaxed text-slate-700">
+          {{ planLine }}，共 {{ check.repairableCount }} 处
+        </span>
+      </p>
+      <p class="leading-relaxed text-[11px] text-slate-500">
+        只修"修法唯一"的三类：合并同级重名（两边的子节点与引用都保留）、压掉单子链
+        （两层标题拼成「外层 / 内层」）。超上限的那几条会列出来，不截断。
+      </p>
+      <div class="flex items-center gap-2">
+        <button
+          type="button"
+          data-test="repair-apply"
+          class="rounded-md bg-emerald-700 px-2 py-0.5 text-[11px] text-white disabled:opacity-40"
+          :disabled="check.busy || check.repairing"
+          title="一次修到底；改完按一次 Ctrl+Z 就能整体退回"
+          @click="repair"
+        >{{ check.repairing ? '正在修…' : '一键修复' }}</button>
+        <!-- 说清"点了会怎样"：步骤数在点之前是从诊断数来的，点之后以后端为准。 -->
+        <span class="text-[11px] text-slate-400">改完可整体撤销</span>
+      </div>
+    </div>
+
+    <!-- 修完之后：改了什么（逐条，可展开）、没修什么（原因）、怎么反悔。 -->
+    <div
+      v-if="report"
+      data-test="repair-report"
+      class="flex flex-col gap-1 rounded border border-sky-200 bg-sky-50/60 px-2 py-1.5"
+    >
+      <p class="flex items-center gap-1.5">
+        <span class="rounded bg-sky-100 px-1 text-[10px] text-sky-700">已修复</span>
+        <span data-test="repair-summary" class="min-w-0 flex-1 break-words leading-relaxed text-slate-700">
+          {{ report.summary || `改了 ${report.steps} 处` }}
+        </span>
+      </p>
+      <!-- 树在那之后又变过：这份清单说的是修复当时那一棵。说起来比悄悄留着准确。 -->
+      <p
+        v-if="!check.repairReportCurrent"
+        data-test="repair-report-stale"
+        class="leading-relaxed text-[11px] text-amber-800"
+      >这张图在修复之后又改过（或者撤销了），下面这份清单说的是修复当时那一棵。</p>
+      <ul v-if="shownChanges.length" data-test="repair-changes" class="flex flex-col gap-0.5">
+        <li
+          v-for="(item, index) in shownChanges"
+          :key="index"
+          data-test="repair-change"
+          class="flex flex-wrap items-baseline gap-x-1 break-words text-[11px] leading-relaxed text-slate-600"
+        >
+          <span class="rounded bg-slate-100 px-1 text-[10px] text-slate-500">{{ item.label }}</span>
+          <span class="min-w-0 flex-1">{{ item.message }}</span>
+        </li>
+      </ul>
+      <button
+        v-if="hiddenChanges > 0 || changesOpen"
+        type="button"
+        data-test="repair-changes-expand"
+        class="self-start text-[11px] text-slate-500 underline decoration-dotted underline-offset-2 hover:text-slate-900"
+        :aria-expanded="changesOpen"
+        @click="changesOpen = !changesOpen"
+      >{{ changesOpen ? '收起改动' : `展开全部 ${report.changes.length} 处改动（还有 ${hiddenChanges} 处）` }}</button>
+      <!-- 没修的那几条必须说出来：静默跳过会让"点了一键修复却没变"变成查不出来的状态。 -->
+      <p v-if="report.skipped.length" data-test="repair-skipped" class="leading-relaxed text-[11px] text-amber-800">
+        有 {{ report.skipped.length }} 处没修（{{ skipLine }}）：超出契约上限的会整条放弃，不截断引文。
+      </p>
+      <p class="leading-relaxed text-[11px] text-slate-500">
+        按一次 Ctrl+Z 回到修复之前，Ctrl+Shift+Z 回来。
+      </p>
+    </div>
 
     <!-- 建议：**只有点了「应用」才改图**，而且走的是 store 的编辑路径（可撤销）。 -->
     <ul v-if="shownSuggestions.length" class="flex flex-col gap-1.5">

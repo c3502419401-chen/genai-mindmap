@@ -6,6 +6,7 @@ import type {
   CheckResponse,
   CreateTextSourceResponse,
   Credentials,
+  Diagnostic,
   EditEventPayload,
   EditEventRow,
   EditHealth,
@@ -14,6 +15,7 @@ import type {
   LibraryList,
   LibrarySource,
   MapRecord,
+  MindMapContent,
   DiagramContent,
   ModelSettings,
   Pref,
@@ -406,6 +408,91 @@ export async function suggestOptimization(
   };
 }
 
+// ---- 自动修复（三条"修法唯一"的规则）----
+
+/**
+ * 一条修复动作。`kind` 是 `merge_duplicate` / `collapse_chain`（后端
+ * `RepairKind`），`code` 是它对应的诊断码——一次合并可能同时被两个码解释，
+ * 所以两者分开（与后端同一条口径）。
+ */
+export interface RepairStep {
+  code: string;
+  kind: string;
+  node_id: string;
+  /** 一句人话，界面逐条显示"改了什么"。后端保证它写清了新标题是什么。 */
+  message: string;
+  /**
+   * 反操作（`RepairUndo`：槽位 + 字段快照 + 重定向记录）。
+   *
+   * **前端不读它**。撤销走 store 的快照栈（一步回到修复之前），不逐条重放
+   * `RepairUndo`——理由写在 `stores/mindmap.ts::replaceContent`。所以这里故意
+   * 声明成 `unknown` 而不是把后端那个结构抄一遍：抄一份没人读的类型，只会在后端
+   * 改字段时给出假的"我懂它"。
+   */
+  undo?: unknown;
+}
+
+/** 看到了但没修的那一条（超出契约上限、或诊断在处理途中过期）。 */
+export interface RepairSkip {
+  code: string;
+  node_id?: string | null;
+  reason: string;
+}
+
+export interface RepairResult {
+  /** 修好的树。**整体替换**，不是补丁：修复会删节点、改标题、搬子树。 */
+  content: MindMapContent;
+  applied: RepairStep[];
+  skipped: RepairSkip[];
+  /** 修完之后重跑的 `check()`：界面据此说"还剩几条"。 */
+  diagnostics: Diagnostic[];
+  steps: number;
+  /** 一句人话（无修复时是空串），例如"合并了 3 处同级重名"。 */
+  summary: string;
+}
+
+/**
+ * 把树修到不动点（`POST /optimization/repair`）。
+ *
+ * ## 它不进 openapi 快照，但接口是通的
+ *
+ * 后端那条路由挂着 `include_in_schema=False`（理由见 `optimization/router.py`：
+ * 这一轮 `openapi.json` 与 `schema.d.ts` 由另一条线在改，不能重导）。那一个参数
+ * **只影响文档与生成的类型**，不影响路由本身——所以这里手写上面那几个类型，
+ * 请求照常打到 `POST /api/optimization/repair`。等快照能重导的那一轮，把这段换成
+ * 生成的类型，`include_in_schema` 一起删掉（两步都要做）。
+ *
+ * ## 为什么不带 `codes`
+ *
+ * 后端缺省就是三条全修。规则之间是有交互的（合并会改同名集合、压链会改 label，
+ * 所以它两段交替到不动点），分三次点会得到"每点一次都还没修完"。要细分的时候
+ * 让后端定义清楚"只修合并"是什么意思，而不是让前端凭 `codes` 参数猜。
+ *
+ * ## 失败形状
+ *
+ * 诊断类响应（check/suggest）拿不到时降级成"零条"；这个**不能降级**：返回体里没有
+ * `content` 就等于"没有可落地的树"，静默返回一棵原样的树会让用户以为修过了。
+ */
+export async function repairOptimization(content: DiagramContent): Promise<RepairResult> {
+  const body = await request<Partial<RepairResult>>('/optimization/repair', {
+    method: 'POST',
+    body: JSON.stringify({ content }),
+  });
+  if (!body?.content) {
+    throw new ApiError(200, 'empty_repair', '后端没有返回修复结果，这次修复没有落地。');
+  }
+  const applied = Array.isArray(body.applied) ? body.applied : [];
+  return {
+    content: body.content as MindMapContent,
+    applied,
+    skipped: Array.isArray(body.skipped) ? body.skipped : [],
+    diagnostics: Array.isArray(body.diagnostics) ? body.diagnostics : [],
+    // 后端给了就信它，没给就按 `applied` 数：这条数字界面要显示，不能是 NaN。
+    steps: typeof body.steps === 'number' ? body.steps : applied.length,
+    summary: typeof body.summary === 'string' ? body.summary : '',
+  };
+}
+
 // ---- 文档上传 ----
 
 /**
@@ -603,9 +690,17 @@ export function listLibrary(limit = 50): Promise<LibraryList> {
   return request<LibraryList>(`/knowledge/library?limit=${limit}`);
 }
 
-/** 单份材料的正文预览（后端最多回 4000 字，`truncated` 标明是否截断）。 */
-export function readLibrarySource(id: string): Promise<LibrarySource> {
-  return request<LibrarySource>(`/knowledge/library/${encodeURIComponent(id)}`);
+/**
+ * 单份材料的正文。
+ *
+ * 不传 `limit` 时后端回前 4000 字（预览口径，知识库面板用的就是它）。
+ * 传 `limit` 可以要更多，上限由后端 schema 挡（超出是 422，不是静默夹断）——
+ * "点引用跳原文"必须能拿到引用位置之前的正文，而 `SourceRef.start/end` 是
+ * 全文码点偏移，只给前 4000 字的话引用落在第 20000 字处就什么都看不见。
+ */
+export function readLibrarySource(id: string, limit?: number): Promise<LibrarySource> {
+  const query = limit == null ? '' : `?limit=${Math.floor(limit)}`;
+  return request<LibrarySource>(`/knowledge/library/${encodeURIComponent(id)}${query}`);
 }
 
 // ---- 导出 ----

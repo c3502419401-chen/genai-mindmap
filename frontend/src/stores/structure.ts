@@ -1,15 +1,17 @@
 import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
 
-import { checkOptimization, suggestOptimization } from '../api/client';
+import { checkOptimization, repairOptimization, suggestOptimization } from '../api/client';
 import type { DiagramContent, Source } from '../api/types';
 import {
+  diagnosticLabel,
   normalizeDiagnostics,
   normalizeSuggestions,
   structureCounts,
   type DiagnosticNote,
   type SuggestionNote,
 } from '../mindmap/diagnostics';
+import { repairPlan, repairPlanTotal } from '../mindmap/repair';
 import { findIn, isTree } from '../mindmap/shape';
 import { useMindMapStore } from './mindmap';
 
@@ -295,6 +297,136 @@ export const useStructureStore = defineStore('structure', () => {
     dismissed.value = next;
   }
 
+  // ---------------------------------------------------------------- 一键修复
+
+  /** 正在修。它只挡按钮的重复点击，不挡画布——修复是一次往返，不该把编辑锁住。 */
+  const repairing = ref(false);
+
+  /**
+   * 修完之后那份"改了什么"的清单。
+   *
+   * `content` 是**这份清单说的是哪一棵树**（引用相等），界面据此说清"你撤销过 / 又改过
+   * 了，下面这些已经不是眼前这张图的样子"。用引用而不是比较序列化，与 `checkedContent`
+   * 同一条口径：`applyContent` 每次整体替换 `content.value`，引用相等恰好等于"一个字
+   * 都没变"。
+   */
+  const repairReport = ref<{
+    content: DiagramContent;
+    steps: number;
+    summary: string;
+    changes: { code: string; label: string; message: string }[];
+    skipped: { code: string; label: string; reason: string }[];
+  } | null>(null);
+
+  /** 那份清单还准不准（`false` = 修完之后又撤销过、或者又改了）。 */
+  const repairReportCurrent = computed(
+    () => !!repairReport.value && repairReport.value.content === map.content,
+  );
+
+  /**
+   * 能自动修的那几处，按码分组。
+   *
+   * 从 `visibleDiagnostics` 算（忽略过的不算），理由见 `mindmap/repair.ts::repairPlan`。
+   * 它是**按钮出不出现**的判据——一份 `check` 就够，不必先跑一次 `suggest`。
+   */
+  const repairablePlan = computed(() => repairPlan(visibleDiagnostics.value));
+  const repairableCount = computed(() => repairPlanTotal(repairablePlan.value));
+
+  /**
+   * 一键修到底（`POST /optimization/repair`），然后把修好的树**整体装进画布**。
+   *
+   * ## 与 `applySuggestion` 的分工
+   *
+   * `applySuggestion` 是"一条建议 → 一个节点的动作"（现在只有删叶子）。这里是"三条
+   * 修法唯一的规则 → 整棵树跑到不动点"。后者只能整体替换，因为一次修复会删节点、搬
+   * 子树、改标题——增量补丁描述不了它（后端 `RepairResponse` 的注释也是这么写的）。
+   *
+   * ## 落地必须走 `map.replaceContent`，不能直接改 `content`
+   *
+   * 那一行是这次接线唯一的难点：整体替换要进撤销栈，而且**只进一步**。绕过它手写
+   * `content = next` 能改，但不可撤销、`dirty` 与 `clientRevision` 不更新、改动账本
+   * 也记不上。粒度为什么是一条，见 `stores/mindmap.ts::replaceContent`。
+   *
+   * ## 在途期间图被改过 → 不落地
+   *
+   * 请求飞出去之后用户可能又改了两笔（画布在修的时候不锁）。拿回来的树是按**旧**那棵
+   * 算的，装进去等于把用户手里的两笔静默丢掉。所以落地前比一次引用：变了就放弃这次
+   * 结果并说清原因，而不是报"应用成功"。
+   *
+   * ## 落地之后
+   *
+   * 后端响应里带着**修完之后重跑的 `check()`**（`diagnostics`），直接拿来用，不再多打
+   * 一次 `/check`：树是我们刚装进去的那一棵，重跑只可能得到同一份结论。建议列表不清空
+   * ——指向已消失节点的那些会被 `stillLive` 滤掉，"还剩几条"仍然是真的。
+   */
+  async function applyRepair(): Promise<
+    'ok' | 'none' | 'empty' | 'unsupported' | 'stale' | 'failed'
+  > {
+    if (repairing.value) return 'none';
+    const content = map.content;
+    if (!content) return 'empty';
+    if (!isTree(content)) {
+      error.value = '自动修复现在只支持思维导图：后端那三条规则读的是树的根节点。';
+      return 'unsupported';
+    }
+
+    repairing.value = true;
+    error.value = '';
+    try {
+      const result = await repairOptimization(content);
+
+      // 在途期间画布被换掉了：这份结果属于旧那棵树。与 `commitGenerated` 的冲突判定
+      // 同一条判据（引用相等），只是这里不保留两棵树——修复可以再点一次。
+      if (map.content !== content) {
+        error.value = '这张图在点了修复之后又改过，这次的结果没有应用。请重新检查再修。';
+        return 'stale';
+      }
+
+      // 一处都没修：不动画布（连历史都不压），只把真相说出来。真图实测 41/58 张属于
+      // 这一类，所以这句话不能写成"修复失败"。
+      if (!result.steps) {
+        diagnostics.value = normalizeDiagnostics(result.diagnostics);
+        ran.value = true;
+        checkedContent.value = content;
+        map.status = result.skipped.length
+          ? `${result.skipped.length} 处没能自动修（超出契约上限或诊断过期）。`
+          : '没有可以自动修的地方。';
+        return 'none';
+      }
+
+      if (!map.replaceContent(result.content)) return 'empty';
+
+      diagnostics.value = normalizeDiagnostics(result.diagnostics);
+      ran.value = true;
+      // 报告说的就是眼前这棵树了：不更新的话面板上会挂一句"这张图在检查之后又改过"，
+      // 而我们刚刚才核对过新树。
+      checkedContent.value = map.content;
+      repairReport.value = {
+        content: map.content,
+        steps: result.steps,
+        summary: result.summary,
+        changes: result.applied.map(item => ({
+          code: item.code,
+          label: diagnosticLabel(item.code),
+          message: item.message,
+        })),
+        skipped: result.skipped.map(item => ({
+          code: item.code,
+          label: diagnosticLabel(item.code),
+          reason: item.reason,
+        })),
+      };
+      map.status = `已自动修复 ${result.steps} 处`
+        + `${result.summary ? `：${result.summary}` : ''}，可撤销。`;
+      return 'ok';
+    } catch (caught) {
+      error.value = caught instanceof Error ? caught.message : '自动修复没跑成，请重试。';
+      return 'failed';
+    } finally {
+      repairing.value = false;
+    }
+  }
+
   /**
    * 报告作废（换了一张图、或者新一轮生成落地）。
    *
@@ -311,6 +443,9 @@ export const useStructureStore = defineStore('structure', () => {
     busy.value = false;
     withSuggestions.value = false;
     checkedContent.value = null;
+    repairing.value = false;
+    // 换图之后那份"刚修了什么"属于上一棵树：留着它就是在新图上说旧话。
+    repairReport.value = null;
   }
 
   return {
@@ -334,6 +469,13 @@ export const useStructureStore = defineStore('structure', () => {
     runFull,
     applySuggestion,
     dismiss,
+    // 一键修复：能修几处（`repairablePlan`）、正在修、修完的清单与它是否还准
+    repairing,
+    repairablePlan,
+    repairableCount,
+    repairReport,
+    repairReportCurrent,
+    applyRepair,
     reset,
   };
 });
