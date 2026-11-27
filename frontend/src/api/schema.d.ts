@@ -870,6 +870,61 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/knowledge/aliases/candidates": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start Alias Preview
+         * @description 创建只读候选任务；计算可能消耗向量额度。
+         */
+        post: operations["start_alias_preview_api_knowledge_aliases_candidates_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/knowledge/aliases/candidates/{job_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read Alias Preview */
+        get: operations["read_alias_preview_api_knowledge_aliases_candidates__job_id__get"];
+        put?: never;
+        post?: never;
+        /** Cancel Alias Preview */
+        delete: operations["cancel_alias_preview_api_knowledge_aliases_candidates__job_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/knowledge/aliases/apply": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Apply Alias Preview */
+        post: operations["apply_alias_preview_api_knowledge_aliases_apply_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/knowledge/aliases": {
         parameters: {
             query?: never;
@@ -1084,6 +1139,41 @@ export interface components {
             /** Goal */
             goal: string;
         };
+        /** AliasApplyRequest */
+        AliasApplyRequest: {
+            /** Job Id */
+            job_id: string;
+            /** Candidate Ids */
+            candidate_ids: string[];
+        };
+        /** AliasApplyResult */
+        AliasApplyResult: {
+            /** Relationships Created */
+            relationships_created: number;
+            /** Created */
+            created: components["schemas"]["AliasPair"][];
+            /** Skipped */
+            skipped: number;
+        };
+        /** AliasCandidate */
+        AliasCandidate: {
+            /** Id */
+            id: string;
+            /** Alias */
+            alias: string;
+            /** Canonical */
+            canonical: string;
+            /** Similarity */
+            similarity: number;
+            /** Reason */
+            reason: string;
+            /** Alias Evidence */
+            alias_evidence: components["schemas"]["AliasEvidence"][];
+            /** Canonical Evidence */
+            canonical_evidence: components["schemas"]["AliasEvidence"][];
+            /** Selectable */
+            selectable: boolean;
+        };
         /**
          * AliasClearance
          * @description 清空别名的结果。与 `AliasDeletion` 分开：清空没有"哪一条"这个字段。
@@ -1115,6 +1205,19 @@ export interface components {
             /** Created At */
             created_at: string;
         };
+        /** AliasEvidence */
+        AliasEvidence: {
+            /** Source Id */
+            source_id: string;
+            /** Filename */
+            filename: string;
+            /** Start */
+            start: number;
+            /** End */
+            end: number;
+            /** Quote */
+            quote: string;
+        };
         /** AliasListing */
         AliasListing: {
             /** Items */
@@ -1123,6 +1226,29 @@ export interface components {
             total: number;
             /** Configured */
             configured: boolean;
+        };
+        /** AliasPair */
+        AliasPair: {
+            /** Alias */
+            alias: string;
+            /** Canonical */
+            canonical: string;
+        };
+        /** AliasPreview */
+        AliasPreview: {
+            /** Job Id */
+            job_id: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "running" | "done" | "failed" | "cancelled" | "applying" | "applied";
+            /** Stage */
+            stage: string;
+            /** Error */
+            error: string | null;
+            /** Items */
+            items: components["schemas"]["AliasCandidate"][];
         };
         /**
          * AudioSentence
@@ -4281,6 +4407,121 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    start_alias_preview_api_knowledge_aliases_candidates_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AliasPreview"];
+                };
+            };
+        };
+    };
+    read_alias_preview_api_knowledge_aliases_candidates__job_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AliasPreview"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cancel_alias_preview_api_knowledge_aliases_candidates__job_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AliasPreview"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    apply_alias_preview_api_knowledge_aliases_apply_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AliasApplyRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AliasApplyResult"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
             };
         };
     };
