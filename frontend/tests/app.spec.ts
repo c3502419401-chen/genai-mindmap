@@ -337,6 +337,91 @@ describe('节点引用', () => {
     expect(empty.text()).toContain('都没有原文引用');
   });
 
+  /**
+   * `origin` 落地之后的那个硬要求：**界面上不再有一句把两件事并列的免责声明**。
+   *
+   * 三档各说各的，判据是"下一步动作不同"：
+   *   - `generated` → 可以补材料再生成一次；
+   *   - `manual` → 本来就没有原文可引，不必处理；
+   *   - `unknown` → 界面不替它归因。
+   *
+   * 这三条必须能红：把 `NO_CITE_NOTE` 换回原来那句"……或者这个节点是你自己加的"，
+   * 后两条立刻失败（那句既不说"不必处理"，也不说"不判断原因"）。
+   */
+  describe('没有引用那句按来历分开说', () => {
+    const withOrigin = (origin: 'generated' | 'manual' | 'unknown' | undefined) => ({
+      title: '分来历',
+      root: {
+        id: 'r',
+        label: '根',
+        children: [{
+          id: 'a', label: '甲', children: [], ...(origin ? { origin } : {}),
+        }],
+      },
+    });
+
+    const mountWith = async (origin: 'generated' | 'manual' | 'unknown') => {
+      const wrapper = mountApp();
+      const store = useMindMapStore();
+      store.preview(withOrigin(origin), 'right');
+      store.select('a');
+      await wrapper.vm.$nextTick();
+      return wrapper;
+    };
+
+    it('generated：说成"模型没找到对应句子"，并给出可以做的事', async () => {
+      const why = (await mountWith('generated')).get('[data-test="ref-empty-why"]');
+      expect(why.text()).toContain('生成时写的');
+      expect(why.text()).toContain('补一份材料');
+      // 这一档最容易被写成"不必处理"——那是 `manual` 的话
+      expect(why.text()).not.toContain('不必处理');
+    });
+
+    it('manual：说清"不来自生成链路、不必处理"，不冒充成生成产出', async () => {
+      const why = (await mountWith('manual')).get('[data-test="ref-empty-why"]');
+      expect(why.text()).toContain('不来自生成链路');
+      expect(why.text()).toContain('不必处理');
+      expect(why.text()).not.toContain('没在材料里找到');
+    });
+
+    it('unknown：不替旧图下结论', async () => {
+      const why = (await mountWith('unknown')).get('[data-test="ref-empty-why"]');
+      expect(why.text()).toContain('没有来历记录');
+      expect(why.text()).toContain('不判断原因');
+      // 既不能说成生成产出（"可以补材料"），也不能说成手加（"不必处理"），
+      // 也不能替它编一个原因（"这张图是旧的"——第三方导入与演示内容同样是 unknown）
+      expect(why.text()).not.toContain('补一份材料');
+      expect(why.text()).not.toContain('不来自生成链路');
+      expect(why.text()).not.toContain('之前保存的');
+    });
+
+    it('全图那句把"没有引用"按来历拆成计数，而不是一句免责', async () => {
+      const wrapper = mountApp();
+      const store = useMindMapStore();
+      // 2 个生成 + 1 个手加 + 1 个旧数据，全都没有引用
+      store.preview({
+        title: '混的',
+        root: {
+          id: 'r', label: '根', origin: 'generated',
+          children: [
+            { id: 'a', label: '甲', children: [], origin: 'generated' },
+            { id: 'b', label: '乙', children: [], origin: 'manual' },
+            { id: 'c', label: '丙', children: [], origin: 'unknown' },
+          ],
+        },
+      }, 'right');
+      store.select('a');
+      await wrapper.vm.$nextTick();
+
+      const text = wrapper.get('[data-test="ref-empty"]').text();
+      expect(text).toContain('2 个是生成时没在材料里找到对应句子');
+      expect(text).toContain('1 个不来自生成链路');
+      expect(text).toContain('1 个没有来历记录');
+      // 旧那句的两个并列词一个都不能留
+      expect(text).not.toContain('或者');
+    });
+  });
+
   it('点引用打开右侧抽屉；来源不在知识库里时说明只能看摘录', async () => {
     // 抽屉会按 `source_id` 去知识库取原文——这份临时来源（`s1`）不在库里，后端 404。
     vi.stubGlobal('fetch', vi.fn(async () => ({

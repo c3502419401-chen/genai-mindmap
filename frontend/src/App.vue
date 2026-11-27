@@ -25,7 +25,7 @@ import { usePrefsStore } from './stores/prefs';
 import { resolveRefs, type ResolvedRef } from './mindmap/refs';
 import { agentDetailVisible } from './mindmap/run-status';
 import { EDGE_KINDS, EDGE_KIND_LABELS, NODE_COLORS, NODE_COLOR_LABELS } from './mindmap/edits';
-import type { DiagramContent, EdgeKind, RelationKind } from './api/types';
+import type { DiagramContent, EdgeKind, NodeOrigin, RelationKind } from './api/types';
 import { containerNoun, kindOf, topBranchesOf } from './mindmap/shape';
 
 const store = useMindMapStore();
@@ -48,24 +48,67 @@ const activeRef = ref<ResolvedRef | null>(null);
 /**
  * 全图引用覆盖率的一句话说明，只在"这个节点没有引用"时出现。
  *
- * 三档写法，各自对应一个真实形态：
- *   - 一个都没有 → 说清"这次生成没有可回查的材料"，而不是让用户去点空白；
- *   - 有部分 → 给出比例，让"没引用的节点"变成这张图的常态而不是一处异常；
- *   - 全都有 → 这一档不会进来（节点没有任何引用才算覆盖率说明），
- *     所以不写第 3 句。
+ * 它答两件事，**分开答**，因为它们不是一件事：
  *
- * 最后那句"或者是你自己加的"是**诚实的边界**：`MindNode` 没有"手动/生成"标记，
- * 分不出这两种，所以不假装能分。
+ *   1. 这个数在说什么——"有多少条结论能核对到原文"，**不是质量分数**。不说这句，
+ *      50% 会被读成一个及格分。
+ *   2. 那 12 个没有引用的节点各自该做什么。**按 `origin` 分组给出计数**：
+ *      `generated` 的下一步是"补材料再生成一次"，`manual` 的下一步是"什么都不用做"，
+ *      `unknown` 的下一步是"界面不替你判断"。
+ *
+ * 这里曾经是「生成时模型没在材料里找到对应句子，**或者**这个节点是你自己加的」：
+ * 把两件下一步动作不同的事并列成一句免责声明。那不是措辞问题——当时契约里没有
+ * 能分开它们的字段，所以界面只能替数据模型道歉。`Node.origin` 落地之后，那句话
+ * 既没有依据也没有必要：能数出来的就不该并列，数不出来的（`unknown`）就直说不知道。
  */
 const citationSummary = computed(() => {
-  const { total, cited } = store.refCoverageStat;
-  if (!total) return '';
+  const { total, cited, uncited } = store.refCoverageStat;
+  const gaps = total - cited;
+  if (!total || gaps <= 0) return '';
+  // 每一段的结尾都是"用户能做什么"。顺序按动作的紧迫度：能补的先说。
+  const parts: string[] = [];
+  if (uncited.generated) {
+    parts.push(`${uncited.generated} 个是生成时没在材料里找到对应句子`
+      + '（补材料再生成一次，它们就可能带上出处）');
+  }
+  if (uncited.manual) {
+    parts.push(`${uncited.manual} 个不来自生成链路（本来就没有原文可引，不必处理）`);
+  }
+  if (uncited.unknown) {
+    parts.push(`${uncited.unknown} 个没有来历记录（界面不判断它们）`);
+  }
+  const split = parts.join('；');
   if (!cited) {
-    return '这张图的节点都没有原文引用——生成时没有可回查的材料，或者这张图是手工画的。';
+    return `这张图 ${total} 个节点都没有原文引用${split ? `：${split}` : ''}。`;
   }
   const percent = Math.round((cited / total) * 100);
-  return `这张图 ${total} 个节点里有 ${cited} 个带原文引用（${percent}%）。没有引用的节点不代表内容有错：生成时模型没在材料里找到对应句子，或者这个节点是你自己加的。`;
+  return `这张图 ${total} 个节点里有 ${cited} 个带原文引用（${percent}%）。`
+    + `这个数说的是"有多少条结论能核对到原文"，不是质量分数${split ? `：${split}` : ''}。`;
 });
+
+/**
+ * 「这个节点没有引用」那一句，按它的来历分三个版本。
+ *
+ * 三句都只回答一个问题：**没有引用是不是问题**。同一句"没有原文引用"，对
+ * `generated` 是一个可以补的洞，对 `manual` 是一个定义（它本来就没有原文），
+ * 对 `unknown` 是一个我们不知道的答案。合成一句就只能并列——而并列是道歉。
+ *
+ * `manual` 那一句**不写"你自己加的"**：编辑轮里模型 `add_node` 加的节点同样是
+ * `manual`（"不来自生成链路"），写成人加的会让那句话在一半场合下是假的，而用户
+ * 无从分辨。剩下的那一半信息在改动记录里（`actor: user | agent`，带时间）。
+ *
+ * `unknown` 那一句**不写"这张图是旧的"**：`unknown` 有三种来源（这个字段之前保存的
+ * 旧图、第三方格式导入的图、演示模式的占位内容），界面分不出是哪种——给一个它认不出
+ * 的原因，就是把"不知道"又写成了"归因"。
+ */
+const NO_CITE_NOTE: Record<NodeOrigin, string> = {
+  generated: '它是生成时写的：模型没在材料里找到对应句子。补一份材料、或把主题写得更贴原文，再生成一次就可能带上出处。',
+  manual: '它不来自生成链路，本来就没有原文可引——不必处理。',
+  unknown: '它没有来历记录，界面不判断原因。没有引用不代表内容有错——要出处就把材料加进来再生成一次。',
+};
+
+const noCiteNote = computed(() =>
+  NO_CITE_NOTE[selected.value?.node.origin ?? 'unknown']);
 
 const copied = ref('');
 
@@ -1610,12 +1653,19 @@ const agentHasDetail = computed(() => agentDetailVisible(store));
 
             一次生成里总有节点拿不到引文（实测薄批 78–80%、厚批 86% 的覆盖率）。
             只写一句"这个节点没有来源引用"，用户看到的是一枚**洞**：是不是引用功能
-            坏了、是不是这条点不开、是不是漏生成了一步。而这恰恰不是数据层能回答的
-            问题——`MindNode` 契约里没有"这个节点是手动的还是生成的"，只有
-            `label` / `detail` / `source_refs`，所以界面无法断言原因。
+            坏了、是不是这条点不开、是不是漏生成了一步。
 
-            能做的是**把口径摆出来**：告诉用户这张图本来就有多少节点没有引文。
-            这样"这个节点没依据"读起来才是一张图的属性，而不是一个坏掉的功能。
+            能做的是两件事，**分两句说**：
+
+              1. 这一个节点为什么没有引用——按 `Node.origin` 分三种说法（见
+                 `NO_CITE_NOTE`）。`manual` 的节点本来就没有原文可引，"没有引用"
+                 对它不是缺陷；`generated` 的是可以补的洞；`unknown` 的不归因。
+              2. 把全图口径摆出来（`citationSummary`），这样"这个节点没依据"读起来
+                 才是一张图的属性，而不是一个坏掉的功能。
+
+            第二句的结尾永远是"用户能做什么"。第二件（曾经那句"……或者这个节点是
+            你自己加的"）之所以删掉，不是因为它不准确，而是因为它把一个**免责**
+            写成了**归因**：用户读完只知道自己被解释了，不知道下一步。
           -->
           <section
             v-else
@@ -1623,6 +1673,9 @@ const agentHasDetail = computed(() => agentDetailVisible(store));
             data-test="ref-empty"
           >
             <p class="text-xs text-slate-500">这个节点没有原文引用。</p>
+            <p class="text-xs leading-relaxed text-slate-500" data-test="ref-empty-why">
+              {{ noCiteNote }}
+            </p>
             <p v-if="citationSummary" class="text-xs leading-relaxed text-slate-400">
               {{ citationSummary }}
             </p>
