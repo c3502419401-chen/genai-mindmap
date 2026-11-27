@@ -10,7 +10,7 @@
 //   node scripts/report-test-cost.mjs --idle scripts/_test-cost-idle.json \
 //                                    --loaded scripts/_test-cost-loaded.json \
 //                                    --md docs/TEST-LOAD-SENSITIVITY-TABLE.md
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DEFAULT_TIMEOUT, collectLimits, walkSpecs } from './test-cost-limits.mjs';
@@ -38,11 +38,21 @@ function pct(values, q) {
   return Math.round(sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))] * 100) / 100;
 }
 
+function readSnapshot(path, what, hint) {
+  const full = resolve(FRONTEND, path);
+  if (!existsSync(full)) {
+    throw new Error(`缺少${what}快照 ${path}。${hint}`);
+  }
+  return JSON.parse(readFileSync(full, 'utf8'));
+}
+
 function main() {
   const args = parseArgs(process.argv.slice(2));
   if (!args.idle || !args.loaded) throw new Error('需要 --idle 与 --loaded 两份快照');
-  const idle = JSON.parse(readFileSync(resolve(FRONTEND, args.idle), 'utf8'));
-  const loaded = JSON.parse(readFileSync(resolve(FRONTEND, args.loaded), 'utf8'));
+  const idle = readSnapshot(args.idle, '空闲档', '先跑 `npm run test:cost`。');
+  const loaded = readSnapshot(args.loaded, '满载档',
+    '另开终端 `cd ../backend && python -m pytest -o addopts="" -q`，再\n' +
+    '  node scripts/measure-test-cost.mjs --label loaded --out _test-cost-loaded.json');
 
   const limitsByFile = new Map();
   for (const file of walkSpecs(resolve(FRONTEND, 'tests'))) {
@@ -51,7 +61,12 @@ function main() {
   }
 
   const index = new Map(loaded.tests.map((t) => [`${t.file}::${t.full}`, t]));
-  const solo = args.solo ? JSON.parse(readFileSync(resolve(FRONTEND, args.solo), 'utf8')) : null;
+  // 单跑档是可选的（只对 top 慢用例所在的文件采样），缺了就不出那一列，不阻断。
+  let solo = null;
+  if (args.solo) {
+    if (existsSync(resolve(FRONTEND, args.solo))) solo = JSON.parse(readFileSync(resolve(FRONTEND, args.solo), 'utf8'));
+    else console.warn(`（跳过单跑档：${args.solo} 不存在，表里不会有"单跑"那一列）`);
+  }
   const soloIndex = new Map((solo?.tests ?? []).map((t) => [`${t.file}::${t.full}`, t]));
   const rows = [];
   for (const t of idle.tests) {
