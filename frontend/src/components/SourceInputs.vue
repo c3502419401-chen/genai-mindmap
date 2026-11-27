@@ -31,6 +31,14 @@ const charCount = computed(() => mergedCharCount(sources.readySources));
 const problem = computed(() => sources.materialProblem);
 
 /**
+ * 列表里有没有"已进知识库"的材料。
+ *
+ * 只有它才可能有「彻底删除」那个按钮（未入库的材料从没进过库，删它就是移出本轮），
+ * 所以两个词的对照说明只在这种情况下才显示。
+ */
+const hasLibraryItem = computed(() => sources.items.some(item => sources.inLibrary(item)));
+
+/**
  * 有导图时才谈"这份来源有没有被引用"。
  *
  * 还没生成就摆一条 amber 提示，等于催用户去做他正要做的下一步；而且刚添加完
@@ -120,6 +128,25 @@ async function onPickFiles(event: Event) {
         @click="sources.clear()"
       >清空来源</button>
     </div>
+    <!--
+      两个动作的区别**必须在这里说清**，而不是留给文档兜底。
+
+      「从本轮移除」与「彻底删除」曾经并排在同一行（`移除` / `删除`），而后者在材料
+      被导图引用时要**点两次**才生效。两个词都像是"把这个东西从我眼前拿掉"，而实际
+      后果差一个数量级：一个只影响这一轮生成，一个从知识库里永久消失。上一轮把它
+      记成"文档里写清即可"是错的——写手册的人自己都要读两遍才分清，用户不会去读
+      手册。
+
+      只在列表里真有"已入库材料"时显示：还没生成过的材料只有一个动作（从本轮移除），
+      摆一句两个词的对照等于让用户去找一个不存在的按钮。
+    -->
+    <p
+      v-if="hasLibraryItem"
+      data-test="source-actions-legend"
+      class="text-xs leading-relaxed text-slate-400"
+    >
+      「从本轮移除」= 这次生成不用它，材料还在知识库里；「彻底删除」= 从知识库永久删除，不可恢复。
+    </p>
     <p v-if="!sources.items.length" class="text-xs leading-relaxed text-slate-400">
       多个来源会一起生成；不加材料也行。
     </p>
@@ -131,10 +158,11 @@ async function onPickFiles(event: Event) {
           <button
             type="button"
             class="shrink-0 text-slate-400 hover:text-rose-600 disabled:opacity-50"
-            :aria-label="`移除 ${item.label}`"
+            :aria-label="`从本轮移除 ${item.label}`"
+            :title="`这次生成不用它；材料还在知识库里，下次还能用`"
             :disabled="generating"
             @click="sources.remove(item.key)"
-          >移除</button>
+          >从本轮移除</button>
         </div>
         <p v-if="item.state === 'queued'" class="mt-1 text-xs text-slate-500">等待解析…</p>
         <p v-else-if="item.state === 'parsing'" class="mt-1 text-xs text-slate-500" aria-live="polite">
@@ -147,9 +175,14 @@ async function onPickFiles(event: Event) {
             <span v-if="item.source.duration_seconds != null"> · {{ Math.round(item.source.duration_seconds) }} 秒</span>
           </p>
           <!--
-            已进知识库的材料要能删干净。`移除` 只把它从这一轮生成里拿掉，库里那份还在
-            ——传错一份、生成过一次之后，用户在列表里点掉它，"我的材料"里消失的只是
-            这一行，知识库里还占着位置，下次传同一份文件还会被静默复用。
+            已进知识库的材料要能删干净。`从本轮移除` 只把它从这一轮生成里拿掉，库里
+            那份还在——传错一份、生成过一次之后，用户在列表里点掉它，"我的材料"里
+            消失的只是这一行，知识库里还占着位置，下次传同一份文件还会被静默复用。
+
+            **文案分两段**（`彻底删除` → `确认彻底删除`），因为被导图引用时它要点
+            两次：第一次后端 409，界面据此进入 `armed`。这一段过去只在按钮上换个
+            词（`确认删除（连知识库）`），用户看不出"第一次点了个寂寞"——现在
+            `armed` 时旁边那句话直接写"再点一次即永久删除"，点第一次的结果是可见的。
           -->
           <p v-if="sources.inLibrary(item)" class="mt-1 flex flex-wrap items-center gap-2 text-xs">
             <span class="rounded bg-slate-100 px-1 py-0.5 text-slate-500">已在知识库</span>
@@ -157,13 +190,14 @@ async function onPickFiles(event: Event) {
               type="button"
               class="underline decoration-slate-300 disabled:opacity-50"
               :class="item.deleteState === 'armed' ? 'font-medium text-rose-700' : 'text-slate-600 hover:text-rose-600'"
+              :title="item.deleteState === 'armed'
+                ? '再点一次就永久删除，不可恢复'
+                : '从知识库永久删除这份材料，不可恢复（被导图引用时会先问一次）'"
               :disabled="generating || item.deleteState === 'busy'"
               @click="sources.forget(item.key)"
             >{{ item.deleteState === 'busy' ? '删除中…'
-              : item.deleteState === 'armed' ? '确认删除（连知识库）' : '删除' }}</button>
-            <span v-if="item.deleteState !== 'armed'" class="text-slate-400">
-              移除只影响这一轮；删除会连知识库那份一起删掉。
-            </span>
+              : item.deleteState === 'armed' ? '确认彻底删除' : '彻底删除' }}</button>
+            <span v-if="item.deleteState === 'armed'" class="text-rose-700">再点一次即永久删除，不可恢复。</span>
           </p>
           <p v-if="item.error" role="alert" class="mt-1 whitespace-pre-wrap break-words text-xs leading-relaxed text-rose-700">{{ item.error }}</p>
           <p v-if="sourceWarning(item.source)" role="alert" class="mt-1 text-xs leading-relaxed text-amber-700">

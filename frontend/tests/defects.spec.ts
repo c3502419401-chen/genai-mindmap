@@ -4,7 +4,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { MapRecord } from '../src/api/types';
 import HistoryDrawer from '../src/components/HistoryDrawer.vue';
+import SourceInputs from '../src/components/SourceInputs.vue';
 import { useMindMapStore } from '../src/stores/mindmap';
+import { useSourcesStore } from '../src/stores/sources';
 
 /**
  * **写用户手册时撞到的缺陷，逐条变成回归。**
@@ -119,5 +121,55 @@ describe('缺陷一：删除导图', () => {
     expect(store.maps).toHaveLength(1);
     // 回到"可以再删"的状态，而不是停在一个再也点不到的确认态。
     expect(wrapper.find('[data-test="drawer-map-delete"]').exists()).toBe(true);
+  });
+});
+
+describe('缺陷二：移除与删除并排', () => {
+  it('两个动作的文案一眼能分清，并且各有一句就地说明', async () => {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    const sources = useSourcesStore();
+    const wrapper = mount(SourceInputs, { global: { plugins: [pinia] } });
+
+    sources.addText('一份传错的正文');
+    const key = sources.items[0].key;
+    // 生成过一次 → 后端把临时 id 换成库里的持久 id，从此这一行才有"彻底删除"。
+    sources.remap({ [key]: 'lib-1' });
+    await wrapper.vm.$nextTick();
+
+    const labels = wrapper.findAll('button').map(button => button.text());
+    // 两个词不再共用一个"把这个东西拿掉"的语感：一个带范围（本轮），一个带后果（彻底）。
+    expect(labels).toContain('从本轮移除');
+    expect(labels).toContain('彻底删除');
+    expect(labels).not.toContain('移除');
+    expect(labels).not.toContain('删除');
+    // 就地说明（不是"写在手册里"）：两个词各指什么，就在列表上方。
+    const legend = wrapper.find('[data-test="source-actions-legend"]');
+    expect(legend.exists()).toBe(true);
+    expect(legend.text()).toContain('从本轮移除');
+    expect(legend.text()).toContain('彻底删除');
+  });
+
+  it('被引用时点第一次：按钮变成「确认彻底删除」，并说明再点一次就不可恢复', async () => {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    stubFetch(() => jsonResponse({ code: 'source_cited', message: '还被 1 张导图引用' }, 409));
+    const sources = useSourcesStore();
+    const wrapper = mount(SourceInputs, { global: { plugins: [pinia] } });
+    sources.addText('被引用的正文');
+    const key = sources.items[0].key;
+    sources.remap({ [key]: 'lib-1' });
+    await wrapper.vm.$nextTick();
+
+    const target = wrapper.findAll('button').find(button => button.text() === '彻底删除');
+    expect(target, '要有「彻底删除」这个入口').toBeTruthy();
+    await target!.trigger('click');
+    await flushPromises();
+
+    // 第一次点击的结果必须是**可见的**（这正是"要点两次"曾经的问题：用户看不出
+    // 第一次点了个寂寞）。
+    const labels = wrapper.findAll('button').map(button => button.text());
+    expect(labels).toContain('确认彻底删除');
+    expect(wrapper.text()).toContain('再点一次即永久删除');
   });
 });

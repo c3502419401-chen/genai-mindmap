@@ -314,7 +314,7 @@ describe('多来源输入界面', () => {
     await pickFile(wrapper, smallFile('失败.png'));
     await vi.waitFor(() => expect(wrapper.text()).toContain('图片识别失败'));
     expect(submitButton(wrapper).attributes('disabled')).toBeDefined();
-    await wrapper.get('[aria-label="移除 失败.png"]').trigger('click');
+    await wrapper.get('[aria-label="从本轮移除 失败.png"]').trigger('click');
     // 失败项移除后闸门放开：剩下的来源仍然可用（投递形态由 agent 那条链路的用例验）。
     expect(submitButton(wrapper).attributes('disabled')).toBeUndefined();
     expect(sources.readySources).toHaveLength(1);
@@ -338,7 +338,7 @@ describe('多来源输入界面', () => {
     expect(calls).toHaveLength(0);
     expect(sources.items).toHaveLength(2);
 
-    await wrapper.get('[aria-label="移除 文本 2"]').trigger('click');
+    await wrapper.get('[aria-label="从本轮移除 文本 2"]').trigger('click');
     expect(submitButton(wrapper).attributes('disabled')).toBeUndefined();
   });
 
@@ -385,7 +385,7 @@ describe('多来源输入界面', () => {
     // 取消之后对话框回来，材料还在、能继续改：取消不该顺手把用户收集的材料清掉。
     await wrapper.vm.$nextTick();
     expect(sources.items).toHaveLength(1);
-    expect(buttonByText(wrapper, '移除').attributes('disabled')).toBeUndefined();
+    expect(buttonByText(wrapper, '从本轮移除').attributes('disabled')).toBeUndefined();
     release(jsonResponse({}));
   });
 

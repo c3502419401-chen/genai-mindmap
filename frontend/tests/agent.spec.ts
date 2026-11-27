@@ -1129,7 +1129,7 @@ describe('材料入库后的 id 重映射', () => {
     // 两行的 id 相同不能当成"重复 key"：行身份挂在 key 上
     expect(sourcesStore.items.map(item => item.key)).toEqual(['tmp-a', 'tmp-b']);
 
-    const removes = rows[0].findAll('button').filter(button => button.text() === '移除');
+    const removes = rows[0].findAll('button').filter(button => button.text() === '从本轮移除');
     await removes[0].trigger('click');
 
     expect(wrapper.findAll('ul[aria-label="待生成来源"] > li')).toHaveLength(1);
