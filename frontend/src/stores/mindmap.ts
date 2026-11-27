@@ -19,7 +19,7 @@ import {
   type InsertIntent,
   type InsertRejectionCode,
 } from '../mindmap/drop-plan';
-import { diffEdits, EDIT_EVENT_LIMIT, generateEvent, type EditActor, type EditEvent } from '../mindmap/edit-log';
+import { diffEdits, EDIT_EVENT_LIMIT, generateEvent, type EditActor, type EditEvent, type EditKind } from '../mindmap/edit-log';
 import { CONNECTION_LOST, guideForFailure, INVALID_SOURCES, NO_CONTENT, type FailureGuide } from '../mindmap/failures';
 import { evictCount } from '../mindmap/history-limit';
 import { moveScopeProblem } from '../mindmap/move-scope';
@@ -1142,9 +1142,27 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * `content` 允许为 `null`：画布本来是空的时那一步没有"改动之前那棵树"，但差分
    * 本身会返回空数组（整棵树都是新的，不是 diff）——那条判断在 `diffEdits` 里。
    */
+  /**
+   * 一次改动记到谁头上、是一次什么动作。
+   *
+   * `pushHistory()` / `applyContent()` 收它而**不收位置参数**：`actor` 与 `kind` 都是
+   * 字符串字面量联合，位置传反（`('agent', 'repair')` 写成 `('repair', 'agent')`）
+   * 编译器只会在别处报一句"类型不符"，而"两个都改对了但顺序错"在加第三个参数时
+   * 必然会发生。对象字面量让每个字段自己说出名字，加字段也不会动任何调用点。
+   *
+   * 三个字段的默认值都是"最常见的那条路"：`actor='user'`（手工编辑）、`kind` 不给
+   * （让 `diffEdits` 自己判动作名）、`runId` 不给（手工编辑没有 run）。
+   */
+  interface EditOrigin {
+    actor?: EditActor;
+    kind?: EditKind;
+    runId?: string;
+  }
+
   let editBase: {
     content: DiagramContent | null;
     actor: EditActor;
+    kind?: EditKind;
     runId?: string;
   } | null = null;
 
@@ -2682,17 +2700,27 @@ export const useMindMapStore = defineStore('mindmap', () => {
   /**
    * 改动前调用：记一步历史，并让重做栈失效（树从这里长出新的分支了）。
    *
-   * `actor` 决定这次改动记到谁头上：默认 `user`（手工编辑，绝大多数调用点），
-   * `agent` 只有 `commitGenerated()` 传（用户没动手，改动是模型算的）。
+   * `origin` 决定这次改动记到谁头上、以及它是一次什么动作：
+   *
+   *  - 缺省（`{}`）：`actor='user'`、动作名由 `diffEdits` 自己判——手工编辑的绝大多数
+   *    调用点都走这条；
+   *  - `actor: 'agent'`：只有 `commitGenerated()` 传（用户没动手，改动是模型算的）；
+   *  - `kind: 'repair'`：只有 `replaceContent()` 传（一键修复，见那里的注释）。
+   *
    * 区分只能靠参数——`pushHistory()` 返回之后 `content.value` 已经是新树，那时候
-   * 再想看出"谁改的"是不可能的。
+   * 再想看出"谁改的 / 什么动作"是不可能的。
    */
-  function pushHistory(actor: EditActor = 'user', runId?: string) {
+  function pushHistory(origin: EditOrigin = {}) {
     const current = content.value;
     if (!current) return;
     recordPast(JSON.stringify(current));
     future.value = [];
-    editBase = { content: current, actor, ...(runId ? { runId } : {}) };
+    editBase = {
+      content: current,
+      actor: origin.actor ?? 'user',
+      ...(origin.kind ? { kind: origin.kind } : {}),
+      ...(origin.runId ? { runId: origin.runId } : {}),
+    };
   }
 
   /** 还能撤销几步、占了多少字节：界面与测试都靠它确认字节上限真的生效。 */
@@ -2746,6 +2774,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     const events = diffEdits(base.content, after, {
       actor: base.actor,
       at,
+      ...(base.kind ? { kind: base.kind } : {}),
       ...(base.runId ? { runId: base.runId } : {}),
     });
     if (!events.length) return;
@@ -2796,7 +2825,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
   function applyContent(
     next: DiagramContent,
     history: boolean,
-    actor: EditActor = 'user',
+    origin: EditOrigin = {},
   ): boolean {
     // **生成期间不再禁止编辑。** 从前锁画布是为了"候选落地"那一步：它要用户点一下，
     // 而那一刻必须比对版本。现在落地是自动的，锁住反而让"这 25 秒我顺手改个标题"
@@ -2804,7 +2833,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
     //
     // 代价由 `commitGenerated` 的冲突判定兜住：期间改过（`clientRevision` 变了）
     // 就**不覆盖**，两棵树都留着让用户选。这里一个字都不用判。
-    if (history) pushHistory(actor);
+    if (history) pushHistory(origin);
     content.value = slot(next);
     dirty.value = true;
     clientRevision.value += 1;
@@ -2847,14 +2876,27 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 已经不存在的输入框。逐项入口各自处理这件事（`deleteNode` 会把选中挪给父节点），
    * 整体替换得自己收。
    *
-   * 账本记谁：`actor` 保持 `user`。修复没有调模型，扳机是用户按的；记成 `agent` 会让
-   * "模型改的"这个桶被确定性规则污染。理由与代价见 `docs/OPTIMIZATION-REPAIR.md` §7。
+   * 账本记谁：`actor` 保持 `user`（修复没有调模型，扳机是用户按的；记成 `agent` 会让
+   * "模型改的"这个桶被确定性规则污染），**`kind` 记 `repair`**。
+   *
+   * ## 为什么 `kind` 写死在这里，而不是加一个参数
+   *
+   * 这个函数**只服务一件事**：`/optimization/repair` 修好的树落地（`applyRepair` 是
+   * 唯一调用方，其余都是用例）。既然"这一次是规则批量整理"是它的定义而不是它的选项，
+   * 那就不该由调用方来传——传参意味着某个下一个人用 `replaceContent` 落地一次**不是**
+   * 修复的整体替换时，会静默地把它记成 `repair`，或者反过来忘了传、把修复记成
+   * "用户改的"（这一轮修的正是那个 bug）。
+   *
+   * 写死之后，"哪些事件记成 `repair`"只有这一个答案，改它要改这个函数——而改这个函数
+   * 的人一定读得到这段注释。
    */
   function replaceContent(next: DiagramContent): boolean {
     // 空画布没有"修复前"可退，也没有可修的东西：后端那三条规则都要读 `content.root`。
     // 返回 false 而不是悄悄装进去——调用方据此能说清"为什么什么都没发生"。
     if (!content.value) return false;
-    applyContent(next, true);
+    // `kind: 'repair'` 会覆盖这一批事件各自的动作名（add / remove / move / update），
+    // 见 `edit-log.ts::DiffOptions`。`actor` 不传：缺省 `user`，理由见上。
+    applyContent(next, true, { kind: 'repair' });
     ensureSelection();
     editingId.value = null;
     return true;
@@ -4898,7 +4940,7 @@ export const useMindMapStore = defineStore('mindmap', () => {
       // `actor` 必须是 `agent`：这条路上用户没动手，改动是模型算出来的。
       // `runId` 带上——统计里"这次生成被改了几处"只能靠它把改动事件与
       // `generate` 那条对上，而它过了 `reportRunSaved()` 就没了。
-      pushHistory('agent', meta.runId);
+      pushHistory({ actor: 'agent', runId: meta.runId });
     }
     content.value = slot(next);
     // 改动与"这次生成"共享同一个 `at`：它是"一次操作产生了几条事件"的唯一分组

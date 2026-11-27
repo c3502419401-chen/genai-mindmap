@@ -6,7 +6,7 @@ import `contracts.mindmap`。事件模型留在仓储层的话，`contracts → 
 mindmaps.repository → contracts` 就成环了，只能靠函数内 import 打补丁——那是症状，
 不是解法。
 
-六个刻意的取舍（数字怎么读全靠它们）：
+几处刻意的取舍（数字怎么读全靠它们，条数故意不写死——每加一种 `kind` 都会变）：
 
   - **`before` / `after` 是摘要，不是内容。** `label` 存全文（≤200 字，统计要算
     长度），`detail` / `note` 只存 `"1800字"`。一份 2000 字的正文进日志表，它就
@@ -29,6 +29,16 @@ mindmaps.repository → contracts` 就成环了，只能靠函数内 import 打�
     它就是统计的分母：`SUM(node_count) WHERE kind='generate'`。
     `change_count` 曾经承担过"这次接受带来几处改动"，现在不用了——"这次生成有没有
     被改"只要看同一个 `run_id` 下有没有改动事件就够了，不需要前端算好塞进来。
+  - **`kind="repair"` 是"规则批量整理"，不是"谁改的"。** 一键修复（`POST
+    /optimization/repair`）把整棵树替换掉，diff 出来的是 add / remove / move /
+    update 那些动作——**但这些事件的 `kind` 一律记成 `repair`**，`actor` 仍是
+    `user`（扳机是用户按的，见 `docs/OPTIMIZATION-REPAIR.md` §7）。
+    于是 `by_kind` 少掉"这次修复删了几个、搬了几个"的分桶，换来的是一个干净的
+    事实：**用户回看"我改过什么"时，不会看到自己没做过的改动。**
+    动作粒度没有丢——`field` / `before` / `after` / `depth` / `subtree_size` 都还在
+    事件行上，只是不能再按 `kind` 分组读。`repair` 是**一次模型调用都没有**的动作，
+    所以它不能进 `agent` 桶（那会让"模型改的"这个分母失去意义），也不该混进
+    `user` 那份"人手动改了什么"的账。
   - **`kind="accept"` 保留在字面量里，但已不再写入。** 它是"应用候选"那个动作的
     遗迹：候选层删掉之后没有"应用"这一步，新数据一律是 `generate`。留着它是因为
     库里已有几千行历史（`by_kind` 要能读到它们），而老前端还会发——拒收会让一次
@@ -55,10 +65,13 @@ MAX_SUMMARY_CHARS = 400
 #: 与前端 `mindmap/edit-log.ts` 的三个联合类型逐字对应。写成 `Literal` 而不是 `str`：
 #: 它们会进 OpenAPI，前端镜像那边是同一份字面量联合，两端对齐靠契约。
 #:
-#: `generate` 与其余六种并列：它不是"改了什么"，而是"本来可以改却没改"的那个分母。
-#: `accept` 是它的前身（候选层的"应用到画布"），只读不写，见文件头。
+#: `generate` 与其余几种并列：它不是"改了什么"，而是"本来可以改却没改"的那个分母。
+#: `repair` 也不是"哪一处被改了"，而是一次**批量整理**——它替换掉 diff 出来那批
+#: 事件的 `kind`（动作粒度仍在事件行上，见文件头）。
+#: `accept` 是 `generate` 的前身（候选层的"应用到画布"），只读不写，见文件头。
 EditActor = Literal["user", "agent"]
-EditKind = Literal["add", "remove", "update", "move", "edge", "style", "accept", "generate"]
+EditKind = Literal["add", "remove", "update", "move", "edge", "style", "accept", "generate",
+                   "repair"]
 EditField = Literal["label", "title", "detail", "note", "color", "icon"]
 
 
@@ -136,12 +149,19 @@ class EditEventRow(EditEventIn):
 
 
 class LabelShrunk(BaseModel):
-    """标题被改短的统计，**只统计 `actor="user"`**。
+    """标题被改短的统计，**只统计 `actor="user"` 且 `kind != "repair"`**。
 
     过滤 actor 的理由：`agent` 的改动是"模型自己又改了一遍"（生成直接落画布时那批
     改动记在 `agent` 名下），它不反映用户的偏好。混进来时 `count` 会比用户的真实
     条数多（实测 B 图 3 条 user 的缩短被算成 4 条，多出来的那条是 agent 的 13→10
     字），而"用户的缩短偏好"正是这个数字要回答的东西。
+
+    过滤 `kind` 的理由：一键修复的 `actor` 也是 `user`（扳机是用户按的），而
+    `SINGLE_CHILD` 那条修法**是改文字**——"外层 / 内层"两层合成一个标题，必然比
+    外层原来那个短。不过滤它，"规则把两层标题拼成一个"就会被读成"用户嫌标题太长"，
+    而那条规则本身已经把标题改短过一次：拿它去论证"生成侧该写短一点"是循环论证。
+
+    两条过滤各挡一样东西：`actor` 挡模型，`kind` 挡规则。
 
     `avg_before` / `avg_after` 是**字数**（码点），只有 `count` 为 0 时才是 `None`。
     两个平均值的差（18.3 → 9.1）就是"缩短了多少"，比只看 count 有信息量得多：
@@ -162,6 +182,11 @@ class EditSummary(BaseModel):
       - `sum(by_field) == by_kind["update"] + by_kind["style"]`。
 
     对不上就说明有写入路径绕过了契约，而不是"统计有点怪"。
+
+    第二条**不会**因为加了 `kind="repair"` 而失效：`repair` 事件里改文字的确实带
+    `field`，但 `by_field` 只统计 `kind in ('update','style')` 的行（与 `label_shrunk`
+    排除 `repair` 同一条理由：那不是人写的）。所以 `sum(by_kind) == total` 与
+    `sum(by_field) == update + style` 两条都照旧是等式，`by_kind` 只是多了一个桶。
 
     改动量与"本来可以不改"的分母分列四组，全部是原始量（比例让读的人自己除）：
     分母 `generated_nodes`、分子 `changed_events`、以及"这次生成一处都没被改"的
@@ -194,8 +219,14 @@ class EditSummary(BaseModel):
     #: **分母**：`SUM(node_count) WHERE kind='generate'`。即"模型一共交给用户多少个
     #: 节点"。用户删掉一半再保存，这数不变——它说的是模型给了什么。
     generated_nodes: int = 0
-    #: **分子**：`COUNT(*) WHERE kind IN ('update','remove','add','move','style')`。
-    #: `edge` 不进：分母数的是节点，把"加了一条关系"算进节点改动会让比例失去意义。
+    #: **分子**：`COUNT(*) WHERE kind IN ('update','remove','add','move','style','repair')`。
+    #: 两点都由"分子"这个身份决定，不是随手列的：
+    #:
+    #:  - `edge` 不进：分母数的是节点，把"加了一条关系"算进节点改动会让比例失去意义；
+    #:  - `repair` **进**：一键修复确实改了节点（删、搬、改文字），不算进来的话，
+    #:    一次"模型给了 30 个节点、规则删掉 12 个"的生成会被读成"一字未改"。它与
+    #:    `untouched_runs` 的集合必须逐字相同，否则会出现"既不算改动、也不算一字未改"
+    #:    的黑洞，见 `app/mindmaps/edits.py::summary` 里那段注释。
     changed_events: int = 0
     #: 那个 `run_id` 下**一条改动事件都没有**的 generate 行数——"生成完一字未改"。
     #:

@@ -1426,7 +1426,7 @@ export interface components {
              * Kind
              * @enum {string}
              */
-            kind: "add" | "remove" | "update" | "move" | "edge" | "style" | "accept" | "generate";
+            kind: "add" | "remove" | "update" | "move" | "edge" | "style" | "accept" | "generate" | "repair";
             /** Node Id */
             node_id?: string | null;
             /** Field */
@@ -1462,7 +1462,7 @@ export interface components {
              * Kind
              * @enum {string}
              */
-            kind: "add" | "remove" | "update" | "move" | "edge" | "style" | "accept" | "generate";
+            kind: "add" | "remove" | "update" | "move" | "edge" | "style" | "accept" | "generate" | "repair";
             /** Node Id */
             node_id?: string | null;
             /** Field */
@@ -1527,6 +1527,11 @@ export interface components {
          *       - `sum(by_field) == by_kind["update"] + by_kind["style"]`。
          *
          *     对不上就说明有写入路径绕过了契约，而不是"统计有点怪"。
+         *
+         *     第二条**不会**因为加了 `kind="repair"` 而失效：`repair` 事件里改文字的确实带
+         *     `field`，但 `by_field` 只统计 `kind in ('update','style')` 的行（与 `label_shrunk`
+         *     排除 `repair` 同一条理由：那不是人写的）。所以 `sum(by_kind) == total` 与
+         *     `sum(by_field) == update + style` 两条都照旧是等式，`by_kind` 只是多了一个桶。
          *
          *     改动量与"本来可以不改"的分母分列四组，全部是原始量（比例让读的人自己除）：
          *     分母 `generated_nodes`、分子 `changed_events`、以及"这次生成一处都没被改"的
@@ -1996,12 +2001,19 @@ export interface components {
         };
         /**
          * LabelShrunk
-         * @description 标题被改短的统计，**只统计 `actor="user"`**。
+         * @description 标题被改短的统计，**只统计 `actor="user"` 且 `kind != "repair"`**。
          *
          *     过滤 actor 的理由：`agent` 的改动是"模型自己又改了一遍"（生成直接落画布时那批
          *     改动记在 `agent` 名下），它不反映用户的偏好。混进来时 `count` 会比用户的真实
          *     条数多（实测 B 图 3 条 user 的缩短被算成 4 条，多出来的那条是 agent 的 13→10
          *     字），而"用户的缩短偏好"正是这个数字要回答的东西。
+         *
+         *     过滤 `kind` 的理由：一键修复的 `actor` 也是 `user`（扳机是用户按的），而
+         *     `SINGLE_CHILD` 那条修法**是改文字**——"外层 / 内层"两层合成一个标题，必然比
+         *     外层原来那个短。不过滤它，"规则把两层标题拼成一个"就会被读成"用户嫌标题太长"，
+         *     而那条规则本身已经把标题改短过一次：拿它去论证"生成侧该写短一点"是循环论证。
+         *
+         *     两条过滤各挡一样东西：`actor` 挡模型，`kind` 挡规则。
          *
          *     `avg_before` / `avg_after` 是**字数**（码点），只有 `count` 为 0 时才是 `None`。
          *     两个平均值的差（18.3 → 9.1）就是"缩短了多少"，比只看 count 有信息量得多：

@@ -1257,10 +1257,14 @@ export interface ChangePasswordRequest {
 export interface EditEventPayload {
   actor: 'user' | 'agent';
   /**
-   * `generate` 是"一次生成落到画布"（新数据）；`accept` 是它的前身（候选层还在时
-   * "用户点了应用"），只在历史行里出现。两字样都在，是因为库里既有老行也有新行。
+   * `generate` 是"一次生成落到画布"（新数据）；`repair` 是一键修复（规则批量整理，
+   * 整批事件的 kind 都被它覆盖，动作粒度仍在 field / before / after 上）；
+   * `accept` 是 `generate` 的前身（候选层还在时"用户点了应用"），只在历史行里出现。
+   * 三字样都在，是因为库里既有老行也有新行。
    */
-  kind: 'add' | 'remove' | 'update' | 'move' | 'edge' | 'style' | 'accept' | 'generate';
+  kind:
+    | 'add' | 'remove' | 'update' | 'move' | 'edge' | 'style' | 'accept' | 'generate'
+    | 'repair';
   node_id?: string;
   field?: 'label' | 'title' | 'detail' | 'note' | 'color' | 'icon';
   /** 摘要，不是内容（`detail`/`note` 只存 `"1800字"` 这种长度）。 */
@@ -1303,6 +1307,10 @@ export interface EditEventRow extends EditEventPayload {
  * 两条恒等式让这份数字可以先自校验再读结论：
  *  - `sum(by_actor) === total`；
  *  - `sum(by_field) === by_kind.update + by_kind.style`（只有这两种事件带 field）。
+ *
+ * 第二条不会因为 `kind='repair'` 而失效：`by_field` 只统计 `update` / `style` 的行，
+ * `repair` 那种"规则改的文字"不算进"用户最常改哪个字段"——与 `label_shrunk` 排除
+ * `repair` 是同一条理由（后端 `app/mindmaps/edits.py::FIELD_KINDS`）。
  */
 export interface EditSummary {
   total: number;

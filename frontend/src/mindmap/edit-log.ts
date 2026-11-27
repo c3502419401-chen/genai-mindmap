@@ -84,9 +84,18 @@ export type EditActor = 'user' | 'agent';
  * `accept` 是它的前身（候选层还在时"用户点了应用"）。**前端不再产生它**，保留在
  * 联合类型里只是为了与后端 `EditKind` 逐字对齐：库里还有几千行历史，镜像少写一个
  * 字面量，读老数据的人就会以为那些行是非法的。
+ *
+ * `repair` 是**一键修复**（`replaceContent`，规则批量整理整棵树）。它不是"哪一处
+ * 被改了"，而是"这一次动作是规则干的"：`replaceContent` 落地时用 `DiffOptions.kind`
+ * 把这一整批事件的 `kind` 全部换成 `'repair'`，`actor` 仍是 `user`（扳机是用户按的）。
+ * 于是 `by_kind` 少掉"这次修复删了几个、搬了几个"的分桶，换来的是一个干净的事实：
+ * **用户回看"我改过什么"时，不会看到自己没做过的改动。**
+ * 动作粒度没丢——`field` / `before` / `after` / `depth` / `subtreeSize` 都还在事件行上，
+ * 只是不能再按 `kind` 分组读。理由与代价见 `docs/OPTIMIZATION-REPAIR.md` §7。
  */
 export type EditKind =
-  | 'add' | 'remove' | 'update' | 'move' | 'edge' | 'style' | 'accept' | 'generate';
+  | 'add' | 'remove' | 'update' | 'move' | 'edge' | 'style' | 'accept' | 'generate'
+  | 'repair';
 
 /**
  * 改动落在哪个字段上。**只有 `kind` 为 `update` / `style` 的事件才有值。**
@@ -294,6 +303,14 @@ export interface DiffOptions {
   /** 同一次提交共享的时刻（`new Date().toISOString()` 由调用方取一次）。 */
   at: string;
   runId?: string;
+  /**
+   * 这一次动作的 `kind`：给了它就**覆盖**每条事件自己的 `kind`。
+   *
+   * 只有 `repair` 用（一键修复把整棵树换掉，diff 出来的是 add / remove / move /
+   * update 那批动作，但整批只回答一件事："这一次是规则批量整理"）。缺省不给，
+   * 每条事件保留 `diffEdits` 自己判出来的动作名——手工编辑那条路一个字都不变。
+   */
+  kind?: EditKind;
 }
 
 /**
@@ -320,6 +337,9 @@ export function diffEdits(
       at: options.at,
       ...(options.runId ? { runId: options.runId } : {}),
       ...event,
+      // 放在 `...event` **之后**：`options.kind` 给了就压过动作名（见 `DiffOptions`）。
+      // 这是这个文件里唯一一处"动作名可以被外部改写"的地方，所以只有一处。
+      ...(options.kind ? { kind: options.kind } : {}),
     });
   };
 
