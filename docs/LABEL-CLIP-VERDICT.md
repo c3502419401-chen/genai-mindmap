@@ -24,6 +24,13 @@
 GENERATED_LABEL_MAX_CHARS = 16
 ```
 
+> **★ 上面这段注释已经改掉了（本轮）。** 它留在这里是因为这一节要对比"代码里写的"
+> 与"实际发生的"，而这句话正是那次对比的对象。§7.1 的结论是：画布那段是**事后补
+> 的理由**，真实来历是 16 跟着"提出 `detail`"一起进来，且没做 A/B。现在
+> `contracts/mindmap.py` 里写的是诚实版："16 是提出 `detail` 那一次的取舍，不是量
+> 出来的；改它要重跑生成对照（约 20 次调用）"。**一个看起来有依据的数字，会让下一个
+> 人以为它测过。**
+
 ### ② 生成侧（`backend/app/agent/tools.py:2624`，`_slot_from` 的 docstring）
 
 ```
@@ -295,19 +302,24 @@ Learning`——它的全称在 `detail` 里（这正是 §二那条判定的前�
 是对的，但"16 而不是 14 或 18"没有任何一条实测支持——这一轮也没有补上这个测量，因为
 补它要重跑 20 次生成（模型调用），超出这一件的范围。**账留着。**
 
+> **★ 本轮已把代码注释改成诚实版**（`contracts/mindmap.py::GENERATED_LABEL_MAX_CHARS`
+> 上方）：删掉"180px / 一行 12 / 两行 24"那套事后论证，写清"16 是提出 `detail` 那一次的
+> 取舍、未做 A/B、改它要重跑约 20 次调用"。**没补测，但也不再让注释假装测过**——
+> 这两件事的区别就是这一轮的全部改动。§7.2 A 里那四处同源副本也已统一（见 §7.3）。
+
 ### 7.2 扫全部长度/数量上限常量：同值不同职责的清单
 
 `grep` 全 `app/**` 的 `*_CHARS / *_MAX / *_LIMIT / *_BYTES / *_NODES / *_DEPTH`，
 按值分组后只有三类值得说。
 
-**A · 同源却写了两遍（真隐患：改一处另一处不跟，且都不报错）**
+**A · 同源却写了两遍（真隐患：改一处另一处不跟，且都不报错）— 已在 §7.3 统一**
 
-| 常量 | 位置 | 契约侧的对应物 |
-|---|---|---|
-| `MAX_DEPTH = 8` | `optimization/service.py:97` | `contracts/mindmap.py:29 MAX_TREE_DEPTH = 8`，**没 import**，注释自己写着"与契约保持一致" |
-| `MAX_LABEL_CHARS = 200` | `agent/stream_items.py:25` | `contracts/mindmap.py:82 MAX_NODE_LABEL_CHARS = 200`，**没 import**，注释写着"与契约里 `Node.label` 同口径" |
-| `LEAF_MAX_CHARS = 300` | `knowledge/service.py:651` | `contracts/source.py:332` 的 `max_length=300` 是**内联字面量**，连常量都没有；而 `service.py` 的注释说"不得超过 `SourceRef.quote` 的 300" |
-| `GENERATED_LABEL_HINT = 16` | `frontend/src/mindmap/edits.ts:390` | `contracts/mindmap.py:101 GENERATED_LABEL_MAX_CHARS = 16`，**跨语言手写**，没有构建期同步 |
+| 常量（改前） | 位置 | 契约侧的对应物 | 改后 |
+|---|---|---|---|
+| `MAX_DEPTH = 8` | `optimization/service.py:97` | `contracts/mindmap.py MAX_TREE_DEPTH = 8`，**没 import**，注释自己写着"与契约保持一致" | 删本地定义，直接用 `MAX_TREE_DEPTH` |
+| `MAX_LABEL_CHARS = 200` | `agent/stream_items.py:25` | `contracts/mindmap.py MAX_NODE_LABEL_CHARS = 200`，**没 import**，注释写着"与契约里 `Node.label` 同口径" | 删本地定义，直接用 `MAX_NODE_LABEL_CHARS` |
+| `LEAF_MAX_CHARS = 300` | `knowledge/service.py:651` | `contracts/source.py` 的 `max_length=300` 是**内联字面量**，连常量都没有 | 内联值提成 `SOURCE_REF_QUOTE_MAX_CHARS`，两侧同源 |
+| `GENERATED_LABEL_HINT = 16` | `frontend/src/mindmap/edits.ts:390` | `contracts/mindmap.py GENERATED_LABEL_MAX_CHARS = 16`，**跨语言手写** | 保持手写 + 后端用例对账（见 §7.3） |
 
 判：**这四个都该统一**。前两个是"字面量复制 + 注释承诺同步"，第三个更糟——被引用的那一侧
 根本不是常量，第四个是跨语言复制（而这个仓库已经有"值域单一源、构建期生成"的先例，
@@ -319,6 +331,22 @@ Learning`——它的全称在 `detail` 里（这正是 §二那条判定的前�
 所以这一件把实际 label 改短之后它更少触发，不受影响；`schema.d.ts` 里 `label` 也只是
 `string | null`，没有 `maxLength: 16`。**前端不依赖 16 这个数做校验**——这一点是查过的，
 不是推的。
+
+### 7.3 四处统一的结果（本轮）
+
+判据不是"值相等"——四处改前就都相等。判据是**丢同步机制会不会红**。
+
+| # | 统一方式 | 为什么两侧应该相等（不是"故意更严的副本"） | 守卫 |
+|---|---|---|---|
+| ① | `optimization/service.py` 删 `MAX_DEPTH`，直接读 `MAX_TREE_DEPTH` | `_iter_nodes` 的 `depth` 从 1 起、含根，与契约同一个口径。它报的是 `DEPTH_LIMIT`（"已到上限"），比契约更严就变成**假诊断** | 等值 + 顶层不许有数字字面量常量（`ast`）+ 第 N 层报、第 N+1 层契约拒 |
+| ② | `agent/stream_items.py` 删 `MAX_LABEL_CHARS`，直接读 `MAX_NODE_LABEL_CHARS` | 预览和最终树是同一段文字，预览更短会让用户以为字被吃了，更长会被 `Field` 拒 | 等值 + 无数字副本 + 超长真的按契约数切、刚好到上限不切 |
+| ③ | `contracts/source.py` 内联 `300` → `SOURCE_REF_QUOTE_MAX_CHARS`；`knowledge/service.py` 的 `LEAF_MAX_CHARS` 引用它 | 子块整段会当 `evidence_quote` 回给模型，超过引用容量就只能不给偏移，逐字校验对这批命中失效 | 等值 + 无数字副本 + `SourceRef(quote=…)` 正好过、多一字 422 |
+| ④ | `edits.ts` 保持手写 16，**后端用例读前端文件取数**（`test_thinking_options.py` 同一条路） | 跨语言只能这样钉：一个提示文案，不值得为它复制"脚本→json→import"整条管线 | 正则取 `GENERATED_LABEL_HINT = (\d+)`，断言 == `GENERATED_LABEL_MAX_CHARS` |
+
+四处守卫都在 `backend/tests/test_shared_constants.py`，逐条**验过红**（改一处 → 对应用例红
+→ 改回）。第三处的守卫特意多了一条"**契约字段真的接在那个常量上**"：把内联 `300` 提成常量
+之后忘了把 `Field` 那行换过去，两侧照样相等、测试照样绿，而常量根本没生效——值相等不等于
+接上了。
 
 **B · 同值不同职责（都各自成立，但读代码的人会以为是同一个东西）**
 
@@ -337,17 +365,18 @@ Learning`——它的全称在 `detail` 里（这正是 §二那条判定的前�
 
 **C · 一个数在契约里当硬约束、在别处当可读性建议（父任务问的那个形状）**
 
-| 硬的那一侧 | 软的那一侧 | 现状 |
+| 硬的那一侧 | 软的那一侧 | 现状（本轮之后） |
 |---|---|---|
 | `MAX_NODE_LABEL_CHARS = 200`（`Field` 硬拒，旧图必须能读） | `GENERATED_LABEL_MAX_CHARS = 16`（生成侧硬切） | **已经写清了**（"这是生成侧的约束，不是契约校验"），是本仓库处理得最好的一对 |
-| `MAX_TREE_DEPTH = 8`（第 9 层加不出来） | `optimization/service.py` 的 `MAX_DEPTH`（只报 warn 诊断） | 值对了，同步机制没有（见 A） |
-| `SourceRef.quote max_length=300`（硬拒） | `LEAF_MAX_CHARS = 300`（分块目标长度，注释说"不得超过"） | 靠注释维持，没有常量（见 A） |
+| `MAX_TREE_DEPTH = 8`（第 9 层加不出来） | `optimization/service.py` 的深度上限（只报 warn 诊断） | ✅ 已统一：优化侧读的就是契约常量 |
+| `SOURCE_REF_QUOTE_MAX_CHARS = 300`（硬拒） | `LEAF_MAX_CHARS`（分块目标长度） | ✅ 已统一：`LEAF_MAX_CHARS = SOURCE_REF_QUOTE_MAX_CHARS` |
 
-判：**这一族里只有第一对是健康的**——因为它把两个数**放在同一个文件、相邻的位置、
+判：**这一族里只有第一对当初是健康的**——因为它把两个数**放在同一个文件、相邻的位置、
 并且在注释里互相解释**。A 里那三个的失败不是"值错了"，是"没有把'它们是一回事'写进
-能被执行的东西里"。这一轮不动它们（不在第 6 件的地盘），但它该是下一件：把 `MAX_DEPTH`
-与 `MAX_LABEL_CHARS` 改成 `from app.contracts.mindmap import ...`，再给 `quote` 的 300
-一个常量名。**三条 import 的改动，加上两个用例就能钉住，成本比这一件低。**
+能被执行的东西里"。**本轮已按这一节的建议做完**：三条 import、`quote` 的 300 有了名字
+`SOURCE_REF_QUOTE_MAX_CHARS`，守卫在 `tests/test_shared_constants.py`（六条用例，逐条验过红）。
+当初那句"三条 import 的改动，加上两个用例就能钉住"估得偏少——实际是两条用例就能**断言**
+相等，但要**验红**、要防"副本长回来"、要证明"常量真的接在字段上"，落到 7 条才够。
 
 ---
 
