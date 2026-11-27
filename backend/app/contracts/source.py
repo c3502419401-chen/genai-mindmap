@@ -17,6 +17,19 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 # 的 `.` 之后），而检索前置过滤正是靠字典序比较时间。
 ISO_SECONDS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
+# 引用原文（`SourceRef.quote`）的字数上限 = 300。
+#
+# 它原本是 `Field(max_length=300)` 里的一个内联字面量，而 `knowledge/service.py`
+# 那边另写了一个 `LEAF_MAX_CHARS = 300` 并加注释说"不得超过 `SourceRef.quote` 的
+# 300"。两处都是肉眼比对：内联字面量没法被 import，于是"不得超过"这句承诺只能靠
+# 读注释的人记着。提到这里，才有第二个地方能引用它。
+#
+# 为什么两处**必须**相等（不是碰巧同值）：检索把命中的子块整段当 `evidence_quote`
+# 回给模型，子块一超过它，这条命中就只能不给偏移——模型随即退回"只抄 quote、不写
+# 区间"，逐字校验对这批命中整个失效。账在 `knowledge/service.py`
+# 的 `LEAF_MAX_CHARS` 那段长注释里，断言在 `tests/test_shared_constants.py`。
+SOURCE_REF_QUOTE_MAX_CHARS = 300
+
 
 def to_utc_iso(value: str | None) -> str | None:
     """把任意 ISO8601 时间串归一化成 UTC 秒级 `...Z`；解析不了返回 None。
@@ -329,7 +342,7 @@ class SourceRef(BaseModel):
     page: int | None = Field(default=None, ge=1, strict=True)
     start: int | None = Field(default=None, ge=0, strict=True)
     end: int | None = Field(default=None, ge=0, strict=True)
-    quote: str | None = Field(default=None, max_length=300)
+    quote: str | None = Field(default=None, max_length=SOURCE_REF_QUOTE_MAX_CHARS)
 
     @field_validator("source_id")
     @classmethod

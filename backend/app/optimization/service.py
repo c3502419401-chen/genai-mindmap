@@ -39,7 +39,7 @@ check() 检查单子节点、达到深度上限及同一父节点下的重复标
 见 `NOT_SUGGESTED`（码 → 理由）与 `_REFERENCE_CODE_PREFIXES`。两条要点：
 
   · `DEPTH_LIMIT`——"已到 8 层"不是一个可执行的动作。契约本身禁止第 9 层
-    （`MAX_DEPTH` 与 `contracts.mindmap` 的深度上限同值），所以既没有"再展开一层"
+    （诊断用的深度上限就是契约的 `MAX_TREE_DEPTH`），所以既没有"再展开一层"
     可做，也没有"减一层"这种可定位的编辑——要减掉的是这一支的中间层，那是重写
     一支而不是改一个节点。它只作为 warn 诊断存在。
   · 引用类（`SOURCE_*` / `UNSOURCED_*` / `UNVERIFIED_*` / `INVALID_*` / `EMPTY_*`）
@@ -87,14 +87,21 @@ from app.contracts.diagnostic import (
     Suggestion,
     SuggestionKind,
 )
-from app.contracts.mindmap import MindMapContent, Node
+from app.contracts.mindmap import MAX_TREE_DEPTH, MindMapContent, Node
 from app.contracts.source import Source
 from app.optimization.source_refs import verify_source_refs
 
 logger = logging.getLogger(__name__)
 
-# 与契约保持一致的硬限制，诊断时复用
-MAX_DEPTH = 8
+# 层数上限**就是**契约那一个数，不另存一份。
+#
+# 这里曾经写着 `MAX_DEPTH = 8` 加一句"与契约保持一致"——那是注释承诺，不是机制：
+# 把契约改成 9，这边仍会在第 8 层报"已到上限"，而图还能合法加一层。诊断说错了话
+# 却没有任何东西会红。现在它是 `MAX_TREE_DEPTH` 的引用，契约一动它跟着动。
+#
+# 口径核对过，不是"看起来像"：`_iter_nodes` 的 `depth` 从 1 起（根是第 1 层），
+# 契约的 `MAX_TREE_DEPTH` 也是**含根**的层数，所以"第 8 层是最后一层"两侧同义。
+# 断言在 `tests/test_shared_constants.py`。
 
 # ---------------------------------------------------------------- 规则层阈值
 #
@@ -353,12 +360,12 @@ def _shape_diagnostics(root: Node) -> list[Diagnostic]:
                     node_id=node.id,
                     message=f"节点「{node.label}」只有一个子节点，可考虑展开或合并",
                 ))
-        if depth >= MAX_DEPTH:
+        if depth >= MAX_TREE_DEPTH:
             diagnostics.append(Diagnostic(
                 level=DiagnosticLevel.warn,
                 code="DEPTH_LIMIT",
                 node_id=node.id,
-                message=f"节点「{node.label}」已到 {MAX_DEPTH} 层上限",
+                message=f"节点「{node.label}」已到 {MAX_TREE_DEPTH} 层上限",
             ))
     return diagnostics
 

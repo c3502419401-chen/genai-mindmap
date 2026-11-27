@@ -37,8 +37,9 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
 
-from app.contracts.source import (Source, SourceKind, SourceMetadata, blank_to_none,
-                                  clean_tags, to_utc_iso)
+from app.contracts.source import (SOURCE_REF_QUOTE_MAX_CHARS, Source, SourceKind,
+                                  SourceMetadata, blank_to_none, clean_tags,
+                                  to_utc_iso)
 from app.knowledge import library as knowledge_library
 from app.knowledge import rerank as knowledge_rerank
 from app.knowledge import vector_cache
@@ -648,19 +649,23 @@ def _chunks(text: str) -> Iterator[tuple[int, int, str]]:
 # 测试的基础，它的块边界同时是父块的边界——两套边界一旦不同，"父块"就会变成
 # 一个与 `search_sources` 返回的块无法对齐的概念，将来接落库时要多一份映射。
 LEAF_TARGET_CHARS = 200    # 子块目标长度：一句话群，足够判定"讲的是这件事"
-LEAF_MAX_CHARS = 300       # 子块硬上限：不得超过 `SourceRef.quote` 的 300（理由见下）
+# 子块硬上限：**就是** `SourceRef.quote` 的字数上限，不是"另写的 300 恰好相等"。
+# 这个数曾经是本地字面量，而被引用的那一侧（`contracts/source.py`）也是内联字面量
+# ——两处都没名字，等于靠读注释的人记住"它们得一样"。现在同源。
+LEAF_MAX_CHARS = SOURCE_REF_QUOTE_MAX_CHARS
 LEAF_MIN_CHARS = 100       # 低于它向后合并：一百字以下的子块匹配时区分度不足
 
-# `LEAF_MAX_CHARS` 取 300 不只是"再长会混进两三个话题"：它是**引用证据链**的一段。
+# 为什么 `LEAF_MAX_CHARS` 必须等于 `SourceRef.quote` 的上限（不只是"再长会混进两三个话题"）
+# ——它是**引用证据链**的一段。
 # `tools._citable_hits` 把命中的子块整段当 `evidence_quote` 回给模型，而
-# `SourceRef.quote` 的上限就是 300。子块超过它时那条命中只能不给 `evidence_*`
-# （截断后的 quote 与偏移对不上，逐字校验必挂），模型随即退回"只抄 quote、不写
-# 偏移"——而 `source_refs._evidence_problem` 对没有区间的引用不施加约束，于是
+# `SourceRef.quote` 的上限也是同一个常量。子块超过它时那条命中只能不给
+# `evidence_*`（截断后的 quote 与偏移对不上，逐字校验必挂），模型随即退回"只抄
+# quote、不写偏移"——而 `source_refs._evidence_problem` 对没有区间的引用不施加约束，于是
 # "引的这句在命中的那段里吗"这条判定对这批命中整个失效。模型可以从父块里挑任意
 # 一句看着相关的话，逐字校验照样通过。缝原来只有二十几个字，但它正是这条防护要
 # 挡的那件事，所以子块上限与引用上限取同一个数。
 #
-# 压到 300 之后，**末块合并也必须跟着压**（见 `_leaf_spans` 的 `last_ceiling`）：
+# 压到那个数之后，**末块合并也必须跟着压**（见 `_leaf_spans` 的 `last_ceiling`）：
 # `_merge_short` 默认把末块上限放宽到 `ceiling + minimum`（父块是 700+150），子块
 # 照抄这条规则会让末块并到 400 字——缝不但没堵上，还比原来更宽。
 

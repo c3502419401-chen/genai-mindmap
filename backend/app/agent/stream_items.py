@@ -20,9 +20,15 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 
-# 与契约里 `Node.label` 同口径。预览和最终树用同一个上限，否则同一条文字
-# 在预览里比落库之后长一截。
-MAX_LABEL_CHARS = 200
+from app.contracts.mindmap import MAX_NODE_LABEL_CHARS
+
+# 预览里 label 的上限**就是**契约 `Node.label` 那一个数，不另存一份。
+#
+# 这里曾经写着 `MAX_LABEL_CHARS = 200` 加一句"与契约里 `Node.label` 同口径"——
+# 同口径的承诺没人执行：把契约放宽到 300，预览仍截在 200，于是同一条文字在预览里
+# 比落库之后短一截，而没有任何东西会红。现在直接引用契约常量。
+#
+# 断言在 `tests/test_shared_constants.py`。
 
 # 展开响应里装着子项的那个键。第一个出现的才是这次要的那层；模型多给一层时
 # 里层也会有一个 `children`，那不是同一层。
@@ -61,7 +67,7 @@ def _as_item(parsed: object) -> StreamItem | None:
             item for item in (_as_item(entry) for entry in nested) if item is not None
         )
     return StreamItem(
-        label=label.strip()[:MAX_LABEL_CHARS],
+        label=label.strip()[:MAX_NODE_LABEL_CHARS],
         expandable=flag if isinstance(flag, bool) else None,
         children=children,
     )
@@ -151,4 +157,4 @@ def closed_items(buffer: str) -> list[StreamItem]:
     return items
 
 
-__all__ = ["MAX_LABEL_CHARS", "StreamItem", "closed_items"]
+__all__ = ["MAX_NODE_LABEL_CHARS", "StreamItem", "closed_items"]

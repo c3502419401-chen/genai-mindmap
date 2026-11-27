@@ -386,6 +386,18 @@ export function pruneDanglingRefs(content: DiagramContent): DiagramContent {
  * 与 `LIMITS.label`（200，契约硬上限、旧图读取口径）是两件事：生成侧要求 16 字，
  * 但旧图里那句 20–30 字的长标题必须照常读、照常存。前端用它只做**提示**（"这个
  * 标题有点长，画布上会折行"），不做校验——把 16 写进校验会让用户改不动旧节点。
+ *
+ * ## 这个 16 是跨语言副本，由后端用例对账
+ *
+ * 后端是 Python、这里是 TypeScript，没有 import 关系，所以这一行**必须**有人钉住：
+ * `backend/tests/test_shared_constants.py::test_frontend_generated_label_hint` 读本文件、
+ * 正则取出这个字面量，断言它等于 `GENERATED_LABEL_MAX_CHARS`。改部署侧那个数而
+ * 忘了这里，红的是后端测试。
+ *
+ * 为什么不走 `thinking-options.json` 那条生成物管线（后端脚本 → json → 前端 import）：
+ * 那条路是为"首屏就要用的**列表**"建的，产物是一个文件加一次导出、一次守卫用例。
+ * 这里只有一个标量、只喂一句提示文案，为它复制一整条管线是拿结构换一个数字。
+ * 值真变成"界面要靠它算"的那天，再升级成生成物不迟。
  */
 export const GENERATED_LABEL_HINT = 16;
 
