@@ -119,6 +119,7 @@ v2 重复同 seq 同内容忽略、同 seq 异内容/跳号/损坏 JSON/未知�
 
 ## 6. 兼容、测试逐文件迁移与数据库
 
+<!-- claims-ok: knowledge_search_implemented 计划文档，记的是当时的落地状态 -->
 旧 `POST /api/generations`、`POST /api/generations/stream`、`POST /api/pipeline/generate` 已删除（连同 `generation/router.py`、`pipeline/` 整包）；`POST /api/agent/tasks`、`POST /api/knowledge/search` 保留且继续 implemented=false。生成与编辑现在只有 `/api/agent/runs/stream` 一条出口。
 数据库 schema 不变：`B/mindmaps/repository.py::connect()` 仍只有 mindmaps(id,version,content,updated_at)。op、运行日志、候选状态不落业务库；旧图默认空引用即可读取。刷新会丢未接受候选，已保存内容不丢；持久任务/协作须另立迁移，不暗中加 session 表。
 测试基线：下面第一组是**计划期**的静态枚举值（后端 196 用例/12 文件，含参数展开；前端 168/13），写在计划当时，只作对照，不代表现在的规模；**当前实测**为后端 `pytest` 488 passed + 19 subtests（20 个测试文件）、前端 `vitest` 358 用例 / 23 文件。以下为预期改动，本次只写计划，未运行会产生缓存或临时数据库的测试。

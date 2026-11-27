@@ -150,11 +150,11 @@ recall@1/3/5/10 与 mrr@3 **逐位相同**、coverage@10 −0.5pp、+85ms、58 �
 
 唯一能"对数字"的三条，2–3 天，现在是空的。
 
-**2. 两个桩没删**
+**2. 还有一个桩没删**
 
 ```
 POST /api/agent/tasks       返回固定阶段的桩
-POST /api/knowledge/search  仍是桩
+POST /api/knowledge/search  已接（2026-11，见 WIRING-GAPS.md 第二节）
 ```
 
 半小时能换掉被问穿的窟窿——要么实现，要么在接口文档里标清楚。

@@ -1,6 +1,6 @@
 # API 与数据契约
 
-前后端以 `/api` 为前缀。FastAPI 启动后的 `/docs` 展示当前路由；本页说明每条路由是否真正实现。当前无身份认证，仅限本机开发。
+前后端以 `/api` 为前缀。FastAPI 启动后的 `/docs` 展示当前路由；本页说明每条路由是否真正实现。身份层已落地（游客 / 登录 + 门禁，匿名请求 401），部署形态见 [部署文档](DEPLOY.md)。
 
 **错误体已统一**：所有错误响应都是 `{code, message, detail, request_id}`（实现见 `backend/app/core/errors.py`）。`message` 是中文可读文案，`detail` 保留原始细节（校验错误为数组），`request_id` 优先沿用请求头 `X-Request-ID`、没有则生成，并同时通过响应头回传。前端 `src/api/client.ts` 的 `ApiError` 读 `message`，缺失时回退到 `detail`。
 
@@ -202,7 +202,7 @@
 
 | 路由 | 当前行为 |
 |---|---|
-| `POST /api/knowledge/search` | 返回空列表与 `implemented: false`，没有接入检索。 |
+| `POST /api/knowledge/search` | 在**用户自己的知识库**里检索（BM25 + 向量混合，RRF 融合），返回 `hits` 与 `implemented: true`；空结果分「没检索到」与「库是空的」两种说。 |
 | `POST /api/agent/tasks` | 返回固定阶段与 `implemented: false`，不会生成导图；真正能跑的是 `/api/agent/runs/stream`。 |
 
 ## 功能接口规划（均未实现）
@@ -212,7 +212,7 @@
 | 多模态文件 | 已落地 `POST /api/ingestion/files`（文档 + 图片 + WAV）；来源查询接口待确定 | 上传或解析 PDF、Word、PPT、图片、WAV 音频已可用；音频已有逐句时间戳，但节点引用还不能指回"第几秒"，页码级定位也缺。 |
 | 生成任务 | `POST /api/generation-tasks`、`GET /api/generation-tasks/{id}`、`GET .../{id}/events` | 多来源输入、持久任务状态与进度；输出仍转换为统一导图结构。当前只有 agent 这一条 SSE 流，没有持久任务。 |
 | 优化 | 已有 `/api/optimization/suggest`，持久化和应用接口待确定 | 未来补齐矛盾、缺失、重组、跨节点关系候选及依据，不直接覆盖。 |
-| 知识库 | 已落地 `GET /api/knowledge/library` 与 `.../library/{id}`（读），`DELETE .../library/{id}`（删材料）与 `GET/DELETE /api/knowledge/aliases*`（实体别名的清单与修正） | 材料列表、被引用次数、正文预览、删材料可用；别名可列可删（删掉的是"模型把两个名字认成一个"的错判）。**产生别名的入口还没有**（`graph_resolve.resolve_entities` 是运维 API，产品不调）——所以"跨材料同名不同写法合不起来"这一档仍然存在；检索（`POST /api/knowledge/search`）仍是桩。 |
+| 知识库 | 已落地 `GET /api/knowledge/library` 与 `.../library/{id}`（读），`DELETE .../library/{id}`（删材料）与 `GET/DELETE /api/knowledge/aliases*`（实体别名的清单与修正） | 材料列表、被引用次数、正文预览、删材料可用；别名可列可删（删掉的是"模型把两个名字认成一个"的错判）。**产生别名的入口还没有**（`graph_resolve.resolve_entities` 是运维 API，产品不调）——所以"跨材料同名不同写法合不起来"这一档仍然存在；检索（`POST /api/knowledge/search`）已接上（`implemented: true`，见 F13）。 |
 | AI 代理 | `POST /api/agent/runs/stream`、`GET /api/agent/runs` 系列已实现；`POST /api/agent/tasks` 仍是桩 | 工具循环、生成即落画布、"运行结束后落草稿"（`runs` 表，SQLite）与用户偏好（`user_prefs`）已可用；任务化长跑、`runs` 的跨进程/跨机存储（现为本地 SQLite，多 worker 共享同一文件）与多角色仍待设计。 |
 | 协作 | 房间授权接口 + Yjs WebSocket | 房间鉴权、实时同步、在线状态、恢复；最终协议由协作负责人完成设计。 |
 | 更多导出 | `/api/export/puml`、`/markdown`、`/opml` 均已实现；图像导出待开发 | PNG/SVG 渲染要额外依赖，优先用浏览器端截图或交给 PlantUML 服务。 |

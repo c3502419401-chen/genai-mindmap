@@ -114,7 +114,7 @@
 | 逐段相关性过滤（relevance grader） | **不做** | RAGFlow 实测：全量 gate 比关闭过滤 **token +48.7%**（被丢的段落会被重新读回来），且"仍然丢了大部分金标准证据"；其本地蒸馏 head precision 0.62 / recall 0.36 |
 | HyDE | **不做** | +800ms（四方案里延迟最高），收益 +2~8 点；而向量检索本身已在桥接语义鸿沟，边际收益被抵消大半 |
 | 语义切块 | **不做** | 词面检索下收益≈0（bigram 不看话题自洽性），且需要每句一次 embedding、阈值随语料漂移 |
-| 父子切块 | **已实现、默认关、未接入**（`search_parent` + `MINDMAP_PARENT_RETRIEVAL=0`） | 当前的顾虑是父子切块会让引用链失真：`score` 来自 200 字的子块，`quote` 却是 450–700 字的父块，模型从父块里挑一句与查询无关的话也照样通过逐字校验，`verify_source_refs` 就从「证据核验」退化成「格式检查」。所以默认关；等库落地、且引用校验支持子块区间（`EvidenceSpan.leaf_start/leaf_end` 已就位，调用点待接）后再评估 |
+| 父子切块 | **已实现、默认开、已接入**（`search_parent` + `MINDMAP_PARENT_RETRIEVAL`，缺省 `1`） | 当前的顾虑是父子切块会让引用链失真：`score` 来自 200 字的子块，`quote` 却是 450–700 字的父块，模型从父块里挑一句与查询无关的话也照样通过逐字校验，`verify_source_refs` 就从「证据核验」退化成「格式检查」。所以当初默认关（`MINDMAP_PARENT_RETRIEVAL` 的缺省值后来翻成 `1`）；等库落地、且引用校验支持子块区间（`EvidenceSpan.leaf_start/leaf_end` 已就位，调用点待接）后再评估 |
 | 子问题分解引擎 | **不做** | 每个子问题跑完整流水线（含各自合成调用）；我们的 agent 循环本就能多轮调 `rag_query`，缺的只是"一次带多 query" |
 | 全局 top-k 塞 prompt | **不做** | 大材料下会被"反复出现关键词的模板段落"占满，且证据归属不清 |
 

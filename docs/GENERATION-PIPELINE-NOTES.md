@@ -93,6 +93,7 @@
 ### 四、流式挂错了路径（历史记录）
 
 > **这一节的结论已被推翻，别按它读现状。** 当时（整树生成被删的那两天）这里写的是
+<!-- claims-ok: create_registers_generate 引用一句已被推翻的旧断言 -->
 > "`mindmap_generate` 不再存在、`node_grow` 只剩分片一条上报路径、分片是 `create` 唯一的生成路"
 > ——三条都错了。2026-11-18 的 `bc3494e` 让整树生成以另一种接法回来：`create` 只注册
 > `mindmap_generate`，`_GenerateGrowStream`（`tools.py`）也一起回来，`node_grow` 在结构那一次

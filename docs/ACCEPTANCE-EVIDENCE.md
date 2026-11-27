@@ -283,6 +283,7 @@ POST /api/knowledge/search {"query":"缓存命中率对查询延迟的影响","t
 `edit_events` 有 565 条，但采集口径/基线评估/可行性三件仍缺。
 
 **判定：向量库本体真在且量级与 `OPTIMIZATION-CROSS-MAP.md` 一致（numpy 一侧毫秒级）；
+<!-- claims-ok: knowledge_search_implemented 验收留档：当轮的读数 -->
 对外 `/api/knowledge/search` 是桩；微调仍是 C。**
 
 ### P11 AI 代理自动生成 —— 真能用（`/tasks` 仍是桩）
@@ -429,6 +430,7 @@ source_usage = 9 份：1 份 text（150 字）+ 1 份 paper + 7 份 web（合计
   很容易被误判成"引用核验功能坏了"。建议在 `CheckRequest` 上把这条前置写进 schema
   description，或让 `/check` 也接受 `mapping`。
 
+<!-- claims-ok: knowledge_search_implemented B4 标题是当轮现象，下一段紧跟「已修」 -->
 ### B4 `/api/knowledge/search` 是桩（`implemented:false`）
 
 > **已修**：`docs/WIRING-GAPS.md` 第二节。接的是生成链路同一套（`_library_sources` →
@@ -503,6 +505,7 @@ P8 的失败形态从 500 变成 422（更诚实）。
 
 1. **`link.suggest` 零调用（B1）**：8 条用例 + 一个能跑通的度量脚本，产品里没有调用者。
    用例测"给定输入产出什么建议"，永远不测"这个建议会不会出现在用户面前"。
+<!-- claims-ok: knowledge_search_implemented 验收留档：当轮的现象清单 -->
 2. **`/api/knowledge/search` 是桩（B4）**：`chunk_vectors` 4913 条向量、`search_sources()` 可用、
    用例覆盖 service；路由返回 `implemented:false`。用例测 service，不测路由。
 3. **`sources` id 漂移（B3）**：用例里 `content` 与 `sources` 用同一份 id；真链路里生成侧换了 id，

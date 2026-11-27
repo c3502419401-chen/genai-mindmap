@@ -18,7 +18,7 @@
 
 | 维度 | 当前状态 |
 |---|---|
-| 后端 | FastAPI，14 条路由。9 条真干活，2 条桩（`knowledge/search`、`agent/tasks` 返回 `implemented:false`），3 条返回 501 |
+| 后端 | FastAPI，14 条路由。9 条真干活，1 条桩（`agent/tasks` 返回 `implemented:false`；`knowledge/search` 已接），3 条返回 501 |
 | 前端 | Vue 3 + Vite + Tailwind，R1 骨架：输入 → 生成 → **只读列表**。编辑、保存、画布都没有 |
 | 数据 | SQLite 单文件 + 版本号乐观锁。节点树走 JSON，契约 `title` / `root` / `source_usage` |
 | 模型 | `demo` 模式返回占位结构；`model` 模式代码写了，**从未在真实 Key 下验收** |

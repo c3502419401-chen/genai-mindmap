@@ -69,7 +69,7 @@ flowchart LR
 
 ## 安全与部署边界
 
-当前仅限本机与单机部署：没有用户认证、权限隔离、文件上传和生产日志策略。目标形态是**单台 2 核 2G ECS + Docker Compose**（nginx / api / web / postgres / y-websocket 五个容器；语音转写走云端 API，不占容器也不需要 sidecar），先以 `IP:8080` 暴露、不做 TLS，域名与 Cloudflare 推迟到 W3（理由与降级路径见 [执行计划](PLAN.md) 第 4 节与 R1/R3）。
+当前仅限单机部署：没有多租户权限隔离与生产日志策略（账号 / 游客身份、门禁与文件上传都已落地）。目标形态是**单台 2 核 2G ECS + Docker Compose**（nginx / api / web / postgres / y-websocket 五个容器；语音转写走云端 API，不占容器也不需要 sidecar），先以 `IP:8080` 暴露、不做 TLS，域名与 Cloudflare 推迟到 W3（理由与降级路径见 [执行计划](PLAN.md) 第 4 节与 R1/R3）。
 
 **这条与录音功能冲突**：浏览器只在安全上下文（HTTPS 或 localhost）下暴露 `navigator.mediaDevices`，`http://IP:8080` 打开时浏览器内录音不可用，只能上传音频文件。要开放录音必须先上 TLS，详见 [部署文档](DEPLOY.md) 第 6 节。
 

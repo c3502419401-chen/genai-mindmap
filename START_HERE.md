@@ -11,6 +11,7 @@
   `create` 只注册整树一次成型的 **`mindmap_generate`**（内部四步：骨架 → 每支检索 → 结构 → 只写说明，节点多时拆两半并发，实测见 `docs/ONE-CALL.md`）；
   分片的 **`mindmap_generate_deep`** 代码、规格与用例都还在，但**不注册到 `create`**——它挂在非产品意图 `create_deep` 下，服务的是"一次响应写不下 200+ 节点"的情形，`service.run` 永远不会把意图解成这个名字。
   `docs/ONE-PATH.md`（2026-11-16）删掉的是**形态开关 `MINDMAP_SOURCE_MODE` 与 `full` 那两份提示词**，不是整树生成；整树生成在 2026-11-18 以另一种接法回来了（`bc3494e`，`docs/ONE-CALL.md`）。
+<!-- claims-ok: create_registers_generate 告诫句：「别再写」后面引的正是这句禁语 -->
   **别再写"新建导图只剩分片这一条路"**：把活的写成死的，下一个人会按错模型改提示词。这条被 `backend/tests/test_one_path.py` 钉着，`AGENTS.md` 第 49 行也写着同样的口径。
 - 设 `MINDMAP_LLM_MODE=demo` 时生成固定结构，用于联调，**不会调用 AI**；agent 只认显式的 `demo`，没设这个变量不会自动降级成占位图（缺模型配置会直接报错）。设 `model` 并配好 `MINDMAP_LLM_BASE_URL` / `MINDMAP_LLM_API_KEY` / `MINDMAP_LLM_MODEL` 才会走 Chat Completions 兼容服务，实际能力取决于服务商和模型（线上用 `z-ai/glm-5.3-flash` 经 `https://api.commandcode.ai/provider/v1`，2026-11-16 起；此前的 `deepseek-flash` 走官方端点）。
 - **尚未实现/未接界面**：知识图谱的**嵌入与节点关系优化算法**（抽取、消解、别名边、两跳图检索都已落地，实测零收益所以 `MINDMAP_GRAPH_SEARCH` 默认 0，见 `docs/FEATURES_AND_OWNERS.md` F14）、协作（F17）、翻译（F19）、评测（F24–F26）、主题预设与字体主色的**界面渲染**（`Theme.preset` / `font` / `accent` 前端一个都没渲染；v2 的 `relations` / `style` / `pos` 只落库、界面不读。注意：**四种朝向是真的有**，见上一行）、浏览器内 PlantUML 渲染（只生成+下载）、容器化（Docker/compose 写了但从未真机构建，线上的 systemd + nginx 方案见 `docs/DEPLOY.md` 第 9 节）。

@@ -9,6 +9,7 @@
 > `service.run` 永远不会把意图解成这个名字）。依据是 `runs` 表里 16 次真实运行 `sources` 全为 0
 > ——分片的核心优势（材料覆盖 30.5% vs 整树 5.1%）需要材料才成立，而代价每次都要付。
 > 取舍与实测见 `docs/ONE-CALL.md`，被 `backend/tests/test_one_path.py` 钉住。
+<!-- claims-ok: create_registers_generate 订正块：明说这句只在 11-16 到 11-18 成立 -->
 > 所以下面"新建导图只剩分片这一条路"**只在 2026-11-16 到 11-18 之间成立**；
 > 现在的口径写在 `AGENTS.md` 第 49 行与 `TEAM-GUIDE.md` 第 4 节。
 >
@@ -102,6 +103,7 @@ prompt）与整树一次成型的 `mindmap_generate` 一起删除，`create` 意
 （`heading_outline` 覆盖率 ≥60% 才喂）、按支检索（每支各检索一次、只带自己的命中）、
 限额补查（每支 1 次、每次运行 3 次）、**材料过短退化**（<300 字 → 视为无材料 →
 外部检索 / 纯主题）、**外部知识检索**（默认开）与它的词面相关性门、引用逐字校验、
+<!-- claims-ok: create_registers_generate 这句说 EVIDENCE_UNUSED 的产生点，不是生成路 -->
 `Node.detail`、`expandable` 三态、runs 表、`EVIDENCE_UNUSED`（现在只剩分片与
 `_expand` 两条路）、`DETAIL_PROMPT` / `CONTENT_FREEDOM_CONTRACT` /
 `DETAIL_NO_SOURCE_RULES`（纯主题那条退路：没有可检索材料时拼在骨架与每次展开的

@@ -21,7 +21,7 @@
 | 缺口 | 是刻意留的吗 | 修法 | 修完的实跑读数 |
 |---|---|---|---|
 | `sources` 的 id 被换掉 | **不是**——换 id 是设计，只给 `mapping` 是遗漏 | SSE `sources` 帧补上**最终清单**（`SourceIdentity`，不带正文），`mapping` 保留 | 真 SSE：`sources` 帧的 1 个 id 与 `done` 帧 `content.source_usage` 里的那个 id 一致 |
-| `/api/knowledge/search` 是桩 | **不是刻意**，是"没来得及"（`TODO(F12/F13)` 从脚手架那天就在） | 走生成链路同一套：`_library_sources` 选候选 → `search_parent` 打分 → `touch` 记账 | 真库 4913 条向量：5 条命中、`method=hybrid`、**1.1–1.7 s**（首次冷缓存 9.7 s） |
+| `/api/knowledge/search` 是桩 | **不是刻意**，是"没来得及"（`TODO(F12/F13)` 从脚手架那天就在） | 走生成链路同一套：`_library_sources` 选候选 → `search_parent` 打分 → `touch` 记账 | 真库 4913 条向量：5 条命中、`method=hybrid`、**1.1–1.7 s**（首次冷缓存 9.7 s） | <!-- claims-ok: knowledge_search_implemented 缺口名 + 那一轮的修法与实跑读数 -->
 | `link.suggest` 零调用 | **一半是刻意**：不给"应用"按钮是刻意的（改层级不可逆）；"连出现都没有"是遗漏 | 接进 `/optimization/suggest`，产出 `kind="link"` + `SuggestResponse.link` 状态 | 真图（80 节点、无缺陷）：**2.9 s → `already_best`**；人造错挂树：**1.97 s → 1 条 link** |
 
 ---
@@ -111,6 +111,7 @@ external_in_usage: 8
 
 ---
 
+<!-- claims-ok: knowledge_search_implemented 章节标题是缺口名，正文是修复记录 -->
 ## 二、`/api/knowledge/search` 是桩（B4）
 
 ### 为什么是桩：不是刻意，是"没来得及"，但有历史形状
@@ -232,7 +233,7 @@ candidates = [risk（风险控制）, root（挂在一级评审根下与成本�
 | 缺口 | 有理由吗 | 判定 |
 |---|---|---|
 | `sources` id | 换 id 有理由（跨会话可解析），**只给 `mapping` 没有理由** | 设计对、出口缺一半 → **疏忽** |
-| `/knowledge/search` | 只有 `TODO(F12/F13)` 与 `implemented=false`，**没有一句"为什么先不接"** | **纯遗漏**（脚手架遗留） |
+| `/knowledge/search` | 只有 `TODO(F12/F13)` 与 `implemented=false`，**没有一句"为什么先不接"** | **纯遗漏**（脚手架遗留） | <!-- claims-ok: knowledge_search_implemented 回顾表格：讲的是当初为什么是桩 -->
 | `link.suggest` | 有理由，而且写得很清楚——但理由覆盖的是"不给应用按钮"，**覆盖不到"连出现都没有"** | **刻意留门 + 遗漏接线**：该接的是"出现"，不该接的是"一键应用" |
 
 一条反例可以校准判据：`optimization/router.py::repair_map` 挂着
