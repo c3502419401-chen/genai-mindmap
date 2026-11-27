@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import importlib.util
 import re
 import sys
@@ -59,7 +60,7 @@ REVERSE_SAMPLES: dict[str, str] = {
 
 def rules() -> list:
     return (list(claims.RULES) + claims._switch_rules(REAL)
-            + claims._backlog_rules(REAL))
+            + claims._backlog_rules(REAL) + claims._drift_rules())
 
 
 def fresh(**overrides):
@@ -464,3 +465,78 @@ def test_the_backlog_is_scanned_even_before_git_tracks_it() -> None:
     assert problems == [], problems
     names = [path.relative_to(claims.REPO_DIR).as_posix() for path in files]
     assert claims.BACKLOG_RELATIVE in names, names
+
+
+# ---------------------------------------------------------------- 会漂的数（D 族）
+#
+# 第四族判"这句话会不会自己过期"。它不起因于代码变了，起因于**别人正常干活**：
+# 同一条"2113 条用例"被抄到三处，三处都过期了而没人发现——每句话单独看都曾经是真的。
+
+
+def _drift(name: str):
+    return {rule.name: rule for rule in claims._drift_rules()}[name]
+
+
+def _scoped(rule, document: Path):
+    """把一条 D 族规则的 scope 改到临时文件上：`scan` 只按仓库内相对路径比。"""
+    return dataclasses.replace(rule, scopes=(claims._relative(document),))
+
+
+def test_a_bare_count_in_a_state_document_is_red(tmp_path: Path) -> None:
+    """`2113 条用例 / 85 个文件` 这个形状必须红——它就是本轮三处过期的那个数。"""
+    document = tmp_path / "README.md"
+    document.write_text("后端 2113 条用例 / 85 个文件，前端 900 条用例 / 55 个 spec。\n",
+                        encoding="utf-8")
+    for name in ("drift:use_cases", "drift:test_files"):
+        hits = claims.scan(fresh(), [_scoped(_drift(name), document)], [document])
+        assert [item for item in hits if item.rule.name == name], name
+
+
+def test_the_reference_form_is_what_we_want_written(tmp_path: Path) -> None:
+    """"现跑 `pytest --collect-only`" 这类写法必须放行——否则这一族只会教人删信息。"""
+    document = tmp_path / "README.md"
+    document.write_text(
+        "后端规模现跑 `python -m pytest --collect-only -q`，前端现跑 `npm test`；"
+        "端点数见 `backend/openapi.json`；份数见 `git ls-files '*.md'`。\n",
+        encoding="utf-8")
+    hits = claims.scan(fresh(), [dataclasses.replace(rule, scopes=(claims._relative(document),))
+                                for rule in claims._drift_rules()], [document])
+    assert hits == [], hits
+
+
+def test_the_drift_family_only_judges_the_state_documents(tmp_path: Path) -> None:
+    """历史留档写的是"那一天是多少"，是正确的过去时——`docs/PLAN.md` 的版本表不进来。"""
+    document = tmp_path / "PLAN.md"
+    document.write_text("基线 1630+610 → 后端 2120（另有 29 subtest）、前端 900（55 文件）\n",
+                        encoding="utf-8")
+    assert claims.scan(fresh(), claims._drift_rules(), [document]) == []
+
+
+def test_the_drift_probe_reads_the_wiring_not_a_constant(tmp_path: Path) -> None:
+    """台账第 12 条的 probe 判**接线**：规则写了却没拼进 `main()`，这一类一行都不扫。
+
+    与 `find_unwired.py` 同一条教训：代码在、没接上，本地与 CI 都是绿的。
+    """
+    script = _SCRIPT.read_text(encoding="utf-8")
+    wired = tmp_path / "wired.py"
+    wired.write_text(script, encoding="utf-8")
+    values, _ = claims.probe_backlog_facts(script=wired)
+    assert values["doc_drift_guard"] is True
+
+    unwired = tmp_path / "unwired.py"
+    replaced = script.replace("+ _drift_rules()", "", 1)
+    assert replaced != script, "样例失效：`main()` 里找不到 `+ _drift_rules()`"
+    unwired.write_text(replaced, encoding="utf-8")
+    values, _ = claims.probe_backlog_facts(script=unwired)
+    assert values["doc_drift_guard"] is False
+
+
+def test_the_drift_family_is_green_on_this_repo() -> None:
+    """本仓 HEAD 上这五份文档里没有裸数字了——这是"改成引用式"这一轮的直接读数。"""
+    files, _ = claims.doc_files()
+    scoped = [path for path in files
+              if path.relative_to(claims.REPO_DIR).as_posix() in claims.DRIFT_SCOPE]
+    assert len(scoped) == len(claims.DRIFT_SCOPE), scoped
+    hits = claims.scan(fresh(), claims._drift_rules(), scoped)
+    assert [item for item in hits if not item.excused] == [], \
+        [f"{item.path}:{item.line} {item.rule.name}" for item in hits if not item.excused]

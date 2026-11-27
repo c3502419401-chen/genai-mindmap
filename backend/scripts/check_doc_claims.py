@@ -119,6 +119,26 @@ c 跑 `TestClient` 打一个受保护端点断言 401/403。
 （**没有机器判据的"已做"不许进表**），`probe: none` 的条目只能是待做/不做，它们单列在
 `--facts` 输出里：可判的判到底，判不了的摆出来，不假装。
 
+## 第四类判据：会漂的数（`drift:` 一族）
+
+前三族判"文档说的与代码做的是不是同一件事"，这一族判**"这句话会不会自己过期"**。
+起因是一个数被抄到三处（`FEATURES_AND_OWNERS.md` 写"后端 2113 条用例 / 85 个文件，
+前端 900 条 / 55 个 spec"，`PLAN-REWORDING.md` 与 `SCOPE.md` 各抄一份）：数早就是
+别的了，而三处都还印着旧值——**每句话单独看都曾经是真的，错的是"它还写着现在"**。
+前三族一条都发现不了它，因为没有任何代码事实对应"用例数应该是多少"。
+
+所以这一族不立"数应当是多少"（那要每次 collect 一遍，十几秒，而读数下一秒就过期），
+立的是**形状**：这类数不许以字面量出现，要写就写"怎么现取"。
+
+    会随别人正常干活自然变化   → 引用式（用例数 / 文件数 / 端点数 / 开关数 / md 份数）
+    不会（契约上限、算法常量）  → 允许写（50 步撤销、50_000 字、压测 P50），自有前三族管
+
+判据是一句话：**这个数会不会因为别人正常提交而变。** 会变的写进文档，就是给自己排了
+一件永远干不完的活——每轮手抄一遍，而漏抄不会报错。`holds` 恒为真：这一族没有事实
+可读，"永远成立"就是它的语义。范围只到**断言现状**的那几份（`DRIFT_SCOPE`），历史
+留档（`docs/PLAN.md` 的版本表、`docs/AGENT_PLAN.md` 的计划期数字）写的是正确的过去时，
+不进来。还剩哪几份没搬，见 `docs/BACKLOG.md` 第 12 条。
+
 ## 跑法
 
     cd backend
@@ -761,6 +781,8 @@ BACKLOG_PROBE_DOC: dict[str, str] = {
         "`unwired_baseline.json` 里没有 `status=todo` 的条目",
     "thin_material_offline":
         "`OUTLINE_FEW_BLOCKS_NOTE` 与薄材料探针脚本都在",
+    "doc_drift_guard":
+        "D 族（会漂的数）真的被 `--gate` 跑：`_drift_rules` 在，且 `main()` 拼进了 rules",
 }
 
 
@@ -800,9 +822,38 @@ def _calls_named(tree: ast.Module, function: str, called: str) -> bool:
     return False
 
 
+def _drift_guard_wired(script: Path) -> bool:
+    """D 族真的被 `--gate` 跑吗：模块里定义 `_drift_rules`，且 `main()` 把它拼进 rules。
+
+    这与 `find_unwired.py` 判的是同一件事——**代码在、没接上**。`_drift_rules` 写好了
+    却忘了拼进 `main()`，这一类就一行都不扫，而本地与 CI 都是绿的。所以台账第 12 条
+    的 probe 读的不是常量，是这层接线。
+    """
+    try:
+        tree = _parse(script)
+    except (OSError, SyntaxError):
+        return False
+    if not any(isinstance(node, ast.FunctionDef) and node.name == "_drift_rules"
+               for node in tree.body):
+        return False
+    for node in tree.body:
+        if not (isinstance(node, ast.FunctionDef) and node.name == "main"):
+            continue
+        for inner in ast.walk(node):
+            if not isinstance(inner, ast.Call):
+                continue
+            func = inner.func
+            name = func.id if isinstance(func, ast.Name) else (
+                func.attr if isinstance(func, ast.Attribute) else None)
+            if name == "_drift_rules":
+                return True
+    return False
+
+
 def probe_backlog_facts(app_dir: Path | None = None,
                         baseline: Path | None = None,
-                        scripts_dir: Path | None = None) -> tuple[dict[str, bool], list[str]]:
+                        scripts_dir: Path | None = None,
+                        script: Path | None = None) -> tuple[dict[str, bool], list[str]]:
     """台账里六条 `probe` 的读数。
 
     三个参数只为用例存在：喂一份假代码树，读数必须跟着变——否则探针可以硬编码 `True`
@@ -873,6 +924,8 @@ def probe_backlog_facts(app_dir: Path | None = None,
                 if isinstance(row, dict) and row.get("status") == "todo"]
         values["unwired_no_todo"] = not todo
 
+    values["doc_drift_guard"] = _drift_guard_wired(script or Path(__file__).resolve())
+
     for name in BACKLOG_PROBE_DOC:
         if name not in values:
             problems.append(f"台账探针 `{name}` 没读到读数")
@@ -881,7 +934,7 @@ def probe_backlog_facts(app_dir: Path | None = None,
 
 def probe_backlog(facts: Facts, path: Path | None = None,
                   app_dir: Path | None = None) -> None:
-    """读 `docs/BACKLOG.md`：块结构 + 六条 probe 的读数。读不到即红，不静默跳过。"""
+    """读 `docs/BACKLOG.md`：块结构 + 七条 probe 的读数。读不到即红，不静默跳过。"""
     target = path or BACKLOG
     try:
         text = _read(target)
@@ -1031,6 +1084,9 @@ class Rule:
     history_excused: bool = False
     #: 非空：这条规则只在**这一份文档**里判。台账一族用（见 `_backlog_rules`）。
     scope: str = ""
+    #: 非空：只在**这几份文档**里判。D 族用（见 `_drift_rules`）——"会漂的数"只管
+    #: 断言现状的那几份，历史留档（`docs/PLAN.md` 的版本表）不进去。
+    scopes: tuple[str, ...] = ()
     #: 非 `(0, 0)` 时只在**这些行**里判（1-based，含两端）。台账的每条一个块。
     block: tuple[int, int] = (0, 0)
 
@@ -1265,6 +1321,78 @@ def _backlog_rules(facts: Facts) -> list[Rule]:
     return rules
 
 
+# ---------------------------------------------------------------- 会漂的数（D 族）
+#
+# 前三族判的是"文档说的与代码做的是不是同一件事"，这一族判的是**"这句话会不会自己过期"**。
+# 起因是一个数被抄到三处：`FEATURES_AND_OWNERS.md` 写着"后端 2113 条用例 / 85 个文件，
+# 前端 900 条 / 55 个 spec"，`PLAN-REWORDING.md` 与 `SCOPE.md` 各抄了一份。数早就变成
+# 3471 / 155 与 1462 / 93 了，而三处都还印着旧值——**没有任何一条断言能发现它**，因为
+# 每句话单独看都曾经是真的，错的是"它还写着现在"。
+#
+# 所以这一族不给"用例数应该是多少"立事实（那要每次 collect 一遍，太贵，而且 collect 出来
+# 的数下一秒就变了）；它立的是**形状**：这类数一律不许以字面量出现，要写就写"怎么现取"。
+#
+#   会随别人正常干活自然变化（用例数、测试文件数、端点数、开关数、md 份数）→ 引用式
+#   不会（契约上限 50 步撤销、`FULL_TEXT_MATERIAL_CHARS = 50_000`、压测 P50）→ 允许写，
+#   那些自有前三族与用例管着
+#
+# 判据是"这个数会不会因为**别人正常提交**而变"。会变的写进文档就是给自己排了一个永远
+# 干不完的活（每轮都要手抄一遍，而漏抄没有报错）。
+
+#: 一族一条规则：`(名字后缀, 禁句正则, 该改成什么)`。加一类 = 加一行。
+DRIFT_CLASSES: tuple[tuple[str, str, str], ...] = (
+    ("use_cases", r"\d{2,5}\s*(?:条|个)\s*(?:用例|测试)",
+     "现跑 `pytest --collect-only` / `npm test`，文档里写命令不写结果"),
+    ("test_files", r"\d{2,4}\s*个\s*(?:测试)?文件|\d{2,4}\s*个\s*spec",
+     "同上：文件数一并交给命令"),
+    ("endpoints", r"\d{1,3}\s*个?\s*(?:路径|端点)",
+     "指向 `backend/openapi.json`（CI ⑥ 用 `git diff --exit-code` 钉着它）"),
+    ("route_groups", r"\d{1,2}\s*组路由",
+     "指向 `backend/app/main.py` 的 `include_router`"),
+    ("switch_count", r"\d{1,3}\s*个开关",
+     "指向本闸门的开关一族（它每次自己数）"),
+    ("doc_count", r"\d{2,3}\+?\s*份\s*md|docs/\s*下\s*\d{2,3}\+?\s*份"
+                  r"|\d{2,3}\+?\s*份\s*文件|\d{2,3}\+?\s*份(?=[、，—])",
+     "现算：`git ls-files '*.md' | wc -l`"),
+    ("now_value", r"[（(]\s*现在\s*\d{2,4}|现在是\s*\d{2,4}",
+     "写测量的**日期**（\"2026-11-27 那次是 17\"），不写\"现在\""),
+)
+
+#: 这一族只管**断言现状**的文件。历史留档不进来——它们写的是"那一天是多少"，是正确的
+#: 过去时（`docs/PLAN.md` 的版本表、`docs/AGENT_PLAN.md` 的计划期数字、`docs/TODO.md`
+#: 的快照）。加一份 = 加一行；还没搬进来的见 `docs/BACKLOG.md` 第 12 条。
+DRIFT_SCOPE: tuple[str, ...] = (
+    "README.md",
+    "docs/FEATURES_AND_OWNERS.md",
+    "docs/PLAN-REWORDING.md",
+    "docs/SCOPE.md",
+    "docs/BACKLOG.md",
+)
+
+
+def _drift_rules() -> list[Rule]:
+    """D 族：文档里会漂的数。`holds` 恒为真——这一族**没有事实可读**。
+
+    这与前三族的分工是刻意的：事实探针答"代码现在是什么"，而"用例数是多少"不是代码
+    事实，是**测量结果的快照**。给它立探针就要在每次 `--gate` 里 collect 一遍（十几秒），
+    而读数下一秒就过期——那是用贵得多的办法换来一个更差的判据。所以判"不许写"：
+    `holds=True` 只表示"这条禁句永远成立"。
+    """
+    rules: list[Rule] = []
+    for suffix, pattern, advice in DRIFT_CLASSES:
+        rules.append(Rule(
+            name=f"drift:{suffix}",
+            evidence="backend/tests/test_doc_claims.py::"
+                     "test_a_bare_count_in_a_state_document_is_red",
+            kind="contract",
+            holds=lambda _facts: True,
+            expect=lambda _facts, advice=advice: f"不写裸数字：{advice}",
+            when_true=(pattern,),
+            scopes=DRIFT_SCOPE,
+        ))
+    return rules
+
+
 # ---------------------------------------------------------------- 扫描
 
 @dataclass
@@ -1387,6 +1515,8 @@ def scan(facts: Facts, rules: list[Rule], files: list[Path]) -> list[Violation]:
                     continue
                 if rule.scope and relative != rule.scope:
                     continue
+                if rule.scopes and relative not in rule.scopes:
+                    continue
                 if rule.block[0] and not rule.block[0] <= index + 1 <= rule.block[1]:
                     continue
                 holds = decided[rule.name]
@@ -1501,7 +1631,7 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
 
     facts = collect()
-    rules = RULES + _switch_rules(facts) + _backlog_rules(facts)
+    rules = RULES + _switch_rules(facts) + _backlog_rules(facts) + _drift_rules()
     if args.facts:
         describe_facts(facts, rules)
         describe_backlog(facts)
