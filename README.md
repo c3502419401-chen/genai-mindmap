@@ -1,200 +1,318 @@
 # 基于生成式 AI 的思维导图系统
 
-> 输入一段文字、一份文档或一张草图，自动生成逻辑清晰、结构完整、可继续编辑的思维导图。
+> 输入一段文字、一份文档、一张图片或一段录音，自动生成一张逻辑清晰、结构完整、**可继续编辑**的思维导图。
+>
+> 节点上的引用能点回原文；生成结果直接进画布、标成未保存，错了用撤销栈退回。
+>
+> 在线跑着：**[genai-mindmap.rpegio.top](https://genai-mindmap.rpegio.top/)** —— 打开即用，不用本地部署。
 
-**在线体验：[https://genai-mindmap.rpegio.top/](https://genai-mindmap.rpegio.top/)** —— 打开即用，无需本地部署。输入一段文字即可生成一张能继续编辑的导图。
-
----
-
-## 项目简介
-
-该项目聚焦于提升思维导图创作效率与质量。以生成式 AI 为核心技术，通过自然语言输入，快速生成逻辑清晰、结构完整的思维导图。系统支持智能优化节点关系，根据用户需求自动调整内容布局，并具备个性化主题、风格定制功能。能广泛应用于知识梳理、会议记录、项目规划等场景，帮助用户高效整理思路、激发创意，降低思维导图制作门槛，为用户提供便捷、智能的可视化思维工具。
-
-## 项目目的
-
-该项目旨在突破传统思维导图制作的效率与创意瓶颈，运用生成式 AI 技术，降低用户绘制思维导图的操作门槛，让非专业人士也能快速产出高质量内容。通过自然语言处理与智能算法，自动完成内容提取、逻辑编排和结构设计，减少人工梳理时间。同时，利用 AI 的学习能力，实现思维导图的个性化定制与动态优化，满足用户在学习、工作、创作等多场景下的需求，为用户提供高效、智能、便捷的思维可视化解决方案。
+**申报书原文**（项目简介 / 研究内容 / 国内外研究现状 / 创新点 / 拟解决的关键问题 / 预期成果）已搬到 [docs/PROPOSAL.md](docs/PROPOSAL.md)，那份文件是**目标**，本文件讲**现状与怎么跑**。
 
 ---
 
-## 研究内容
+## 60 秒跑起来（Windows PowerShell）
 
-### 生成式 AI 与思维导图的融合机制
+需要 **Python 3.12+**（CI 用 3.12，本机在 3.13.5 上验过）与 **Node.js 20.19+ / 22.12+**（CI 用 24）。
 
-**自然语言理解（NLU）与思维节点生成**
+### 路线 A：用仓库根目录的三个 `*.bat`（本机惯用入口）
 
-研究如何通过大语言模型（如 GPT、Claude 等）将用户输入的自然语言（关键词、句子或段落）自动分解为层次化的思维导图节点，并识别核心主题与分支逻辑。
+| 脚本 | 干什么 | 什么时候用 |
+|---|---|---|
+| `run-backend.bat` | 配好本机全部环境变量 → 调 `ensure-neo4j.bat` 确保图数据库在跑 → 起 uvicorn（`127.0.0.1:8000`，日志追加到 `.visioncheck\backend.log`，环境快照写 `.visioncheck\env-dump.txt`） | 日常开发，一条命令起后端 |
+| `run-neo4j.bat` | 控制台模式起 Neo4j 5.26（`JAVA_HOME` / `NEO4J_HOME` **写死在文件里**，换机器要改这两行；日志 `.visioncheck\neo4j.log`） | 需要图谱那几段时手动起 |
+| `ensure-neo4j.bat` | 幂等：7687 已在监听就立刻返回，否则拉起 `run-neo4j.bat` 并最多等 40 秒；**等不到也照样返回 0**（图那几段会自己降级，不会挡住后端） | `run-backend.bat` 自动调用它 |
 
-### 多模态交互与智能生成
+> **`run-backend.bat` 里写着真实密钥（模型 / 语音 / embedding 三套），`.gitignore` 已把它排除。别提交、别贴到 issue、别复制进别的目录。**
+> 换机器时不要照抄它的值，只照抄**变量名**——下面那张表就是变量名清单。
 
-**多模态输入支持**
+前端另开一个窗口：
 
-支持文本、语音、图像（如手绘草图）甚至 PPT 输入，通过 AI 转换为结构化思维导图。
+```powershell
+cd frontend
+npm install
+npm run dev
+```
 
-例如：用户上传演讲的 PPT，AI 自动生成关于此 PPT 的思维导图。
+### 路线 B：不用 bat，两个窗口
 
-**可视化生成与风格适配**
+后端：
 
-AI 根据内容主题自动设计导图布局（如树状图、流程图、鱼骨图），并适配颜色、图标等视觉元素。研究用户偏好学习，实现个性化风格推荐。
+```powershell
+cd backend
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
 
-### 知识增强与动态优化
+首次装依赖要拖 `docling` + `torch`（CPU 版），**几个 GB、几分钟**，只有文档解析用得上。不想建 venv 也能跑：本机依赖装齐后直接 `python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000`。
 
-**外部知识库集成**
+前端（第二个窗口）：
 
-连接行业数据库（如学术论文、百科）、企业文档或用户个人知识库，自动填充或验证节点内容。
+```powershell
+cd frontend
+npm install
+npm run dev
+```
 
-示例：用户输入“碳中和”，AI 自动关联政策、技术路径、企业案例等分支。
+### 怎么确认它真的起来了
 
-**逻辑纠错与冲突检测**
+```powershell
+Invoke-WebRequest -Uri 'http://127.0.0.1:8000/api/health' -UseBasicParsing | Select-Object -Expand Content
+# {"status":"ok","version":"dev"}
 
-AI 识别思维导图中的逻辑矛盾、冗余节点或缺失环节，提出优化建议（如“分支 A 与分支 B 存在因果关系，建议添加连接线”）。
+Invoke-WebRequest -Uri 'http://localhost:5173' -UseBasicParsing | Select-Object -Expand StatusCode
+# 200
 
-### 协同创作与 AI 代理
+Invoke-WebRequest -Uri 'http://localhost:5173/api/health' -UseBasicParsing | Select-Object -Expand Content
+# {"status":"ok","version":"dev"}   ← 走通了 Vite 的 /api → 127.0.0.1:8000 代理
+```
 
-**多人实时协作中的 AI 辅助**
+打开 <http://localhost:5173> 就是工作台；接口文档在 <http://127.0.0.1:8000/docs>。数据默认落 `backend/data/mindmaps.db`（SQLite，已被 `.gitignore` 排除）。
 
-在团队协作场景下，AI 扮演“协作者”角色：自动整合多用户输入、解决冲突提议、记录讨论轨迹。支持多语言实时翻译，消除跨语言协作障碍。
+**默认不联网**：不设 `MINDMAP_LLM_MODE` 直接生成会报"缺模型配置"，而不是悄悄给你一张占位图。想先看界面动起来，就设 `$env:MINDMAP_LLM_MODE = 'demo'`——它返回固定结构、一次模型都不调。
 
-**AI 代理自动生成**
+### 环境变量（变量名在下面，值自己填）
 
-用户输入目标（如“设计一款智能家居产品”），AI 自动生成完整思维导图框架，包括市场分析、功能设计、技术难点等分支。
+`.env` 不会被自动加载，必须在**启动后端的那个窗口**里先 `$env:名字='值'` 再起服务。
 
----
+**要真跑模型（四个变量缺一不可）**
 
-## 国内外研究现状和发展动态
-
-### 国外研究现状和发展动态
-
-**研究现状**：国外在生成式 AI 领域起步较早，有许多先进的技术和模型。像 OpenAI 的 GPT 系列模型，在自然语言处理和文本生成方面表现出色，为基于生成式 AI 的思维导图系统提供了强大的语言理解和生成基础。不少研究机构和企业利用这些模型开发了相关的思维导图生成工具，能够较为准确地提取输入文字中的关键信息，并转化为结构化的思维导图形式。一些工具还在尝试与其他领域的技术相结合，如知识图谱技术，以进一步提升对文本语义的理解和知识关联的挖掘能力，使生成的思维导图更加完善和准确。
-
-**发展动态**：一方面，个性化和定制化成为发展重点，致力于根据不同用户的需求和使用习惯，生成符合其特定要求的思维导图，例如调整节点的布局、颜色、字体等元素。另一方面，多模态融合的趋势逐渐显现，除了文本输入生成思维导图外，还在探索结合图像、音频等多模态信息，让思维导图的内容更加丰富和多样化。
-
-### 国内研究现状和发展动态
-
-**研究现状**：国内在生成式 AI 和思维导图系统结合方面也取得了不少成果。一些大型科技公司如百度、阿里、腾讯等，凭借其在人工智能领域的技术积累和强大的研发实力，开发了各自的大模型和相关应用。例如，百度的文心大模型在自然语言处理任务上有出色表现，也被应用于思维导图生成等场景中。同时，一些创业公司也专注于这一领域，推出了具有特色的思维导图生成工具。
-
-**发展动态**：国内的发展趋势与国外有相似之处，也在朝着个性化、智能化方向发展。此外，由于国内市场对中文文本处理的需求较大，所以更加注重对中文语义理解的优化和提升。像 XMind Copilot 这样的产品，已经在全球范围内获得了一定的用户认可，展示了国内在该领域的技术实力和市场竞争力。
-
----
-
-## 创新点与项目特色
-
-### 多模态智能交互创新
-
-深度融合 GPT-4、GPT-4V 等多模态模型，突破传统文本输入局限，支持图片、语音等多样化信息输入。例如，用户上传一张产品设计草图，系统能快速解析图中元素，自动生成包含产品功能、设计亮点等内容的思维导图，极大拓展输入边界与创作可能性。
-
-### 动态结构智能优化
-
-利用 AI 持续分析用户使用习惯和思维导图结构，实时调整节点关系与布局。当用户在思维导图中添加新节点时，系统能智能判断其与已有节点的逻辑联系，自动优化层级结构，使思维导图始终保持清晰、合理。
-
-### 零门槛复杂思维管理
-
-通过生成式 AI 的自然语言理解与结构化能力，彻底消除思维导图制作的技术与思维门槛，实现复杂内容的快速梳理与可视化呈现。
-
-- **一句话生成专业导图**：用户仅需输入简单指令（如“帮博士生规划 AI 伦理研究路线”），系统即可基于 LLMs 的深度语义理解与知识图谱，自动提取核心要素，生成包含“哲学基础”“技术风险”“法律案例”等专业维度的三级框架，无需手动分层或设计逻辑，显著提升专业场景下的创作效率。
-- **混乱思维自动整理**：支持直接粘贴碎片化文本（如会议纪要、学习笔记），AI 通过 NLP 技术识别信息类型，自动归类至“问题描述”“解决方案”“待验证假设”等逻辑分支，并补充关联内容，将无序信息转化为层次清晰、内容完整的思维导图，解决传统手动整理耗时长、易疏漏的痛点。
-
-### 跨场景深度赋能
-
-区别于传统思维导图工具，该系统在教育、科研、企业管理等场景中均展现独特价值。如在企业项目管理中，自动生成项目进度、风险分析等可视化图表，助力高效决策。
-
----
-
-## 技术路线
-
-### 系统架构设计
-
-#### 前端
-
-前端是 Vue 3 单页工作台（`frontend/src/`）：`<script setup>` 组件化，Pinia 管理导图内容、编辑历史与保存状态，TailwindCSS 负责样式，`@vue-flow/core` 负责节点画布，Vitest + Vue Test Utils 覆盖关键交互。画布支持四种布局方向、双击内联改文字、Tab / Enter / Delete 建树、撤销重做（整树快照 50 步）、Ctrl+S 保存（`version` 乐观锁，冲突 409 弹三选）与打开已保存导图；输入侧支持文本、文档、图片与浏览器录音（`src/components/SourceInputs.vue`、`src/audio/`），导出走 PUML / Markdown / OPML / JSON 四种格式（JSON 无损保留关系线），Agent 面板（`src/components/AgentPanel.vue`）跟着工具循环把结果直接落到画布上、标成未保存（没有「应用」这一步）。顶栏已收成「★ / 标题 / +」三件，保存 / 打开 / 导入 / 导出 / 演示 / 知识库 / 偏好 / 节点详情都在左抽屉（`src/components/HistoryDrawer.vue`）；知识库列出库里材料、每份被几张导图引用、点开看正文前 4000 字。节点上的引用可点回原文（`docs/SOURCE-REFERENCES.md`），右侧抽屉另有这张图的改动账本（`EditLedger.vue`）与实体消解面板（`AliasResolver.vue`，把同一实体的不同叫法合并）。网络层是自写的 `fetch` 封装 `src/api/client.ts`，非 2xx 统一抛 `ApiError`；类型由 `src/api/types.ts` 镜像后端契约，校验以后端 Pydantic 为准。
-
-| 位置 | 选型 |
+| 变量 | 说明 |
 |---|---|
-| UI 框架 | Vue 3（`<script setup>` 组合式 API） |
-| 状态管理 | Pinia |
-| 开发语言 | TypeScript |
-| 构建与测试 | Vite 7 + Vitest + Vue Test Utils |
-| 样式方案 | TailwindCSS 4 |
-| 画布 | `@vue-flow/core` + 自研 tidy-tree 布局（R2），编辑与撤销在 store（R3） |
-| 网络通信 | `fetch`（`src/api/client.ts` 统一错误体） |
-| 数据校验 | 后端 Pydantic v2 契约；前端只做类型镜像 |
+| `MINDMAP_LLM_MODE` | `demo` = 不联网发占位树；`model` = 走 Chat Completions 兼容接口 |
+| `MINDMAP_LLM_BASE_URL` / `MINDMAP_LLM_API_KEY` / `MINDMAP_LLM_MODEL` | 服务商地址 / 密钥 / 模型名 |
+| `MINDMAP_LLM_MODEL_DEEP` | 可选，"深度思考"开关用的那个模型 |
 
-> 申报书原文写的是 React + Zustand + axios + Zod + `plantuml-encoder`/`viz.js`。实际实现改走 Vue 生态：React 骨架仅作过渡，已打 tag `v0.1.0-react-scaffold` 存档；Zustand/axios/Zod 未采用；PUML 由后端生成文本、前端只下载，不在浏览器里渲染，因此 `plantuml-encoder` 与 `viz.js` 也不引入。
+也可以用页面内配置代替环境变量：顶栏齿轮 → 模型服务（落 SQLite 单行表、立即生效、密钥只回打码值，库里没值时逐字段回落环境变量）。
 
-#### 后端
+**可选，按需**
 
-FastAPI + Pydantic v2，11 组路由（43 个路径 / 53 个端点）统一挂在 `/api` 下。模型服务地址、密钥与模型名可以只在环境变量里配，也可以在页面顶栏的齿轮里改（`backend/app/settings/`，落 SQLite 单行表、立即生效、密钥只回打码值；库里没有值时逐字段回落环境变量），面板只接受 OpenAI 兼容接口。当前用 SQLite 本地存取（`backend/app/mindmaps/repository.py`），规划迁到 PostgreSQL + pgvector。**不返回空对象冒充成功**：还不可用的接口带 `implemented: false`（现在只剩 `agent/tasks` 一个桩 —— 早期阶段规划的遗留接口，保留给旧调用方，真正的入口是 `POST /api/agent/runs/stream`），没有返回 501 的路由。模型调用集中在 `backend/app/agent/` 的工具循环（`mindmap_generate` / `mindmap_generate_deep` / `node_expand` / `rag_query` / `audit_tree` / `add_node` / `update_node` / `remove_node` / `move_node` / `add_edge` / `remove_edge` / `mindmap_fill_details` / `mindmap_edit`，`POST /api/agent/runs/stream` 是生成与编辑的唯一入口）与 `backend/app/generation/` 的底层 `chat_async`：设 `MINDMAP_LLM_MODE=demo` 时不联网、直接发占位树（agent 不把"没配置"默认降级成 demo，缺省则缺模型配置会报错），设 `model` 才走 Chat Completions 兼容接口。文档解析在 `backend/app/ingestion/`（PDF 逐页视觉识别、Docling 结构化格式、LibreOffice 转旧格式、百炼语音转写），导出在 `backend/app/export/`（PUML / Markdown / OPML / JSON）。生成结果不自动保存也不等你确认：`done` 一到，整棵树直接落进画布并标成未保存，再显式保存（带版本号的乐观锁，冲突返回 409）；要退回去用「回到生成之前」或撤销。
-
-### 核心模块开发
-
-**1、文本解析与处理**
-
-使用 LLMs 解析用户输入的自然语言文本，提取实体、关系和关键信息。多模态模型支持图片 / 语音输入，转化为文本后生成思维导图节点。
-
-**2、思维导图生成引擎**
-
-基于知识图谱嵌入优化节点层级关系，生成结构化思维导图。
-
-**3、数据流程与优化**
-
-- 数据预处理：材料与节点转 1024 维向量（`text-embedding-v3`），以「文本指纹 + 模型名」为键缓存在本机 SQLite，检索用归一化向量的余弦矩阵乘完成。全库 3652 个节点时单次检索约 15 ms。本期不引入独立向量数据库：同规模对照实测 Milvus Lite 单次查询 179 ms、进程常驻内存 +119 MB、官方不支持 Windows，而其 FLAT 索引内部同样是暴力扫描，在数千条量级不产生收益（复评门槛：历史节点达 50 万条）。见 `docs/OPTIMIZATION-CROSS-MAP.md`。
-- 模型调优：本期不微调基础模型。改为把用户对生成结果的实际修改按字段落库（`edit_events`：改了哪个字段、哪个层级、由人改还是由模型改），作为偏好信号参与后续生成的排序与提示词；一张典型导图约记录 37 条改动事件。微调所需的数据量级与实施方案列为后续工作。见 `docs/EDIT-LOG.md`。
-
-**4、部署与测试**
-
-- 部署：生产环境为单机 systemd（ECS 2C2G / 无 GPU）。另提供可选的单机容器化方案（`docker compose`，后端 + 前端两个服务，含健康检查与 90 秒优雅停机），**该方案尚未在真机上完成一次完整构建与运行验证**，待确认清单见 `docs/DOCKER.md` 第 9 节。
-- 性能：生成延迟分三段实测，不报单一数字 —— 首帧（界面进入"正在生成"）约 0.1 秒；首个节点落地 **41.5 秒**（含冷启动外部检索 14.8 秒）；整棵树完成端到端 **139.5 秒**（工具级 41.0–72.6 秒，线上压测 P50 76.5 秒）。压力测试覆盖 1–3 路并发，据此补了生成期心跳帧。见 `docs/LATENCY-BREAKDOWN.md`。
-- 自动化闸门：CI 每次提交跑后端 `pytest` + `ruff` + 零引用函数棘轮 + OpenAPI 快照比对，前端 Vitest + 契约类型 + 零引用棘轮（`.github/workflows/ci.yml`）。
-
-本项目有在线部署，见 [https://genai-mindmap.rpegio.top/](https://genai-mindmap.rpegio.top/)。
-
-### 拟解决的关键问题
-
-1. **语义理解与结构映射**：如何将非结构化文本准确转化为层次分明的思维导图节点关系。
-2. **多模态融合**：实现图片 / 语音输入与文本生成的无缝衔接，支持跨模态编辑。
-3. **知识准确性**：通过 RAG 与本地向量检索提升生成内容的专业性，并为每个节点保留可点回原文的来源引用，减少事实性错误。
-4. **个性化生成**：根据用户历史使用习惯，动态调整思维导图的生成风格和侧重点。
-5. **性能优化**：降低 LLMs 调用延迟，实现实时生成与交互反馈。
-
-### 预期成果
-
-**1、功能完整的原型系统**
-
-支持自然语言输入、多模态交互、思维导图自动生成与编辑。
-
-**2、技术指标**
-
-| 指标 | 目标 |
+| 变量 | 不配会怎样 |
 |---|---|
-| 思维导图生成准确率（结构合理性） | > 85% |
-| 多模态输入支持率（文本 + 图片 + 语音） | ≥ 90% |
-| 系统响应时间 | < 5 秒（复杂场景） |
+| `DASHSCOPE_API_KEY` | `.wav` 上传返回 422（百炼 Qwen-Audio-ASR 转写） |
+| `MINDMAP_SOFFICE_CMD` | `.doc` / `.ppt` 返回 422（要给 LibreOffice 的 `soffice` 路径，或让它从 `PATH` 里找） |
+| `MINDMAP_DB_PATH` | 默认 `backend/data/mindmaps.db` |
+| `MINDMAP_AGENT_ENABLED` | 默认开；设 `0` 关闭 `/api/agent/runs/stream` |
+| `MINDMAP_NLI_ENABLED` / `MINDMAP_NLI_MODEL_DIR` / `MINDMAP_NLI_MIN_FREE_MB` | 只做机械核验，不做引用语义复核（ONNX 模型，默认关） |
+| `MINDMAP_EMBEDDING_*`（`PROTOCOL` / `BASE_URL` / `API_KEY` / `MODEL` / `DIM`） | 检索退回纯 BM25，没有向量那一路 |
+| `MINDMAP_RERANK` / `MINDMAP_RERANK_MODEL` | 不重排 |
+| `MINDMAP_LIBRARY_SEARCH` / `MINDMAP_LIBRARY_REMEMBER` | 分别为"库里的材料参与生成"与"生成时把用到的材料收进库"，代码默认都开；**线上把检索那条置 0 做纯展示** |
+| `MINDMAP_EXTERNAL_KNOWLEDGE` / `MINDMAP_EXTERNAL_PROXY` | 主题生成时先联网检索五源（默认开）；代理缺省是本机 Clash Verge 的 `127.0.0.1:7897`，写 `none` 表示直连 |
+| `MINDMAP_EXTERNAL_DEEPSEEK_SEARCH` / `MINDMAP_EXTERNAL_DEEPSEEK_FETCH` | 第 6 个外部源与"贴链接抓正文"，**默认关**，要 key |
+| `MINDMAP_DEEPSEEK_TOOLS_API_KEY` / `MINDMAP_DEEPSEEK_TOOLS_BASE_URL` | 上面两个功能用的 key；不填就回落到 `MINDMAP_LLM_*` |
+| `MINDMAP_FREE_TIER` / `MINDMAP_FREE_TIER_API_KEY` / `MINDMAP_FREE_QUOTA_LIMIT` | 免费档与每人每天次数（默认 3；不配 key 就没有免费档） |
 
-> 上表是申报书里的目标值，不是当前实测。性能实测分首帧 / 首个节点 / 完整导图三段报，数字见「技术路线 → 4、部署与测试」（整树端到端 139.5 秒）；两处口径不同，以实测为准。
+**生成侧的开关**（`run-backend.bat` 里逐个写着开还是关，改之前先读它旁边的注释——每个都是实测后定的）：`MINDMAP_SECTION_SLICE`、`MINDMAP_GRAPH_INGEST`、`MINDMAP_GRAPH_EXTRACTION`、`MINDMAP_DETAIL_RETRIEVAL`、`MINDMAP_NODE_SCALE`、`MINDMAP_DETAIL_SCALE`、`MINDMAP_DETAIL_LENGTH`、`MINDMAP_OPTIMIZATION_CROSS_MAP`、`MINDMAP_VERIFY_AFTER_GENERATE`。
 
-**3、创新性突破**
+### Neo4j 是可选的——不配就退化，不会挡住任何一条主链路
 
-- 基于知识图谱的逻辑优化算法。
-- 多模态混合生成的思维导图范式。
+`backend/app/knowledge/graph_store.py` 的密码**没有默认值**：不设 `MINDMAP_NEO4J_PASSWORD` 就等于"没配置"。
 
-**4、应用价值**
+| 不配 Neo4j 时 | 表现 |
+|---|---|
+| 写接口（图入图、实体抽取落库） | 抛错，但只在显式写的时候 |
+| 读接口（两跳图检索） | 返回空；`MINDMAP_GRAPH_SEARCH` 本来就默认 `0`（实测零收益，理由见 [F14](docs/FEATURES_AND_OWNERS.md) / [OPTIMIZATION-CROSS-MAP.md](docs/OPTIMIZATION-CROSS-MAP.md)） |
+| 第三档骨架（材料抽不出章节标题时用图谱定分支） | 跳过那一段，诊断里出现 `GRAPH_OUTLINE_UNAVAILABLE`，**不判失败** |
 
-- 教育领域：辅助课程大纲生成、知识点梳理。
-- 企业场景：会议纪要自动生成、项目管理可视化。
+真要开：`MINDMAP_NEO4J_URI` / `MINDMAP_NEO4J_USER` / `MINDMAP_NEO4J_PASSWORD` / `MINDMAP_NEO4J_DATABASE`（默认 `bolt://127.0.0.1:7687` / `neo4j` / — / `neo4j`），本机怎么起见 [NEO4J-LOCAL.md](docs/NEO4J-LOCAL.md)。
+
+---
+
+## 怎么验证没改坏（和 CI 一样的命令）
+
+后端（在 `backend` 目录，`pytest.ini` 已设 `pythonpath = .`）：
+
+```powershell
+python -m pytest -q                                   # 3435 条用例 / 153 个文件（2026-11-27 收集数）
+python -m ruff check .                                # CI 钉版本 ruff==0.9.10
+python scripts/check_script_hygiene.py --gate         # 探针脚本周边的五档卫生检查
+python scripts/acc3/find_unwired.py --gate            # "用例测了函数、产品没接上" 的棘轮
+python scripts/export_openapi.py; git diff --exit-code openapi.json   # OpenAPI 快照必须无差异
+```
+
+前端（在 `frontend` 目录）：
+
+```powershell
+npm test                                              # 1462 条 vitest 用例 / 93 个文件
+node scripts/find_unwired.mjs --gate                  # 前端同一道棘轮
+npm run gen:api; git -C .. diff --exit-code frontend/src/api/schema.d.ts   # 生成类型必须与提交一致
+npm run build                                         # vue-tsc --noEmit && vite build
+```
+
+两组的对应关系写在 [.github/workflows/ci.yml](.github/workflows/ci.yml)，PR 上两个 job 必须双绿。
+
+**改了 `backend/app/contracts/` 里的任何字段**，按这个顺序走，别漏（漏哪一步，`pytest` / `vue-tsc` / CI 会各报一处）：
+
+```powershell
+cd backend
+python scripts/export_openapi.py     # 更新 backend/openapi.json
+cd ..\frontend
+npm run gen:api                      # 重新生成 src/api/schema.d.ts
+```
+
+再手工同步 `frontend/src/api/types.ts`（手写镜像）——`contract-check.ts` 会在编译期断言镜像与生成类型的键集合一致。
+
+---
+
+## 架构（一屏）
+
+```
+来源：文本 / 文档(PDF·docx·pptx·xlsx·md·html·旧 Office) / 图片 / WAV
+   │
+   │  POST /api/agent/runs/stream   （SSE v2，生成与编辑的唯一入口）
+   ▼
+backend/app/agent/  工具循环，工具按意图注册（_ALLOWED_BY_INTENT）
+   ├── create → mindmap_generate            四步、3–4 次模型调用
+   │      ① 骨架：只定一级分支（>10 支先归成 3–6 组）
+   │      ② 检索：knowledge/ 混合检索，每支各一次
+   │      ③ 结构：一次写整棵树 + source_refs（detail 留空）
+   │      ④ 只写说明：按节点数切两半并发，按 id 对号写回
+   ├── expand → node_expand / audit_tree
+   └── edit   → 六条细粒度 + mindmap_edit + mindmap_fill_details
+   │
+   │  done 帧：整棵树直接落画布（不落库、不需要点"应用"）
+   ▼
+frontend/src/  Pinia store → @vue-flow/core 画布（四种朝向）
+   │  Ctrl+S / 保存（version 乐观锁，409 走三选弹层）
+   ▼
+backend/app/mindmaps/  SQLite（data/mindmaps.db）+ edit_events 改动账本
+```
+
+**为什么"按意图注册"这件事要单独记住**：生成侧有**两条实现、一条注册**——`mindmap_generate`（整树一次成型，`create` 唯一注册的那条）与 `mindmap_generate_deep`（分片，代码/规格/用例都在但**不注册到 `create`**，挂在非产品意图 `create_deep` 下，服务"一次响应写不下 200+ 节点"的大图）。两条共用材料准备（`_intake`）、骨架（`_skeleton_outline`）与按支检索（`_retrieve_branches`），**改这几处等于同时改两条路**。历史上有四次"只改了两三条路径"，单点测试全绿而链路是断的——这条警告原文在 [AGENTS.md](AGENTS.md) 第 49 行，被 `backend/tests/test_one_path.py` 钉着。
+
+### 目录导览
+
+```
+backend/app/
+  main.py              应用装配，11 组路由（43 个路径 / 53 个端点）全挂 /api
+  contracts/           数据契约：树 / 流程图 / 鱼骨图三种形状、Node、请求响应、ops、edits（★改这里要通知另一人）
+  agent/               AI 代理：工具循环、op 执行器、SSE v2、运行台账 —— 生成与编辑的唯一入口
+  generation/          单次模型调用（demo / model）、上下文预算、增量解析、免费档与额度
+  ingestion/           多模态输入 → Source（文本 / 文档 / 图片 / WAV）
+  knowledge/           切块、混合检索、rerank、知识库（只读入口 + 生成时入库）、外部五源、图谱
+  optimization/        结构诊断（三条规则 + 引用核验 + NLI）、自动修复、跨图参照
+  importing/           外部文件 → 导图（xmind / freemind / opml / puml / markdown / json）
+  export/              导出 puml / markdown / opml / json
+  mindmaps/            保存 / 读取 / 版本冲突 / 改动日志（repository 层）
+  prefs/               用户偏好（显式偏好 + 风格画像 + 从历史推建议）
+  memory/              记忆模块（生成时注入、会话结束总结）
+  settings/            模型服务的页面内配置（SQLite 单行表，回落环境变量）
+  auth/                账号与会话（scrypt 口令、sessions 表、HttpOnly cookie、门禁中间件）
+  core/                进程级配置
+  tests/               3435 条用例 / 153 个文件
+
+frontend/src/
+  App.vue              工作台（画布居中、左材料、右对话与详情）
+  canvas/              Vue Flow 容器、自定义节点、三种几何（tidy 树 / dagre 流程 / 手写鱼骨）
+  mindmap/             纯函数：改名/加删节点/断关系（edits.ts）、op 执行（ops.ts）、形状与排版、改动账本、引用
+  stores/              Pinia：内容与撤销栈、来源、对话、偏好、模型设置
+  api/                 fetch 封装 + ApiError、types.ts（手写镜像）、schema.d.ts（生成，勿手改）、contract-check.ts
+  components/          AgentPanel / HistoryDrawer / EditLedger / AliasResolver / SourceInputs / RecordButton …
+  sources/ audio/      输入侧常量与校验、浏览器录音（16kHz WAV）
+  demo/ dev/           生产也带的三张预置导图、仅 `npm run dev` 加载的布局示例
+  tests/               1462 条用例 / 93 个文件
+```
+
+---
+
+## 技术栈与实测口径
+
+| 位置 | 选型 | 说明 |
+|---|---|---|
+| UI | Vue 3（`<script setup>`）+ TypeScript | 申报书原写 React，React 骨架打过 tag `v0.1.0-react-scaffold` 存档 |
+| 状态 | Pinia | 不用 Zustand |
+| 画布 | `@vue-flow/core` + 自研 tidy-tree | 流程用 dagre，鱼骨手写 60° 主骨；不引通用图布局库 |
+| 样式 | TailwindCSS 4 | — |
+| 网络 | 原生 `fetch` + 直接读 SSE 流 | 非 axios；错误统一 `ApiError` |
+| 校验 | 后端 Pydantic v2；前端 `openapi-typescript` 生成 + 编译期契约断言 | 不引运行期 schema 库（非 Zod） |
+| 后端 | FastAPI + Pydantic v2，单进程 | 11 组路由 / 43 路径 / 53 端点 |
+| 存储 | SQLite 单文件 + 版本号乐观锁 | 不用 PG；`repository.py` 直连 |
+| 检索 | 本机 SQLite 缓存向量 + numpy 余弦矩阵乘（1024 维 `text-embedding-v3`，BM25 混合、RRF 融合） | **不引独立向量库**：同规模实测 Milvus Lite 单次 179 ms、常驻内存 +119 MB、官方不支持 Windows，而本机方案全库 3652 节点单次约 15 ms；复评门槛是历史节点达 50 万条（[OPTIMIZATION-CROSS-MAP.md](docs/OPTIMIZATION-CROSS-MAP.md)） |
+| 图谱 | Neo4j（可选） | 开关默认 0，实测零收益（F14） |
+| 部署 | 单机 systemd + nginx 同源反代（ECS 2C2G / 无 GPU） | 同源所以不需要 CORS，鉴权在应用层；`docker compose` 写了但**从未在真机上完成一次完整构建与运行验证**（[DOCKER.md](docs/DOCKER.md) 第 9 节的待确认清单） |
+| 模型 | 任意 OpenAI 兼容 `/chat/completions`；线上 `z-ai/glm-5.3-flash` | `demo` 模式不联网 |
+
+**延迟分三段报，不报单一数字**（`docs/ACCEPTANCE-METRICS.md` §4.2，20 条材料样本、单并发）：
+
+| 段 | 你感觉到什么 | P50 | P95 |
+|---|---|---|---|
+| 首帧 | 界面有反应了 | **0.09 秒** | 0.12 秒 |
+| 中心主题上屏 | 画布开始长 | **5.4 秒** | 9.5 秒 |
+| 完整树落地 | 可以保存/导出了 | **31.3 秒** | 41.4 秒（无材料冷启动 74–89 秒） |
+
+极端组合（205 节点、外部检索冷启动、生产开关全开）端到端实测 **139.5 秒**；耗时近似 `节点数 × 0.35 秒`，由模型输出速度决定，不由本系统决定（[LATENCY-BREAKDOWN.md](docs/LATENCY-BREAKDOWN.md)）。申报书写的"整图 < 3 秒 / 复杂场景 < 5 秒"是**目标值**，物理上做不到，口径怎么改的见 [PLAN-REWORDING.md](docs/PLAN-REWORDING.md) 第一节。
+
+---
+
+## 功能状态表
+
+**逐条状态以 [docs/FEATURES_AND_OWNERS.md](docs/FEATURES_AND_OWNERS.md) 的 26 项（F01–F26）为准**，那张表每一项都写到"做了哪部分 / 没做哪部分 / 依据在哪个文件"。申报书与实现的 22 项逐条核对（含未实现项、口径修正、复现脚本）在 [docs/PLAN-VS-IMPLEMENTATION.md](docs/PLAN-VS-IMPLEMENTATION.md)。
+
+粗分三档：
+
+| 档 | 是什么 |
+|---|---|
+| **能用** | 文本/文档/图片/录音多来源 → 生成（demo 或真实模型，`mindmap_generate` 四步）｜三种图型（树 / 流程 / 鱼骨，各自独立几何）｜画布编辑（改字、Tab/Enter/Delete 建树、拖动改父子、撤销重做 50 步）｜保存与版本冲突（409 三选）｜导入 6 种 / 导出 4 种｜节点级来源引用（三层校验，界面可点回原文）｜结构诊断 + 引用核验 + NLI｜外部五源检索｜账号与会话（游客 cookie + 注册/登录，导图存自己名下）｜改动账本｜用户偏好与风格画像｜记忆模块 |
+| **部分** | 知识图谱（抽取/消解/两跳检索都写了，**实测零收益所以默认关**）｜主题预设与字体主色的**界面渲染**（契约有字段，界面不渲染）｜`relations` / `style` / `pos`（只落库、界面不读）｜容器化（写了没真机验证）｜评测（85% / 90% / 5 秒三条指标**没有实测数据**） |
+| **没做** | 多人实时协作（F17）、协作场景的 AI 汇总（F18）、多语言翻译（F19）、模型微调（F21）、浏览器内 PlantUML 渲染（语法上不可能，见 [PLAN-REWORDING.md](docs/PLAN-REWORDING.md) 第五节）、Kubernetes |
+
+**唯一的桩**是 `POST /api/agent/tasks`（返回固定四阶段、不产生导图，`implemented: false`）。知识检索 `/api/knowledge/search` **不是桩**——早先的文档说"返回空 + implemented:false"，那句已经过时。全站没有返回 501 的路由。
+
+---
+
+## 已知限制与坑
+
+**它会让你等**
+
+- 一次生成 **31–140 秒**，看节点数与开关。这不是检索慢，是输出量大（3–4 次模型往返，≈ 节点数 × 0.35 秒）。要快就关 `MINDMAP_NODE_SCALE`（实测 −43%）；"深度思考"开着会更慢。
+- **引用覆盖不到三成**：同一份 14,120 字材料、纯 BM25 下材料覆盖率实测 **30.5%**。界面上表现为大量节点没有可核验引用——一次 64 节点的图 20 条诊断里绝大多数是这一条。它是提示不是错误。
+
+**输入格式是窄的**
+
+- **语音只收 8k / 16k 的 WAV**（`SUPPORTED_RATES = (8000, 16000)`，16bit 单声道）。手机录音默认 44.1 kHz，直接传会 422；浏览器内录的那个按钮产出的是合规 WAV。
+- `.doc` / `.ppt` 要装 LibreOffice（约 1.5 GB），没装返回 422 而不是降级；`.xls` 要 `xlrd`（已在 `requirements.txt`）。各格式的前提表在 [TEAM-GUIDE.md](TEAM-GUIDE.md) 第 4 节。
+- PDF 视觉识别要求 `MINDMAP_LLM_MODE=model` + 密钥；`demo` 下只回落文本层，扫描件 422。
+
+**数据上的边界**
+
+- **改动账本记不住"为什么"**：`edit_events` 只记"谁（`user` / `agent`）在哪个字段、哪一层、改了什么"，不记动机；也**记不住是哪个用户**——`actor` 只有 `user` / `agent` 两个取值。想回答"用户为什么嫌这一层多余"，现在只能看分布、靠人猜（`docs/EDIT-LOG.md`）。一张典型导图约 37 条事件。
+- **引用的原文不落库**：`source_refs`（`source_id` + `quote` + 可选页码与区间）随导图保存，但 `Source.text` 只活在本次会话里。刷新重开，角标与引文还在，抽屉里没有前后文。
+- **后端只在生成时校验引用，保存时不复检**：手工改过节点文字之后，旧引用可能已经对不上原文。
+- **导入会丢东西**：只有本仓库 JSON 无损；其余格式形状会退化、引用被清空。
+- 视图默认只画 40 个节点（收起状态不持久化）；导图最多 8 层；流程图/鱼骨图不支持跨容器拖动，阶段与骨的次序拖不动；坐标只由布局算，不能自由摆放。
+
+**工程上的坑**
+
+- `run-backend.bat` / `run-neo4j.bat` / `ensure-neo4j.bat` **写死本机路径**（`D:\genai-mindmap`、`C:\tools\jdk-21…`、`D:\neo4j\neo4j-community-5.26.0`），换机器要改；`.bat` 用纯 ASCII 注释，cmd 在 936 代码页下会把 UTF-8 注释切成半个字符当命令执行。
+- Neo4j 在这台机器上**不会自启**（没有 service，装 service 要管理员），所以 `run-backend.bat` 才去调 `ensure-neo4j.bat`。
+- 本机跑后端测试若报 `No module named 'xlrd'`，是依赖没装齐，不是代码问题。
+- `backend/app/pipeline/` 目录下只剩 `__pycache__`（源码整包删了），别照着名字找实现。
+
+---
+
+## 文档地图
+
+`docs/` 下 90+ 份，分八组。**只想知道"现在是什么状态"读前三份就够了**：`PROJECT-STATUS.md` → `FLOW.md` → `FEATURES_AND_OWNERS.md`。
+
+| 组 | 先读这些 | 讲什么 |
+|---|---|---|
+| **入门 / 现状** | `PROJECT-STATUS.md`、`FLOW.md`、`ARCHITECTURE.md`、`ARCHITECTURE_ADDENDUM.md`、`API.md`、`CONTRACT_V2.md` | 现状总览、端到端流程 ← 第一份该读的、模块边界与选型、接口逐条实现到哪、契约 v2 |
+| **计划 / 分工 / 交接** | `PLAN.md`、`FEATURES_AND_OWNERS.md`、`HANDOFF.md`、`TODO.md`、`W1_DAY1.md` | 里程碑与验收门（含决策记录 Q1–Q36）、26 项功能追踪与 A/B 分工、需双方确认的跨人决策、文件占用 |
+| **生成链路**（最常改） | `ONE-CALL.md`、`ONE-PATH.md`、`GENERATION-PIPELINE-NOTES.md`、`AGENT_STREAM_PROTOCOL.md`、`AGENT_PLAN.md`、`GRAPH-OUTLINE.md`、`SECTION-SLICE.md`、`MIXED-SKELETON.md`、`BRANCH-CAP.md`、`BRANCH-DIGEST.md`、`INPUT-EXTRACT.md`、`OFF-TOPIC-AND-FEW-BRANCHES.md`、`GENERATE-REPAIR-SELFCHECK.md` | 四步生成为什么这么切（含实测与红线判定）、删/恢复整树生成的那两轮、SSE 帧、骨架三档、按章切、两级骨架、分支数与概括角标、收尾自检 |
+| **检索 / 知识 / 图谱** | `RAG-DECISIONS.md`、`RETRIEVAL-EVAL.md`、`RETRIEVAL-KEEP.md`、`SOURCE-REFERENCES.md`、`DETAIL-RETRIEVAL.md`、`EXTERNAL-SELECTION.md`、`EXTERNAL-RELEVANCE.md`、`LIBRARY-MEASUREMENTS.md`、`ENTITY-RESOLVE.md`、`GRAPH-TWO-PASS.md`、`NEO4J-LOCAL.md` | 混合检索与 RRF、评估基线、按分数取数、三层引用校验、外部五源与相关性门、库与实体别名、图谱两段式 |
+| **画布 / 交互 / 导出** | `NODE-EDIT.md`、`NODE-DRAG.md`、`DRAG-ROUND3.md`、`VIEW-COLLAPSE.md`、`LAYOUT-CLARITY.md`、`FISHBONE-CATEGORIES.md`、`IMPORT.md`、`EDIT-LOG.md`、`NODE-ORIGIN.md` | 三个编辑动作的判据、拖动语义、收起与可读性、鱼骨类别、导入退化、改动账本字段 |
+| **质量 / 验收 / 核算** | `ACCEPTANCE-REPORT.md`、`ACCEPTANCE-METRICS.md`、`ACCEPTANCE-EVIDENCE.md`、`BLIND-SCORING.md`、`PLAN-VS-IMPLEMENTATION.md`、`PLAN-REWORDING.md`、`LATENCY-BREAKDOWN.md`、`USER-PATH-TESTS.md`、`WIRING-GAPS.md`、`SCRIPT-HYGIENE.md`、`TEST-COST-136-NODE.md` | 三条指标的口径与实测、"代码在、用例绿、产品没接上"的三种形状、申报书的替换句、延迟分段账 |
+| **部署 / 依赖 / 成本** | `DEPLOY.md`、`DOCKER.md`、`LEGACY-FORMAT-COST.md`、`PDF-PARSER-SELECTION.md`、`FREE-MODELS.md`、`OPTIMIZATION-CROSS-MAP.md` | systemd + nginx 一条命令装完、compose 的未验证清单、旧 Office 解析代价、免费模型档、向量库选型实测 |
+| **历史 / 已退休 / 调研** | `ONE-PATH.md`、`FOLD-RETIRED.md`、`TWO-ARCH-COMPARISON.md`、`EXTERNAL-SELECTION.md`、`MEMORY-PROPOSITION.md`、`PROFILE-ISOLATION.md`、`research/` | 决策留档与被推翻的部分（**引用前先读文件头的订正块**）、外部调研汇总 |
+
+**读文档的一条纪律**：这个仓库的文档写得很细，也因此有"反了"的风险——**说某个东西死了，可能它活着**（`ONE-PATH.md` 说"只剩分片"，实际 `create` 注册的是整树生成）；**说某个东西是桩，可能它已经接了**（知识检索）。凡涉及"已删除 / 仍是桩 / 默认关"的断言，去代码或 `backend/tests/` 里核一次再引用——这三类断言都有自己的钉子用例。
 
 ---
 
 ## 关于本仓库
 
-- 前五节（项目简介、项目目的、研究内容、国内外研究现状、创新点与项目特色）整理自本项目申报书，未作技术方案层面的增补。
-- 「技术路线」一节已按实际实现更新：技术栈（Vue 3 + Pinia + FastAPI）、端点数量、检索方案（本机 SQLite + numpy，不引入独立向量数据库）、部署形态（单机 systemd + 未真机验证的 compose）、性能三段口径。与申报书原文的差异在原文处用引用块标注。
-- 申报书原文写作 `pluml-encode`，此处按 npm 实际包名写作 `plantuml-encoder`（另有 `plantuml-encode` 存在，为不同包）。
-- 后端架构在申报书中留空，现按 `docs/ARCHITECTURE.md` 与 `docs/API.md` 实现。
-- 申报书与实现的逐条差异（含未实现项、口径修正与复现脚本）见 `docs/PLAN-VS-IMPLEMENTATION.md` 与 `docs/PLAN-REWORDING.md`。
-
----
-
-## 开发骨架与团队分工
-
-请参阅 [组员阅读说明](TEAM-GUIDE.md)、[开发骨架使用说明](START_HERE.md)、[系统架构](docs/ARCHITECTURE.md)、[功能清单与分工](docs/FEATURES_AND_OWNERS.md) 和 [项目执行计划](docs/PLAN.md)（里程碑、验收门、风险表、决策记录）。各功能的实现状态以清单为准（已实现 / 部分实现 / 未实现逐条标注）。
-
-用户视角的操作说明见 [用户指南](docs/USER-GUIDE.md)，部署与运维见 [部署文档](docs/DEPLOY.md) 与 [容器化说明](docs/DOCKER.md)。
+- 申报书原文（项目简介、研究内容、国内外研究现状、创新点、拟解决的关键问题、预期成果）与"技术路线"那一节的原文摘录，见 [docs/PROPOSAL.md](docs/PROPOSAL.md)；本文件写的是**实现侧的现状**。
+- 申报书原文写作 `pluml-encode`，这里按 npm 实际包名写作 `plantuml-encoder`（另有 `plantuml-encode` 存在，是不同包）。
+- 用户视角的操作说明见 [docs/USER-GUIDE.md](docs/USER-GUIDE.md)（从装好到做出一张有用的图）；组员上手与分工见 [TEAM-GUIDE.md](TEAM-GUIDE.md)；仓库根目录的 [START_HERE.md](START_HERE.md) 是状态与易错点清单，[NEXT-PLAN.md](NEXT-PLAN.md) 是 2026-11-02 的排期评估快照（已过期，只作历史）。
+- 协作规则：`main` 是生产分支（线上跑的就是它）、`dev` 是集成分支、PR 目标一律 `dev`；提交信息用中文 Conventional Commits；CI 必须绿才能合并。改 `backend/app/contracts/` 必须两人同时知道。
