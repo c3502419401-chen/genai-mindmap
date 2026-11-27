@@ -121,26 +121,32 @@ Invoke-WebRequest -Uri 'http://localhost:5173/api/health' -UseBasicParsing | Sel
 
 ## 怎么验证没改坏（和 CI 一样的命令）
 
+顺序与 [.github/workflows/ci.yml](.github/workflows/ci.yml) 的两个 job 逐条对应，照着从上往下跑就是 CI。
+
 后端（在 `backend` 目录，`pytest.ini` 已设 `pythonpath = .`）：
 
 ```powershell
-python -m pytest -q                                   # 3435 条用例 / 153 个文件（2026-11-27 收集数）
-python -m ruff check .                                # CI 钉版本 ruff==0.9.10
-python scripts/check_script_hygiene.py --gate         # 探针脚本周边的五档卫生检查
-python scripts/acc3/find_unwired.py --gate            # "用例测了函数、产品没接上" 的棘轮
-python scripts/export_openapi.py; git diff --exit-code openapi.json   # OpenAPI 快照必须无差异
+python -m ruff check .                                # ① Lint，CI 钉版本 ruff==0.9.10
+python scripts/check_script_hygiene.py --gate         # ② 探针脚本周边的五档卫生检查
+python scripts/check_doc_claims.py --gate             # ③ 文档断言与代码一致（双向反句表）
+python -m pytest -q                                   # ④ 全量（3435 条 / 153 个文件，2026-11-27 收集数，之后还在涨）
+python scripts/acc3/find_unwired.py --gate            # ⑤ "用例测了函数、产品没接上" 的棘轮
+python scripts/export_openapi.py; git diff --exit-code openapi.json   # ⑥ OpenAPI 快照必须无差异
 ```
 
 前端（在 `frontend` 目录）：
 
 ```powershell
-npm test                                              # 1462 条 vitest 用例 / 93 个文件
-node scripts/find_unwired.mjs --gate                  # 前端同一道棘轮
-npm run gen:api; git -C .. diff --exit-code frontend/src/api/schema.d.ts   # 生成类型必须与提交一致
-npm run build                                         # vue-tsc --noEmit && vite build
+npm run gen:api; git -C .. diff --exit-code frontend/src/api/schema.d.ts   # ① 生成类型必须与提交一致
+npm test                                              # ② 全量 vitest（1462 条 / 93 个文件）
+npm run test:cost:gate                                # ③ 用例的成本棘轮（超时上限 vs 满载实测）
+node scripts/find_unwired.mjs --gate                  # ④ 前端同一道零引用棘轮
+npm run build                                         # ⑤ vue-tsc --noEmit && vite build
 ```
 
 两组的对应关系写在 [.github/workflows/ci.yml](.github/workflows/ci.yml)，PR 上两个 job 必须双绿。
+
+**③ 是"文档也会漂"的那一道**：它把"文档说的事"与"代码现在做的事"对表——`create` 到底注册了哪个生成工具、`knowledge/search` 是不是桩、有没有门禁、哪些开关默认是开的、画布有几种朝向。发现矛盾时它先告诉你**这条事实凭什么成立**（用例名或文件），再让你选改文档还是改代码。怎么加一行、怎么豁免，见 [DOC-CLAIMS.md](docs/DOC-CLAIMS.md)。
 
 **改了 `backend/app/contracts/` 里的任何字段**，按这个顺序走，别漏（漏哪一步，`pytest` / `vue-tsc` / CI 会各报一处）：
 
@@ -257,6 +263,7 @@ frontend/src/
 | **部分** | 知识图谱（抽取/消解/两跳检索都写了，**实测零收益所以默认关**）｜主题预设与字体主色的**界面渲染**（契约有字段，界面不渲染）｜`relations` / `style` / `pos`（只落库、界面不读）｜容器化（写了没真机验证）｜评测（85% / 90% / 5 秒三条指标**没有实测数据**） |
 | **没做** | 多人实时协作（F17）、协作场景的 AI 汇总（F18）、多语言翻译（F19）、模型微调（F21）、浏览器内 PlantUML 渲染（语法上不可能，见 [PLAN-REWORDING.md](docs/PLAN-REWORDING.md) 第五节）、Kubernetes |
 
+<!-- claims-ok: knowledge_search_implemented 这句在纠正旧说法，引用的是被否定的原话 -->
 **唯一的桩**是 `POST /api/agent/tasks`（返回固定四阶段、不产生导图，`implemented: false`）。知识检索 `/api/knowledge/search` **不是桩**——早先的文档说"返回空 + implemented:false"，那句已经过时。全站没有返回 501 的路由。
 
 ---
@@ -302,11 +309,14 @@ frontend/src/
 | **生成链路**（最常改） | `ONE-CALL.md`、`ONE-PATH.md`、`GENERATION-PIPELINE-NOTES.md`、`AGENT_STREAM_PROTOCOL.md`、`AGENT_PLAN.md`、`GRAPH-OUTLINE.md`、`SECTION-SLICE.md`、`MIXED-SKELETON.md`、`BRANCH-CAP.md`、`BRANCH-DIGEST.md`、`INPUT-EXTRACT.md`、`OFF-TOPIC-AND-FEW-BRANCHES.md`、`GENERATE-REPAIR-SELFCHECK.md` | 四步生成为什么这么切（含实测与红线判定）、删/恢复整树生成的那两轮、SSE 帧、骨架三档、按章切、两级骨架、分支数与概括角标、收尾自检 |
 | **检索 / 知识 / 图谱** | `RAG-DECISIONS.md`、`RETRIEVAL-EVAL.md`、`RETRIEVAL-KEEP.md`、`SOURCE-REFERENCES.md`、`DETAIL-RETRIEVAL.md`、`EXTERNAL-SELECTION.md`、`EXTERNAL-RELEVANCE.md`、`LIBRARY-MEASUREMENTS.md`、`ENTITY-RESOLVE.md`、`GRAPH-TWO-PASS.md`、`NEO4J-LOCAL.md` | 混合检索与 RRF、评估基线、按分数取数、三层引用校验、外部五源与相关性门、库与实体别名、图谱两段式 |
 | **画布 / 交互 / 导出** | `NODE-EDIT.md`、`NODE-DRAG.md`、`DRAG-ROUND3.md`、`VIEW-COLLAPSE.md`、`LAYOUT-CLARITY.md`、`FISHBONE-CATEGORIES.md`、`IMPORT.md`、`EDIT-LOG.md`、`NODE-ORIGIN.md` | 三个编辑动作的判据、拖动语义、收起与可读性、鱼骨类别、导入退化、改动账本字段 |
-| **质量 / 验收 / 核算** | `ACCEPTANCE-REPORT.md`、`ACCEPTANCE-METRICS.md`、`ACCEPTANCE-EVIDENCE.md`、`BLIND-SCORING.md`、`PLAN-VS-IMPLEMENTATION.md`、`PLAN-REWORDING.md`、`LATENCY-BREAKDOWN.md`、`USER-PATH-TESTS.md`、`WIRING-GAPS.md`、`SCRIPT-HYGIENE.md`、`TEST-COST-136-NODE.md` | 三条指标的口径与实测、"代码在、用例绿、产品没接上"的三种形状、申报书的替换句、延迟分段账 |
+| **质量 / 验收 / 核算** | `ACCEPTANCE-REPORT.md`、`ACCEPTANCE-METRICS.md`、`ACCEPTANCE-EVIDENCE.md`、`BLIND-SCORING.md`、`PLAN-VS-IMPLEMENTATION.md`、`PLAN-REWORDING.md`、`LATENCY-BREAKDOWN.md`、`USER-PATH-TESTS.md`、`WIRING-GAPS.md`、`SCRIPT-HYGIENE.md`、`DOC-CLAIMS.md`、`TEST-COST-136-NODE.md` | 三条指标的口径与实测、"代码在、用例绿、产品没接上"的三种形状、申报书的替换句、延迟分段账、**"文档说的事与代码对不对"那道闸门怎么加一行** |
 | **部署 / 依赖 / 成本** | `DEPLOY.md`、`DOCKER.md`、`LEGACY-FORMAT-COST.md`、`PDF-PARSER-SELECTION.md`、`FREE-MODELS.md`、`OPTIMIZATION-CROSS-MAP.md` | systemd + nginx 一条命令装完、compose 的未验证清单、旧 Office 解析代价、免费模型档、向量库选型实测 |
 | **历史 / 已退休 / 调研** | `ONE-PATH.md`、`FOLD-RETIRED.md`、`TWO-ARCH-COMPARISON.md`、`EXTERNAL-SELECTION.md`、`MEMORY-PROPOSITION.md`、`PROFILE-ISOLATION.md`、`research/` | 决策留档与被推翻的部分（**引用前先读文件头的订正块**）、外部调研汇总 |
 
+<!-- claims-ok: create_registers_generate 「读文档的纪律」一节里引用旧说法当反例 -->
 **读文档的一条纪律**：这个仓库的文档写得很细，也因此有"反了"的风险——**说某个东西死了，可能它活着**（`ONE-PATH.md` 说"只剩分片"，实际 `create` 注册的是整树生成）；**说某个东西是桩，可能它已经接了**（知识检索）。凡涉及"已删除 / 仍是桩 / 默认关"的断言，去代码或 `backend/tests/` 里核一次再引用——这三类断言都有自己的钉子用例。
+
+**而这件"核一次"现在有机器在做了**：`python scripts/check_doc_claims.py --gate`（CI 第三步，机制见 [DOC-CLAIMS.md](docs/DOC-CLAIMS.md)）把"文档说的事"与"代码现在做的事"对表——`create` 注册了哪个生成工具、`knowledge/search` 是不是桩、有没有门禁、49 个开关各自默认开还是关、画布有几种朝向。上面那句"去核一次"仍然成立，只是**漏核会红在 CI 上**，而不是等下一轮的人读到时才发现。
 
 ---
 
