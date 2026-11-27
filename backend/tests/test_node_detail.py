@@ -102,6 +102,108 @@ def test_clip_label_counts_code_points():
     assert clip_label("") == ""
 
 
+# ------------------------------------------------- 一·二 切点不落在半个 token 上
+
+
+def test_clip_label_does_not_cut_a_token_in_half():
+    """切在半个 token 上时往前退：`#21` 不是 `#218` 的缩写，是**另一个东西**。
+
+    实测（`scripts/measure_label_clip.py`，20 棵验收树 / 1130 节点）里 16 字 label
+    有 10 条是这么撞出来的：`Kru`←Kruskal、`VLA`←VLAN、`BG`←BGP、`P`←PNG、
+    `W`←Word、`Pos`←PostgreSQL（三处）、`Eleme`←Element Plus、`21`←21ms、`#21`←#218。
+    前八个只是"读不通"，最后两个是**说错事**——`#21` 与 `#218` 指的是两个不同的
+    issue，`21` 与 `21ms` 差三个数量级。长度是"排不排得进盒子"，切点是"切开之后
+    还是不是同一个东西"，后者更硬。
+    """
+    # 两个说错事的
+    assert clip_label("错位问题已提 issue #218") == "错位问题已提 issue"
+    assert clip_label("平均查询 180ms 降到 21ms") == "平均查询 180ms 降到"
+    # 六个读不通的
+    assert clip_label("路由协议 RIP OSPF BGP") == "路由协议 RIP OSPF"
+    assert clip_label("CSMA/CD 与交换机 VLAN") == "CSMA/CD 与交换机"
+    assert clip_label("最小生成树 Prim 与 Kruskal") == "最小生成树 Prim 与"
+    assert clip_label("导入 docx 生成导图导出 PNG") == "导入 docx 生成导图导出"
+    assert clip_label("后端 Node.js + PostgreSQL") == "后端 Node.js"
+    assert clip_label("前端 Vue 3 + Element Plus") == "前端 Vue 3"
+
+
+def test_clip_label_strips_what_the_retreat_left_dangling():
+    """退到 token 之前以后，末尾的空白 / `/+|` / 悬空运算符要抹掉。
+
+    不抹的话 `导出 PNG / PDF / W` 会退化成 `导出 PNG / PDF /`——末尾一个孤零零的
+    斜杠，读起来像被截了两次；`精确完成率≥90%` 会退化成 `…完成率≥`。
+    """
+    assert clip_label("导出 PNG / PDF / Word") == "导出 PNG / PDF"
+    assert clip_label("90 次局部请求精确完成率≥90%") == "90 次局部请求精确完成率"
+    # `、`/`,`/`:` 不抹：它们留在末尾是"这里还有下文"的可见标记
+    assert clip_label("(user_id, created_at)") == "(user_id,"
+
+
+def test_clip_label_does_not_pretend_to_know_chinese_word_boundaries():
+    """已知边界：中文词内切**不**修，钉住这个取舍。
+
+    `与归一` 后面的"化"没了（原文"归一化"），`服务器` 本来就是完整词。两者在
+    机制上不可区分——中文没有词边界符，要判它就得引词表，而词表会把模型新造的
+    术语判错。为了少几个不好看的切点引入一类新故障，方向是反的。
+    """
+    assert clip_label("训练技巧：dropout 与归一化") == "训练技巧：dropout 与归一"
+    assert clip_label("部署在校内 2 核 4G 服务器上") == "部署在校内 2 核 4G 服务器"
+
+
+def test_clip_label_leaves_half_quotes_alone():
+    """引用配平**不**修，同样钉住：两个方向的代价都比"留着半个括号"大。
+
+    退到开符号之前会整块丢掉引用里的内容（`Silberschatz《操作系统概念》` →
+    `Silberschatz`）；而开符号落在第 0 个码点时退无可退（`(user_id, created_at)`）。
+    半个括号至少还读得出原意，还给了"这里被截过"的可见提示。
+    """
+    assert clip_label("Silberschatz《操作系统概念》") == "Silberschatz《操作系"
+    assert clip_label("第 3 章 数据链路层（6 学时）") == "第 3 章 数据链路层（6 学时"
+
+
+def test_clip_label_never_empties_a_single_token_label():
+    """整条就是一个 token 时放弃回退：清空标题比切一刀更糟。
+
+    `ensure_finish_reason` 是实测里真出现过的那种 label（主库 `mindmaps.db` 的
+    一棵图里就是 `ensure_finish_re`）。它整条是 token，退无可退，所以仍然切在
+    中间——这是这条规则的极限，账写在 `docs/LABEL-CLIP-VERDICT.md`。
+    """
+    assert clip_label("abcdefghijklmnopqrstuvwxyz") == "abcdefghijklmnop"
+    assert clip_label("ensure_finish_reason 的兜底") == "ensure_finish_re"
+
+
+@pytest.mark.parametrize("text", [
+    "路由协议 RIP OSPF BGP",
+    "错位问题已提 issue #218",
+    "平均查询 180ms 降到 21ms",
+    "导出 PNG / PDF / Word",
+    "90 次局部请求精确完成率≥90%",
+    "导入 docx 生成导图导出 PNG",
+    "后端 FastAPI 加 PostgreSQL",
+    "CSMA/CD 与交换机 VLAN",
+    "最小生成树 Prim 与 Kruskal",
+    "The quick brown fox jumps over the lazy dog",
+    "(user_id, created_at, deleted_at)",
+])
+def test_clip_label_output_never_ends_inside_a_token(text):
+    """性质：产出撞上限时，切点两侧不会同属一个 token。
+
+    判据与 `scripts/measure_label_clip.py` 同一套（`_IDENT_CHARS`），所以这条性质
+    和那份测量说的是同一件事——测量报"库里还剩几条"，这条钉"以后不再新增"。
+    """
+    result = clip_label(text)
+    assert len(result) <= GENERATED_LABEL_MAX_CHARS
+    if len(text) <= GENERATED_LABEL_MAX_CHARS:
+        assert result == text
+        return
+    ident = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._+#%<>=-")
+    cut = len(result)
+    assert cut < len(text)
+    assert not (text[cut - 1] in ident and text[cut] in ident), (
+        f"{text!r} 切在 token 中间：{result!r}"
+    )
+
+
 # ---------------------------------------------------------------- 2. ops 携带 detail
 
 

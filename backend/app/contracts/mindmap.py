@@ -88,6 +88,16 @@ MAX_NODE_LABEL_CHARS = 200
 # 16 这个数的依据是画布：`180px` 宽的圆角框里放 14px 字，一行约 12 个字、两行
 # 24 个字，16 字是"缩到能看见全貌"之后仍读得出的长度。超过它的内容属于详情
 # （`detail`），不属于标题。
+#
+# **它是一个上界，不是目标长度。** 切点会往前退，退到能读的地方为止（见
+# `clip_label`）：16 字里正好切在半个 token 上时（`issue #21` ← `#218`），那半个
+# token 不是缩写，是**另一个东西**，比短 2 个字严重得多。所以实际落库的 label
+# 可能短于 16——账在 `docs/LABEL-CLIP-VERDICT.md`。
+#
+# 为什么不是 24（画布两行的理论值）：那 24 个字是"排得进、读得出"的上界，不是
+# 舒适值；而可读是验收里唯一下降的维度（3.30 → 3.15，见 `ACCEPTANCE-REPORT` §6.1），
+# 在这条维度上把上限抬高，方向是反的。同一个 24 在前端还有另一个身份
+# （`stores/mindmap.ts::TRUNCATE_CHARS`，显示层兜底），两者不是一回事。
 GENERATED_LABEL_MAX_CHARS = 16
 
 # 节点详情上限。与 `note` 同为 2000：同一块文字在界面上占同一块地方，两个字段
@@ -250,6 +260,24 @@ def normalize_icon(value: object) -> str | None:
     return text[:MAX_NODE_ICON_CHARS]
 
 
+#: `clip_label` 认作"一个不可切开的 token"的字符集：拉丁字母、数字，以及本身
+#: 就属于标识符 / 版本号 / 单位 / 数值的符号。`#21` 与 `#218` 是两个 issue 号，
+#: `21` 与 `21ms` 是两个数——切在这套字符中间，得到的不是缩写，是另一个东西。
+_IDENT_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._+#%<>=-"
+)
+
+#: 退到 token 之前以后，末尾可能悬着的分隔符。只收"后面必然还接着东西"的符号：
+#: 空白、`/`、`+`、`|`。顿号、逗号、冒号**不在这里**——它们留在末尾是"这里还有
+#: 下文"的可见标记（`(user_id,` 比 `(user_id` 更像一张被截的参数表）。
+_TRAILING_SEPARATORS = frozenset(" \t\u3000/+|")
+
+#: 退到 token 之前以后，末尾可能悬着的**非词内**符号：`精确完成率≥90%` 的"≥"。
+#: 与 `_`/`.`/`#`/`-` 的区别是后者两侧仍属同一个词（`ensure_finish_reason` 的
+#: 下划线），抹它们会把整条 token 退光；`≥`/`=`/`<` 单独挂在末尾则什么也不表达。
+_TRAILING_OPERATORS = frozenset("≥≤=+<>")
+
+
 def clip_label(text: str, limit: int = GENERATED_LABEL_MAX_CHARS) -> str:
     """按**码点**截断标题，返回不超过 `limit` 个码点的字符串。
 
@@ -259,11 +287,56 @@ def clip_label(text: str, limit: int = GENERATED_LABEL_MAX_CHARS) -> str:
 
     省略号**不**追加：它是 1 个码点，加上去会让"16 字"变成 17 字，于是再截一次、
     再判一次，最后谁也不知道上限到底是几。要显示省略号的地方（画布）自己加。
+
+    **切点不落在半个 token 上**（`_clip_index`）。这是 16 这个上界之下的第二条
+    约束：长度是"排不排得进盒子"，切点是"切开之后还是不是同一个东西"。
+    `issue #21`（原文 `#218`）与 `21`（原文 `21ms`）不是短了两个字符的标题，是
+    **说了一件错事**——这两个数字指的不是同一件事。所以那一类切口往前退，退到
+    token 之前，代价是标题可能短几个字。
     """
     if limit <= 0:
         return ""
     chars = list(text or "")
-    return "".join(chars[:limit])
+    return "".join(chars[:_clip_index(chars, limit)])
+
+
+def _clip_index(chars: list[str], limit: int) -> int:
+    """`limit` 落在半个 token 上时，往前退到 token 之前；否则原样返回 `limit`。
+
+    只处理**有客观边界**的那一类：拉丁字母、数字，以及 `#`/`.`/`+`/`%`/`=` 这些
+    本身就属于标识符、版本号、单位、数值的字符（`#218`、`Node.js`、`C++`、`35%`）。
+    判据是切口两侧都在这套字符里——那说明它们本来是一个 token，被刀切成了两半。
+
+    退到 token 之前以后，再抹掉末尾悬着的空白与 `/+|`（`导出 PNG / PDF /` 不能
+    留着那个斜杠）。**抹完不再动汉字**：中文单字构词太自由，`降到` 的"到"、
+    `增加` 的"加"、"总和"的"和"与真正的连接词在字面上不可区分，去它们会把
+    `180ms 降到` 变成 `180ms 降`——那是拿一个新错误换一个旧错误。
+
+    **不处理中文词内切**：中文没有词边界符，`与归一`（原文"归一化"）与
+    `服务器`（本来就是完整词）在机制上不可区分，要判它就得引一张词表，而词表
+    会把模型新造的术语判错——为了少几个不好看的切点引入一个新故障，方向是反的。
+    账在 `docs/LABEL-CLIP-VERDICT.md`。
+
+    **不处理引用配平**（`《》`/`（）` 里切）：`Silberschatz《操作系` 退到开符号
+    之前会整块丢掉书名（`Silberschatz`），而 `(user_id, created_at)` 这种开符号
+    就在第 0 个码点的，退无可退。两个方向的代价都比"留着半个括号"大——半个
+    括号至少还读得出原意，还给了"这里被截过"的可见提示。
+
+    退到 0 时放弃回退（整条就是一个 token，比如 17 个字母的单词）：把标题清空比
+    切一刀更糟。
+    """
+    if limit <= 0 or limit >= len(chars):
+        return max(limit, 0)
+    if not (chars[limit - 1] in _IDENT_CHARS and chars[limit] in _IDENT_CHARS):
+        return limit
+    cut = limit
+    while cut > 0 and chars[cut - 1] in _IDENT_CHARS:
+        cut -= 1
+    while cut > 0 and chars[cut - 1] in _TRAILING_OPERATORS:
+        cut -= 1
+    while cut > 0 and chars[cut - 1] in _TRAILING_SEPARATORS:
+        cut -= 1
+    return cut or limit
 
 
 def _fold(text: str) -> str:
