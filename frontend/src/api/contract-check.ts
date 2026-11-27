@@ -36,6 +36,12 @@ import type {
   AliasDeletion,
   AliasEntry,
   AliasListing,
+  AliasEvidence,
+  AliasCandidate,
+  AliasPreview,
+  AliasApplyRequest,
+  AliasApplyResult,
+  AliasPair,
   AuthUser,
   ChangePasswordRequest,
   Credentials,
@@ -119,6 +125,12 @@ export const checks = {
   aliasListingKeys: true satisfies SameKeys<AliasListing, Schemas['AliasListing']>,
   aliasDeletionKeys: true satisfies SameKeys<AliasDeletion, Schemas['AliasDeletion']>,
   aliasClearanceKeys: true satisfies SameKeys<AliasClearance, Schemas['AliasClearance']>,
+  aliasEvidenceKeys: true satisfies SameKeys<AliasEvidence, Schemas['AliasEvidence']>,
+  aliasCandidateKeys: true satisfies SameKeys<AliasCandidate, Schemas['AliasCandidate']>,
+  aliasPreviewKeys: true satisfies SameKeys<AliasPreview, Schemas['AliasPreview']>,
+  aliasApplyRequestKeys: true satisfies SameKeys<AliasApplyRequest, Schemas['AliasApplyRequest']>,
+  aliasApplyResultKeys: true satisfies SameKeys<AliasApplyResult, Schemas['AliasApplyResult']>,
+  aliasPairKeys: true satisfies SameKeys<AliasPair, Schemas['AliasPair']>,
   // 模型设置：这五条是密钥保护契约的编译期一半。`ModelSettings` 里若出现任何
   // 明文字段（`api_key` 而不是 `api_key_masked`），这里会红——比 code review 可靠，
   // 因为加字段的人往往只是想"顺手把值也带出来"。
@@ -178,6 +190,12 @@ export const checks = {
   aliasListingShape: true satisfies SameShape<AliasListing, Schemas['AliasListing']>,
   aliasDeletionShape: true satisfies SameShape<AliasDeletion, Schemas['AliasDeletion']>,
   aliasClearanceShape: true satisfies SameShape<AliasClearance, Schemas['AliasClearance']>,
+  aliasEvidenceShape: true satisfies SameShape<AliasEvidence, Schemas['AliasEvidence']>,
+  aliasCandidateShape: true satisfies SameShape<AliasCandidate, Schemas['AliasCandidate']>,
+  aliasPreviewShape: true satisfies SameShape<AliasPreview, Schemas['AliasPreview']>,
+  aliasApplyRequestShape: true satisfies SameShape<AliasApplyRequest, Schemas['AliasApplyRequest']>,
+  aliasApplyResultShape: true satisfies SameShape<AliasApplyResult, Schemas['AliasApplyResult']>,
+  aliasPairShape: true satisfies SameShape<AliasPair, Schemas['AliasPair']>,
   modelSettingsShape: true satisfies SameShape<ModelSettings, Schemas['ModelSettings']>,
   instanceSettingsShape: true satisfies
     SameShape<InstanceSettings, Schemas['InstanceSettings']>,

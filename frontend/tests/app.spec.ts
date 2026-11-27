@@ -1015,6 +1015,8 @@ describe('实体别名入口', () => {
     expect(wrapper.text()).toContain('→');
     expect(wrapper.text()).toContain('国家市场监督管理总局');
     expect(wrapper.text()).toContain('构词关系');
+    expect(wrapper.text()).toContain('找出可合并的实体');
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/aliases/candidates'))).toBe(false);
 
     const remove = wrapper.findAll('button').filter(node => node.text() === '删除').pop();
     await remove!.trigger('click');

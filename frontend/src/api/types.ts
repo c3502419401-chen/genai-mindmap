@@ -701,6 +701,51 @@ export interface AliasClearance {
   deleted: number;
 }
 
+export interface AliasEvidence {
+  source_id: string;
+  filename: string;
+  start: number;
+  end: number;
+  quote: string;
+  kind: 'graph_edge' | 'text_match';
+}
+
+export interface AliasCandidate {
+  id: string;
+  alias: string;
+  canonical: string;
+  similarity: number;
+  reason: string;
+  alias_evidence: AliasEvidence[];
+  canonical_evidence: AliasEvidence[];
+  selectable: boolean;
+}
+
+export interface AliasPreview {
+  job_id: string;
+  status: 'running' | 'done' | 'failed' | 'cancelled' | 'applying' | 'applied';
+  stage: string;
+  error: string | null;
+  warnings: string[];
+  items: AliasCandidate[];
+}
+
+export interface AliasApplyRequest {
+  job_id: string;
+  candidate_ids: string[];
+}
+
+export interface AliasPair {
+  alias: string;
+  canonical: string;
+}
+
+export interface AliasApplyResult {
+  relationships_created: number;
+  created: AliasPair[];
+  skipped: number;
+}
+
 // ---- agent 运行 ----
 
 /**

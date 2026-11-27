@@ -4,6 +4,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import MindMapCanvas from './canvas/MindMapCanvas.vue';
 import type { Direction } from './canvas/layout/tidy';
 import AgentPanel from './components/AgentPanel.vue';
+import AliasResolver from './components/AliasResolver.vue';
 import ChatDock from './components/ChatDock.vue';
 import HistoryDrawer from './components/HistoryDrawer.vue';
 import MessageFab from './components/MessageFab.vue';
@@ -696,9 +697,8 @@ async function runLibraryDelete(entry: LibraryEntry, force: boolean): Promise<vo
 /**
  * 别名清单。**这是"模型把实体认错了、能不能改回来"唯一的界面入口**。
  *
- * 别名不参与证据：删掉一条只让这两个名字重新变成两个实体，挂在它们身上的证据边
- * 一条不动。所以这里只有"删掉错的那条"，没有"合并两个实体"——合并要跨图搬引用，
- * 是另一件事。
+ * 别名不参与证据：删掉一条只移除名称之间的别名关系，挂在它们身上的证据边一条不动。
+ * 新的候选预览与逐对确认由 AliasResolver 负责，确认或撤回后刷新这里的清单。
  */
 const aliasesOpen = ref(false);
 const aliasEntries = ref<AliasEntry[]>([]);
@@ -2026,9 +2026,7 @@ const agentHasDetail = computed(() => agentDetailVisible(store));
           </p>
 
           <!--
-            实体别名：模型推断出来的"这两个名字是同一个东西"。猜错之后没有界面能改，
-            所以这一节的意义不在"便利"，在于它是唯一的修正入口。只做删除，不做合并
-            （合并要跨图搬引用，是另一件事）。
+            实体别名：先预览候选、逐对确认，再可按名称对撤回错误的别名关系。
           -->
           <section class="mt-4 border-t border-slate-100 pt-3">
             <div class="flex items-center justify-between gap-3">
@@ -2038,9 +2036,10 @@ const agentHasDetail = computed(() => agentDetailVisible(store));
               </button>
             </div>
             <p class="mt-1 text-xs leading-relaxed text-slate-400">
-              生成时模型会猜「这两个名字指同一个东西」，猜完记成别名（左 → 右是"别名 → 主名"）。猜错了删掉那一条：实体与证据边都不受影响。
+              别名表示「这两个名字可能指同一个东西」（左 → 右是"别名 → 主名"）。可先核对候选出处再添加；猜错了删掉那一条，实体与证据边都不受影响。
             </p>
             <template v-if="aliasesOpen">
+              <AliasResolver v-if="aliasConfigured" @changed="loadAliases()" />
               <p v-if="aliasesBusy && aliasEntries.length === 0" class="mt-2 text-xs text-slate-400">正在读取…</p>
               <p v-else-if="aliasesError" class="mt-2 rounded-md bg-rose-50 p-3 text-xs leading-relaxed text-rose-700">
                 {{ aliasesError }}
@@ -2049,7 +2048,7 @@ const agentHasDetail = computed(() => agentDetailVisible(store));
                 图存储没有启用（缺 MINDMAP_NEO4J_PASSWORD），这一层暂时不可用。
               </p>
               <p v-else-if="aliasEntries.length === 0" class="mt-2 text-xs leading-relaxed text-slate-400">
-                还没有别名。实体消解跑过一轮之后，合并结果会出现在这里。
+                还没有别名。可在上方查找候选，核对并确认后结果会出现在这里。
               </p>
               <template v-else>
                 <ul class="mt-2 divide-y divide-slate-100">

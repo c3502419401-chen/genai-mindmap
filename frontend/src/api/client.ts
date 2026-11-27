@@ -2,6 +2,9 @@ import type {
   AliasClearance,
   AliasDeletion,
   AliasListing,
+  AliasApplyRequest,
+  AliasApplyResult,
+  AliasPreview,
   AgentEvent,
   AgentRunRequest,
   AuthUser,
@@ -772,6 +775,26 @@ export function deleteAlias(alias: string, canonical?: string): Promise<AliasDel
 /** 清空全部别名（"这一批合并全错了"的退路，别拿它当常规修正手段）。 */
 export function clearAliases(): Promise<AliasClearance> {
   return request<AliasClearance>('/knowledge/aliases', { method: 'DELETE' });
+}
+
+export function startAliasPreview(): Promise<AliasPreview> {
+  return request<AliasPreview>('/knowledge/aliases/candidates', { method: 'POST' });
+}
+
+export function readAliasPreview(jobId: string): Promise<AliasPreview> {
+  return request<AliasPreview>(`/knowledge/aliases/candidates/${encodeURIComponent(jobId)}`);
+}
+
+export function cancelAliasPreview(jobId: string): Promise<AliasPreview> {
+  return request<AliasPreview>(`/knowledge/aliases/candidates/${encodeURIComponent(jobId)}`, {
+    method: 'DELETE',
+  });
+}
+
+export function applyAliasPreview(body: AliasApplyRequest): Promise<AliasApplyResult> {
+  return request<AliasApplyResult>('/knowledge/aliases/apply', {
+    method: 'POST', body: JSON.stringify(body),
+  });
 }
 
 // ---- 导出 ----
