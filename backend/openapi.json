@@ -2398,6 +2398,11 @@
             "type": "string",
             "title": "Reason"
           },
+          "notice": {
+            "type": "string",
+            "title": "Notice",
+            "default": ""
+          },
           "alias_evidence": {
             "items": {
               "$ref": "#/components/schemas/AliasEvidence"

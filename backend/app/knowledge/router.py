@@ -288,6 +288,9 @@ class AliasCandidate(BaseModel):
     canonical: str
     similarity: float
     reason: str
+    #: 结构上"该看一眼"的提示（目前只有合称）：`碳达峰碳中和` 是两项政策的合称，
+    #: `碳中和` 不是它的简写。它不改变可选性——真实的判断还是得由人做。
+    notice: str = ""
     alias_evidence: list[AliasEvidence]
     canonical_evidence: list[AliasEvidence]
     selectable: bool
@@ -463,6 +466,7 @@ def _run_alias_preview(job: dict) -> None:
                 items.append(AliasCandidate(
                     id=str(len(items)), alias=alias, canonical=canonical,
                     similarity=group["similarity"], reason=group["reason"],
+                    notice=group.get("notice", ""),
                     alias_evidence=alias_evidence, canonical_evidence=canonical_evidence,
                     selectable=bool(alias_evidence and canonical_evidence),
                 ))

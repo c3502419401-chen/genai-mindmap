@@ -137,7 +137,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import sumprod as _dot
 
 from app.knowledge import graph_store, vector_cache
@@ -205,7 +205,7 @@ REASON_NONE = ""                 # 不合并
 # 缩写形（办/委/局）也在表里：「数字化转型办」的"办"仍然是类型词。
 DOC_TYPE_WORDS = (
     "办法", "条例", "规定", "通知", "细则", "规则", "章程", "制度", "流程", "程序",
-    "报告", "方案", "台账", "清单", "评估", "审查", "法",
+    "报告", "方案", "台账", "清单", "评估", "审查", "标准", "法",
 )
 ORG_TYPE_WORDS = (
     "委员会", "办公室", "管理局", "总局", "部门", "公司", "集团", "中心", "单位",
@@ -229,6 +229,40 @@ GENERIC_TERMS = frozenset({
     "台账", "清单", "权限", "岗位", "指标", "标准", "体系", "机制", "合同", "项目",
 })
 
+# 否定 / 取值对立的标记字。出现在"长名比短名**多出来的那段字**"里，就说明长名不是
+# 短名的另一种写法，而是它的反面或相邻取值：
+#
+#     监督学习 ⊂ 无监督学习         ← 「无」
+#     监督学习 ⊂ 半监督学习         ← 「半」
+#     化石能源 ⊂ 非化石能源         ← 「非」
+#     学校群体 ⊂ 学校的非正式群体    ← 「非」
+#
+# 与 `GENERIC_TERMS` 同一个取向：命中即拒，失效模式是漏合（该合的短名没合），不是
+# 错合。区别在于这一族的错合特别像真的——材料里两个词都出现过，出处、坐标、摘录
+# 一样成立，只有懂这个词的人才看得出「无监督学习」不是「监督学习」的简写。
+#
+# **每个字都要有真库命中才留**：「准」曾经在表里，它在「标准」「精准」里出现得更多
+# （`可再生能源 ⊂ 可再生能源标准`、`英语教学 ⊂ 高中英语精准教学`），于是它把
+# "多出一个修饰词"误判成"多出一个否定"——词表里多一个字，就多一片误杀面。
+OPPOSING_MARKERS = ("无", "不", "非", "反", "未", "半", "零", "伪")
+
+# 拉丁前缀按**词首**匹配（多出的那一段必须以它开头）。中文的否定字可以落在多出段的
+# 中段（「的**非**正式」），英文不行——`dex` 里没有否定，`unsupervised` 的 `un` 在
+# 开头。英文这一族不是"碰巧躲过去"：`supervised ⊂ unsupervised` 与中文同构，这次
+# 的库里只是恰好没有那一对。
+OPPOSING_PREFIXES = ("un", "non", "anti", "dis", "mis", "in", "im", "ir", "il")
+
+# 拉丁标识符允许的字符。这一类名字**不是由"取字"构成的**：`mode` / `model`、
+# `revision` / `baserevision`、`ai` / `api` 的差别是一个字符，而那是两个配置项、
+# 两个接口、两个文件。子序列判据在这里不是"近似成立"，是根本不成立。
+IDENTIFIER_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-/: ")
+#: 包在标识符外面的成对符号：`execute()` 与 `execute` 是同一个函数的两种写法。
+IDENTIFIER_WRAPPERS = "()[]{}<>\"'"
+#: 纯拉丁短名到这个长度等同于中文的泛称（`ai` / `api` / `sse` / `rag`）：
+#: 「AI 伦理」是 AI 的一个领域而不是它的另一个名字，「API」更不是「AI」。
+ASCII_GENERIC_MAX = 3
+
 
 @dataclass(frozen=True)
 class MergeCandidate:
@@ -251,6 +285,9 @@ class MergeCandidate:
     aliases: list[str]      # 建议并进去的
     similarity: float       # 合并依据的强度（随 reason：长度比 / 余弦）
     reason: str = REASON_NONE   # "substring" | "embedding" | ""（未标注：手工构造）
+    #: 人话提示：这一对通过了判据，但结构上有一个"该看一眼"的特征（目前只有合称）。
+    #: 它**不影响**合并与否，只出现在界面与 dry-run 的返回值里。
+    notice: str = ""
 
 
 def _clamp_limit(limit: int) -> int:
@@ -280,6 +317,96 @@ def _lost_type_word(short: str, long: str) -> bool:
         return True
     return _ends_with(long, ORG_TYPE_WORDS) and not any(
         word in short for word in ORG_TYPE_WORDS)
+
+
+def _surplus(short: str, long: str) -> str:
+    """长名里短名**没用到**的那些字，按它们在长名中出现的顺序拼起来。
+
+    用最靠前的一次匹配，与 `_is_ordered_subsequence` 同一个口径——两处说的"多出来的
+    部分"必须是同一段字，否则判据自相矛盾。「学校的非正式群体」减去「学校群体」剩下
+    「的非正式」，「无监督学习」减去「监督学习」剩下「无」。
+
+    `short` 不是 `long` 的子序列时返回空串：调用方已经先判过子序列，这里不重复报错。
+    """
+    position = 0
+    surplus: list[str] = []
+    for char in long:
+        if position < len(short) and char == short[position]:
+            position += 1
+            continue
+        surplus.append(char)
+    return "" if position < len(short) else "".join(surplus)
+
+
+def _opposing_marker(surplus: str) -> str:
+    """多出的那段字里的否定/取值对立标记；没有就返回空串（供调用方判断，也便于测试）。
+
+    中文按**包含**查（否定字可以在中段），拉丁前缀按**词首**查。
+    """
+    for marker in OPPOSING_MARKERS:
+        if marker in surplus:
+            return marker
+    lowered = surplus.lower()
+    for prefix in OPPOSING_PREFIXES:
+        if lowered.startswith(prefix):
+            return prefix
+    return ""
+
+
+def _identifier_key(name: str) -> str | None:
+    """纯拉丁标识符 → 归一化后的键；含中文或夹空格的返回 `None`（该走构词规则）。
+
+    只做三件**有确定语法等价关系**的归一：去掉包在尾部的括号引号（`execute()` →
+    `execute`）、只取路径最后一段（`stores/mindmap.ts` → `mindmap.ts`，同一文件的
+    两种引用）、统一大小写。
+
+    **不做**单复数、版本号、`_`/`-` 互换：「source」与「sources」、「pydantic」与
+    「pydantic v2」在代码里是两个**符号**，一个字符之差就是另一个东西。这一类宁可
+    漏合——漏合是缺失，错合是伪造。
+    """
+    if not name or not name.isascii():
+        return None
+    key = name.strip()
+    while key and key[-1] in IDENTIFIER_WRAPPERS:
+        key = key[:-1].rstrip()
+    if not key or any(char not in IDENTIFIER_CHARS for char in key):
+        return None
+    return key.rsplit("/", 1)[-1].lower()
+
+
+def _splits(long: str, short: str, other: str) -> bool:
+    """`long` 是不是 `short` 与 `other` 首尾相接拼出来的（中间允许一个连接字）。
+
+    「碳达峰碳中和」=「碳达峰」+「碳中和」。这条判据只认**连续**拼接：简称与全称之间
+    那种"抽字"关系不算，所以「市场监管总局」⊂「国家市场监督管理总局」不会被误报。
+    """
+    for head, tail in ((short, other), (other, short)):
+        if not head or not long.startswith(head):
+            continue
+        rest = long[len(head):]
+        if rest == tail or rest.strip("·、的与和") == tail:
+            return True
+    return False
+
+
+def _composite_notice(short: str, long: str, names: set[str]) -> str:
+    """长名是不是"短名 + 库里另一个实体名"拼起来的合称；是就返回一句人话提示。
+
+    `碳达峰碳中和` 是两项政策的合称，`碳达峰` 与 `碳中和` 各有各的材料。把分称并进
+    合称之后，「碳中和」的检索会把碳达峰的材料一起带出来，而两份材料里本来就同时写着
+    这两个词——**事后看不出错**。这一条不排除（「城市」+`雨污分流改造` 是同一个东西
+    的两种写法），只让界面能提示人看一眼。
+    """
+    short_key, long_key = _identifier_key(short), _identifier_key(long)
+    if short_key is not None and long_key is not None and short_key == long_key:
+        # `execute` 与 `execute()` 归一后是同一个标识符，不是合称。
+        return ""
+    for other in sorted(names):
+        if other in (short, long) or len(other) < 2 or 2 * len(other) < len(short):
+            continue
+        if _splits(long, short, other):
+            return f"「{long}」可能是「{short}」与「{other}」的合称"
+    return ""
 
 
 def _is_ordered_subsequence(short: str, long: str) -> bool:
@@ -323,16 +450,24 @@ def _longest_common_run(left: str, right: str) -> int:
 def _abbreviation_ratio(left: str, right: str) -> float:
     """两个名字的结构关系强度：返回长度比，**不构成缩写形态时返回 0.0**。
 
-    五条同时成立才算"缩写形态"，顺序按代价从便宜到贵：
+    前两条先分流，因为它们判的不是"像不像"，而是**这条判据在这个名字上成不成立**：
+
+      1. 两个都是拉丁标识符（`mode`/`model`、`ai`/`api`）→ 只认归一后完全相同；
+      2. 短名是两三字符的纯拉丁缩写（`ai`/`api`/`sse`）→ 等同于泛称，直接拒。
+
+    余下的是中文构词判据，六条同时成立才算"缩写形态"，顺序按代价从便宜到贵：
 
       1. 短名不在 `GENERIC_TERMS` 里（泛称永远不是别名，见该常量的注释）；
       2. 长度比 ≥ `MIN_LENGTH_RATIO`；
       3. 短名是长名的**顺序子序列**（构词关系，见 `_is_ordered_subsequence`）；
-      4. **最长连续公共段 ≥ 短名的一半**（`2 * run >= len(短名)`）：短名里至少有一
+      4. **长名多出来的那段字里没有否定/取值标记**（见 `_opposing_marker`）：
+         `监督学习 ⊂ 无监督学习`、`监督学习 ⊂ 半监督学习` 都是两种范式，不是一个
+         名字的两种写法；
+      5. **最长连续公共段 ≥ 短名的一半**（`2 * run >= len(短名)`）：短名里至少有一
          半的字是连着的一整块。这一闸挡的是"子序列巧合"——`数据安全法` ⊂
          `数据出境安全评估办法`、`数据安全` ⊂ `数据出境安全评估` 这类两个不同专名
          共享高频字的形态；
-      5. 短名没有丢掉长名那一侧的类型词（见 `_lost_type_word`）：`数据安全 ⊂
+      6. 短名没有丢掉长名那一侧的类型词（见 `_lost_type_word`）：`数据安全 ⊂
          数据安全法`、`董事会 ⊂ 董事会议事规则` 都是"上位/别层 ⊂ 专名"，返回 0.0。
 
     返回值直接当强度用：长度比越大，短名覆盖长名的比例越高，"整名缩写"的可信度越好
@@ -343,10 +478,25 @@ def _abbreviation_ratio(left: str, right: str) -> float:
     short, long = (left, right) if len(left) <= len(right) else (right, left)
     if short in GENERIC_TERMS:
         return 0.0
+    short_key, long_key = _identifier_key(short), _identifier_key(long)
+    if short_key is not None and long_key is not None:
+        # 两个都是拉丁标识符。`execute` / `execute()` 归一后相同，仍是同一个函数的
+        # 两种写法；差一个字符的（`mode` / `model`）是**两个不同的东西**，不接受
+        # "近似"——它们本来就是靠那一个字符区分的。
+        if short_key != long_key:
+            return 0.0
+        ratio = len(short) / len(long)
+        return ratio if ratio >= MIN_LENGTH_RATIO else 0.0
+    if short_key is not None and len(short_key) <= ASCII_GENERIC_MAX:
+        # `AI` / `API` / `SSE` 这一档：短到不能承载专名，扩展名不是它的别名。
+        return 0.0
     ratio = len(short) / len(long)
     if ratio < MIN_LENGTH_RATIO:
         return 0.0
     if not _is_ordered_subsequence(short, long):
+        return 0.0
+    if _opposing_marker(_surplus(short, long)):
+        # 多出来的那段字把意思反过来了：这是对立的另一个概念，不是简称。
         return 0.0
     if 2 * _longest_common_run(short, long) < len(short):
         return 0.0
@@ -539,6 +689,27 @@ def _preview_pairs(
     return candidates
 
 
+def _with_notices(
+    candidates: list[MergeCandidate], names: set[str],
+) -> list[MergeCandidate]:
+    """给通过判据的候选补一句结构提示。**不改判定**，只加说明。
+
+    标记与排除是两件事：否定前缀是"确定不是同一个"（拒），合称是"可能是拼起来的一个
+    名字"（留给人看）。把后者也拒掉会误伤「城市」+`雨污分流改造` 那一类，而静默放过
+    又等于让「碳达峰碳中和」把两项政策合并成一项——所以它进候选，但带一句提示。
+    """
+    marked: list[MergeCandidate] = []
+    for candidate in candidates:
+        notice = ""
+        for alias in candidate.aliases:
+            notice = (_composite_notice(alias, candidate.canonical, names)
+                      or _composite_notice(candidate.canonical, alias, names))
+            if notice:
+                break
+        marked.append(replace(candidate, notice=notice) if notice else candidate)
+    return marked
+
+
 def _preview_cached_vectors(names: list[str]) -> dict[str, list[float]]:
     """预览通过 SQLite 只读连接复用已有缓存，不执行建表或写入。"""
     path = repository.db_path().resolve()
@@ -705,14 +876,16 @@ async def find_merge_candidates(
                 similarity=strength,
                 reason=reason,
             ))
+    candidates = _with_notices(candidates, set(names))
 
     logger.info(
         "实体消解：实体 %d / 有向量 %d / 子串边 %d / 兜底边 %d / %s %d / "
-        "耗时 %dms",
+        "合称提示 %d / 耗时 %dms",
         len(names), len(vectors),
         sum(1 for edge in edges if edge[3] == REASON_SUBSTRING),
         sum(1 for edge in edges if edge[3] == REASON_EMBEDDING),
         "候选对" if preview else "候选组", len(candidates),
+        sum(1 for candidate in candidates if candidate.notice),
         int((time.perf_counter() - started) * 1000),
     )
     return candidates
@@ -723,12 +896,16 @@ def _describe(candidates: list[MergeCandidate]) -> list[dict]:
 
     `reason` 一定要出现在这里：dry-run 的价值是让人在落库前看出判定依据。传统模式
     的值是组内最弱一环；产品预览只列直接判定通过的一对，值对应这一对。
+
+    `notice` 也在：它不影响任何判定，是"这一对通过了判据，但结构上有个该看一眼的
+    特征"（目前只有合称）。dry-run 的人看到的必须与界面看到的是同一份说明。
     """
     return [
         {"canonical": candidate.canonical,
          "aliases": list(candidate.aliases),
          "similarity": round(candidate.similarity, 4),
-         "reason": candidate.reason or REASON_NONE}
+         "reason": candidate.reason or REASON_NONE,
+         "notice": candidate.notice}
         for candidate in candidates
     ]
 

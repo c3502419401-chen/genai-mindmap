@@ -176,6 +176,10 @@ onBeforeUnmount(() => {
             <input v-model="selected" type="checkbox" :value="item.id" :disabled="!item.selectable || applying">
             <span class="min-w-0 break-words"><strong>{{ item.alias }} → {{ item.canonical }}</strong>（{{ basis(item) }}）</span>
           </label>
+          <p v-if="item.notice" role="status"
+            class="mt-1 break-words rounded bg-amber-50 px-2 py-1 leading-relaxed text-amber-800">
+            ⚠ {{ item.notice }}：两个名字可能指不同的事物，合并后它们会共用一条查询路径。
+          </p>
           <div v-for="side in [{ name: item.alias, evidence: item.alias_evidence }, { name: item.canonical, evidence: item.canonical_evidence }]"
             :key="side.name" class="mt-2 break-words leading-relaxed">
             <p v-if="!side.evidence.length" class="text-amber-700">「{{ side.name }}」的原文出处不可核验，不能选择这一对。</p>

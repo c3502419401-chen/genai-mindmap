@@ -716,6 +716,7 @@ export interface AliasCandidate {
   canonical: string;
   similarity: number;
   reason: string;
+  notice: string;
   alias_evidence: AliasEvidence[];
   canonical_evidence: AliasEvidence[];
   selectable: boolean;

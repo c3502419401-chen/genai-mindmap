@@ -394,8 +394,22 @@ def test_preview_uses_strong_direct_edges_instead_of_flattening_a_group():
                (item.canonical, item.aliases[0]) in direct for item in candidates)
 
 
+def _without_notices(result: dict) -> dict:
+    """去掉候选里的 `notice` 再做逐字节比较。
+
+    下面这个守卫锚在一个固定提交上，语气是"默认路径一个字都不许变"。`notice`
+    是这一轮**有意**加的唯一一处字段（合称提示，见 `graph_resolve._with_notices`），
+    所以只把它摘出来；其余任何一个字节漂移仍然会红。
+    """
+    return {
+        **result,
+        "candidates": [{key: value for key, value in item.items() if key != "notice"}
+                       for item in result["candidates"]],
+    }
+
+
 def test_default_resolver_matches_previous_commit_byte_for_byte(monkeypatch):
-    """新预览关闭时仍走原来的分组、缓存与返回值口径。"""
+    """新预览关闭时仍走原来的分组、缓存与返回值口径（`notice` 除外）。"""
     root = Path(__file__).resolve().parents[2]
     current_degrees = graph_store.entity_degrees
     source = subprocess.run(
@@ -423,8 +437,8 @@ def test_default_resolver_matches_previous_commit_byte_for_byte(monkeypatch):
         previous_writes = list(writes)
         writes.clear()
         current = asyncio.run(graph_resolve.resolve_entities())
-        assert json.dumps(current, ensure_ascii=False).encode() == json.dumps(
-            previous, ensure_ascii=False).encode()
+        assert json.dumps(_without_notices(current), ensure_ascii=False).encode() == json.dumps(
+            _without_notices(previous), ensure_ascii=False).encode()
         assert writes == previous_writes
 
     graph_source = subprocess.run(

@@ -19,13 +19,21 @@ const evidence = (filename: string, quote: string) => [{
 
 const candidates: AliasCandidate[] = [{
   id: '0', alias: '市场监管总局', canonical: '国家市场监督管理总局',
-  similarity: 0.6, reason: 'substring', selectable: true,
+  similarity: 0.6, reason: 'substring', notice: '', selectable: true,
   alias_evidence: evidence('简称.txt', '市场监管总局发布通知。'),
   canonical_evidence: evidence('全称.txt', '国家市场监督管理总局负责监管。'),
 }, {
   id: '1', alias: '缺出处', canonical: '缺出处的全称',
-  similarity: 0.9, reason: 'embedding', selectable: false,
+  similarity: 0.9, reason: 'embedding', notice: '',
+  selectable: false,
   alias_evidence: [], canonical_evidence: evidence('全称.txt', '缺出处的全称。'),
+}, {
+  // 合称提示：这一对**可选**，但界面必须让人看见"它们可能不是同一个东西"。
+  id: '2', alias: '碳中和', canonical: '碳达峰碳中和',
+  similarity: 0.5, reason: 'substring',
+  notice: '「碳达峰碳中和」可能是「碳中和」与「碳达峰」的合称', selectable: true,
+  alias_evidence: evidence('碳中和.txt', '碳中和目标。'),
+  canonical_evidence: evidence('双碳.txt', '碳达峰碳中和目标。'),
 }];
 
 const running: AliasPreview = {
@@ -60,6 +68,9 @@ describe('实体消解预览', () => {
     expect(wrapper.text()).toContain('构词比例 0.60');
     expect(wrapper.text()).toContain('可能漏掉候选');
     expect(wrapper.text()).toContain('不能选择这一对');
+    // 合称提示：这一对可选，但"它们可能不是同一个东西"必须在界面上看得见。
+    expect(wrapper.text()).toContain('「碳达峰碳中和」可能是「碳中和」与「碳达峰」的合称');
+    expect(wrapper.text()).toContain('可能指不同的事物');
     const boxes = wrapper.findAll('input[type="checkbox"]');
     expect((boxes[0].element as HTMLInputElement).checked).toBe(false);
     expect((boxes[1].element as HTMLInputElement).disabled).toBe(true);

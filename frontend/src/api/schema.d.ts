@@ -1167,6 +1167,11 @@ export interface components {
             similarity: number;
             /** Reason */
             reason: string;
+            /**
+             * Notice
+             * @default
+             */
+            notice: string;
             /** Alias Evidence */
             alias_evidence: components["schemas"]["AliasEvidence"][];
             /** Canonical Evidence */
