@@ -716,7 +716,8 @@ A / B / C 是同一条路。实测一次 C 臂（`data/branch-budget-large.json`
 2. **薄材料上骨架判废**：`_material_inventory` 把"这次的材料共 2 份"告诉骨架之后，模型
    按**份数**给了 2 条一级分支（26 次采样里 24 次），`MIN_BRANCHES = 3` 直接判废 ——
    用户看到的是报错而不是一张图。关掉清单（`MINDMAP_PLAN_INVENTORY=0`）后 5/5 都给 6 条。
-   是另一个 bug，见 `docs/PLAN-INVENTORY.md`。
+   是另一个 bug，见 `backend/tests/test_plan_inventory.py` 与
+   `backend/scripts/probe_plan_inventory.py`。
 
 ### 复现
 

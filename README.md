@@ -105,7 +105,7 @@ AI 识别思维导图中的逻辑矛盾、冗余节点或缺失环节，提出�
 
 #### 前端
 
-前端是 Vue 3 单页工作台（`frontend/src/`）：`<script setup>` 组件化，Pinia 管理导图内容、编辑历史与保存状态，TailwindCSS 负责样式，`@vue-flow/core` 负责节点画布，Vitest + Vue Test Utils 覆盖关键交互。画布支持四种布局方向、双击内联改文字、Tab / Enter / Delete 建树、撤销重做（整树快照 50 步）、Ctrl+S 保存（`version` 乐观锁，冲突 409 弹三选）与打开已保存导图；输入侧支持文本、文档、图片与浏览器录音（`src/components/SourceInputs.vue`、`src/audio/`），导出走 PUML / Markdown / OPML 三种格式，Agent 面板（`src/components/AgentPanel.vue`）跟着工具循环把结果直接落到画布上、标成未保存（没有「应用」这一步）。顶栏「知识库」抽屉列出库里材料、每份被几张导图引用、点开看正文前 4000 字。网络层是自写的 `fetch` 封装 `src/api/client.ts`，非 2xx 统一抛 `ApiError`；类型由 `src/api/types.ts` 镜像后端契约，校验以后端 Pydantic 为准。
+前端是 Vue 3 单页工作台（`frontend/src/`）：`<script setup>` 组件化，Pinia 管理导图内容、编辑历史与保存状态，TailwindCSS 负责样式，`@vue-flow/core` 负责节点画布，Vitest + Vue Test Utils 覆盖关键交互。画布支持四种布局方向、双击内联改文字、Tab / Enter / Delete 建树、撤销重做（整树快照 50 步）、Ctrl+S 保存（`version` 乐观锁，冲突 409 弹三选）与打开已保存导图；输入侧支持文本、文档、图片与浏览器录音（`src/components/SourceInputs.vue`、`src/audio/`），导出走 PUML / Markdown / OPML / JSON 四种格式（JSON 无损保留关系线），Agent 面板（`src/components/AgentPanel.vue`）跟着工具循环把结果直接落到画布上、标成未保存（没有「应用」这一步）。顶栏已收成「★ / 标题 / +」三件，保存 / 打开 / 导入 / 导出 / 演示 / 知识库 / 偏好 / 节点详情都在左抽屉（`src/components/HistoryDrawer.vue`）；知识库列出库里材料、每份被几张导图引用、点开看正文前 4000 字。节点上的引用可点回原文（`docs/SOURCE-REFERENCES.md`），右侧抽屉另有这张图的改动账本（`EditLedger.vue`）与实体消解面板（`AliasResolver.vue`，把同一实体的不同叫法合并）。网络层是自写的 `fetch` 封装 `src/api/client.ts`，非 2xx 统一抛 `ApiError`；类型由 `src/api/types.ts` 镜像后端契约，校验以后端 Pydantic 为准。
 
 | 位置 | 选型 |
 |---|---|
@@ -122,7 +122,7 @@ AI 识别思维导图中的逻辑矛盾、冗余节点或缺失环节，提出�
 
 #### 后端
 
-FastAPI + Pydantic v2，11 组路由（38 个路径 / 43 个端点）统一挂在 `/api` 下。模型服务地址、密钥与模型名可以只在环境变量里配，也可以在页面顶栏的齿轮里改（`backend/app/settings/`，落 SQLite 单行表、立即生效、密钥只回打码值；库里没有值时逐字段回落环境变量），面板只接受 OpenAI 兼容接口。当前用 SQLite 本地存取（`backend/app/mindmaps/repository.py`），规划迁到 PostgreSQL + pgvector。**不返回空对象冒充成功**：还不可用的接口带 `implemented: false`（现在只剩 `knowledge/search` 与 `agent/tasks` 两个桩），没有返回 501 的路由。模型调用集中在 `backend/app/agent/` 的工具循环（`mindmap_generate` / `mindmap_generate_deep` / `node_expand` / `rag_query` / `audit_tree` / `add_node` / `update_node` / `remove_node` / `move_node` / `add_edge` / `remove_edge` / `mindmap_fill_details` / `mindmap_edit`，`POST /api/agent/runs/stream` 是生成与编辑的唯一入口）与 `backend/app/generation/` 的底层 `chat_async`：设 `MINDMAP_LLM_MODE=demo` 时不联网、直接发占位树（agent 不把"没配置"默认降级成 demo，缺省则缺模型配置会报错），设 `model` 才走 Chat Completions 兼容接口。文档解析在 `backend/app/ingestion/`（PDF 逐页视觉识别、Docling 结构化格式、LibreOffice 转旧格式、百炼语音转写），导出在 `backend/app/export/`（PUML / Markdown / OPML / JSON）。生成结果不自动保存也不等你确认：`done` 一到，整棵树直接落进画布并标成未保存，再显式保存（带版本号的乐观锁，冲突返回 409）；要退回去用「回到生成之前」或撤销。
+FastAPI + Pydantic v2，11 组路由（43 个路径 / 53 个端点）统一挂在 `/api` 下。模型服务地址、密钥与模型名可以只在环境变量里配，也可以在页面顶栏的齿轮里改（`backend/app/settings/`，落 SQLite 单行表、立即生效、密钥只回打码值；库里没有值时逐字段回落环境变量），面板只接受 OpenAI 兼容接口。当前用 SQLite 本地存取（`backend/app/mindmaps/repository.py`），规划迁到 PostgreSQL + pgvector。**不返回空对象冒充成功**：还不可用的接口带 `implemented: false`（现在只剩 `agent/tasks` 一个桩 —— 早期阶段规划的遗留接口，保留给旧调用方，真正的入口是 `POST /api/agent/runs/stream`），没有返回 501 的路由。模型调用集中在 `backend/app/agent/` 的工具循环（`mindmap_generate` / `mindmap_generate_deep` / `node_expand` / `rag_query` / `audit_tree` / `add_node` / `update_node` / `remove_node` / `move_node` / `add_edge` / `remove_edge` / `mindmap_fill_details` / `mindmap_edit`，`POST /api/agent/runs/stream` 是生成与编辑的唯一入口）与 `backend/app/generation/` 的底层 `chat_async`：设 `MINDMAP_LLM_MODE=demo` 时不联网、直接发占位树（agent 不把"没配置"默认降级成 demo，缺省则缺模型配置会报错），设 `model` 才走 Chat Completions 兼容接口。文档解析在 `backend/app/ingestion/`（PDF 逐页视觉识别、Docling 结构化格式、LibreOffice 转旧格式、百炼语音转写），导出在 `backend/app/export/`（PUML / Markdown / OPML / JSON）。生成结果不自动保存也不等你确认：`done` 一到，整棵树直接落进画布并标成未保存，再显式保存（带版本号的乐观锁，冲突返回 409）；要退回去用「回到生成之前」或撤销。
 
 ### 核心模块开发
 
@@ -136,13 +136,14 @@ FastAPI + Pydantic v2，11 组路由（38 个路径 / 43 个端点）统一挂�
 
 **3、数据流程与优化**
 
-- 数据预处理：将思维导图样本转换为向量格式，存入 Milvus / Pinecone。
-- 模型调优：通过用户反馈数据微调 LLMs，提升生成准确性。
+- 数据预处理：材料与节点转 1024 维向量（`text-embedding-v3`），以「文本指纹 + 模型名」为键缓存在本机 SQLite，检索用归一化向量的余弦矩阵乘完成。全库 3652 个节点时单次检索约 15 ms。本期不引入独立向量数据库：同规模对照实测 Milvus Lite 单次查询 179 ms、进程常驻内存 +119 MB、官方不支持 Windows，而其 FLAT 索引内部同样是暴力扫描，在数千条量级不产生收益（复评门槛：历史节点达 50 万条）。见 `docs/OPTIMIZATION-CROSS-MAP.md`。
+- 模型调优：本期不微调基础模型。改为把用户对生成结果的实际修改按字段落库（`edit_events`：改了哪个字段、哪个层级、由人改还是由模型改），作为偏好信号参与后续生成的排序与提示词；一张典型导图约记录 37 条改动事件。微调所需的数据量级与实施方案列为后续工作。见 `docs/EDIT-LOG.md`。
 
 **4、部署与测试**
 
-- 容器化部署（Docker / Kubernetes）确保扩展性。
-- 压力测试优化系统响应速度（如生成思维导图时间 < 3 秒）。
+- 部署：生产环境为单机 systemd（ECS 2C2G / 无 GPU）。另提供可选的单机容器化方案（`docker compose`，后端 + 前端两个服务，含健康检查与 90 秒优雅停机），**该方案尚未在真机上完成一次完整构建与运行验证**，待确认清单见 `docs/DOCKER.md` 第 9 节。
+- 性能：生成延迟分三段实测，不报单一数字 —— 首帧（界面进入"正在生成"）约 0.1 秒；首个节点落地 **41.5 秒**（含冷启动外部检索 14.8 秒）；整棵树完成端到端 **139.5 秒**（工具级 41.0–72.6 秒，线上压测 P50 76.5 秒）。压力测试覆盖 1–3 路并发，据此补了生成期心跳帧。见 `docs/LATENCY-BREAKDOWN.md`。
+- 自动化闸门：CI 每次提交跑后端 `pytest` + `ruff` + 零引用函数棘轮 + OpenAPI 快照比对，前端 Vitest + 契约类型 + 零引用棘轮（`.github/workflows/ci.yml`）。
 
 本项目有在线部署，见 [https://genai-mindmap.rpegio.top/](https://genai-mindmap.rpegio.top/)。
 
@@ -150,7 +151,7 @@ FastAPI + Pydantic v2，11 组路由（38 个路径 / 43 个端点）统一挂�
 
 1. **语义理解与结构映射**：如何将非结构化文本准确转化为层次分明的思维导图节点关系。
 2. **多模态融合**：实现图片 / 语音输入与文本生成的无缝衔接，支持跨模态编辑。
-3. **知识准确性**：通过 RAG 和向量数据库提升生成内容的专业性，减少事实性错误。
+3. **知识准确性**：通过 RAG 与本地向量检索提升生成内容的专业性，并为每个节点保留可点回原文的来源引用，减少事实性错误。
 4. **个性化生成**：根据用户历史使用习惯，动态调整思维导图的生成风格和侧重点。
 5. **性能优化**：降低 LLMs 调用延迟，实现实时生成与交互反馈。
 
@@ -168,6 +169,8 @@ FastAPI + Pydantic v2，11 组路由（38 个路径 / 43 个端点）统一挂�
 | 多模态输入支持率（文本 + 图片 + 语音） | ≥ 90% |
 | 系统响应时间 | < 5 秒（复杂场景） |
 
+> 上表是申报书里的目标值，不是当前实测。性能实测分首帧 / 首个节点 / 完整导图三段报，数字见「技术路线 → 4、部署与测试」（整树端到端 139.5 秒）；两处口径不同，以实测为准。
+
 **3、创新性突破**
 
 - 基于知识图谱的逻辑优化算法。
@@ -182,13 +185,16 @@ FastAPI + Pydantic v2，11 组路由（38 个路径 / 43 个端点）统一挂�
 
 ## 关于本仓库
 
-- 前四节（背景、现状、创新点、预期成果）整理自本项目申报书，未作技术方案层面的增补。
-- 「技术路线」一节已按实际实现更新（Vue 生态 + FastAPI），与申报书原文的差异在上一节用引用块标注。
+- 前五节（项目简介、项目目的、研究内容、国内外研究现状、创新点与项目特色）整理自本项目申报书，未作技术方案层面的增补。
+- 「技术路线」一节已按实际实现更新：技术栈（Vue 3 + Pinia + FastAPI）、端点数量、检索方案（本机 SQLite + numpy，不引入独立向量数据库）、部署形态（单机 systemd + 未真机验证的 compose）、性能三段口径。与申报书原文的差异在原文处用引用块标注。
 - 申报书原文写作 `pluml-encode`，此处按 npm 实际包名写作 `plantuml-encoder`（另有 `plantuml-encode` 存在，为不同包）。
 - 后端架构在申报书中留空，现按 `docs/ARCHITECTURE.md` 与 `docs/API.md` 实现。
+- 申报书与实现的逐条差异（含未实现项、口径修正与复现脚本）见 `docs/PLAN-VS-IMPLEMENTATION.md` 与 `docs/PLAN-REWORDING.md`。
 
 ---
 
 ## 开发骨架与团队分工
 
-请参阅 [组员阅读说明](TEAM-GUIDE.md)、[开发骨架使用说明](START_HERE.md)、[系统架构](docs/ARCHITECTURE.md)、[功能清单与分工](docs/FEATURES_AND_OWNERS.md) 和 [项目执行计划](docs/PLAN.md)（里程碑、验收门、风险表、决策记录）。当前为开发骨架，具体功能状态见清单。
+请参阅 [组员阅读说明](TEAM-GUIDE.md)、[开发骨架使用说明](START_HERE.md)、[系统架构](docs/ARCHITECTURE.md)、[功能清单与分工](docs/FEATURES_AND_OWNERS.md) 和 [项目执行计划](docs/PLAN.md)（里程碑、验收门、风险表、决策记录）。各功能的实现状态以清单为准（已实现 / 部分实现 / 未实现逐条标注）。
+
+用户视角的操作说明见 [用户指南](docs/USER-GUIDE.md)，部署与运维见 [部署文档](docs/DEPLOY.md) 与 [容器化说明](docs/DOCKER.md)。
