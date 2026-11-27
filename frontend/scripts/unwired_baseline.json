@@ -1,0 +1,34 @@
+{
+  "_comment": "前端版 find_unwired 的棘轮基线：逐条写清「这条为什么可以零引用」。闸门只对基线之外的新增报错；条目里的 evidence 文件不存在也会报错——豁免的理由被删了而豁免还在，那是腐烂的形状。",
+  "entries": {
+    "getEditSummary": {
+      "status": "gap",
+      "reason": "后端 GET /mindmaps/{id}/edits/summary 在、client.ts 的函数在、界面上没有任何入口。client.ts 自己的注释说它是「这一版真正的交付物」（label_shrunk 回答标题是不是被普遍改短，removed_depth 回答删掉的集中在第几层），但用户点不到它——src/** 里除 client.ts 之外零出现。本轮只加测试、不改产品代码，所以先登记为缺口。",
+      "evidence": [
+        "frontend/src/api/client.ts"
+      ]
+    },
+    "listEditEvents": {
+      "status": "gap",
+      "reason": "同上一条的明细面：summary 给分布，listEditEvents 给「那 42 条具体是什么」。没有它，一个反常的平均值只能靠连数据库才查得下去。界面零入口。",
+      "evidence": [
+        "frontend/src/api/client.ts"
+      ]
+    },
+    "getEditHealth": {
+      "status": "gap",
+      "reason": "跨图的链路健康检查（昨日编辑过的图数 / 昨日保存的图数）。它是运维视角的一条，不一定是用户手册里的动作——按现有界面形状，它更可能该接在一个管理视图里，而不是画布上。判「该接，但接在哪还没定」，先登记。",
+      "evidence": [
+        "frontend/src/api/client.ts"
+      ]
+    },
+    "changePassword": {
+      "status": "intentional",
+      "reason": "有意不接，理由写在界面上：AuthPanel.vue 已登录那一段明写「不再给一个改密码的入口——改密码要旧密码，而且改完所有设备都要重新登录，那是设置页的事」。这一版没有账号设置页，所以入口缺席是决定，不是遗漏。等设置页上线时它会变成第一条「该接」。",
+      "evidence": [
+        "frontend/src/components/AuthPanel.vue",
+        "frontend/src/api/client.ts"
+      ]
+    }
+  }
+}
