@@ -40,6 +40,21 @@ RECENT_LIMIT = 500
 #: "这一列永远是 NULL"——与"没人加过节点"长得一模一样。
 PARENT_COLUMN = "parent_id"
 
+#: `by_field` 只统计这两种 `kind` 的行。`field` 本来就只在 `update` / `style` 上有
+#: 意义（见 `contracts/edits.py` 文件头那条恒等式），而 `repair` 事件改文字时虽然
+#: 也带 `field`，它**不是人写的**——混进"最常改哪个字段"会让规则自己改出来的
+#: `label` 计入用户的偏好。与 `label_shrunk` 排除 `repair` 是同一条理由。
+FIELD_KINDS = ("update", "style")
+
+#: 被算作"节点改动"的 `kind` 集合。**`changed_events` 与 `untouched_runs` 共用它**：
+#: 这两个集合必须逐字相同，否则会出现"既不算改动事件、也不算一字未改"的黑洞，而那
+#: 正是 `changed_events == 0 ⇒ untouched_runs == generated_runs` 这条恒等式破掉的
+#: 样子。原来两处各写一遍 `IN (...)`、靠一句注释守着"别改歪"，现在靠一个常量守着。
+#:
+#: `edge` 不在里面（分母数的是节点）；`repair` 在里面（一键修复确实删了/搬了/改了
+#: 节点，不算进来，"模型给了 30 个节点、规则删掉 12 个"会被读成"一字未改"）。
+CHANGE_KINDS = ("update", "remove", "add", "move", "style", "repair")
+
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     """补上 `edit_events` 后来才加的 `parent_id` 列。幂等。
@@ -175,16 +190,26 @@ def record(
     return len(rows)
 
 
-def _count_by(conn, column: str, map_id: str) -> dict:
+def _count_by(conn, column: str, map_id: str,
+              kinds: Sequence[str] | None = None) -> dict:
     """按一列分组计数。
 
     排序固定（先次数降序、再键升序）：同样的数据永远同样的输出，两次调用之间不会
     因为 SQLite 的扫描顺序而抖动——抖动的统计没法对比"这周和上周"。
     空值（比如 `field` 在 add/remove 上是 NULL）不进结果：那不是一"种"字段。
+
+    `kinds` 是"只看这几种 kind 的行"。只有 `by_field` 传它（见 `FIELD_KINDS`）。
     """
     sql = (f"SELECT {column}, COUNT(*) FROM edit_events WHERE map_id = ? "
            f"GROUP BY {column} ORDER BY COUNT(*) DESC, {column}")
-    return {row[0]: row[1] for row in conn.execute(sql, (map_id,)) if row[0] is not None}
+    params: tuple = (map_id,)
+    if kinds:
+        marks = ",".join("?" for _ in kinds)
+        sql = (f"SELECT {column}, COUNT(*) FROM edit_events "
+               f"WHERE map_id = ? AND kind IN ({marks}) "
+               f"GROUP BY {column} ORDER BY COUNT(*) DESC, {column}")
+        params = (map_id, *kinds)
+    return {row[0]: row[1] for row in conn.execute(sql, params) if row[0] is not None}
 
 
 def summary(map_id: str) -> EditSummary:
@@ -193,8 +218,8 @@ def summary(map_id: str) -> EditSummary:
     `label_shrunk` 与 `removed_depth` / `removed_subtree` 是特意要的三个数，因为它们
     直接对应生成侧该改什么：
 
-      - 标题普遍被缩短（**只算 user**）→ 生成侧 16 字上限可能还是太长，或者提示词
-        让它写得太长；
+      - 标题普遍被缩短（**只算 user、且不算 `kind='repair'`**）→ 生成侧 16 字上限可能
+        还是太长，或者提示词让它写得太长；
       - 零散删掉的集中在第 3 层 → 初次深度太深；
       - 删掉的是整支还是零散 → "整支被删"更像"这一支根本不该生成"，与"挖太深"是
         两件事，混在一起读会得出错的处方。
@@ -219,7 +244,7 @@ def summary(map_id: str) -> EditSummary:
         total, last_event_at = totals[0], totals[1]
         by_actor = _count_by(conn, "actor", map_id)
         by_kind = _count_by(conn, "kind", map_id)
-        by_field = _count_by(conn, "field", map_id)
+        by_field = _count_by(conn, "field", map_id, kinds=FIELD_KINDS)
 
         # 分母与生成次数。`COALESCE(SUM(...), 0)`：只有 generate 行而它们全都没有
         # `node_count`（加列之前的老行）时，`SUM` 是 NULL 而不是 0，直接进 JSON
@@ -230,41 +255,48 @@ def summary(map_id: str) -> EditSummary:
             (map_id,),
         ).fetchone()
 
-        # 分子。`edge` 不进：分母数的是节点，把"加了一条关系"算成节点改动，比例就
-        # 再也读不出"每个节点被改了几次"。
+        # 分子。集合见 `CHANGE_KINDS`（`edge` 不进：分母数的是节点，把"加了一条关系"
+        # 算成节点改动，比例就再也读不出"每个节点被改了几次"）。
+        changed_marks = ",".join("?" for _ in CHANGE_KINDS)
         changed_events = conn.execute(
-            """SELECT COUNT(*) FROM edit_events
-               WHERE map_id = ? AND kind IN ('update', 'remove', 'add', 'move', 'style')""",
-            (map_id,),
+            f"""SELECT COUNT(*) FROM edit_events
+                WHERE map_id = ? AND kind IN ({changed_marks})""",
+            (map_id, *CHANGE_KINDS),
         ).fetchone()[0]
 
-        # 零改动次数。**与分子的 kind 集合逐字相同**（`edge` 在两边都不算）：只要
+        # 零改动次数。**与分子的 kind 集合是同一个常量**（见 `CHANGE_KINDS`：只要
         # 一边多认一种，就会出现"既不算改动事件、也不算一字未改"的黑洞，而那正是
-        # `changed_events == 0 ⇒ untouched_runs == generated_runs` 这条恒等式破掉的样子。
+        # `changed_events == 0 ⇒ untouched_runs == generated_runs` 这条恒等式破掉的样子）。
         # `g.run_id IS NOT NULL`：老数据里 generate 行可能没有 run_id
         # （NULL = NULL 在 SQL 里不成立，会被 `NOT EXISTS` 判成"没有改动事件"），
         # 那条数不是"一字未改"，是"当时没记"。
         untouched = conn.execute(
-            """SELECT COUNT(*) FROM edit_events AS g
-               WHERE g.map_id = ? AND g.kind = 'generate' AND g.run_id IS NOT NULL
-                 AND NOT EXISTS (
-                   SELECT 1 FROM edit_events AS e
-                    WHERE e.map_id = g.map_id AND e.run_id = g.run_id
-                      AND e.kind IN ('update', 'remove', 'add', 'move', 'style')
-                 )""",
-            (map_id,),
+            f"""SELECT COUNT(*) FROM edit_events AS g
+                WHERE g.map_id = ? AND g.kind = 'generate' AND g.run_id IS NOT NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM edit_events AS e
+                     WHERE e.map_id = g.map_id AND e.run_id = g.run_id
+                       AND e.kind IN ({changed_marks})
+                  )""",
+            (map_id, *CHANGE_KINDS),
         ).fetchone()[0]
 
         # `length()` 对 TEXT 在 UTF-8 下按**字符**算，与前端 `charLength`（码点）
-        # 同一口径。两处过滤各管一件事：
+        # 同一口径。三处过滤各管一件事：
         #  - `field='label'`：`title`（导图标题）的改动是另一件事，混进来会让"节点
         #    标题被改短"这个信号被导图标题稀释；
         #  - `actor='user'`：`agent` 那批是"生成自己的改动记在模型名下"，性质完全
         #    不同。实测 B 图只有 3 条 user 的缩短，不过滤会读成 4 条。
+        #  - `kind != 'repair'`：一键修复的 actor 也是 `user`（扳机是用户按的），而
+        #    `SINGLE_CHILD` 那条修法**就是改文字**（"外层 / 内层"拼成一个，必然更短）。
+        #    不过滤，"规则把两层标题拼成一个"会被算成"用户把标题改短"——而这个数字
+        #    的唯一用途正是给生成侧定"标题该多长"，拿规则自己造成的缩短去论证它，
+        #    是循环论证。
         shrunk = conn.execute(
             """SELECT COUNT(*), AVG(length(before)), AVG(length(after))
                FROM edit_events
                WHERE map_id = ? AND field = 'label' AND actor = 'user'
+                 AND kind != 'repair'
                  AND before IS NOT NULL AND after IS NOT NULL
                  AND length(after) < length(before)""",
             (map_id,),
@@ -273,6 +305,12 @@ def summary(map_id: str) -> EditSummary:
         # **只统计零散删除。** 一条 remove 现在代表一整棵被删的子树，根所在的层不等于
         # "这一层的内容被嫌弃"；`subtree_size IS NULL` 的老数据同理（当时没记，无法
         # 判断它是零散还是整支），两者都不进这个分布——否则"每层都在被删"那次污染还在。
+        #
+        # `kind = 'remove'` 是**精确匹配**，所以一键修复删掉的那些节点（`kind='repair'`）
+        # 自动不进这个分布，也不进下面的 `removed_subtree`。这正是要的：这个数回答的是
+        # "用户嫌哪一层的节点多余"，规则删掉的（重名合并、单子链压缩）不是同一件事。
+        # 代价：修复删了多少节点**没有专门口径**，只能到 `GET /edits` 的明细里按
+        # `kind='repair'` + `subtree_size` 数（见 `docs/EDIT-LOG.md` 的局限那一段）。
         depths = conn.execute(
             """SELECT depth, COUNT(*) FROM edit_events
                WHERE map_id = ? AND kind = 'remove' AND depth IS NOT NULL
