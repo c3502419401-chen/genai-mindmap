@@ -8,7 +8,7 @@
  * 2. 字符区间按 Unicode 码点算（后端契约如此），不是 UTF-16 下标；
  *    直接拿 `String.slice` 切会把 emoji 和部分汉字切在半个上。
  */
-import type { MindNode, Source, SourceRef, SourceUsage } from '../api/types';
+import type { MindNode, NodeOrigin, Source, SourceRef, SourceUsage } from '../api/types';
 import { SOURCE_LABELS } from '../sources/input';
 
 export interface ResolvedRef {
@@ -325,6 +325,15 @@ export interface RefCoverage {
   cited: number;
   /** `cited / total`，`total` 为 0 时按 0 处理。 */
   ratio: number;
+  /**
+   * **没有引用的节点按来历分组**。这个分组是 `Node.origin` 存在的全部理由：
+   * 同一个"12 个没有引用"的括号里，`generated` 那些是"可以补材料再生成一次"，
+   * `manual` 那些是"本来就没有原文可引，不必处理"。合成一个数时界面只能把它们
+   * 并列成一句免责声明——那是这个字段要消灭的那种话。
+   *
+   * 缺字段（旧图）按 `unknown` 算：那正是"不知道"的意思，不是 `manual`。
+   */
+  uncited: Record<NodeOrigin, number>;
 }
 
 /**
@@ -340,17 +349,22 @@ export interface RefCoverage {
  * 三者必须来自同一次遍历。
  */
 export function refCoverage(root: MindNode | readonly MindNode[] | null): RefCoverage {
-  if (!root) return { total: 0, cited: 0, ratio: 0 };
+  const uncited: Record<NodeOrigin, number> = { generated: 0, manual: 0, unknown: 0 };
+  if (!root) return { total: 0, cited: 0, ratio: 0, uncited };
   const roots: readonly MindNode[] = Array.isArray(root) ? root : [root as MindNode];
   let total = 0;
   let cited = 0;
   const walk = (node: MindNode) => {
     total += 1;
-    if ((node.source_refs ?? []).length) cited += 1;
+    if ((node.source_refs ?? []).length) {
+      cited += 1;
+    } else {
+      uncited[node.origin ?? 'unknown'] += 1;
+    }
     for (const child of node.children) walk(child);
   };
   for (const item of roots) walk(item);
-  return { total, cited, ratio: total ? cited / total : 0 };
+  return { total, cited, ratio: total ? cited / total : 0, uncited };
 }
 
 /**

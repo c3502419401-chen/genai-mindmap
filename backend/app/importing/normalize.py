@@ -80,6 +80,7 @@ from app.contracts.mindmap import (
     MAX_TREE_DEPTH,
     MAX_TREE_NODES,
     NODE_EXPANDABLE,
+    NODE_ORIGINS,
     DiagramContent,
     Edge,
     FishboneBone,
@@ -336,6 +337,15 @@ def _node(raw: RawNode, taken: set[str], tally: _Tally, keep_pos: bool) -> Node:
     # 在契约层 422——为一个装饰性字段把整份导入判死，代价方向错了。
     if raw.role in _ROLES:
         kwargs["role"] = raw.role
+    # 来历：文件说了、且在值域内就照抄，否则 `unknown`。**这是六种导入格式唯一的
+    # 一个 `RawNode → Node` 转换点**，所以判定只写这一处——六个解析器各写一遍的
+    # 结局一定是 markdown 那条路忘了搬、而往返用例只覆盖 JSON 那条路。
+    #
+    # 缺省 `unknown` 而不是 `manual`：第三方文件里没有这个概念，"不知道"是真话；
+    # 猜成 `manual` 会让界面说"这个节点不来自生成链路"——那句话在导进来的图上
+    # 也许对，但它是我们编的，不是文件说的。
+    if raw.origin in NODE_ORIGINS:
+        kwargs["origin"] = raw.origin
     return Node(**kwargs)
 
 

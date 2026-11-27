@@ -516,6 +516,23 @@ def _absorb(outer: Node, inner: Node) -> tuple[Node | None, bool]:
         # `pos` 是**手动坐标**（layoutMode=manual 时才生效）。两层合成一层之后旧坐标
         # 没有意义，取内层的那个：它是用户最后动过的位置的概率更高。
         pos=inner.pos if inner.pos is not None else outer.pos,
+        # `origin` 取**内层自己的**，不取外层的、也不标成"repair"。
+        #
+        # 三个理由，每条都是"这个字段问的是什么"决定的：
+        #
+        #   - 存活下来的是内层（id / label / 子节点都是它的），外层的身份被溶解了；
+        #     `origin` 说的是"这个节点从哪来"，那就该问存活的这一个。
+        #   - **"被谁改过"不是 `origin` 的问题**。压链是一次改动，而撤销数据
+        #     （`RepairUndo.replaced` / `inner`，两者都是全字段的 `NodeFields`）已经
+        #     把两个节点的来历各存了一份，撤销时逐字段还原。若在这里写一个
+        #     `repair`，字段就同时答"来源"与"改动史"两件事，而界面还得为它多编一句
+        #     话——那正是这个字段要消灭的那种话。
+        #   - 下一步动作也对：合并结果若一条引用都没有，按内层说"生成时没找到出处"
+        #     或"不来自生成链路"，正好是用户这一刻该做的那件事。
+        #
+        # 不写这一行的后果是静默的：`Node` 的缺省是 `unknown`，于是**每一次压链都
+        # 把节点的来历抹成"不知道"**，而界面上看起来只是"这张图变旧了"。
+        origin=inner.origin,
     ), deferred
 
 
@@ -554,6 +571,9 @@ def _merge_siblings(keep: Node, drop: Node) -> Node | None:
         role=keep.role or drop.role,
         source_refs=refs,
         pos=keep.pos if keep.pos is not None else drop.pos,
+        # 同 `_absorb`：保留者的身份不变，所以它的来历也不变。被并掉的那个的来历
+        # 已经进了 `RepairUndo.inserted[i].fields`，撤销时还原。
+        origin=keep.origin,
     )
 
 

@@ -507,6 +507,12 @@ export function setNodeVisual(
  * 空白处双击要的是"插在这个位置"（见 `drop-plan.ts::planInsert`）。两者合成一个
  * 函数会让调用方每次都猜"我该传什么"，而"末尾"在插入语境里恰好是最不容易出错的那个
  * 默认值——错的那个方向会被当成对的。
+ *
+ * **新节点一律 `origin: 'manual'`**：它是人在这里按出来的。这一条只在创建处写一次，
+ * 三种入口（Tab 加子节点 / Enter 加兄弟 / 空白处双击插入）全部经过这里或
+ * `addSibling`，所以"手动加一个节点却没标来历"这件事在这里是不可表达的——而不是
+ * 靠每个调用方记得加一行。`origin` 的相反面（生成产出）由后端在它自己的出口写，
+ * 前端不猜。
  */
 export function addChildAt(
   root: MindNode,
@@ -516,7 +522,7 @@ export function addChildAt(
 ): { root: MindNode; node: MindNode } {
   if (!findNode(root, parentId)) throw new Error('父节点不存在');
 
-  const node: MindNode = { id: newId(), label, children: [] };
+  const node: MindNode = { id: newId(), label, children: [], origin: 'manual' };
   return {
     root: replaceChildren(root, parentId, children => {
       const at = Math.max(0, Math.min(index, children.length));
@@ -549,7 +555,7 @@ export function addSibling(
   const parent = findParent(root, id);
   if (!parent) return addChild(root, root.id, label);
 
-  const node: MindNode = { id: newId(), label, children: [] };
+  const node: MindNode = { id: newId(), label, children: [], origin: 'manual' };
   return {
     root: replaceChildren(root, parent.id, children => {
       const at = children.findIndex(child => child.id === id);

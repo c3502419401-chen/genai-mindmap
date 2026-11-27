@@ -4839,6 +4839,16 @@
             "title": "Expandable",
             "default": "unknown"
           },
+          "origin": {
+            "type": "string",
+            "enum": [
+              "generated",
+              "manual",
+              "unknown"
+            ],
+            "title": "Origin",
+            "default": "unknown"
+          },
           "collapsed": {
             "type": "boolean",
             "title": "Collapsed",
@@ -4987,6 +4997,16 @@
               "unknown"
             ],
             "title": "Expandable",
+            "default": "unknown"
+          },
+          "origin": {
+            "type": "string",
+            "enum": [
+              "generated",
+              "manual",
+              "unknown"
+            ],
+            "title": "Origin",
             "default": "unknown"
           },
           "collapsed": {

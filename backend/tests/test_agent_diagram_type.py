@@ -233,6 +233,24 @@ def _snapshot(module, *, request_diagram_type: str | None, arguments: dict) -> t
     return result.content, result.data, ctx.candidate.model_dump()
 
 
+def _strip_origin(node: dict) -> dict:
+    """去掉 `origin` 之后的节点树（递归）。
+
+    与 `test_edges.py` 的同名函数是同一处例外、同一份理由：`Node.origin` 是这个基线
+    之后才加的契约字段，记的是"这个节点怎么写进来的"，树的形状一个字节都没动。
+    剥之前先证明基线里它只有缺省值 / `manual`、新树里只有 `generated`——否则剥皮会
+    掩盖真正的行为改变。
+    """
+    out = {key: value for key, value in node.items() if key != "origin"}
+    out["children"] = [_strip_origin(child) for child in node.get("children", [])]
+    return out
+
+
+def _origins_in(node: dict) -> list[str]:
+    return [node.get("origin")] + [item for child in node.get("children", [])
+                                   for item in _origins_in(child)]
+
+
 class TestRequestWithoutDiagramTypeIsUnchanged:
     def test_generation_matches_the_pre_request_layer_version(self):
         """请求不带 `diagram_type`（老前端）时，产出与 `2ed92ac` **逐字节一致**。
@@ -276,8 +294,18 @@ class TestRequestWithoutDiagramTypeIsUnchanged:
         assert new_content == old_content
         assert json.dumps(comparable, ensure_ascii=False, sort_keys=True) == \
                json.dumps(old_data, ensure_ascii=False, sort_keys=True)
-        assert json.dumps(new_tree, ensure_ascii=False, sort_keys=True) == \
-               json.dumps(old_tree, ensure_ascii=False, sort_keys=True)
+        # `Node.origin` 那处例外的两半。基线跑的是"旧的 `tools.py` + 现在的
+        # `ops.py`"：旧代码从不写这个字段，所以直接建出来的节点停在缺省 `unknown`，
+        # op 落的节点带着现在执行器写的 `manual`。两句话合起来是"基线这一路从不产出
+        # `generated`"，而新树整棵都是它——剥掉的那一列里因此只有本次新增的行为。
+        assert set(_origins_in(old_tree["root"])) <= {"unknown", "manual"}, \
+            "基线不该出现 generated：出现了说明它其实已经在写这个字段"
+        assert set(_origins_in(new_tree["root"])) == {"generated"}, \
+            "剥掉 origin 的前提是它的取值只有一个正确值"
+        assert json.dumps(_strip_origin(new_tree["root"]), ensure_ascii=False,
+                          sort_keys=True) == \
+               json.dumps(_strip_origin(old_tree["root"]), ensure_ascii=False,
+                          sort_keys=True)
 
     def test_tool_schema_is_byte_identical_when_no_type_is_fixed(self):
         """请求没定图型时，下发给模型的工具定义与 `2ed92ac` 一字不差。

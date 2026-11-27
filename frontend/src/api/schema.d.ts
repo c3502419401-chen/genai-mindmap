@@ -2320,6 +2320,12 @@ export interface components {
              */
             expandable: "yes" | "no" | "unknown";
             /**
+             * Origin
+             * @default unknown
+             * @enum {string}
+             */
+            origin: "generated" | "manual" | "unknown";
+            /**
              * Collapsed
              * @default false
              */
@@ -2353,6 +2359,12 @@ export interface components {
              * @enum {string}
              */
             expandable: "yes" | "no" | "unknown";
+            /**
+             * Origin
+             * @default unknown
+             * @enum {string}
+             */
+            origin: "generated" | "manual" | "unknown";
             /**
              * Collapsed
              * @default false

@@ -8246,7 +8246,12 @@ def _shape_output(
 
     `tree` 这条分支一个字节都不动：不做 `model_copy`、不加 `diagram_type`（那本来
     就是默认值）。`tests/test_edges.py::TestTreeIsByteIdentical` 用旧模块钉着它。
+
+    **`origin` 在这里统一刷成 `generated`**，排在折形状之前：三种产物共用同一个
+    `Node`，折形状（`to_fishbone` / `to_flow`）是搬对象不是复制，所以刷一次三种形状
+    同时有；反过来先折再刷就要在两套容器上各走一遍。
     """
+    _stamp_origin(content)
     if diagram_type == "fishbone":
         problem = _fishbone_problem(raw_plan, content.title, diagnostics)
         shaped, extras = shapes.to_fishbone(content, problem=problem)
@@ -13207,6 +13212,12 @@ async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:
         max_depth=mindmap_contract.MAX_TREE_DEPTH,
     )
 
+    # `origin` 同理，而且**必须**在这里刷：这条路把节点做成 `add` 草案交给
+    # `apply_ops` 落树，而 op 执行器把所有 add 出来的节点记成 `manual`（那是编辑轮
+    # 的语义）。不刷的话，一张分片生成出来的整图会被界面说成"不来自生成链路"——
+    # 每一支都检索过、每一条引用都逐字核过，那句话会劝用户"不必处理"。
+    _stamp_origin(content)
+
     # 第五步：确定性验收，全部用代码，不调模型。整树重跑一次契约校验——
     # `apply_ops` 内部也做了，但"骨架没有任何要点"时不会经过它（没有 op 可应用），
     # 只靠那边会把一棵只剩根和空分支的树放过去。
@@ -14014,6 +14025,27 @@ def _stamp_expandable(
         node.expandable = "no" if depth >= max_depth else stamps.get(node.id, "yes")
 
 
+def _stamp_origin(content: DiagramContent) -> None:
+    """把"这些节点是生成链路写的"刷进整棵树。就地改，不 `model_copy`。
+
+    与 `_stamp_expandable` 同一条位置规矩：**打标紧跟在树定形之后**，因为它是
+    "这一次写入"的事实，越晚写越容易漏掉某条收尾路径（那条路径之后还有整树
+    `model_validate`，写坏了会直接判 `invalid_tree`——那正是我们要的）。
+
+    为什么**整棵**刷而不是在建节点的每一处各写一次：生成这条路里造节点的口子有
+    五个（骨架、两级分支、分片 `emit` 的 add 草案、切片、单节点展开），逐个写等于
+    给将来新加的那个口子留一个静默的 `unknown`——而 `unknown` 在界面上长得像
+    "旧图"，用户会读到一句不该出现在新图上的话。收口在"这一次的树"上，一个口子
+    都不用数。
+
+    **没有 `origin` 参数**：这个函数只服务一件事（生成产出 → `generated`）。加一个
+    参数就会有第二个取值，而"哪些节点算生成链路"是这里判的事，不该由调用方各自
+    决定；编辑轮那是另一条路（`ops._apply_add`），不是这条的参数。
+    """
+    for node, _depth in shapes.walk_depths(content):
+        node.origin = "generated"
+
+
 def _walk_depths(root: Node):
     """`(节点, 层号)`，root 为 1。与 `_depth_of` 同一口径。"""
     stack: list[tuple[Node, int]] = [(root, 1)]
@@ -14523,6 +14555,11 @@ async def _expand(args: ExpandArgs, ctx: RunContext) -> ToolResult:
             label=item.label,
             detail=item.detail,
             source_refs=owned,
+            # 这一批是**生成链路**写的（检索 → 提示词 → 逐字核验都在上面走过了），
+            # 所以是 `generated`。**只标这一批**：树上原有的节点各自保留自己的
+            # `origin`——一次展开不该把用户手加的节点改写成"模型写的"，那会让
+            # "没找到出处，可以补材料"套到一批本来就没有原文的节点上。
+            origin="generated",
         ))
     refs_dropped += _verify_expand_refs(new_nodes, sources, evidence)
     refs_kept = sum(len(child.source_refs) for child in new_nodes)

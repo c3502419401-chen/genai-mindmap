@@ -47,6 +47,26 @@ export interface MindNode {
    */
   expandable?: NodeExpandable;
   /**
+   * 这个节点**是怎么写进来的**。契约字段，三态，缺省 `unknown`。
+   *
+   * 它只服务一句话："这个节点没有引用，是不是问题。"
+   *
+   *  - `generated`：生成链路写出来的（骨架 / 分片展开 / 单节点展开），可能有
+   *    `source_refs`。没有引用的意思是"模型没在材料里找到对应句子"——补材料或
+   *    把主题写得更贴原文，再生成一次就**可能**带上出处；
+   *  - `manual`：**不属于任何一次生成产物**——你在界面里加的、编辑那一轮里模型加的、
+   *    第三方格式导入的图。没有引用不是缺陷：它本来就没有原文可引，**不必处理**；
+   *  - `unknown`：不知道（这个字段之前保存的旧图）。界面据此**不替它归因**。
+   *
+   * 三态而不是布尔，理由与 `expandable` 相同：布尔没有"不知道"，它会把旧图默认成
+   * "生成产出"，而那会让界面替二十几张旧图许下"可以补材料"的承诺。
+   *
+   * **不让模型写、也不进 `UpdateOp`**：它是自证，能被执行方改就等于能被伪造溯源。
+   * 唯一的三处写入方在后端（生成出口、add op 的执行器、导入侧），前端只在
+   * "用户手动加节点"那一个动作里写 `manual`（`mindmap/edits.ts`）。
+   */
+  origin?: NodeOrigin;
+  /**
    * 节点级引用，镜像后端 `Node.source_refs`（v1 契约里**已经存在**，不是 v2 预告）。
    *
    * 之前前端缺这个字段，`client.ts::toContractV1()` 只保留 id/label/children，
@@ -113,6 +133,16 @@ export type NodeColor = 'blue' | 'green' | 'amber' | 'red' | 'purple' | 'teal' |
  * 界面上按钮灰着、说明"已经到底了"——用户被一句假话挡住了唯一能继续的入口。
  */
 export type NodeExpandable = 'yes' | 'no' | 'unknown';
+
+/**
+ * 节点的来历。与后端 `Node.origin` / `mindmap.NODE_ORIGINS` 一一对应。
+ *
+ * 没有第四个 `imported`：导入是**通道**，不是作者。我们导出的 JSON 里带着这个值，
+ * 搬回来逐节点不变；第三方格式（FreeMind / OPML / XMind / Markdown）的文件里没有
+ * 这个概念，读出来就是 `unknown`。加一个 `imported` 会让同一个节点因为"被搬过
+ * 一次"而改变取值，而那与"它有没有原文可引"无关。
+ */
+export type NodeOrigin = 'generated' | 'manual' | 'unknown';
 
 /** 节点引用。与 backend/app/contracts/source.py 的 `SourceRef` 对应。 */
 export interface SourceRef {

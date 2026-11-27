@@ -53,6 +53,15 @@ class RawNode:
     icon: str | None = None
     collapsed: bool = False
     expandable: str | None = None
+    # 节点的来历（`generated` / `manual` / `unknown`），只由我们自己的 JSON 填：
+    # 其余五个格式的文件里根本没有这个概念，`None` 就是"文件没说"。
+    #
+    # **它原样搬回去，不做推断**。导出的 JSON 里带着 `origin`，再导入应当逐节点
+    # 不变（往返用例钉着）；第三方格式读出来是 `unknown`，而"未知"在这里恰好是
+    # 真话——猜成 `manual` 会让界面替一个没问过的问题给出答案，而那正是要消灭的
+    # 那种谎。类型留 `str` 而不是契约的 `Literal`：清洗归 `normalize`
+    # （与 `role` 同一个位置、同一条理由），解析器只回答"文件里写了什么"。
+    origin: str | None = None
     # 节点在图里扮演什么（`step` / `decision` / `start` / `end`）。外部格式没有
     # 这个概念，所以只有我们的 JSON 会填。**它是流程图的判定节点唯一的载体**：
     # 丢了 `role`，一条 `branch` 边就不知道自己是从一个菱形出来的，画布上

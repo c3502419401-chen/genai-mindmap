@@ -55,7 +55,7 @@ from __future__ import annotations
 
 import json
 
-from app.contracts.mindmap import NODE_COLORS, NODE_EXPANDABLE
+from app.contracts.mindmap import NODE_COLORS, NODE_EXPANDABLE, NODE_ORIGINS
 from app.importing.colors import normalize_hex
 from app.importing.errors import ParseFailure, UnsupportedFormat
 from app.importing.model import (
@@ -107,6 +107,13 @@ def _raw_node(data: dict) -> RawNode:
     expandable = data.get("expandable")
     if isinstance(expandable, str) and expandable in NODE_EXPANDABLE:
         node.expandable = expandable
+    # 来历**原样收**：这是我们自己导出的 JSON，文件里写的值就是那个节点在**导出
+    # 那张图里**的来历，搬回来应当逐节点不变（`test_node_origin.py` 的往返用例钉着）。
+    # 不认识的值不在这里猜：`normalize._node` 按 `NODE_ORIGINS` 判，落在集合外就是
+    # `unknown`——"文件自称的出生"和"库里现在这张图"是两件事，只有前者能照抄。
+    origin = data.get("origin")
+    if isinstance(origin, str) and origin in NODE_ORIGINS:
+        node.origin = origin
     # `role` 原样收（合法值由 `normalize` 判）：它是流程图判定节点唯一的载体，
     # 这一层顺手把它过滤掉的话，往返之后「是 / 否」两个出口就找不到自己的起点了。
     role = data.get("role")

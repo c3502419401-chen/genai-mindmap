@@ -409,6 +409,24 @@ class _SnapshotState:
 _GENERATION_SNAPSHOT = _SnapshotState()
 
 
+def _strip_origin(node: dict) -> dict:
+    """去掉 `origin` 之后的节点树（递归）。
+
+    `Node.origin` 是这个基线**之后**才加的字段，与 `diagram_type` 那一支的产出
+    无关：它记的是"这个节点是怎么写进来的"，树的形状、`edges`、标签一个都没动。
+    就像 `EXTERNAL_DISABLED_NOTE` 那一句，剥掉之前先证明基线里确实没有它
+    ——否则剥皮会掩盖真正的行为改变。
+    """
+    out = {key: value for key, value in node.items() if key != "origin"}
+    out["children"] = [_strip_origin(child) for child in node.get("children", [])]
+    return out
+
+
+def _origins_in(node: dict) -> list[str]:
+    return [node.get("origin")] + [item for child in node.get("children", [])
+                                   for item in _origins_in(child)]
+
+
 class TestTreeIsByteIdentical:
     def test_tree_generation_matches_baseline(self):
         """`diagram_type="tree"`（默认值）跑出来的 content / data / 整棵树与
@@ -418,12 +436,17 @@ class TestTreeIsByteIdentical:
         `model_dump()`。tree 这一支多出来任何字段（哪怕一个恒为 0 的 `edges`），
         这条用例就会红——这正是"现有行为一字不改"该有的守门方式。
 
-        **例外只有一句**：外部检索开关在测试环境里是关的（`conftest.clean_env`），
-        而"你关掉了联网检索…"是后来加的用户可见行为。它与此处钉的东西（`diagram_type`
-        这一支的产出）无关，比对前剥掉；它自己的守卫在
-        `test_one_path.test_external_switch_off_says_it_was_switched_off`。
-        剥的时候引用 `tools.EXTERNAL_DISABLED_NOTE` 而不是抄字面量——抄一份就成了
-        第三处真相，下次改文案这里会静默失效。
+        **两处例外**，各自有一条"例外本身可验证"的断言：
+
+          - 外部检索开关在测试环境里是关的（`conftest.clean_env`），而"你关掉了
+            联网检索…"是后来加的用户可见行为。它与此处钉的东西（`diagram_type`
+            这一支的产出）无关，比对前剥掉；它自己的守卫在
+            `test_one_path.test_external_switch_off_says_it_was_switched_off`。
+            剥的时候引用 `tools.EXTERNAL_DISABLED_NOTE` 而不是抄字面量——抄一份就成了
+            第三处真相，下次改文案这里会静默失效。
+          - `Node.origin`（契约字段，后加）：基线里**一个节点都没有**它，新树里
+            **每个节点都有且都是 `generated`**。两句话都在下面断言了，所以"剥掉它"
+            不掩盖任何别的差异。
         """
         from app.agent.tools import EXTERNAL_DISABLED_NOTE
 
@@ -449,11 +472,28 @@ class TestTreeIsByteIdentical:
         assert len(comparable["diagnostics"]) == len(new_data["diagnostics"]) - 1, \
             "这条过滤本身要能被验证：诊断里确实少了一条"
 
+        # `origin` 那处例外的两半。基线跑的是"旧的 `tools.py` + 现在的 `ops.py`"：
+        # 旧代码从不写 `origin`，所以直接建出来的节点停在契约缺省 `unknown`；而 op
+        # 落的节点带着现在执行器写的 `manual`。两句话合起来是"基线这一路**从不产出
+        # `generated`**"，而新树整棵都是它——剥掉的那一列里因此只有本次新增的行为。
+        assert set(_origins_in(old_tree["root"])) <= {"unknown", "manual"}, \
+            "基线不该出现 generated：出现了说明它其实已经在写这个字段"
+        assert set(_origins_in(new_tree["root"])) == {"generated"}, \
+            "剥掉 origin 的前提是它的取值只有一个正确值"
+        stable_tree = {
+            **{key: value for key, value in new_tree.items() if key != "root"},
+            "root": _strip_origin(new_tree["root"]),
+        }
+        baseline_tree = {
+            **{key: value for key, value in old_tree.items() if key != "root"},
+            "root": _strip_origin(old_tree["root"]),
+        }
+
         assert new_content == old_content
         assert json.dumps(comparable, ensure_ascii=False, sort_keys=True) == \
                json.dumps(old_data, ensure_ascii=False, sort_keys=True)
-        assert json.dumps(new_tree, ensure_ascii=False, sort_keys=True) == \
-               json.dumps(old_tree, ensure_ascii=False, sort_keys=True)
+        assert json.dumps(stable_tree, ensure_ascii=False, sort_keys=True) == \
+               json.dumps(baseline_tree, ensure_ascii=False, sort_keys=True)
         # 树上确实没有多出一"半"东西：edges 是空列表。
         assert new_tree["edges"] == []
 

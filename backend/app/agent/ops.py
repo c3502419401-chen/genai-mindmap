@@ -269,6 +269,14 @@ def _apply_add(content: MindMapContent, op: AddOp, base: str) -> None:
         # 契约层被判非调色板键。
         color=op.color or None,
         icon=op.icon,
+        # 走 op 落树的节点一律 `manual`：**op 是编辑轮的语言**（`add_node` /
+        # `mindmap_edit` / 界面上的每一次结构改动），而"生成产出"从不经过 op
+        # 的语义——生成链路在自己的出口统一刷 `generated`（`tools._stamp_origin`），
+        # 包括那条确实借 `apply_ops` 落树的分片路（它刷在 `apply_ops` 之后）。
+        #
+        # 不从 op 里读：`origin` 是自证，能被 op 写就等于能被伪造溯源（契约里
+        # `AddOp` 刻意没有这个字段，`UpdateOp` 更没有）。
+        origin="manual",
     ))
 
 

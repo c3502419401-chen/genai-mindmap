@@ -113,6 +113,23 @@ MAX_NODE_DETAIL_CHARS = 2000
 # 有更多内容"可选，白花一次调用。
 NODE_EXPANDABLE = ("yes", "no", "unknown")
 
+# 这个节点**是怎么写进来的**。它只服务一句话："没有引用是不是问题。"
+#
+# 判据写在取值上，而不是留给界面去猜（取值表见 `Node.origin` 的注释）：
+#
+#   - `generated`：生成链路写出来的（骨架 / 分片展开 / 单节点展开），可能有 `source_refs`；
+#   - `manual`   ：**不属于任何一次生成产物**——用户在界面里加的、编辑轮里 agent 的
+#                  `add_node` 加的、第三方格式导入的图。这是一条**定义**（判据是"它有没有
+#                  被某一次生成写出来"），不是"没有走过生成链路"那种排除法式的说法：
+#                  排除法会让人追问"那排除完还剩什么"，而定义不需要再解释；
+#   - `unknown`  ：不知道（这个字段之前保存的旧图）。
+#
+# **没有第四个 `imported`**：导入是通道，不是作者。我们自己导出的 JSON 里有 `origin`，
+# 搬回来应当逐节点不变（`tests/test_node_origin.py` 钉着）；第三方格式的文件里
+# 根本没有这个概念，读出来就是 `unknown`。加一个 `imported` 会让同一个节点因为
+# "被搬过一次"而改变取值，而那与"它有没有原文可引"毫无关系。
+NODE_ORIGINS = ("generated", "manual", "unknown")
+
 # 节点颜色的**调色板**。`Node.color` 只能取这八个键之一，不接受任意 hex。
 #
 # 为什么不做 `#RRGGBB`：模型自由发挥的 hex 会得到一堆脏色（同一张图里出现
@@ -139,6 +156,10 @@ NODE_COLOR_CSS_PREFIX = "--mind-color-"
 MAX_NODE_ICON_CHARS = 16
 
 NodeColor = Literal["blue", "green", "amber", "red", "purple", "teal", "pink", "gray"]
+
+# 节点来历的取值类型。字面量与上面的 `NODE_ORIGINS` 是同一份值域的两种写法：
+# 契约层用它做校验（非法值直接 422），导入侧用它做"文件里写的算不算数"。
+NodeOrigin = Literal["generated", "manual", "unknown"]
 
 # 图型。三个值同时是 `AgentRunRequest.diagram_type`（请求：用户要画什么）与
 # `MindMapContent.diagram_type`（产物：画成了什么）的取值集合——一处定义，两处
@@ -505,6 +526,28 @@ class Node(BaseModel):
     # 缺省取 `unknown` 而不是 `yes`：库里那些 v1/v2 记录从来没被问过这件事，
     # 把没问过的记成"还能展开"会让界面替旧图许下一个它兑现不了的承诺。
     expandable: Literal["yes", "no", "unknown"] = "unknown"
+    # 这个节点是**怎么写进来的**。它服务一句话："没有引用是不是问题。"
+    #
+    #   - `generated`：生成链路写出来的（整树 / 分片 / 单节点展开），可能有 `source_refs`；
+    #   - `manual`   ：**不属于任何一次生成产物**——用户加的、第三方格式导入的图、agent 在
+    #                  **编辑轮**里 `add_node` 加的；
+    #   - `unknown`  ：不知道（这个字段之前保存的旧图）。
+    #
+    # 三态而不是布尔，理由与 `expandable` 逐字相同：布尔没有"不知道"，它会把旧图默认成
+    # `false` = 生成产出——老图里几乎全是手动节点，报成生成产出比不报更糟。
+    #
+    # `manual` 是**定义**，不是排除法，也不是"人手打的"的别名。判据只有一条："这个节点
+    # 有没有被某一次生成写出来？"没有就是 `manual`，无论那次写入是用户按的还是 agent 在
+    # 编辑轮里按的。若把它定义成"用户加的"，agent 的 `add_node` 就没有位置（它既不是生成
+    # 产出也不是人加的），而界面只能跟着撒谎；定义成"不属于任何一次生成产物"，那句文案
+    # 就永远成立，无论那个按钮是谁按的。
+    #
+    # **不让模型写这个字段**：它是自证（"我是谁加的"），而模型没有任何办法知道。写入方
+    # 只有三处：生成链路的出口统一刷 `generated`（`tools._stamp_origin`）、`add` op 的
+    # 执行器刷 `manual`（`ops._apply_add`）、导入侧读文件里的原值。
+    #
+    # 它**不进 `UpdateOp`**：描述来源，不描述内容；能被 op 改就等于能被伪造溯源。
+    origin: NodeOrigin = "unknown"
     collapsed: bool = False
     # 视觉元素：语义色 + 图标。**两个都可选、缺省 None**，所以库里所有旧图
     # 不需要迁移脚本就能读进来（与 `note` / `detail` / `expandable` 同一条规矩：

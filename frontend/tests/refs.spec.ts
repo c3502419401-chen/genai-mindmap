@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { MindNode, Source, SourceRef, SourceUsage } from '../src/api/types';
-import { buildRefIndex, excerptOf, locateAll, locateInText, quoteOffsets, refName, refWhere, resolveRef, resolveRefs, resolveRefWithText, windowOf } from '../src/mindmap/refs';
+import { buildRefIndex, excerptOf, locateAll, locateInText, quoteOffsets, refCoverage, refName, refWhere, resolveRef, resolveRefs, resolveRefWithText, windowOf } from '../src/mindmap/refs';
 
 const TEXT = '矩阵的秩等于行向量组的极大线性无关组的个数。初等变换不改变矩阵的秩。';
 
@@ -318,5 +318,41 @@ describe('用外部原文解析引用', () => {
     const viaText = resolveRefWithText(ref, TEXT2, null, usage);
     expect(viaText.hit).toBe(viaSource.hit);
     expect(viaText.excerpt).toBe(viaSource.excerpt);
+  });
+});
+
+/**
+ * 覆盖率按来历拆数。
+ *
+ * 这个分组是 `Node.origin` 存在的**全部**理由：同一个"12 个没有引用"里，
+ * `generated` 那些可以补材料再生成一次，`manual` 那些本来就没有原文可引。
+ * 合成一个数时界面只能把它们并列成一句免责声明。
+ */
+describe('引用覆盖率按来历分组', () => {
+  const node = (id: string, extra: Partial<MindNode> = {}): MindNode =>
+    ({ id, label: id, children: [], ...extra });
+
+  it('没引用的节点按 origin 分开数，缺字段算 unknown', () => {
+    const root = node('r', {
+      origin: 'generated',
+      children: [
+        node('cited', { origin: 'generated', source_refs: [{ source_id: 's1' }] }),
+        node('gen', { origin: 'generated' }),
+        node('manual', { origin: 'manual' }),
+        node('old'),                                    // 旧图：没有这个字段
+      ],
+    });
+
+    const stat = refCoverage(root);
+    expect(stat.total).toBe(5);
+    expect(stat.cited).toBe(1);
+    // 有引用的那个不计入任何一组；根自己（没有引用）算进 generated
+    expect(stat.uncited).toEqual({ generated: 2, manual: 1, unknown: 1 });
+  });
+
+  it('一组都不缺（三种都可能是 0），界面才不用判 undefined', () => {
+    expect(refCoverage(null).uncited).toEqual({ generated: 0, manual: 0, unknown: 0 });
+    const stat = refCoverage(node('r', { origin: 'manual' }));
+    expect(stat.uncited).toEqual({ generated: 0, manual: 1, unknown: 0 });
   });
 });

@@ -176,3 +176,31 @@ describe('提交前校验', () => {
     expect(validateDraft(content({ id: 'r', label: '😀'.repeat(LIMITS.label), children: [] }))).toBeNull();
   });
 });
+
+/**
+ * 手动加节点的**来历**。
+ *
+ * 三个入口（Tab 加子节点 / Enter 加兄弟 / 空白处双击插入）在界面层各有一个函数，
+ * 但落到树上只有 `addChildAt` 与 `addSibling` 两个构造点。`origin` 写在这两处，
+ * "手动加的节点没标来历"就变成不可表达的——而不是靠每个调用方记得补一行。
+ *
+ * 这两条必须能红：删掉构造里的 `origin: 'manual'`，它们会拿到 `undefined`。
+ */
+describe('手动加的节点记 origin = manual', () => {
+  it('加子节点：新节点是 manual，树上原有节点不动', () => {
+    const root: MindNode = { ...leaf('r'), children: [leaf('a')] };
+    const { node, root: next } = addChild(root, 'r');
+
+    expect(node.origin).toBe('manual');
+    expect(findNode(next, node.id)?.origin).toBe('manual');
+    // 老节点没有来历字段：这里不该顺手把它补成 manual（那是伪造来源）
+    expect(findNode(next, 'a')?.origin).toBeUndefined();
+  });
+
+  it('加兄弟：同样是 manual', () => {
+    const root: MindNode = { ...leaf('r'), children: [leaf('a')] };
+    const { node } = addSibling(root, 'a');
+
+    expect(node.origin).toBe('manual');
+  });
+});
