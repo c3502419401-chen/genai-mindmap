@@ -404,6 +404,76 @@ def test_label_shrunk_counts_only_user_edits():
     assert shrunk["avg_after"] == 9.0
 
 
+def test_label_shrunk_ignores_repair_edits():
+    """一键修复把两层标题拼成一个，也是一条"变短的 label 改动"，但它不该算。
+
+    修复的扳机是用户按的，所以 `actor` 是 `user`——只有 `kind='repair'` 能把
+    "规则改短"与"人改短"分开。不分开，"规则把两层标题拼成一个"会被读成"用户嫌
+    标题太长"，而这个数字唯一的用途就是给生成侧的标题长度定上限：拿规则自己造成
+    的缩短去论证它，是循环论证。
+    """
+    map_id = _create([
+        # 人改短一条：18 → 9。
+        _event(before="长" * 18, after="短" * 9),
+        # 修复把"外层 18 字"与内层拼成一个 12 字标题。同长度，只有条数能区分。
+        _event(kind="repair", node_id="b", before="长" * 18, after="短" * 12),
+    ])
+
+    shrunk = client.get(f"/api/mindmaps/{map_id}/edits/summary").json()["label_shrunk"]
+
+    # count 是 1 而不是 2：多出来的那条是规则干的。
+    assert shrunk["count"] == 1
+    assert shrunk["avg_before"] == 18.0
+    assert shrunk["avg_after"] == 9.0
+
+
+def test_by_field_ignores_repair_and_keeps_the_identity():
+    """`repair` 改文字时也带 `field`，但它不进 `by_field`：那不是人改的。
+
+    这条同时钉住那条恒等式：`repair` 一旦被算进 `by_field`，
+    `sum(by_field) == by_kind.update + by_kind.style` 立刻不成立，而它是
+    "有没有写入路径绕过契约"的唯一自校验。
+    """
+    map_id = _create([
+        _event(),
+        # 修复改了一个标题（带 field）……
+        _event(kind="repair", node_id="b", before="长" * 10, after="短" * 4),
+        # ……又删掉一个节点（不带 field，带规模）。
+        _event(kind="repair", field=None, node_id="c", before="多余的", after=None,
+               depth=3, subtree_size=1),
+    ])
+
+    summary = client.get(f"/api/mindmaps/{map_id}/edits/summary").json()
+
+    assert summary["by_kind"] == {"update": 1, "repair": 2}
+    assert summary["by_field"] == {"label": 1}
+    assert sum(summary["by_field"].values()) == (
+        summary["by_kind"].get("update", 0) + summary["by_kind"].get("style", 0))
+    # 修复删掉的节点不进"用户嫌哪一层多余"：那个数问的是用户的手。
+    assert summary["removed_depth"] == {}
+    assert summary["removed_subtree"] == {}
+
+
+def test_repair_counts_as_a_change_not_as_untouched():
+    """规则修复改过节点 → 那次生成不算"一字未改"。
+
+    `changed_events` 与 `untouched_runs` 用的是同一个 kind 集合。把 `repair` 漏在
+    两边之外，"模型给了 30 个节点、规则删掉 12 个"会被读成"生成完一字未改"——而
+    `untouched_runs` 是整张表最贵的那个数，误报的方向恰好是"生成质量很好"。
+    """
+    map_id = _create([
+        _generate("run-1", 30),
+        _event(kind="repair", field=None, node_id="c", before="一整支", after=None,
+               depth=2, subtree_size=12, run_id="run-1"),
+    ])
+
+    summary = client.get(f"/api/mindmaps/{map_id}/edits/summary").json()
+
+    assert summary["changed_events"] == 1
+    assert summary["untouched_runs"] == 0
+    assert sum(summary["by_actor"].values()) == summary["total"]
+
+
 def test_last_event_at_is_the_recording_time_not_the_faked_one():
     """死表探测器的读数取**入库**时刻：`at` 由前端时钟给，可以漂到任何地方。"""
     map_id = _create([_event(at="2020-01-01T00:00:00.000Z")])
@@ -616,7 +686,7 @@ def test_existing_table_gets_the_new_columns(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "kind", ["add", "remove", "update", "move", "edge", "style", "accept"])
+    "kind", ["add", "remove", "update", "move", "edge", "style", "accept", "repair"])
 def test_all_kinds_round_trip(kind: str):
     map_id = _create([_event(kind=kind)])
     summary = client.get(f"/api/mindmaps/{map_id}/edits/summary").json()

@@ -140,20 +140,26 @@ describe('一次整体替换 = 一条撤销', () => {
   });
 });
 
-describe('改动账本：批次与 actor', () => {
-  it('一批事件共享一个时刻，actor 记 user（整体替换没有调模型）', () => {
+describe('改动账本：批次、actor 与 kind', () => {
+  it('一批事件共享一个时刻；actor 记 user，kind 记 repair', () => {
     const store = useMindMapStore();
     store.preview(clone(REAL.before), 'right');
 
     store.replaceContent(clone(REAL.first.content));
 
     const events = store.pendingEdits;
-    // 3 处压链会同时改标题（update）、删掉被压掉的那一层（remove）、把孙节点搬上来（move）。
+    // 3 处压链同时改标题、删掉被压掉的那一层、把孙节点搬上来。但整批只记**一个**动作名：
+    // `repair`——它不是"哪一处被改了"，是"这一次动作是规则干的"（见
+    // `edit-log.ts::DiffOptions`）。`actor` 仍是 `user`：扳机是用户按的，只是没有模型参与。
     expect(events.length).toBeGreaterThan(0);
     expect(new Set(events.map(event => event.at)).size).toBe(1);
     expect(events.every(event => event.actor === 'user')).toBe(true);
-    expect(events.some(event => event.kind === 'remove')).toBe(true);
-    expect(events.some(event => event.kind === 'update' && event.field === 'label')).toBe(true);
+    expect(events.every(event => event.kind === 'repair')).toBe(true);
+    // 动作粒度没丢：改文字那条带 `field='label'`，删节点那条带 `subtreeSize`。
+    // 它们只是不能再按 kind 分桶——`.get(kind)` 那种读法会把这批整个归到一个桶里。
+    expect(events.some(event => event.field === 'label')).toBe(true);
+    expect(events.some(event => event.field === undefined && event.subtreeSize !== undefined))
+      .toBe(true);
   });
 
   it('撤销本身不记账（一次被撤销的编辑不是用户的最终意图）', () => {
