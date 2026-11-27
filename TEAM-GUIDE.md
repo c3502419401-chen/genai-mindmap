@@ -1,6 +1,6 @@
 # 给组员的阅读说明
 
-这个包里是**能跑起来的开发骨架**，不是完成品。功能按模块留了位，接口和数据结构已经定死，剩下的活是往对应模块里填实现。
+这个包**已经上线了**（[https://genai-mindmap.rpegio.top/](https://genai-mindmap.rpegio.top/)），不是待填实现的开发骨架。功能按模块分好，接口和数据结构已经定死；剩下的活是补缺口，逐条状态以 [功能清单与分工](docs/FEATURES_AND_OWNERS.md) 为准（已实现 / 部分实现 / 待实现 / 待评估）。
 
 打开顺序建议：先看本文把项目跑起来，再读 `docs/FLOW.md` 搞清楚数据怎么流动，最后按自己负责的部分读 `docs/` 下对应的文档。
 
@@ -68,7 +68,7 @@ npm test
 npm run build
 ```
 
-当前基线（2026-11-24，合入 `coworker/main`（账号系统 + 限量免费额度）之后）：后端 3077 个测试通过 / 37 skip（pytest，另有 29 个 subtest）、前端 1076 个 vitest 用例（67 个文件）。CI（`.github/workflows/ci.yml`）跑的是同一组命令，PR 上两个 job 必须双绿。
+当前基线（2026-11-27 本机复核，两个数字都是现跑的）：后端 `pytest -q` 全绿，收集 **3435 条用例 / 153 个测试文件**（`integration` 那一批要本机 Neo4j，没配会自动 skip）；前端 `npm test` **93 个文件 / 1462 条用例全绿**。CI（`.github/workflows/ci.yml`）跑的是同一组命令（Python 3.12 / Node 24），PR 上两个 job 必须双绿。**别把这里的数字当断言用**——它随提交变，要断言就现跑一次。
 
 本机跑后端测试时如果出现 `LegacyOfficeTest::test_xls_cell_formatting` 失败、报 `No module named 'xlrd'`，是本地依赖没装齐（`.xls` 直读要用它），`pip install xlrd` 即可，不是代码问题。
 
@@ -85,7 +85,7 @@ npm run build
 ```
 backend/
   app/
-    main.py            应用装配，注册 11 组路由（38 个路径 / 43 个端点）
+    main.py            应用装配，注册 11 组路由（43 个路径 / 53 个端点）
     contracts/         数据契约（改这里要通知另一个人）
       mindmap.py       ContentBase 与三个子类（树 / 流程图 / 鱼骨图）、Node、请求响应模型
       source.py        Source / SourceUsage / SourceRef（节点引用）
@@ -104,7 +104,7 @@ backend/
     agent/             AI 代理（工具循环 / op 执行器 / SSE v2 / 运行台账，生成与编辑的唯一入口）
     export/            导出 puml / markdown / opml / json
     mindmaps/          保存 / 读取 / 版本冲突 / 改动日志
-  tests/               3077 个测试通过 / 37 skip（另有 29 个 subtest）
+  tests/               3435 条用例 / 153 个文件（2026-11-27 复核）
 frontend/
   src/
     App.vue            工作台（画布居中、左侧材料、右侧对话与详情，含保存、打开、冲突弹层、导出、来源面板）
@@ -134,7 +134,7 @@ frontend/
     stores/settings.ts Pinia：模型服务配置（读 / 存 / 测试连接）
     demo/presets.ts    三张预置演示导图（生产也带，点按钮才加载）
     dev/samples.ts     开发期布局示例（仅 `npm run dev` 动态加载）
-  tests/               1055 个 vitest 用例（纯函数 / 布局 / store / 编辑 / 保存 / 界面 / 引用 / agent / 对话 / 记忆 / 导入 / 三种图型 / 偏好与体检 / 模型设置）
+  tests/               1462 条 vitest 用例 / 93 个文件（2026-11-27 复核；纯函数 / 布局 / store / 编辑 / 保存 / 界面 / 引用 / agent / 对话 / 记忆 / 导入 / 三种图型 / 偏好与体检 / 模型设置）
 docs/
   FLOW.md              端到端流程 ← 先读这个
   API.md               每条路由实现到什么程度
@@ -146,7 +146,15 @@ docs/
   TODO.md              文件占用与交接（协作文件，动共用文件前先看这里）
   W1_DAY1.md           W1 逐日开工清单
   FEATURES_AND_OWNERS.md    26 项功能追踪与 A/B 分工
-START_HERE.md          原始的骨架说明
+  PROJECT-STATUS.md    现状总览（比这份指南更权威）
+  ONE-CALL.md          生成四步为什么这么切（当前主路径的实测与红线判定）
+  ONE-PATH.md          删 `full` 形态那次决策留档（★ 文件头有订正块，引用前先读）
+  PROPOSAL.md          申报书原文（目标，不是现状）
+  PLAN-VS-IMPLEMENTATION.md  申报书 22 项逐条核对
+  USER-GUIDE.md        用户视角的操作手册
+README.md              开发者上手文档（在线体验 / 60 秒跑起来 / 五道闸的命令 / 功能状态表 / 文档地图）← 新人先读这个
+START_HERE.md          当前可运行范围与易错点清单
+NEXT-PLAN.md           2026-11-02 的排期评估快照（已过期，只作历史）
 ```
 
 ---
@@ -155,7 +163,7 @@ START_HERE.md          原始的骨架说明
 
 **能用的**：文本生成导图（demo 或真实模型，走 `mindmap_generate`——一次生成拆四段：骨架 → 每支检索 → 结构 → 说明并发写，实测见 `docs/ONE-CALL.md`；分片的 `mindmap_generate_deep` 代码与规格还在但不注册到 `create`，服务一次响应写不下 200+ 节点的情形）、三种图型（树 / 流程图 / 鱼骨图，各有独立几何）、多来源混合输入（文本 / 文档 / 图片 / WAV / 浏览器录音，合并后一次生成）、结构诊断（单子节点 / 深度上限 / 同级重复标签）与候选建议、节点级来源引用（三层校验）、四种导出（PUML / Markdown / OPML / JSON）、导入外部文件为导图（xmind / freemind / opml / puml / markdown / json）、保存与版本冲突检测、agent 运行（工具循环 + **生成即落画布，没有候选确认层**，`POST /api/agent/runs/stream` 是生成与编辑的**唯一**入口）、修改日志与统计、用户偏好、记忆模块（生成时注入相关记忆）。
 
-**是桩的**：知识检索（返回空 + `implemented:false`）、`POST /api/agent/tasks`（返回固定四阶段，不产生导图；真正的 agent 走 `/agent/runs/stream`）。
+**是桩的**：只剩 `POST /api/agent/tasks`（返回固定四阶段，不产生导图；真正的 agent 走 `/agent/runs/stream`）。**知识检索 `/api/knowledge/search` 已经不是桩**——`backend/app/knowledge/router.py` 返回 `implemented: true`，混合检索（BM25 + `text-embedding-v3` 向量）在生成链路内部按支跑；早先那句"返回空 + `implemented:false`"已不成立。
 
 **没有 501 的导出**：Markdown / OPML / JSON 均已实现，四种格式都从浏览器直接下载。
 
@@ -176,7 +184,7 @@ START_HERE.md          原始的骨架说明
 
 ---
 
-## 5 接口一览（38 个路径 / 43 个端点）
+## 5 接口一览（43 个路径 / 53 个端点）
 
 ```
 基础
@@ -227,7 +235,7 @@ GET  /api/memory/search            按主题检索（带时间衰减）
 DELETE /api/memory/{item_id}       删除一条记忆
 
 检索与知识库
-POST /api/knowledge/search         检索（桩，返回空）
+POST /api/knowledge/search         检索（已实现；"库里材料参与生成"另由 MINDMAP_LIBRARY_SEARCH 控制）
 POST /api/knowledge/fetch          贴一个 URL，抓回正文变成一份材料（受 MINDMAP_EXTERNAL_DEEPSEEK_FETCH 约束）
 GET  /api/knowledge/library        知识库列表（含被引用次数）
 GET  /api/knowledge/library/{id}   单份材料正文预览（前 4000 字）
@@ -283,7 +291,7 @@ W1 两条线并行：B 做 D1–D3，A 做 D2 契约 + D4 画布 + D5 部署，W
 - **编辑不记协作方**：保存以整棵树为单位（`version` 乐观锁），没有字段级合并；两个人同时编辑同一张图，后保存的会拿到 409，只能选择覆盖（重新加载）或另存为新导图。
 - **撤销栈只在内存**：刷新页面后撤销历史清空，最多 50 步或 10MB（先到者为准，节点上限提到 1000 后单份快照可能几十 KB，只按步数会涨到几十 MB）；保存不写历史。
 - **旧格式要系统依赖**：`.doc` / `.ppt` 依赖 LibreOffice（约 1.5 GB），没装时 422 而不是降级；`.xls` 依赖 `xlrd`。部署机装不装，直接决定这几个格式能不能用。
-- **当前没有登录和权限**：所有接口裸奔，只能在本机跑，不要往公网放。
+- **鉴权在应用层，不在 nginx**：`/api/` 下每条路由都要身份（游客 cookie 或登录，匿名 401 `auth_required`），账号体系在 `backend/app/auth/`（scrypt、`sessions` 表、HttpOnly cookie、身份中间件 + 门禁中间件）。导图存到自己名下、别的账号能看不能改（403 `map_forbidden`）。**仍然没有的**：协作式权限隔离与共享管理、限流与滥用防护——所以别往里放敏感数据。
 
 ---
 
@@ -300,4 +308,6 @@ W1 两条线并行：B 做 D1–D3，A 做 D2 契约 + D4 画布 + D5 部署，W
 
 其余按 `FEATURES_AND_OWNERS.md` 的 F 编号推进，范围取舍以 `docs/PLAN.md` 第 2 节为准。
 
-别急着上 Celery、Redis、Milvus 这些东西。当前是单进程同步架构，RPeGio 与陈嘉涛的时间花在功能上比花在运维上划算得多。
+别急着上 Celery、Redis 这些东西。当前是单进程同步架构，RPeGio 与陈嘉涛的时间花在功能上比花在运维上划算得多。
+
+Milvus 是**已经实测过才没上**的，不是没想过：同一批向量、同一台机器，本机 SQLite + numpy 的余弦矩阵乘单次检索约 15 ms，Milvus Lite 单次查询 179 ms、进程常驻内存 +119 MB、官方不支持 Windows，而它的 FLAT 索引内部同样是暴力扫描，数千条量级不产生收益。复评门槛写在 `docs/OPTIMIZATION-CROSS-MAP.md`（历史节点达 50 万条时再看）。所以这条要当"有数据支撑的裁定"讲，别当成拖延。
