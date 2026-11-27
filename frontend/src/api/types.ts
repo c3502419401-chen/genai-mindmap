@@ -1335,6 +1335,28 @@ export interface EditSummary {
    * `removed_depth`——否则那次"每层都在被删"的污染还在。
    */
   removed_subtree: Record<string, number>;
+  /**
+   * 生成次数：`kind='generate'` 的行数。**分母的次数**。
+   *
+   * 下面这四个字段是后补的：后端 `contracts/edits.py` 加它们的那一轮只改了契约与
+   * 后端，这份镜像没跟——因为编辑日志这几个类型**刻意不在 `contract-check.ts` 的
+   * 断言清单里**（理由见本段上面那段说明：加一个统计字段要改三个文件不划算）。
+   * 代价就是这次：字段悄悄少了一版，直到要给账本界面写"模型给了多少、改了多少"时
+   * 才发现。所以它们三个一组的语义在这里写全，别再靠对后端代码猜。
+   */
+  generated_runs: number;
+  /** **分母**：`SUM(node_count) WHERE kind='generate'`——模型一共交出多少个节点。 */
+  generated_nodes: number;
+  /**
+   * **分子**：`kind IN ('update','remove','add','move','style','repair')` 的条数。
+   *
+   * `edge` 不进（分母数的是节点）；`repair` **进**（一键修复确实改了节点，不算进来
+   * 会让"模型给了 30 个、规则删了 12 个"读成"一字未改"）。集合与 `untouched_runs`
+   * 逐字相同，否则会出现"既不算改动、也不算一字未改"的黑洞。
+   */
+  changed_events: number;
+  /** 那个 `run_id` 下一条改动事件都没有的 generate 行数——"生成完一字未改"。 */
+  untouched_runs: number;
 }
 
 // ---- 结构诊断与建议（`POST /api/optimization/check` / `suggest`）----

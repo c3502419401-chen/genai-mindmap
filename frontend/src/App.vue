@@ -6,6 +6,7 @@ import type { Direction } from './canvas/layout/tidy';
 import AgentPanel from './components/AgentPanel.vue';
 import AliasResolver from './components/AliasResolver.vue';
 import ChatDock from './components/ChatDock.vue';
+import EditLedger from './components/EditLedger.vue';
 import HistoryDrawer from './components/HistoryDrawer.vue';
 import MessageFab from './components/MessageFab.vue';
 import NodeToolbar from './components/NodeToolbar.vue';
@@ -1445,6 +1446,23 @@ const agentHasDetail = computed(() => agentDetailVisible(store));
             `v-if`——那会让"有没有东西可说"这件事在 App 与组件里各写一遍。
           -->
           <StructureCheck />
+
+          <!--
+            账本：**这张图有史以来改过什么**（跨会话，来自 `edit_events` 表）。
+
+            与上面那块「本次生成明细」不是一个东西：那块是"刚才那 25 秒"，数据在
+            chat store 里，关掉页面就没了；账本读的是已落库的事件，含每一次手工编辑与
+            每一次一键修复。两者唯一的共同点是"都长得像日志"。
+
+            排在 `StructureCheck` 之后、节点详情之前：检查结果是"这张图现在有什么
+            问题"（结论，常常在生成之后很久才被点开），账本是"它怎么变成现在这样"
+            （来路）。先结论后来路——来路展开一次往往有几十行。
+
+            **它自己判可见性与空态**（没保存过、没事件、读不到都各有话说），这里不给
+            `v-if`，理由与 `StructureCheck` 那段相同：那会让"有没有东西可说"这件事在
+            App 与组件里各写一遍。
+          -->
+          <EditLedger />
 
           <template v-if="selected">
           <p class="text-xs text-slate-400">{{ pathText }}</p>
