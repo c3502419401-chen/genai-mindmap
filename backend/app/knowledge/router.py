@@ -14,6 +14,16 @@ GET 是知识库的**只读入口**：列出库里有哪些材料、每份被几
 （`MINDMAP_EXTERNAL_DEEPSEEK_FETCH`）约束：前者管"生成时自动去搜一轮"，这里是一次
 用户显式动作（贴了一个链接），两种意愿不该共用一个闸。
 """
+import asyncio
+import logging
+import sqlite3
+import threading
+import time
+from contextlib import closing
+from functools import lru_cache
+from typing import Literal
+from uuid import uuid4
+
 from fastapi import APIRouter, Query
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -25,10 +35,12 @@ from app.contracts.source import (
     SourceMetadata,
 )
 from app.core.errors import AppError
-from app.knowledge import external, graph_store, shelf
+from app.knowledge import external, graph_resolve, graph_store, library, shelf
 from app.knowledge.service import SearchRequest, SearchResponse, search
+from app.mindmaps import repository
 
 router = APIRouter(prefix="/knowledge", tags=["知识增强"])
+logger = logging.getLogger(__name__)
 
 
 @router.post("/search", response_model=SearchResponse)
@@ -259,12 +271,362 @@ class AliasClearance(BaseModel):
     deleted: int = Field(ge=0)
 
 
+class AliasEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source_id: str
+    filename: str
+    start: int
+    end: int
+    quote: str
+    kind: Literal["graph_edge", "text_match"]
+
+
+class AliasCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str
+    alias: str
+    canonical: str
+    similarity: float
+    reason: str
+    alias_evidence: list[AliasEvidence]
+    canonical_evidence: list[AliasEvidence]
+    selectable: bool
+
+
+class AliasPreview(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    job_id: str
+    status: Literal["running", "done", "failed", "cancelled", "applying", "applied"]
+    stage: str
+    error: str | None
+    warnings: list[str]
+    items: list[AliasCandidate]
+
+
+class AliasApplyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    job_id: str = Field(min_length=1, max_length=64)
+    candidate_ids: list[str] = Field(min_length=1, max_length=500)
+
+
+class AliasPair(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    alias: str
+    canonical: str
+
+
+class AliasApplyResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    relationships_created: int
+    created: list[AliasPair]
+    skipped: int
+
+
+# 预览不持久化；限时、限数量且最多一个运行线程，适合单机部署。
+_PREVIEW_LOCK = threading.RLock()
+_ALIAS_WRITE_LOCK = threading.Lock()
+_PREVIEWS: dict[str, dict] = {}
+_PREVIEW_TTL = 15 * 60
+_MAX_PREVIEWS = 3
+
+
+class _PreviewCancelled(Exception):
+    pass
+
+
+class _PreviewConflict(Exception):
+    pass
+
+
+def _prune_previews() -> None:
+    now = time.monotonic()
+    for job_id, job in list(_PREVIEWS.items()):
+        if not job["running"] and job["status"] != "applying" and (
+            now - job["finished_at"] > _PREVIEW_TTL
+        ):
+            del _PREVIEWS[job_id]
+
+
+def _preview_view(job: dict) -> AliasPreview:
+    return AliasPreview(job_id=job["job_id"], status=job["status"], stage=job["stage"],
+                        error=job["error"], warnings=job["warnings"], items=job["items"])
+
+
+def _preview_progress(job: dict, stage: str) -> None:
+    with _PREVIEW_LOCK:
+        if job["status"] == "cancelled":
+            raise _PreviewCancelled
+        job["stage"] = stage
+
+
+def _preview_warning(job: dict, message: str) -> None:
+    with _PREVIEW_LOCK:
+        if job["status"] == "cancelled":
+            raise _PreviewCancelled
+        job["warnings"].append(message)
+
+
+def _preview_evidence(
+    names: list[str], coordinates: dict[str, list[tuple[str, int, int]]],
+) -> dict[str, list[AliasEvidence]]:
+    if not names:
+        return {}
+    result: dict[str, list[AliasEvidence]] = {}
+
+    def excerpt(block: str, name: str) -> tuple[str, int, int] | None:
+        position = block.find(name)
+        if position < 0:
+            return None
+        left = max(block.rfind(mark, 0, position) for mark in "。！？\n") + 1
+        stops = [block.find(mark, position + len(name)) for mark in "。！？\n"]
+        right = min((stop + 1 for stop in stops if stop >= 0), default=len(block))
+        left = max(left, position - 100)
+        right = min(right, max(position + len(name), left + 240))
+        quote = block[left:right].strip()
+        return (quote, left, right) if name in quote else None
+
+    # SQLite 只读连接不会执行 repository.connect() 的建表和迁移；只取块而非整篇。
+    uri = repository.db_path().resolve().as_uri() + "?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True)) as conn:
+        @lru_cache(maxsize=32)
+        def load_block(source_id: str, start: int, end: int):
+            return conn.execute(
+                f"SELECT filename, length(text), substr(text, ?, ?) FROM {library.SOURCES_TABLE} "
+                "WHERE id = ?", (start + 1, end - start, source_id),
+            ).fetchone()
+
+        for name in names:
+            for source_id, start, end in coordinates.get(name, []):
+                if not (0 <= start < end and end - start <= 50000):
+                    continue
+                row = load_block(source_id, start, end)
+                if row is None or row[1] is None or end > row[1] or row[2] is None:
+                    continue
+                found = excerpt(str(row[2]), name)
+                if found is None:
+                    continue
+                # 坐标指向整个原始证据块；quote 是其中逐字摘录的短句。
+                result.setdefault(name, []).append(AliasEvidence(
+                    source_id=source_id, filename=row[0] or "未命名材料",
+                    start=start, end=end, quote=found[0], kind="graph_edge",
+                ))
+                if len(result[name]) >= 2:
+                    break
+        missing = set(names) - result.keys()
+        if missing:
+            # 孤立实体没有 REL 坐标。最多扫描最近 100 篇的前 5 万字，逐字命中才展示；
+            # 这只能说明材料中出现过名字，不声称这篇就是图谱抽取它的来源。
+            rows = conn.execute(
+                f"SELECT id, filename, substr(text, 1, 50000) FROM {library.SOURCES_TABLE} "
+                "ORDER BY last_used_at DESC, id LIMIT 100"
+            )
+            for source_id, filename, block in rows:
+                if not block:
+                    continue
+                for name in sorted(missing):
+                    found = excerpt(str(block), name)
+                    if found is None:
+                        continue
+                    quote, start, end = found
+                    result[name] = [AliasEvidence(
+                        source_id=source_id, filename=filename or "未命名材料",
+                        start=start, end=end, quote=quote, kind="text_match",
+                    )]
+                    missing.remove(name)
+                if not missing:
+                    break
+    return result
+
+
+def _run_alias_preview(job: dict) -> None:
+    try:
+        _preview_progress(job, "正在读取已有别名")
+        snapshot = graph_store.alias_snapshot()
+        result = asyncio.run(graph_resolve.resolve_entities(
+            dry_run=True, preview=True, progress=lambda stage: _preview_progress(job, stage),
+            warning=lambda message: _preview_warning(job, message),
+        ))
+        _preview_progress(job, "正在回查材料出处")
+        groups = result["candidates"]
+        names = sorted({name for group in groups
+                        for name in [group["canonical"], *group["aliases"]]})
+        evidence = _preview_evidence(names, graph_store.entity_evidence(names))
+        existing = set(snapshot)
+        items: list[AliasCandidate] = []
+        for group in groups:
+            canonical = group["canonical"]
+            for alias in group["aliases"]:
+                if (alias, canonical) in existing:
+                    continue
+                alias_evidence = evidence.get(alias, [])
+                canonical_evidence = evidence.get(canonical, [])
+                items.append(AliasCandidate(
+                    id=str(len(items)), alias=alias, canonical=canonical,
+                    similarity=group["similarity"], reason=group["reason"],
+                    alias_evidence=alias_evidence, canonical_evidence=canonical_evidence,
+                    selectable=bool(alias_evidence and canonical_evidence),
+                ))
+        _preview_progress(job, "正在核对预览期间的别名变化")
+        if graph_store.alias_snapshot() != snapshot:
+            raise _PreviewConflict
+        with _PREVIEW_LOCK:
+            if job["status"] == "cancelled":
+                raise _PreviewCancelled
+            job.update(status="done", stage="候选已就绪", items=items, snapshot=snapshot,
+                       running=False, finished_at=time.monotonic())
+    except _PreviewCancelled:
+        pass
+    except Exception as exc:
+        logger.warning("实体消解预览失败：%s", type(exc).__name__)
+        if isinstance(exc, graph_resolve.EmbeddingNotConfigured):
+            message = "向量服务未配置，无法查找候选。"
+        elif isinstance(exc, graph_resolve.EmbeddingError):
+            message = "向量服务调用失败或部分实体没有向量，请稍后重试。"
+        elif isinstance(exc, graph_store.GraphStoreError):
+            message = "图谱存储不可用，请检查连接后重试。"
+        elif isinstance(exc, _PreviewConflict):
+            message = "预览期间数据发生变化，请重新查找。"
+        else:
+            message = "候选查找或出处回查失败，请稍后重试。"
+        with _PREVIEW_LOCK:
+            if job["status"] != "cancelled":
+                job.update(status="failed", stage="查找失败", error=message,
+                           running=False, finished_at=time.monotonic())
+    finally:
+        with _PREVIEW_LOCK:
+            job["running"] = False
+            job["finished_at"] = time.monotonic()
+
+
+@router.post("/aliases/candidates", response_model=AliasPreview, status_code=202)
+def start_alias_preview():
+    """创建只读候选任务；计算可能消耗向量额度。"""
+    if not graph_store.configured():
+        raise AppError("graph_unavailable", "图谱存储没有启用", status=503)
+    if not graph_resolve.embedding_configured():
+        raise AppError("embedding_unavailable", "向量服务未配置", status=503)
+    with _PREVIEW_LOCK:
+        _prune_previews()
+        if any(job["running"] or job["status"] == "applying" for job in _PREVIEWS.values()):
+            raise AppError("preview_busy", "已有候选任务正在运行，请稍后重试", status=409)
+        while len(_PREVIEWS) >= _MAX_PREVIEWS:
+            oldest = min(_PREVIEWS, key=lambda key: _PREVIEWS[key]["finished_at"])
+            del _PREVIEWS[oldest]
+        job = {"job_id": uuid4().hex, "status": "running", "stage": "正在启动",
+               "error": None, "warnings": [], "items": [], "running": True, "finished_at": 0.0,
+               "snapshot": []}
+        _PREVIEWS[job["job_id"]] = job
+        view = _preview_view(job)
+        try:
+            threading.Thread(target=_run_alias_preview, args=(job,), daemon=True).start()
+        except (RuntimeError, OSError) as exc:
+            del _PREVIEWS[job["job_id"]]
+            raise AppError("preview_unavailable", "无法启动候选任务，请稍后重试", status=503) from exc
+        return view
+
+
+@router.get("/aliases/candidates/{job_id}", response_model=AliasPreview)
+def read_alias_preview(job_id: str):
+    with _PREVIEW_LOCK:
+        _prune_previews()
+        job = _PREVIEWS.get(job_id)
+        if job is None:
+            raise AppError("not_found", "预览不存在或已过期，请重新查找", status=404)
+        return _preview_view(job)
+
+
+@router.delete("/aliases/candidates/{job_id}", response_model=AliasPreview)
+def cancel_alias_preview(job_id: str):
+    with _PREVIEW_LOCK:
+        _prune_previews()
+        job = _PREVIEWS.get(job_id)
+        if job is None:
+            raise AppError("not_found", "预览不存在或已过期", status=404)
+        if job["status"] in ("applying", "applied"):
+            raise AppError("preview_conflict", "正在应用或已经应用，不能取消", status=409)
+        job.update(status="cancelled", stage="已取消；已发出的请求返回后停止",
+                   warnings=[], items=[], snapshot=[])
+        if not job["running"]:
+            job["finished_at"] = time.monotonic()
+        return _preview_view(job)
+
+
+@router.post("/aliases/apply", response_model=AliasApplyResult)
+def apply_alias_preview(body: AliasApplyRequest):
+    with _PREVIEW_LOCK:
+        _prune_previews()
+        job = _PREVIEWS.get(body.job_id)
+        if job is None:
+            raise AppError("not_found", "预览不存在或已过期，请重新查找", status=404)
+        if job["status"] != "done" or job["running"]:
+            raise AppError("preview_conflict", "预览尚未完成或已使用", status=409)
+        choices = {item.id: item for item in job["items"]}
+        if (len(set(body.candidate_ids)) != len(body.candidate_ids) or
+                any(key not in choices or not choices[key].selectable
+                    for key in body.candidate_ids)):
+            raise AppError("invalid_candidates", "只能选择本次预览中有出处的候选", status=422)
+        selected = [choices[key] for key in body.candidate_ids]
+        snapshot = job["snapshot"]
+        job.update(status="applying", stage="正在应用选中的别名")
+
+    candidates = [graph_resolve.MergeCandidate(
+        canonical=item.canonical, aliases=[item.alias], similarity=item.similarity,
+        reason=item.reason,
+    ) for item in selected]
+    write_attempted = False
+    try:
+        # 同一进程的其他别名删除/清空与检查、写入、回读串行，避免撤回误删旧关系。
+        with _ALIAS_WRITE_LOCK:
+            names = sorted({name for item in selected for name in (item.alias, item.canonical)})
+            evidence = _preview_evidence(names, graph_store.entity_evidence(names))
+            if any(evidence.get(item.alias, []) != item.alias_evidence or
+                   evidence.get(item.canonical, []) != item.canonical_evidence
+                   for item in selected):
+                raise _PreviewConflict
+            write_attempted = True
+            count = graph_store.add_aliases(candidates, expected_aliases=snapshot)
+            with _PREVIEW_LOCK:
+                job.update(status="applied", stage="已应用", finished_at=time.monotonic())
+            current = set(graph_store.alias_snapshot())
+    except _PreviewConflict as exc:
+        with _PREVIEW_LOCK:
+            job.update(status="failed", stage="出处已变化，请重新预览", finished_at=time.monotonic())
+        raise AppError("preview_conflict", "材料或图谱出处已变化，请重新预览", status=409) from exc
+    except graph_store.AliasSnapshotConflict as exc:
+        with _PREVIEW_LOCK:
+            job.update(status="failed", stage="别名表已变化，请重新预览", finished_at=time.monotonic())
+        raise AppError("preview_conflict", "别名表已变化，请重新预览", status=409) from exc
+    except graph_store.GraphStoreError as exc:
+        with _PREVIEW_LOCK:
+            committed = job["status"] == "applied"
+            if not committed:
+                job.update(status="failed", stage="写入结果未知，请先检查别名清单",
+                           finished_at=time.monotonic())
+        message = ("已提交写入，但无法读取结果；请刷新别名清单" if committed else
+                   "写入结果未知，请先检查别名清单" if write_attempted else
+                   "无法重新核对图谱出处，未执行写入")
+        raise AppError("graph_unavailable", message, status=503) from exc
+    except Exception as exc:
+        logger.warning("实体消解应用失败：%s", type(exc).__name__)
+        with _PREVIEW_LOCK:
+            if job["status"] != "applied":
+                job.update(status="failed", stage="写入结果未知，请先检查别名清单",
+                           finished_at=time.monotonic())
+        message = ("写入结果未知，请先检查别名清单" if write_attempted else
+                   "无法重新核对材料出处，未执行写入")
+        raise AppError("alias_apply_failed", message, status=500) from exc
+    created = [AliasPair(alias=item.alias, canonical=item.canonical) for item in selected
+               if (item.alias, item.canonical) in current]
+    return AliasApplyResult(relationships_created=count, created=created,
+                            skipped=len(selected) - len(created))
+
+
 @router.get("/aliases", response_model=AliasListing)
 def list_aliases(limit: int = Query(500, ge=1, le=2000)):
     """库里的实体别名（`alias → canonical`）。**"模型把两个名字认成一个"唯一看得见的地方**。
 
-    别名是模型推断出来的：实体消解按构词关系与向量相似度猜"这两个名字指同一个
-    东西"，猜完直接写进图库。猜错的时候，`neighbors` 会给出几条**有证据、有位置、
+    别名是推断出来的：实体消解按构词关系与向量相似度猜"这两个名字指同一个
+    东西"，产品入口让用户核对出处、逐对确认后才写入。猜错的时候，`neighbors` 会给出几条**有证据、有位置、
     还通得过校验**的假路径——比少一条路难发现得多。所以这一层必须有可读的清单，
     也必须有删掉错的那一条的入口（`DELETE /api/knowledge/aliases/{alias}`）。
 
@@ -305,7 +667,8 @@ def delete_alias(alias: str, canonical: str | None = Query(None)):
     **不要用重跑实体消解来"修正"猜错**：它按同一批阈值重新算，删掉的那条会一起回来。
     """
     try:
-        removed = graph_store.delete_alias(alias, canonical)
+        with _ALIAS_WRITE_LOCK:
+            removed = graph_store.delete_alias(alias, canonical)
     except graph_store.GraphStoreNotConfigured as error:
         raise AppError(
             "graph_unavailable",
@@ -334,7 +697,8 @@ def clear_aliases():
     实体与 `REL` 一条不碰，所以清空之后图就是"从没合并过"的样子。
     """
     try:
-        removed = graph_store.clear_aliases()
+        with _ALIAS_WRITE_LOCK:
+            removed = graph_store.clear_aliases()
     except graph_store.GraphStoreNotConfigured as error:
         raise AppError(
             "graph_unavailable",

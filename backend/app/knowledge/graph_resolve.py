@@ -132,26 +132,28 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 import time
+from collections import deque
+from collections.abc import Callable
+from contextlib import closing
 from dataclasses import dataclass
 from math import sumprod as _dot
 
 from app.knowledge import graph_store, vector_cache
-from app.knowledge.embedding import EmbeddingNotConfigured
+from app.knowledge.embedding import EmbeddingError, EmbeddingNotConfigured
+from app.knowledge.embedding import MAX_BATCH as EMBEDDING_BATCH
 from app.knowledge.embedding import configured as embedding_configured
 from app.knowledge.embedding import embed_texts
 from app.knowledge.embedding import model_name as embedding_model
+from app.mindmaps import repository
 
 logger = logging.getLogger(__name__)
 
 # 这一层对外的东西只有三个：候选（`MergeCandidate`）、只看不算的 `find_merge_candidates`、
 # 和"算 + 可选落库"的 `resolve_entities`。
 #
-# **`resolve_entities` 在产品里没有调用者，这是设计不是遗漏**：它一次要 Neo4j +
-# embedding 额度，而且 `dry_run=False` 是不可逆的写（落成别名边之后，`neighbors`
-# 的路径会变）。生成链路里没有任何一处该在用户请求的线程上做这件事，所以它只有
-# 手工/运维这一种触发方式。写进 `__all__` 是为了让"它是外部入口"这件事有唯一
-# 一处声明——而不是让零引用闸门把它误记成一条待接的线。
+# 产品入口只调用 dry-run，用户逐对确认后才由图存储写入选中的别名边。
 __all__ = ["MergeCandidate", "find_merge_candidates", "resolve_entities"]
 
 # 余弦兜底阈值。**它不再是唯一判据**：子串关系走另一条路，不看分数。
@@ -232,7 +234,8 @@ GENERIC_TERMS = frozenset({
 class MergeCandidate:
     """一组待合并的名字。
 
-    `similarity` 是**组内最弱一环的强度**，单位随 `reason` 变：
+    传统分组中 `similarity` 是**组内最弱一环的强度**；产品预览是一对名字，
+    强度与依据直接来自该对的判定边。单位随 `reason` 变：
 
       - `reason == "substring"`：长度比（`len(短) / len(长)`）；
       - `reason == "embedding"`：余弦。
@@ -240,8 +243,8 @@ class MergeCandidate:
     取组内最小而不是最大：如果 A~B 是 0.99、B~C 是 0.92，那么"C 也是 A 的名字"这
     件事的全部可信度来自最弱那一跳；报最大值等于让下游以为这是孪生名字。
 
-    `reason` 是**组内最弱的判定层级**：只要组里有一条边是余弦兜底来的，整组就报
-    `embedding`——那一跳的可信度低于结构证据，而它决定了整组的成色。
+    传统分组的 `reason` 是**组内最弱的判定层级**：只要组里有一条边是余弦兜底来的，
+    整组就报 `embedding`。产品预览则逐对报告该对的直接判定依据。
     """
 
     canonical: str          # 建议作为主名的那个
@@ -501,19 +504,109 @@ def _pick_canonical(members: list[str], degrees: dict[str, int]) -> str:
     return min(members, key=lambda name: (-degrees.get(name, 0), -len(name), name))
 
 
-def _name_vectors(names: list[str]) -> dict[str, list[float]]:
+def _preview_pairs(
+    edges: list[tuple[str, str, float, str]], degrees: dict[str, int],
+) -> list[MergeCandidate]:
+    """每个候选对都来自直接判定：最大生成树去掉传递分组的虚构直连。"""
+    names = sorted({name for left, right, _, _ in edges for name in (left, right)})
+    positions = {name: index for index, name in enumerate(names)}
+    forest = _DisjointSet(len(names))
+    tree: dict[str, list[tuple[str, float, str]]] = {name: [] for name in names}
+    # 构词证据优先于向量兜底；同一层级内强度高的优先，最后用名字定序。
+    ordered = sorted(edges, key=lambda edge: (edge[3] != REASON_SUBSTRING,
+                                               -edge[2], edge[0], edge[1]))
+    for left, right, strength, reason in ordered:
+        if forest.find(positions[left]) == forest.find(positions[right]):
+            continue
+        forest.union(positions[left], positions[right])
+        tree[left].append((right, strength, reason))
+        tree[right].append((left, strength, reason))
+
+    candidates: list[MergeCandidate] = []
+    for members, _strength, _reason in _group_pairs(edges):
+        root = _pick_canonical(members, degrees)
+        visited = {root}
+        pending = deque([root])
+        while pending:
+            canonical = pending.popleft()
+            for alias, strength, reason in sorted(tree[canonical]):
+                if alias in visited:
+                    continue
+                visited.add(alias)
+                pending.append(alias)
+                candidates.append(MergeCandidate(canonical=canonical, aliases=[alias],
+                                                 similarity=strength, reason=reason))
+    return candidates
+
+
+def _preview_cached_vectors(names: list[str]) -> dict[str, list[float]]:
+    """预览通过 SQLite 只读连接复用已有缓存，不执行建表或写入。"""
+    path = repository.db_path().resolve()
+    if not path.is_file():
+        return {}
+    hashes = {vector_cache.text_hash(name): name for name in names}
+    found: dict[str, list[float]] = {}
+    model = embedding_model()
+    try:
+        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as conn:
+            keys = list(hashes)
+            for start in range(0, len(keys), vector_cache._QUERY_BATCH):
+                window = keys[start:start + vector_cache._QUERY_BATCH]
+                marks = ",".join("?" * len(window))
+                rows = conn.execute(
+                    f"SELECT text_hash, dim, vector FROM {vector_cache.VECTOR_TABLE} "
+                    f"WHERE model = ? AND text_hash IN ({marks})",
+                    (model, *window),
+                )
+                for hash_value, dim, blob in rows:
+                    vector = vector_cache.unpack(blob, dim)
+                    if vector:
+                        found[hashes[hash_value]] = vector
+    except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
+        logger.info("预览向量缓存不可读，将重新计算：%s", type(exc).__name__)
+        return {}
+    return found
+
+
+def _name_vectors(
+    names: list[str], *, read_only: bool = False, allow_partial: bool = False,
+    progress: Callable[[str], None] | None = None,
+) -> dict[str, list[float]]:
     """名字 → 单位向量。缓存优先，缺失的合成一次 `embed_texts`。
 
     缓存键用现成的 `vector_cache.text_hash`（与块向量同一张表、同一个模型维度）：
     一次消解要跑几百个名字，隔天再跑一遍不该重新烧额度。名字和块文本共用一个
     缓存表没有副作用——同一段文本在任何上下文里的向量本来就该一样。
 
-    分批在 `embed_texts` 里做（`MAX_BATCH = 25`），这里不再切一遍：两处各有一套
-    批大小，迟早分叉成"一片 25 条、一片 40 条"。
+    默认模式把分批交给 `embed_texts`。预览模式使用同一个 `MAX_BATCH` 分批调用，
+    以便在批次之间检查取消，并在向量服务不可用时及时停止后续请求。
 
     返回的字典里只放拿到了向量的名字。缺席**只影响余弦那一路**：子串判定是纯结构的，
     没有向量的名字照样能凭它合并（模块 docstring 的「不合并的边界」）。
     """
+    if read_only:
+        # 不创建或更新缓存表；部分失败不能伪装成完整比较过的空结果。
+        vectors = _preview_cached_vectors(names)
+        missing = [name for name in names if name not in vectors]
+        if not missing:
+            return vectors
+        for start in range(0, len(missing), EMBEDDING_BATCH):
+            window = missing[start:start + EMBEDDING_BATCH]
+            if progress:
+                progress(f"正在计算实体向量（第 {start + 1}–{start + len(window)} / {len(missing)} 项）")
+            try:
+                fresh = embed_texts(window)
+            except EmbeddingNotConfigured:
+                raise
+            except EmbeddingError:
+                if allow_partial:
+                    break
+                raise
+            if not allow_partial and (len(fresh) != len(window) or any(not vector for vector in fresh)):
+                raise EmbeddingError("部分实体的向量未能生成，请重试")
+            vectors.update({name: vector for name, vector in zip(window, fresh) if vector})
+        return vectors
+
     model = embedding_model()
     hashes = [vector_cache.text_hash(name) for name in names]
     cached = vector_cache.get_vectors(hashes, model)
@@ -542,30 +635,39 @@ def _name_vectors(names: list[str]) -> dict[str, list[float]]:
 
 async def find_merge_candidates(
     *, threshold: float = DEFAULT_THRESHOLD, limit: int = DEFAULT_LIMIT,
+    preview: bool = False, progress: Callable[[str], None] | None = None,
+    warning: Callable[[str], None] | None = None,
 ) -> list[MergeCandidate]:
     """找出"可能是同一个事物"的名字组，按依据强度降序返回。
 
-    流程：取度数最高的 `limit` 个实体名 → 两两判定（子串 / 余弦兜底）→ 并查集聚组
-    → 每组选一个主名。判定的分工见模块 docstring。
+    流程：最多取 `limit` 个实体名 → 两两判定（子串 / 余弦兜底）→ 并查集聚组
+    → 每组选一个主名。默认按度数取；产品预览在同一上限内给最近入图的实体留席位。
+    判定的分工见模块 docstring。
 
-    **没配 embedding 时返回 `[]`，不抛错**：这是"还没配"这个预期状态，不是故障
+    默认模式**没配 embedding 时返回 `[]`，不抛错**：这是"还没配"这个预期状态，不是故障
     （与 `service._vector_scores` 的 `unconfigured` 同一口径）。但**配了却调不通**
     时抛 `EmbeddingError`——两者必须分开：前者返回空是答案，后者返回空会被读成
     "没有可合并的名字"，而实际上一次都没比过。哑失败是这一层要消掉的东西，不能
-    在这里再造一个。
+    在这里再造一个。产品预览模式对未配置抛错；调用失败时保留缓存和构词候选，
+    通过 `warning` 明确报告向量覆盖不足。它使用直接判定的生成树边作为逐对候选。
 
     注意 `threshold` 只作用于**余弦兜底**那一路；子串关系不看它（把 threshold 调到
     1.0，子串对也不会消失）。这是刻意的：`threshold` 是数值判据的闸，不是总闸。
     """
     started = time.perf_counter()
     if not embedding_configured():
+        if preview:
+            raise EmbeddingNotConfigured("未配置向量服务")
         # 一次 HTTP 都不发。子串判定本来不需要向量，但候选生成是"embedding 驱动"的
         # 一条路，没配就整条不起——这条契约从第一版就在，不在这里改。
         logger.info("实体消解跳过：未配置 embedding")
         return []
 
     cap = _clamp_limit(limit)
-    rows = graph_store.entity_degrees(limit=cap)
+    if progress:
+        progress("正在读取图谱实体")
+    rows = (graph_store.entity_degrees(limit=cap, strict=True) if preview else
+            graph_store.entity_degrees(limit=cap))
     names = [name for name, _degree in rows]
     degrees = dict(rows)
     if len(names) < MIN_NAMES:
@@ -573,30 +675,45 @@ async def find_merge_candidates(
         return []
 
     try:
-        vectors = _name_vectors(names)
+        if progress:
+            progress("正在计算实体向量")
+        vectors = (_name_vectors(names, read_only=True, allow_partial=True, progress=progress)
+                   if preview else _name_vectors(names))
     except EmbeddingNotConfigured:
+        if preview:
+            raise
         # 预检与调用之间凭证被清掉：并发下真会发生，仍按"未配置"处理，不是故障。
         logger.info("实体消解跳过：embedding 凭证在调用前消失")
         return []
 
+    if preview and len(vectors) < len(names):
+        logger.warning("实体消解预览降级：%d / %d 个名字有向量", len(vectors), len(names))
+        if warning:
+            warning(f"只有 {len(vectors)} / {len(names)} 个实体有向量；其余仅按构词规则比较，可能漏掉候选。")
+    if progress:
+        progress("正在比较并整理候选")
     edges = _merge_edges(names, vectors, threshold)
-    candidates: list[MergeCandidate] = []
-    for members, strength, reason in _group_pairs(edges):
-        canonical = _pick_canonical(members, degrees)
-        candidates.append(MergeCandidate(
-            canonical=canonical,
-            aliases=[name for name in members if name != canonical],
-            similarity=strength,
-            reason=reason,
-        ))
+    if preview:
+        candidates = _preview_pairs(edges, degrees)
+    else:
+        candidates = []
+        for members, strength, reason in _group_pairs(edges):
+            canonical = _pick_canonical(members, degrees)
+            candidates.append(MergeCandidate(
+                canonical=canonical,
+                aliases=[name for name in members if name != canonical],
+                similarity=strength,
+                reason=reason,
+            ))
 
     logger.info(
-        "实体消解：实体 %d / 有向量 %d / 子串边 %d / 兜底边 %d / 候选组 %d / "
+        "实体消解：实体 %d / 有向量 %d / 子串边 %d / 兜底边 %d / %s %d / "
         "耗时 %dms",
         len(names), len(vectors),
         sum(1 for edge in edges if edge[3] == REASON_SUBSTRING),
         sum(1 for edge in edges if edge[3] == REASON_EMBEDDING),
-        len(candidates), int((time.perf_counter() - started) * 1000),
+        "候选对" if preview else "候选组", len(candidates),
+        int((time.perf_counter() - started) * 1000),
     )
     return candidates
 
@@ -604,8 +721,8 @@ async def find_merge_candidates(
 def _describe(candidates: list[MergeCandidate]) -> list[dict]:
     """候选的可读形态（`resolve_entities` 的返回值用）。强度留四位小数。
 
-    `reason` 一定要出现在这里：dry-run 的全部价值就是让人在落库前看出"这一组是凭
-    子串进的，还是凭余弦兜底进的"——后者应当被更仔细地看。
+    `reason` 一定要出现在这里：dry-run 的价值是让人在落库前看出判定依据。传统模式
+    的值是组内最弱一环；产品预览只列直接判定通过的一对，值对应这一对。
     """
     return [
         {"canonical": candidate.canonical,
@@ -618,18 +735,20 @@ def _describe(candidates: list[MergeCandidate]) -> list[dict]:
 
 async def resolve_entities(
     *, threshold: float = DEFAULT_THRESHOLD, dry_run: bool = True,
+    preview: bool = False, progress: Callable[[str], None] | None = None,
+    warning: Callable[[str], None] | None = None,
 ) -> dict:
     """跑一遍候选生成；（`dry_run=False` 时）把候选落成别名边，返回统计。
 
-    **默认 `dry_run=True`**：合并是破坏性的——一旦落库，`neighbors` 的路径会变，
-    而错合会造出一条有证据、有位置、能通过校验的假路径。所以默认只算不写，调用方
-    先把候选打出来看一眼，确认了再 `dry_run=False` 跑第二遍（第二遍的向量全部命中
-    缓存，不会再花额度）。
+    **默认 `dry_run=True`**：落库后 `neighbors` 的路径会变，错合会造出有证据、有
+    位置、能通过校验的假路径。产品入口先预览，再按预览快照只写用户选中的对；不能
+    预览一批、确认后又重算一批并全部写入。`dry_run=False` 只留给明确要批量写入的
+    调用方。图库不搬原始证据边，可以按名称对删除别名，但已生成的导图不会自动回滚。
 
     返回值的键固定为五个，dry-run 与非 dry-run 同构：
 
       - `dry_run`：这一次到底写没写；
-      - `groups`：候选组数；
+      - `groups`：传统模式的候选组数，产品预览模式的逐对候选数；
       - `aliases`：**真正新建**的别名边数（dry-run 恒为 0）；
       - `skipped`：想写却没写成的对数 = 总对数 - `aliases`。已存在的、成环被拒的、
         两端有名字在库里找不到节点的，都算在这里。
@@ -639,20 +758,24 @@ async def resolve_entities(
     `aliases == 0` 且 `groups > 0` 且非 dry-run，说明这一遍是重跑（边早就在了）——
     幂等，不是失败。
 
-    **产品里没有触发点，而且不该有**：这条编排要 Neo4j + embedding 额度，
-    `dry_run=False` 又是一次不可逆的写。它只有手工/运维这一种跑法（`__all__` 里
-    声明了这一点）。落库之后要改一条猜错的别名，走
+    产品入口以 `preview=True, dry_run=True` 运行，不写向量缓存或别名边，并把候选
+    和出处交给用户逐对确认；它不会以 `dry_run=False` 重算并批量写入。落库之后
+    要改一条猜错的别名，走
     `DELETE /api/knowledge/aliases/{alias}`（`graph_store.delete_alias`），**不要
     重跑这里**——重跑会按同一批阈值把删掉的那条重新猜一遍，而"猜错"正是阈值管不到
     的那部分。
     """
-    candidates = await find_merge_candidates(threshold=threshold)
+    if preview and not dry_run:
+        raise ValueError("产品预览不能直接写入")
+    candidates = (await find_merge_candidates(threshold=threshold, preview=True,
+                                              progress=progress, warning=warning) if preview else
+                  await find_merge_candidates(threshold=threshold))
     listing = _describe(candidates)
     pairs = sum(len(candidate.aliases) for candidate in candidates)
     if dry_run:
         logger.info(
-            "实体消解 dry-run：候选组 %d（子串 %d / 兜底 %d）/ 待写别名 %d（未写库）",
-            len(candidates),
+            "实体消解 dry-run：%s %d（子串 %d / 兜底 %d）/ 待写别名 %d（未写库）",
+            "候选对" if preview else "候选组", len(candidates),
             sum(1 for item in candidates if item.reason == REASON_SUBSTRING),
             sum(1 for item in candidates if item.reason == REASON_EMBEDDING),
             pairs,

@@ -380,6 +380,27 @@ CYPHER_ENTITY_DEGREES = (
     "LIMIT $limit"
 )
 
+# 产品预览给最近入图的名字保留席位：新名字可能孤立，也可能只有一两条关系；
+# 只保留孤立名字仍会把它要匹配的新全称排除在外。按名字汇总与度数查询同口径。
+CYPHER_RECENT_ENTITIES = (
+    f"MATCH (e:{ENTITY_LABEL})\n"
+    f"OPTIONAL MATCH (e)-[r:{EDGE_TYPE}]-()\n"
+    "RETURN e.name AS name, count(r) AS degree, max(e.created_at) AS created_at\n"
+    "ORDER BY created_at DESC, name LIMIT $limit"
+)
+
+# 只回查直接挂在名字上的证据，不能走别名展开：预览必须展示合并前各自的出处。
+CYPHER_ENTITY_EVIDENCE = (
+    "UNWIND $names AS name\n"
+    "CALL { WITH name\n"
+    f"  MATCH (e:{ENTITY_LABEL} {{name: name}})-[r:{EDGE_TYPE}]-()\n"
+    "  RETURN DISTINCT r.source_id AS source_id, r.chunk_start AS start, "
+    "r.chunk_end AS end\n"
+    "  ORDER BY source_id, start, end LIMIT 8\n"
+    "}\n"
+    "RETURN name, source_id, start, end ORDER BY name, source_id, start, end"
+)
+
 CYPHER_COUNT_ENTITIES = f"MATCH (e:{ENTITY_LABEL}) RETURN count(e) AS n"
 CYPHER_COUNT_EDGES = f"MATCH ()-[r:{EDGE_TYPE}]->() RETURN count(r) AS n"
 # 孤立实体：一条 `REL` 都没挂的节点。**只看 `REL`，不看任何关系类型**——别名边
@@ -412,6 +433,10 @@ class GraphStoreError(OSError):
 
 class GraphStoreNotConfigured(GraphStoreError):
     """没配 `MINDMAP_NEO4J_PASSWORD`。写接口抛它，读接口当作"什么都没查到"。"""
+
+
+class AliasSnapshotConflict(ValueError):
+    """别名表与用户确认的预览不一致。"""
 
 
 @dataclass(frozen=True)
@@ -651,11 +676,12 @@ def _ensure_constraint(driver: Driver, database: str) -> None:
     _CONSTRAINT_READY = True
 
 
-def _driver() -> Driver:
+def _driver(*, initialize_schema: bool = True) -> Driver:
     """惰性建池。没配密码就抛 `GraphStoreNotConfigured`，连不上由 driver 抛。
 
     约束的创建也在这把锁里：它只在第一次建池时真发语句（之后被 `_CONSTRAINT_READY`
-    挡住），而放在锁外会让并发的首批请求各发一遍 `CREATE CONSTRAINT`。
+    挡住），而放在锁外会让并发的首批请求各发一遍 `CREATE CONSTRAINT`。只读预览显式
+    不初始化约束；后续写入仍会按正常路径确保约束。
     """
     global _DRIVER
     uri, user, password, database = _config()
@@ -678,7 +704,8 @@ def _driver() -> Driver:
                 notifications_disabled_classifications=["DEPRECATION"],
             )
         driver = _DRIVER
-        _ensure_constraint(driver, database)
+        if initialize_schema:
+            _ensure_constraint(driver, database)
     return driver
 
 
@@ -707,7 +734,7 @@ def close_driver() -> None:
 
 
 @contextmanager
-def _session(read_only: bool = False) -> Iterator[Any]:
+def _session(read_only: bool = False, *, initialize_schema: bool = True) -> Iterator[Any]:
     """一个 session（= 一条连接 + 一个 database）。异常折成 `GraphStoreError`。
 
     `read_only` 只在集群里真正起作用（读请求可以被路由到 follower），单机 bolt
@@ -720,7 +747,7 @@ def _session(read_only: bool = False) -> Iterator[Any]:
     两个名字一起写还有一个好处：driver 5.x 里 `DriverError` 是 `Neo4jError` 的子
     类，这套写法跨两个大版本都成立，`requirements.txt` 的范围才有意义。
     """
-    driver = _driver()
+    driver = _driver() if initialize_schema else _driver(initialize_schema=False)
     _, _, _, database = _config()
     mode = _READ if read_only else _WRITE
     try:
@@ -740,7 +767,7 @@ def _session(read_only: bool = False) -> Iterator[Any]:
 
 
 @contextmanager
-def _transaction(read_only: bool = False) -> Iterator[Any]:
+def _transaction(read_only: bool = False, *, initialize_schema: bool = True) -> Iterator[Any]:
     """一个事务：整块要么全成功要么全失败。
 
     `with session.begin_transaction(...)` 正常退出时提交、异常时回滚，所以
@@ -750,7 +777,9 @@ def _transaction(read_only: bool = False) -> Iterator[Any]:
     事务超时设在服务端（`timeout=`），所以整批 `UNWIND` 也受 `QUERY_TIMEOUT_SECONDS`
     约束：一次稠密图上的失控游走不会把请求挂到天荒地老。
     """
-    with _session(read_only) as session:
+    session_context = (_session(read_only) if initialize_schema else
+                       _session(read_only, initialize_schema=False))
+    with session_context as session:
         with session.begin_transaction(timeout=QUERY_TIMEOUT_SECONDS) as transaction:
             yield transaction
 
@@ -977,7 +1006,7 @@ def add_edges_bulk(edges: list[EdgeInput]) -> int:
     return int(summary.counters.relationships_created)
 
 
-def entity_degrees(*, limit: int = 500) -> list[tuple[str, int]]:
+def entity_degrees(*, limit: int = 500, strict: bool = False) -> list[tuple[str, int]]:
     """按边数降序返回前 `limit` 个 `(实体名, 边数)`。`graph_resolve` 的候选源。
 
     **为什么按边数排序**：边少的实体合并价值低——一个只出现过一次、挂着一条边的
@@ -988,16 +1017,53 @@ def entity_degrees(*, limit: int = 500) -> list[tuple[str, int]]:
     别名模型是名字级的，按 `(name, type)` 拆开会让同一个名字拿到两个不同的度数，
     而"该选谁当主名"只该有一个答案。
 
-    读不到库（没配密码 / 连不上 / 超时）时返回 `[]`，与其他读接口一致。
+    默认读不到库（没配密码 / 连不上 / 超时）时返回 `[]`。产品预览传 `strict=True`：
+    失败时抛出，并在同样的总上限内给最近入图的实体保留最多五分之一的席位。
     """
     cap = max(int(limit), 1)
     try:
-        with _transaction(read_only=True) as transaction:
+        context = (_transaction(read_only=True, initialize_schema=False) if strict else
+                   _transaction(read_only=True))
+        with context as transaction:
             records = list(transaction.run(CYPHER_ENTITY_DEGREES, {"limit": cap}))
+            if strict:
+                recent = list(transaction.run(
+                    CYPHER_RECENT_ENTITIES, {"limit": max(1, cap // 5)}))
     except (GraphStoreError, OSError) as exc:
+        if strict:
+            raise
         logger.warning("图谱实体度数不可用：%s", type(exc).__name__)
         return []
-    return [(str(record["name"]), int(record["degree"])) for record in records]
+    ranked = [(str(record["name"]), int(record["degree"])) for record in records]
+    if not strict:
+        return ranked
+    recent_rows = [(str(record["name"]), int(record["degree"])) for record in recent]
+    recent_names = {name for name, _ in recent_rows}
+    return ([item for item in ranked if item[0] not in recent_names][
+        :cap - len(recent_rows)] + recent_rows)
+
+
+def entity_evidence(names: list[str]) -> dict[str, list[tuple[str, int, int]]]:
+    """读取每个名字自身的证据坐标；失败抛出，不能冒充没有出处。"""
+    if not names:
+        return {}
+    with _transaction(read_only=True, initialize_schema=False) as transaction:
+        records = list(transaction.run(CYPHER_ENTITY_EVIDENCE, {"names": names}))
+    found: dict[str, list[tuple[str, int, int]]] = {}
+    for record in records:
+        if record["source_id"] is None or record["start"] is None or record["end"] is None:
+            continue
+        found.setdefault(str(record["name"]), []).append(
+            (str(record["source_id"]), int(record["start"]), int(record["end"]))
+        )
+    return found
+
+
+def alias_snapshot() -> list[tuple[str, str]]:
+    """严格读取全部别名边，包括同名不同类型产生的重复行。"""
+    with _transaction(read_only=True, initialize_schema=False) as transaction:
+        return [(str(row["alias"]), str(row["canonical"]))
+                for row in transaction.run(CYPHER_LOAD_ALIASES)]
 
 
 def _load_alias_map(transaction: Any) -> dict[str, str]:
@@ -1074,7 +1140,10 @@ def resolve(name: str) -> str:
     return _resolve_in(alias_map, entity)
 
 
-def add_aliases(candidates: list[MergeCandidate], *, source: str = "embedding") -> int:
+def add_aliases(
+    candidates: list[MergeCandidate], *, source: str = "embedding",
+    expected_aliases: list[tuple[str, str]] | None = None,
+) -> int:
     """把候选落成别名边，返回**真正新建**的条数。
 
     幂等：同一对重复写只留一条（`MERGE` 只认两端）。三件写前拒绝的事，都不抛错：
@@ -1113,6 +1182,11 @@ def add_aliases(candidates: list[MergeCandidate], *, source: str = "embedding") 
 
     now = _now()
     with _transaction() as transaction:
+        if expected_aliases is not None:
+            current = [(str(row["alias"]), str(row["canonical"]))
+                       for row in transaction.run(CYPHER_LOAD_ALIASES)]
+            if current != expected_aliases:
+                raise AliasSnapshotConflict("别名表已变化，请重新预览")
         alias_map = _load_alias_map(transaction)
         known = _load_candidates(
             transaction, sorted({name for pair in pairs for name in pair[:2]}))
@@ -1168,9 +1242,8 @@ class AliasEdge:
 def list_aliases(*, limit: int = 500) -> list[AliasEdge]:
     """列出库里现存的别名边，按 `(别名, 主名)` 排序。
 
-    **为什么需要读接口**：别名是推断产物，写入它的只有实体消解（`graph_resolve`），
-    而那条路的默认行为是"算出来就落库"。没有一份可读的清单时，用户连"模型把这两个
-    名字当成同一个东西了"都无从知道，更谈不上删掉错的那条。
+    **为什么需要读接口**：别名是推断产物，没有一份可读的清单时，用户连"这两个
+    名字被当成同一个东西了"都无从知道，更谈不上删掉错的那条。
 
     `limit` 只是封顶（默认 500 条，一次别名清理不会涉及更多）；读不到库时返回 `[]`，
     与 `entity_degrees` / `stats` 的降级口径一致——"图没配"与"没有别名"在这一层
