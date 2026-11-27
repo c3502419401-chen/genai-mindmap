@@ -1430,7 +1430,8 @@ const agentHasDetail = computed(() => agentDetailVisible(store));
           </details>
 
           <!--
-            结构检查（`/optimization/check` + `/suggest`）：诊断逐条 + 候选建议。
+            检查与建议（手动那一下打 `/optimization/suggest`，它内含 `/check`）：诊断逐条 +
+            候选建议。这里只是它的**常驻位置**，文案与判据都在 `StructureCheck.vue` 里。
 
             **放在右抽屉里，不给它自己的浮层**。上一轮刚解决的是"诊断/建议不许挡住
             画布"：抽屉是覆盖式的（`absolute` 挂在 `<main>` 上，不参与主区 flex），
@@ -2003,15 +2004,21 @@ const agentHasDetail = computed(() => agentDetailVisible(store));
               <!--
                 删除单独一个按钮：它是"传错了材料"唯一的出口。被引用时先弹一次确认
                 （正文是证据的最终依据，删掉不可逆），未引用则直接删。
+
+                **文案带宾语**（「删除材料」而不是「删除」）：这个抽屉里同时还有别名行的
+                删除，左边的历史抽屉里还有导图的删除——三个按钮都只写「删除」时，读屏
+                与按文本定位的工具只能靠"第几个"来区分，而文档顺序是会变的。
               -->
               <button
                 type="button"
+                data-test="library-source-delete"
                 class="mt-0.5 shrink-0 rounded px-1.5 py-0.5 text-[11px] text-rose-600 hover:bg-rose-50 hover:text-rose-800 disabled:opacity-50"
                 :disabled="libraryDeleting === entry.source_id"
                 :title="entry.cited_by > 0 ? `被 ${entry.cited_by} 张导图引用：删除前会让你确认` : '这份材料还没有被任何导图引用'"
+                :aria-label="`删除材料「${entry.filename || '未命名材料'}」（不可恢复）`"
                 @click="removeLibrarySource(entry)"
               >
-                {{ libraryDeleting === entry.source_id ? '删除中…' : '删除' }}
+                {{ libraryDeleting === entry.source_id ? '删除中…' : '删除材料' }}
               </button>
             </li>
           </ul>
@@ -2063,11 +2070,13 @@ const agentHasDetail = computed(() => agentDetailVisible(store));
                     </span>
                     <button
                       type="button"
+                      data-test="alias-delete"
                       class="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-rose-600 hover:bg-rose-50 hover:text-rose-800 disabled:opacity-50"
                       :disabled="aliasDeleting === aliasKey(edge)"
+                      :aria-label="`删除别名 ${edge.alias} → ${edge.canonical}`"
                       @click="removeAlias(edge)"
                     >
-                      {{ aliasDeleting === aliasKey(edge) ? '删除中…' : '删除' }}
+                      {{ aliasDeleting === aliasKey(edge) ? '删除中…' : '删除别名' }}
                     </button>
                   </li>
                 </ul>
@@ -2202,11 +2211,11 @@ const agentHasDetail = computed(() => agentDetailVisible(store));
                   type="button"
                   data-test="map-delete"
                   class="shrink-0 rounded-md px-2 py-1 text-xs text-slate-400 hover:text-rose-600"
-                  :title="`彻底删除「${item.content.title}」（不可恢复）`"
-                  :aria-label="`彻底删除 ${item.content.title}`"
+                  :title="`彻底删除导图「${item.content.title}」（不可恢复）`"
+                  :aria-label="`彻底删除导图「${item.content.title}」（不可恢复）`"
                   @click="pendingDeleteId = item.id"
                 >
-                  删除
+                  删除导图
                 </button>
               </template>
             </div>

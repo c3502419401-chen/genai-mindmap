@@ -551,11 +551,16 @@ watch(() => store.generatedSummary, (now, before) => {
 });
 
 /**
- * 「检查结构」按钮：手动跑一次 `check` + `suggest`，**带上材料**。
+ * 「检查与建议」按钮：手动跑一次 `/optimization/suggest`，**带上材料**。
  *
- * 只有这条路径带 sources：后端拿到原文才会跑第三层引用核验（"点引用跳回原文"的依据
- * 就是它），而材料全文可能上万字——用户没点的时候不该发这么大的请求体。自动那次
- * 不带，只做结构三件套。
+ * 打的**只有** suggest 一个接口，不是 check + suggest 两个：后端的 `SuggestResponse`
+ * 里就带着 `diagnostics = check(content, sources)`，再补一次 `/check` 是同一份结论
+ * 算两遍。按钮以前叫「检查结构」，那是**低报**了它换回来的东西——一次请求同时给
+ * 结构问题、修改建议、补关系、以及第三层引用核验。
+ *
+ * 只有这条路径带 sources：后端拿到原文才会跑引用核验（"点引用跳回原文"的依据就是
+ * 它），而材料全文可能上万字——用户没点的时候不该发这么大的请求体。自动那次不带，
+ * 只做结构三件套。
  */
 function runStructureCheck(): void {
   structure.runFull(sources.readySources);
@@ -962,10 +967,15 @@ function openMaterial(): void {
  *
  * 收起之后"这次带了几份"必须还看得见——缩略块本来就在，但一个 132px 宽的块在横向
  * 滚动区里只能露出一个半，数不出总数；而这个数决定"要不要再补一份"。
+ *
+ * **空状态也用它，但不说"· 0 份"**：那一行是"材料能怎么给"唯一的常驻入口，而
+ * 「管理材料 · 0 份」读起来像一个点了没反应的空容器。第一眼要回答的是"材料从哪来"，
+ * 所以空的时候它就叫「添加材料」，点开就是粘贴框 / 上传 / 录音三件东西。
  */
-const materialEntryLabel = computed(
-  () => `${materialOpen.value ? '收起材料' : '管理材料'} · ${sources.items.length} 份`,
-);
+const materialEntryLabel = computed(() => {
+  if (!sources.items.length) return materialOpen.value ? '收起材料' : '添加材料';
+  return `${materialOpen.value ? '收起材料' : '管理材料'} · ${sources.items.length} 份`;
+});
 
 function toggleMaterial(): void {
   if (materialOpen.value) closeMaterial();
@@ -1094,12 +1104,19 @@ defineExpose({
 
              「管理材料」放在滚动区**外面**（不是当成最后一个缩略块）：它是个常驻
              入口，材料一多就被推出视野、得先滚到底才点得到，等于没有。
+
+             **这一行不再要求"已经有材料"**。以前整行挂在 `v-if="sources.items.length"`
+             上，于是第一次来的人只看得到一个 `+` 图标（含义只在 title 里），"材料能
+             怎么给"——粘贴正文 / 上传文件 / 录音——一个字都没出现在屏幕上。空状态现在
+             也有一个词：「添加材料」。面板仍然默认收起（理由见 `materialOpen`），
+             变的只是入口在不在。
         -->
         <div
-          v-if="sources.items.length"
           class="flex items-center gap-2 border-b border-slate-100 pr-3"
+          :class="sources.items.length ? '' : 'pl-3'"
         >
           <div
+            v-if="sources.items.length"
             data-test="thumbs"
             class="flex min-w-0 flex-1 flex-nowrap gap-2 overflow-x-auto overflow-y-hidden px-3 py-2"
           >
@@ -1331,7 +1348,12 @@ defineExpose({
               智能搜索
             </label>
             <!--
-              「检查结构」：手动跑一次 `/optimization/check` + `/suggest`。
+              「检查与建议」：手动跑一次 `/optimization/suggest`（它内部就调 `check`，
+              响应对里带 `diagnostics`，所以不需要再打一遍 `/check`）。
+
+              名字与返回值对齐：它给回来的**不只是结构问题**——还有 dedupe / expand 那
+              几类建议、补关系那一层，以及带上材料之后的引用核验。叫「检查结构」是低报，
+              用户会以为点了只得到"结构对不对"。
 
               自动那次（生成落地之后）只跑 check、不带材料；这里**带上材料**，所以后端
               会连第三层引用核验一起做——那是"点引用能跳回原文"的依据。
@@ -1351,9 +1373,9 @@ defineExpose({
               :disabled="runBlocked || structure.busy"
               :title="structureAlert > 0
                 ? `这张图有 ${structureAlert} 处值得看一眼；打开右侧逐条看`
-                : '检查这张图的结构：单子节点、深度上限、同级重名、引用能否核验。只读，不改任何东西。'"
+                : '检查这张图并给出建议：结构问题（单子节点 / 深度上限 / 同级重名）、修改建议、以及引用能否核验。只读，不改任何东西。'"
               @click="runStructureCheck"
-            >{{ structure.busy ? '检查中…' : structureAlert > 0 ? `检查 · ${structureAlert}` : '检查' }}</button>
+            >{{ structure.busy ? '检查中…' : structureAlert > 0 ? `检查与建议 · ${structureAlert}` : '检查与建议' }}</button>
             <p class="order-4 min-w-0 flex-1 truncate text-right leading-tight text-slate-400" data-test="external-search-hint">
               {{ externalSearchHint }}
             </p>

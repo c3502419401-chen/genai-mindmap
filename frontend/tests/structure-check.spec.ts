@@ -527,6 +527,52 @@ describe('抽屉里的那块面板', () => {
   });
 });
 
+// ---------------------------------------------------------------- 名字与请求
+//
+// 「界面上叫什么」与「实际打什么」必须对得上。这一条是**判定的钉子**，不是回归：
+// 手动那一下打的只有 `/optimization/suggest`，而它的响应对里本来就带
+// `diagnostics = check(content, sources)`。所以按钮叫「检查结构」是**低报**——用户
+// 点完看到的是问题 + 建议 + 补关系 + 引用核验，名字只说了第一样。改叫「检查与建议」。
+
+describe('入口文案与实际请求对得上', () => {
+  it('「检查与建议」只打一次 /suggest，不再补一次 /check', async () => {
+    const hits = stubFetch({
+      check: [DUPLICATE],
+      suggest: { suggestions: [DEDUPE], diagnostics: [DUPLICATE] },
+    });
+    const wrapper = mountApp();
+    useMindMapStore().preview(structuredClone(TREE), 'right');
+    await flushPromises();
+
+    const entry = wrapper.get('[data-test="structure-check-run"]');
+    expect(entry.text()).toBe('检查与建议');
+
+    await entry.trigger('click');
+    await flushPromises();
+
+    expect(hits.suggest).toBe(1);
+    // 这一条是那个判定的可执行版本：suggest 的响应里已经带着 check 的结论，
+    // 再打一次 `/check` 等于同一份东西算两遍（带材料时还要多传一遍全文）。
+    expect(hits.check).toBe(0);
+    // 而且那份结论真的落到了面板上——否则"只发一个请求"可以靠"什么都没做"通过。
+    expect(wrapper.find('[data-test="suggestion-apply"]').exists()).toBe(true);
+    expect(wrapper.get('[data-test="structure-summary"]').text()).toContain('1 条建议');
+  });
+
+  it('两个入口同一个名字：侧栏那块面板的标题也读「检查与建议」', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    useMindMapStore().preview(structuredClone(TREE), 'right');
+    await flushPromises();
+
+    const panel = wrapper.get('[data-test="structure-check"]');
+    expect(panel.attributes('aria-label')).toBe('检查与建议');
+    expect(wrapper.get('[data-test="structure-run"]').text()).toBe('检查与建议');
+    // 说明里写的也是这个名字：抄错一次，用户就会去找一个不存在的按钮。
+    expect(wrapper.get('[data-test="structure-empty"]').text()).toContain('点「检查与建议」');
+  });
+});
+
 // ---------------------------------------------------------------- 自动那一趟
 
 describe('生成落地之后自动跑一次检查', () => {

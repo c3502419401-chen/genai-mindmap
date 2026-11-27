@@ -1,4 +1,4 @@
-import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
+﻿import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
 import { createPinia } from 'pinia';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -877,9 +877,15 @@ describe('知识库入口', () => {
     return fetchMock;
   }
 
-  /** 列表里那个"删除"按钮（不是别名区的，也不是"清空全部"）。 */
+  /**
+   * 材料行那个删除按钮。
+   *
+   * 按 `data-test` 而不是按文本「删除」：同一个抽屉里还有别名行的删除，左边的历史
+   * 抽屉里还有导图的删除。三个都叫「删除」时这条用例只能靠"第一个匹配"站住，而
+   * 文档顺序不是契约（见 `delete-actions.spec.ts`）。
+   */
   function deleteButton(wrapper: VueWrapper) {
-    return wrapper.findAll('button').find(node => node.text() === '删除');
+    return wrapper.find('[data-test="library-source-delete"]');
   }
 
   it('删未被引用的材料：不问直接删，删完刷新列表并说明结果', async () => {
@@ -977,6 +983,14 @@ describe('实体别名入口', () => {
       if (url.endsWith('/health')) {
         return { ok: true, status: 200, json: async () => ({ status: 'ok', version: 'dev' }) } as unknown as Response;
       }
+      if (init?.method === 'DELETE' && url.endsWith('/knowledge/aliases')) {
+        // 清空整表：与"删一条"（下面那一支）是两个不同的端点，回执形状也不同
+        // （`AliasClearance` 只有 `deleted` 一个字段，没有"哪一条"）。
+        return {
+          ok: true, status: 200,
+          json: async () => ({ deleted: items.length }),
+        } as unknown as Response;
+      }
       if (init?.method === 'DELETE' && url.includes('/knowledge/aliases/')) {
         return {
           ok: true, status: 200,
@@ -1018,7 +1032,10 @@ describe('实体别名入口', () => {
     expect(wrapper.text()).toContain('找出可合并的实体');
     expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/aliases/candidates'))).toBe(false);
 
-    const remove = wrapper.findAll('button').filter(node => node.text() === '删除').pop();
+    // 按 `data-test` 定位而不是按文本「删除」：那个抽屉里同时有材料行的删除与别名行的
+    // 删除，两个都曾只写「删除」，只能靠"第几个"区分——而那正是缺陷本身（见
+    // `delete-actions.spec.ts`）。
+    const remove = wrapper.get('[data-test="alias-delete"]');
     await remove!.trigger('click');
     await vi.waitFor(() => expect(wrapper.text()).toContain('已删掉'));
     const del = fetchMock.mock.calls.find(

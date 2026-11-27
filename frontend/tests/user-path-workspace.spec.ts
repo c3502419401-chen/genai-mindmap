@@ -51,11 +51,13 @@ const ACTIONS: ActionPoint[] = [
   { name: '看上下文', where: '引用原文抽屉', locator: { selector: '[data-test="ref-context-toggle"]' } },
   { name: '跳原文', where: '引用原文抽屉（外部来源）', locator: { selector: '[data-test="ref-drawer"] a[target="_blank"]' } },
 
-  // 知识库（面板是 `aside[role=dialog]`；左抽屉还开着时它外面还有一个同名的「删除」）
+  // 知识库（面板是 `aside[role=dialog]`）。两个删除各带一个 `data-test`：它们曾经
+  // 都只写「删除」，而左边的历史抽屉里还有第三个同名按钮——按文本来定位只能靠
+  // "第几个"，文档顺序一变就悄悄点到别的动作上（缺陷与修法见 `delete-actions.spec.ts`）。
   { name: '知识库列表', where: '历史抽屉「知识库」', locator: { text: '知识库' } },
-  { name: '删除材料', where: '知识库抽屉（材料行）', locator: { text: '删除', scope: 'aside[role="dialog"]' } },
+  { name: '删除材料', where: '知识库抽屉（材料行）', locator: { selector: '[data-test="library-source-delete"]' } },
   { name: '实体别名清单', where: '知识库抽屉（实体别名）', locator: { text: '查看' } },
-  { name: '删除别名', where: '知识库抽屉（别名行）', locator: { text: '删除', scope: 'aside[role="dialog"]' } },
+  { name: '删除别名', where: '知识库抽屉（别名行）', locator: { selector: '[data-test="alias-delete"]' } },
   {
     name: '找出可合并的实体',
     where: '知识库抽屉（实体别名）',
@@ -63,7 +65,7 @@ const ACTIONS: ActionPoint[] = [
   },
 
   // 检查
-  { name: '检查结构', where: '节点详情侧栏（结构检查）', locator: { selector: '[data-test="structure-run"]' } },
+  { name: '检查与建议', where: '节点详情侧栏（检查与建议）', locator: { selector: '[data-test="structure-run"]' } },
   { name: '一键修复', where: '节点详情侧栏（可自动修复）', locator: { selector: '[data-test="repair-apply"]' } },
   { name: '应用建议', where: '节点详情侧栏（建议）', locator: { selector: '[data-test="suggestion-apply"]' } },
 
@@ -308,9 +310,8 @@ describe('用户路径 · 知识库', () => {
     expect(api.calls.some(call => call.method === 'GET' && call.url.includes('/knowledge/aliases')))
       .toBe(true);
 
-    // 面板里有两个「删除」：材料行一个、别名行一个（两处都没有 data-test 可区分，
-    // 只能按文档顺序取第二个）。
-    await tap(wrapper, act('删除别名'), 1);
+    // 两个删除各有自己的 `data-test`，按文档顺序取第二个的写法已经退休（见该点位的注释）。
+    await tap(wrapper, act('删除别名'));
     await new Promise(resolve => setTimeout(resolve, 0));
     // 别名里的中文会被 `encodeURIComponent` 编码，所以只认路径前缀。
     expect(api.calls.some(call => call.method === 'DELETE'
@@ -323,11 +324,11 @@ describe('用户路径 · 知识库', () => {
 });
 
 describe('用户路径 · 检查', () => {
-  it('检查结构：侧栏有一个「检查结构」，点了把这一轮送出去做体检', async () => {
+  it('检查与建议：侧栏有一个「检查与建议」，点了把这一轮送出去做体检', async () => {
     const { wrapper, api } = await mountPage();
     await openSidePanel(wrapper);
 
-    await tap(wrapper, act('检查结构'));
+    await tap(wrapper, act('检查与建议'));
 
     // 手动路径走的是 `suggest` 而不是 `check`：它要连"建议"与"补关系"一起拿回来
     // （`stores/structure.ts::runFull`），`check` 只服务生成之后那次免费体检。
@@ -347,7 +348,7 @@ describe('用户路径 · 检查', () => {
     });
     const { wrapper } = await mountPage({ api });
     await openSidePanel(wrapper);
-    await tap(wrapper, act('检查结构'));
+    await tap(wrapper, act('检查与建议'));
 
     await tap(wrapper, act('一键修复'));
 
@@ -364,7 +365,7 @@ describe('用户路径 · 检查', () => {
     });
     const { wrapper } = await mountPage({ api });
     await openSidePanel(wrapper);
-    await tap(wrapper, act('检查结构'));
+    await tap(wrapper, act('检查与建议'));
     const store = useMindMapStore();
     const before = store.nodeCount;
 

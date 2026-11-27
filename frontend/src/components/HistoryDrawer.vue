@@ -173,10 +173,10 @@ function onExportChange(event: Event): void {
             type="button"
             data-test="drawer-map-delete"
             class="shrink-0 text-[11px] text-slate-400 hover:text-rose-600"
-            :title="`彻底删除「${item.content?.title ?? '未命名'}」（不可恢复）`"
-            :aria-label="`彻底删除 ${item.content?.title ?? '未命名'}`"
+            :title="`彻底删除导图「${item.content?.title ?? '未命名'}」（不可恢复）`"
+            :aria-label="`彻底删除导图「${item.content?.title ?? '未命名'}」（不可恢复）`"
             @click="pendingDelete = item.id"
-          >删除</button>
+          >删除导图</button>
           <!-- 确认态的说明写在下一行（整行宽度），而不是挤在按钮边上：这句话是
                "删了会失去什么"，读的人正在决定要不要点第二个按钮。 -->
           <p

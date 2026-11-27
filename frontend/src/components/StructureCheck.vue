@@ -129,12 +129,17 @@ const summary = computed(() => {
 /**
  * 按钮文案。
  *
- * 「检查结构」是**唯一**会带材料全文去后端的那条路（第三层引用核验），所以它不是
- * 自动的：材料可能上万字，用户没点的时候不该发。
+ * 「检查与建议」而不是「检查结构」：这条路径打的是 `/optimization/suggest`，而它
+ * 返回的是**三样东西**——结构诊断（`SuggestResponse.diagnostics`，就是 `/check` 的
+ * 那一条）、修改建议（dedupe / expand / add_detail）、补关系那一层，带上材料时还有
+ * 引用核验。叫「检查结构」只说了第一样，用户点完看到建议列表会以为界面多给了东西。
+ *
+ * 它也是**唯一**会带材料全文去后端的那条路，所以不是自动的：材料可能上万字，用户
+ * 没点的时候不该发。
  */
 const runLabel = computed(() => {
   if (check.busy) return '正在检查…';
-  if (check.neverRun) return '检查结构';
+  if (check.neverRun) return '检查与建议';
   if (check.stale) return '图改过了，重新检查';
   return '重新检查';
 });
@@ -217,12 +222,12 @@ function repair(): void {
   <section
     v-if="visible"
     data-test="structure-check"
-    aria-label="结构检查"
+    aria-label="检查与建议"
     class="flex flex-col gap-2 text-xs"
   >
     <div class="flex items-center justify-between gap-2">
       <p class="font-medium text-slate-600">
-        结构检查
+        检查与建议
         <span v-if="check.ran && summary" data-test="structure-summary" class="font-normal text-slate-400">
           · {{ summary }}
         </span>
@@ -237,7 +242,7 @@ function repair(): void {
     </div>
 
     <p v-if="check.neverRun" data-test="structure-empty" class="leading-relaxed text-slate-400">
-      还没检查过。点「检查结构」跑一次：只读，不改任何东西。
+      还没检查过。点「检查与建议」跑一次：结构问题、修改建议、引用能否核验，一次给全。只读，不改任何东西。
     </p>
     <p v-else-if="check.ran && !attention.length && !hints.length && !check.visibleSuggestions.length"
       data-test="structure-clean" class="leading-relaxed text-slate-400">

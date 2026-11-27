@@ -439,6 +439,39 @@ describe('底部对话框的状态机', () => {
 });
 
 describe('材料缩略图', () => {
+  /**
+   * 空状态的入口。
+   *
+   * 以前整行缩略图（连同里面那个「管理材料」）挂在 `v-if="sources.items.length"` 上，
+   * 于是第一次打开的人只看得到一个 `+` 图标——"材料能怎么给"（粘贴正文 / 上传文件 /
+   * 录音）一个字都没出现在屏幕上，只有把鼠标停在 `+` 上才知道。而材料是**可选**的，
+   * 所以这个入口不能只在"已经有材料"之后才存在。
+   *
+   * 这条钉三件事：空状态有一个词（不是「· 0 份」）、它是同一个面板、点开之后词换成
+   * 「收起材料」。
+   */
+  it('空状态也有材料入口：「添加材料」，点开就是粘贴 / 上传 / 录音', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    await flushPromises();
+
+    // 空状态仍然不出缩略图区（一条空横条只是占地方），但入口在。
+    expect(wrapper.find('[data-test="thumbs"]').exists()).toBe(false);
+    const entry = wrapper.get('[data-test="manage-materials"]');
+    expect(entry.text()).toBe('添加材料');
+
+    await entry.trigger('click');
+    await wrapper.vm.$nextTick();
+
+    const panel = wrapper.get('[data-test="material-panel"]');
+    expect(panel.attributes('style') ?? '').not.toContain('display: none');
+    expect(panel.text()).toContain('粘贴材料正文');
+    expect(panel.text()).toContain('添加文件（可多选）');
+    expect(panel.text()).toContain('录音添加来源');
+    // 展开之后同一个按钮变成"收起来"，否则它会指着一个已经打开的面板说"添加"。
+    expect(entry.text()).toBe('收起材料');
+  });
+
   it('一份材料一个缩略块，✕ 就地移除', async () => {
     stubFetch();
     const wrapper = mountApp();

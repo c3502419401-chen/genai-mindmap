@@ -30,7 +30,7 @@ const APPLIERS: Record<string, (nodeId: string) => void> = {
 };
 
 /**
- * 结构检查（`/optimization/check` 与 `/optimization/suggest`）的状态。
+ * 「检查与建议」（`/optimization/check` 与 `/optimization/suggest`）的状态。
  *
  * ## 为什么它是独立的 store，而不是塞进 `useMindMapStore`
  *
@@ -43,7 +43,8 @@ const APPLIERS: Record<string, (nodeId: string) => void> = {
  *
  *  - **自动**：生成落地之后跑一次 `check`，**不带 sources**。它只做结构三件套
  *    （单子节点 / 深度上限 / 同级重名），不落库、不调模型，请求体是那棵树。
- *  - **手动**：用户点「检查结构」时跑 `check` + `suggest`，**带上 sources**。带上之后
+ *  - **手动**：用户点「检查与建议」时跑 `suggest`（它的响应对里就带 `check()` 的
+ *    诊断，所以只打这一个接口），**带上 sources**。带上之后
  *    后端会按原文核验每条引用（第三层），那条链是"点引用能跳回原文"的依据；
  *    代价是请求体里有材料全文，所以它不该在用户没点的时候发生。
  *
@@ -205,7 +206,7 @@ export const useStructureStore = defineStore('structure', () => {
       ran.value = true;
       checkedContent.value = content;
       withSuggestions.value = false;
-      error.value = '结构检查现在只支持思维导图：后端的诊断只遍历树的根节点，鱼骨图与流程图还进不去。';
+      error.value = '检查与建议现在只支持思维导图：后端的诊断只遍历树的根节点，鱼骨图与流程图还进不去。';
       return 'unsupported';
     }
 
@@ -238,7 +239,7 @@ export const useStructureStore = defineStore('structure', () => {
     } catch (caught) {
       if (mine !== token) return 'ok';
       // 体检失败不改任何既有结论：它是一份附加信息，拿不到就当没拿到。
-      error.value = caught instanceof Error ? caught.message : '结构检查没跑成，请重试。';
+      error.value = caught instanceof Error ? caught.message : '检查与建议没跑成，请重试。';
       return 'failed';
     } finally {
       if (mine === token) busy.value = false;
@@ -250,7 +251,7 @@ export const useStructureStore = defineStore('structure', () => {
     void run();
   }
 
-  /** 手动路径：「检查结构」按钮。带上材料，因此第三层引用核验也会跑。 */
+  /** 手动路径：「检查与建议」按钮。一次 `/suggest`（内含诊断）+ 材料，因此第三层引用核验也会跑。 */
   function runFull(sources?: Source[]): void {
     void run({ withSuggest: true, sources });
   }
