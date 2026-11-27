@@ -153,7 +153,7 @@ Invoke-WebRequest -Uri 'http://localhost:5173/api/health' -UseBasicParsing | Sel
 python -m ruff check .                                # ① Lint，CI 钉版本 ruff==0.9.10
 python scripts/check_script_hygiene.py --gate         # ② 探针脚本周边的五档卫生检查
 python scripts/check_doc_claims.py --gate             # ③ 文档断言与代码一致（双向反句表）
-python -m pytest -q                                   # ④ 全量（3435 条 / 153 个文件，2026-11-27 收集数，之后还在涨）
+python -m pytest -q                                   # ④ 全量（规模看最后一行：它会涨，本篇不写死）
 python scripts/acc3/find_unwired.py --gate            # ⑤ "用例测了函数、产品没接上" 的棘轮
 python scripts/export_openapi.py; git diff --exit-code openapi.json   # ⑥ OpenAPI 快照必须无差异
 ```
@@ -162,7 +162,7 @@ python scripts/export_openapi.py; git diff --exit-code openapi.json   # ⑥ Open
 
 ```powershell
 npm run gen:api; git -C .. diff --exit-code frontend/src/api/schema.d.ts   # ① 生成类型必须与提交一致
-npm test                                              # ② 全量 vitest（1462 条 / 93 个文件）
+npm test                                              # ② 全量 vitest（同一个道理：规模看输出，不抄在这里）
 npm run test:cost:gate                                # ③ 用例的成本棘轮（超时上限 vs 满载实测）
 node scripts/find_unwired.mjs --gate                  # ④ 前端同一道零引用棘轮
 npm run build                                         # ⑤ vue-tsc --noEmit && vite build
@@ -215,7 +215,7 @@ backend/app/mindmaps/  SQLite（data/mindmaps.db）+ edit_events 改动账本
 
 ```
 backend/app/
-  main.py              应用装配，11 组路由（43 个路径 / 53 个端点）全挂 /api
+  main.py              应用装配，全部路由全挂 /api（组数 / 路径数 / 端点数见 `backend/openapi.json`，CI ⑥ 钉着它的快照）
   contracts/           数据契约：树 / 流程图 / 鱼骨图三种形状、Node、请求响应、ops、edits（★改这里要通知另一人）
   agent/               AI 代理：工具循环、op 执行器、SSE v2、运行台账 —— 生成与编辑的唯一入口
   generation/          单次模型调用（demo / model）、上下文预算、增量解析、免费档与额度
@@ -230,7 +230,7 @@ backend/app/
   settings/            模型服务的页面内配置（SQLite 单行表，回落环境变量）
   auth/                账号与会话（scrypt 口令、sessions 表、HttpOnly cookie、门禁中间件）
   core/                进程级配置
-  tests/               3435 条用例 / 153 个文件
+  tests/               后端用例（规模现跑：`pytest --collect-only`）
 
 frontend/src/
   App.vue              工作台（画布居中、左材料、右对话与详情）
@@ -241,7 +241,7 @@ frontend/src/
   components/          AgentPanel / HistoryDrawer / EditLedger / AliasResolver / SourceInputs / RecordButton …
   sources/ audio/      输入侧常量与校验、浏览器录音（16kHz WAV）
   demo/ dev/           生产也带的三张预置导图、仅 `npm run dev` 加载的布局示例
-  tests/               1462 条用例 / 93 个文件
+  tests/               前端用例（规模现跑：`npm test`）
 ```
 
 ---
@@ -256,7 +256,7 @@ frontend/src/
 | 样式 | TailwindCSS 4 | — |
 | 网络 | 原生 `fetch` + 直接读 SSE 流 | 非 axios；错误统一 `ApiError` |
 | 校验 | 后端 Pydantic v2；前端 `openapi-typescript` 生成 + 编译期契约断言 | 不引运行期 schema 库（非 Zod） |
-| 后端 | FastAPI + Pydantic v2，单进程 | 11 组路由 / 43 路径 / 53 端点 |
+| 后端 | FastAPI + Pydantic v2，单进程 | 端点数与路径数以 `backend/openapi.json` 为准（CI ⑥ 用 `git diff` 钉着） |
 | 存储 | SQLite 单文件 + 版本号乐观锁 | 不用 PG；`repository.py` 直连 |
 | 检索 | 本机 SQLite 缓存向量 + numpy 余弦矩阵乘（1024 维 `text-embedding-v3`，BM25 混合、RRF 融合） | **不引独立向量库**：同规模实测 Milvus Lite 单次 179 ms、常驻内存 +119 MB、官方不支持 Windows，而本机方案全库 3652 节点单次约 15 ms；复评门槛是历史节点达 50 万条（[OPTIMIZATION-CROSS-MAP.md](docs/OPTIMIZATION-CROSS-MAP.md)） |
 | 图谱 | Neo4j（可选） | 开关默认 0，实测零收益（F14） |
@@ -277,7 +277,9 @@ frontend/src/
 
 ## 功能状态表
 
-**逐条状态以 [docs/FEATURES_AND_OWNERS.md](docs/FEATURES_AND_OWNERS.md) 的 26 项（F01–F26）为准**，那张表每一项都写到"做了哪部分 / 没做哪部分 / 依据在哪个文件"。申报书与实现的 22 项逐条核对（含未实现项、口径修正、复现脚本）在 [docs/PLAN-VS-IMPLEMENTATION.md](docs/PLAN-VS-IMPLEMENTATION.md)。
+**逐条状态以 [docs/FEATURES_AND_OWNERS.md](docs/FEATURES_AND_OWNERS.md) 的 F 编号追踪表为准**（F01 起、每项一个编号，新增功能往后加号，所以这里不写总数），那张表每一项都写到"做了哪部分 / 没做哪部分 / 依据在哪个文件"。申报书与实现的逐条核对（含未实现项、口径修正、复现脚本）在 [docs/PLAN-VS-IMPLEMENTATION.md](docs/PLAN-VS-IMPLEMENTATION.md)。
+
+**这张表只说"做没做"，不说"凭什么做得到、前提是什么"**：边界、前置条件、以及"哪些是这个形态下根本做不到的"的判定在 [docs/SCOPE.md](docs/SCOPE.md)。
 
 粗分三档：
 
@@ -324,7 +326,7 @@ frontend/src/
 
 ## 文档地图
 
-`docs/` 下 90+ 份，分八组。**只想知道"现在是什么状态"读前三份就够了**：`PROJECT-STATUS.md` → `FLOW.md` → `FEATURES_AND_OWNERS.md`。
+`docs/` 下分八组（份数会随提交变，现算：`git ls-files '*.md' | wc -l`）。**只想知道"现在是什么状态"读前三份就够了**：`PROJECT-STATUS.md` → `FLOW.md` → `FEATURES_AND_OWNERS.md`。
 
 | 组 | 先读这些 | 讲什么 |
 |---|---|---|
@@ -340,7 +342,7 @@ frontend/src/
 <!-- claims-ok: create_registers_generate 「读文档的纪律」一节里引用旧说法当反例 -->
 **读文档的一条纪律**：这个仓库的文档写得很细，也因此有"反了"的风险——**说某个东西死了，可能它活着**（`ONE-PATH.md` 说"只剩分片"，实际 `create` 注册的是整树生成）；**说某个东西是桩，可能它已经接了**（知识检索）。凡涉及"已删除 / 仍是桩 / 默认关"的断言，去代码或 `backend/tests/` 里核一次再引用——这三类断言都有自己的钉子用例。
 
-**而这件"核一次"现在有机器在做了**：`python scripts/check_doc_claims.py --gate`（CI 第三步，机制见 [DOC-CLAIMS.md](docs/DOC-CLAIMS.md)）把"文档说的事"与"代码现在做的事"对表——`create` 注册了哪个生成工具、`knowledge/search` 是不是桩、有没有门禁、49 个开关各自默认开还是关、画布有几种朝向。上面那句"去核一次"仍然成立，只是**漏核会红在 CI 上**，而不是等下一轮的人读到时才发现。
+**而这件"核一次"现在有机器在做了**：`python scripts/check_doc_claims.py --gate`（CI 第三步，机制见 [DOC-CLAIMS.md](docs/DOC-CLAIMS.md)）把"文档说的事"与"代码现在做的事"对表——`create` 注册了哪个生成工具、`knowledge/search` 是不是桩、有没有门禁、每个开关各自的默认值（闸门自己数的全量，不是抽验）、画布有几种朝向；它顺带判第四类——**文档里不许写会漂的数**（用例数 / 文件数 / 端点数 / md 份数，理由见 `docs/BACKLOG.md` 第 12 条）。上面那句"去核一次"仍然成立，只是**漏核会红在 CI 上**，而不是等下一轮的人读到时才发现。
 
 ---
 
