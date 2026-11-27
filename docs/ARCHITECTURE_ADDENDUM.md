@@ -118,10 +118,10 @@ data: {"code":"MODEL_TIMEOUT","message":"模型服务请求超时"}
 
 > **本章记的是流水线时代的形态。** `backend/app/pipeline/` 已整包删除（`POST /api/pipeline/generate` 一并删除）；
 > `understand → outline → validate → verify` 里 verify 那一步还活着：结构诊断 `check()` 与语义复核
-> `annotate_nli()` 原先搬进了 `mindmap_generate` 的收尾，那个工具随 `full` 形态一起删除
-> （`docs/ONE-PATH.md`）时它们也跟着没了调用点；现在两者都接在 `_generate_deep` 的收尾
-> （`verify_source_refs` 之后）。下表「现在」列描述的是已删除的那套同步实现，
-> 保留它是为了对照目标形态，不是当前事实。
+> `annotate_nli()` 现在**两条生成路各自跑**——`_generate_deep` 的收尾有（`verify_source_refs` 之后），
+> 2026-11-18 回到一次生成之后 `_generate` 里也有一份（`tools.py` 的 `diagnostics.extend(check(content))`
+> 与 `annotate_nli(...)` 两处调用）。中间那两天它们曾随被删的 `_generate` 一起没有调用点，现在的状态
+> 是"都在"。下表「现在」列描述的是已删除的那套同步实现，保留它是为了对照目标形态，不是当前事实。
 
 现状：生成走 agent 的工具循环——`mindmap_generate_deep` 拆成「骨架 → 按支检索 → 并发展开 → 验收」，每一步的输出由工具自己解析成 `MindMapContent`/`Node`，失败记成工具结果里的诊断而不是抛给调用方。
 

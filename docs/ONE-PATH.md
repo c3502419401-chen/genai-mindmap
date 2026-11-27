@@ -1,5 +1,24 @@
 # 只剩一条生成路：删掉 `full` 形态与整树生成
 
+> **⚠️ 本文写于 2026-11-16。引用前先读这段：结论有一半已被后来的提交推翻。**
+>
+> **被推翻的那一半**：`create` 上注册的生成工具**不是** `mindmap_generate_deep`（分片），
+> 而是 `mindmap_generate`（整树一次成型）。2026-11-18 的 `bc3494e` 把"两条实现、一条注册"
+> 定了下来——`_ALLOWED_BY_INTENT["create"] = ("mindmap_generate",)`，分片改挂在**非产品意图**
+> `create_deep` 下（代码、规格、70 余个用例全部保留，服务"一次响应写不下 200+ 节点"的大图，
+> `service.run` 永远不会把意图解成这个名字）。依据是 `runs` 表里 16 次真实运行 `sources` 全为 0
+> ——分片的核心优势（材料覆盖 30.5% vs 整树 5.1%）需要材料才成立，而代价每次都要付。
+> 取舍与实测见 `docs/ONE-CALL.md`，被 `backend/tests/test_one_path.py` 钉住。
+> 所以下面"新建导图只剩分片这一条路"**只在 2026-11-16 到 11-18 之间成立**；
+> 现在的口径写在 `AGENTS.md` 第 49 行与 `TEAM-GUIDE.md` 第 4 节。
+>
+> **仍然成立的那一半**：`MINDMAP_SOURCE_MODE` 这个形态开关、`full` 的四份提示词、
+> `sources_within_context` 预检、`_material_manifest` 全家确实都删了，`app/` 里没有任何一处
+> 再 `getenv` 它（`test_source_mode_switch_is_gone` 钉着）。回来的整树生成**照旧不吃整份正文**，
+> 它只吃检索命中（`_retrieve_branches`，每支各一次）。
+>
+> 本文其余部分（为什么删、代价、留下的东西、那处自我评估）作为当时的决策记录保留原样。
+
 2026-11-16。这次改动**只做减法**：把 `MINDMAP_SOURCE_MODE=full`（正文整份拼进
 prompt）与整树一次成型的 `mindmap_generate` 一起删除，`create` 意图从此只有一条
 生成路——`rag` 语义的分片生成（`mindmap_generate_deep`）+ 按支检索。

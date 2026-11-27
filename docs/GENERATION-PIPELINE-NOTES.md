@@ -56,8 +56,11 @@
 ### 三、深度被三处压到两级
 
 带材料的新建走 `_generate_deep()` → 骨架 + 按支检索 + 并发展开。**整树一次成型的
-`_generate()` 与其提示词已删除**（`docs/ONE-PATH.md`）：那条路的"一次调用写完整棵树"
-在正文不进 prompt 的前提下覆盖只有 5.1%，而分片按支检索是 30.5%。压深度的三句话
+`_generate()` 当时被删过，但 2026-11-18 又以"骨架 + 每支检索 + 结构 + 只写说明"的接法回来了
+（`bc3494e`，见 `docs/ONE-CALL.md`），现在它是 `create` 唯一注册的那条路**：分片那条路"一次调用
+写完整棵树"在正文不进 prompt 的前提下覆盖只有 5.1%，而分片按支检索是 30.5%——这个数字对比
+仍然成立，它解释的是"为什么整树生成只吃检索命中、不塞整份正文"，不是"整树生成不该存在"。
+压深度的三句话
 （`PLAN_PROMPT` 的骨架规则、`BRANCH_EXPAND_PROMPT` 的"只写一层"、`SUBNODE_EXPAND_PROMPT`
 的路径锚点）仍是现行的三处约束，一处比一处隐蔽：
 
@@ -89,10 +92,13 @@
 
 ### 四、流式挂错了路径（历史记录）
 
-> **这一节描述的问题已经随着整树生成的删除而消失**：`mindmap_generate` 不再存在，
-> `node_grow` 也就只剩分片这一条上报路径（`_generate_deep` → `ask_model` →
-> `_GrowStream`），而分片现在是 `create` 唯一的生成路。下面保留原文，作为"为什么
-> 当初那条路不流式"的存档。
+> **这一节的结论已被推翻，别按它读现状。** 当时（整树生成被删的那两天）这里写的是
+> "`mindmap_generate` 不再存在、`node_grow` 只剩分片一条上报路径、分片是 `create` 唯一的生成路"
+> ——三条都错了。2026-11-18 的 `bc3494e` 让整树生成以另一种接法回来：`create` 只注册
+> `mindmap_generate`，`_GenerateGrowStream`（`tools.py`）也一起回来，`node_grow` 在结构那一次
+> 沿 `on_delta` 照常往上报（实测一次生成 113 帧，见 `docs/LATENCY-BREAKDOWN.md` §二）。
+> 分片仍在但不注册到 `create`。现状口径见 `docs/ONE-CALL.md` 与 `AGENTS.md` 第 49 行；
+> 下面保留原文，作为"为什么当初那条路不流式"的存档。
 
 `node_grow` 帧只在 `_generate_deep` → `ask_model` → `_GrowStream` 这条路上上报。而 `build_registry()` 当时在 `has_sources=True` 时会 `discard("mindmap_generate_deep")`（deep 不读材料，会产出一棵与材料无关的树还以 `ok=true` 返回，移除它是对的）。
 
