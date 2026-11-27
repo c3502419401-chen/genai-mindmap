@@ -440,13 +440,43 @@ def parent_ids(
 ) -> list[tuple[str, str, str | None]]:
     """这张图上"用户把哪个节点放在了哪个父节点下面"的样本：`(kind, node_id, parent_id)`。
 
-    **这是 `parent_id` 这一列唯一的读路径，而它有意不走 HTTP。** `EditEventRow` 是
-    `GET /mindmaps/{id}/edits` 的响应模型，给它加字段就要重导 `openapi.json` 与
-    `schema.d.ts`——那是另一条线正在改的东西。所以这一列先只服务库内的读者
-    （统计、`optimization/link.py` 的候选、`scripts/measure_link_placement.py`），
-    等那些读数证明它有用，再决定要不要进接口。
+    **当前没有任何产品调用方。** 这句写在最前面，因为原来这里是另一句话：那一版说它
+    "服务库内的读者（统计、`optimization/link.py` 的候选、`scripts/measure_link_placement.py`）"
+    ——**那条已经过期了**。查实的引用分布是 `tests=6 / scripts=0`，而 `app` 内只有
+    `repository.py` 的一条注释提到这个名字，`link.py` 从来没有 import 过它。留着过期
+    注释比没有注释更坏：下一个人会以为这一列已经有读者了。
 
-    这不是将就：`node_count` 当初也是先落库、后有统计口径的。
+    ## 为什么当初以为 `link.py` 要读它，而实际上不要
+
+    `link.py` 生成"该挂到谁下面"的候选有两条来源，都不碰这张表：
+
+      - `parent_choices()` 读**当前**这棵树的 `_walk()`。候选父必须来自此刻的树——
+        事件表里那些"曾经当过的父"可能是已经不在的节点；
+      - `history_placements()` 读**其它图**的 `content` 全量遍历（`_walk()`），问的是
+        "别人把这个概念放在哪"。全量树比事件表完整，也更实时。
+
+    事件表这条路径**极度稀疏**：只有"用户手工 add / move 过的节点"才带 `parent_id`，
+    而这份日志跑了几周之后 `add` 一直是 0 条（见 `tests/test_edit_parent.py` 文件头）。
+    接上去等于用一个只覆盖手工动作的样本，替掉 link 现在能读到的全量树——建议质量会
+    变差，不会变好。
+
+    ## 那为什么留着，而不是删掉
+
+    这一列**每次保存都在写**（`parents_of` 从保存那一刻的树上算）。删掉这个函数之后，
+    这一列就只剩"写"和"测试直接查库"两件事，而测试里的直查是手段、不是读者。将来真
+    要接（比如界面按父归组"哪些新节点挂在同一个父下"），得从零重写这段 SQL，而重写时
+    最容易错的是下面那条 `IS NOT NULL` 的口径——它已经踩过一次。
+
+    所以它现在的身份是**这一列唯一的具名读路径**，"零调用方"这件事登记在
+    `docs/EDIT-LOG.md` 第七节，不靠 docstring 提醒。
+
+    ## 接上它需要一次契约变更，本版不做
+
+    `EditEventRow` 是 `GET /mindmaps/{id}/edits` 的响应模型，给它加字段就要重导
+    `openapi.json` 与 `schema.d.ts`。而**界面显示"挂在谁下面"已经有更好的来源**：
+    `move` 事件的 `before` / `after` 存的是父节点**标签**（`"主题 → 风险"`），能直接
+    念出来；`parent_id` 给界面的是 id，还得再查一次树才可读。可读性更差、还要多一条
+    契约变更——等真有"按父归组"这类需求再动。
 
     `kinds` 缺省只取 `add` 与 `move`——它们才是"放置动作"。`update` 的 `parent_id`
     是"改文字那一刻它在谁下面"，回答的是另一个问题（同一列，不同语义的**同一个

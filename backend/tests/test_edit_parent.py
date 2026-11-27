@@ -20,8 +20,9 @@
      静默丢失**，`total` 恒为 0，看着和"没人改过"一模一样。
 
 刻意不测的：`parent_id` 进不进 `GET /edits` 的响应。**它不进**——`EditEventRow` 是
-响应模型，给它加字段就要重导 `openapi.json` 与 `schema.d.ts`，那是另一条线在改的
-东西。这一列现在只服务库内读者（`edits.parent_ids`），等读数证明它有用再说。
+响应模型，给它加字段就要重导 `openapi.json` 与 `schema.d.ts`。这一列目前只有一条库内
+读路径（`edits.parent_ids`），而那一条**零产品调用方**：`link.py` 并不读它（口径见
+那个函数的 docstring，那半句"服务 link.py 的候选"已经改正）。
 """
 from __future__ import annotations
 
