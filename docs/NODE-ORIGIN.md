@@ -1,7 +1,8 @@
 # `origin`：补不补、补成什么
 
-> 这一份只做**判定与设计**，不改契约。`backend/app/contracts/**` 一个字节都没动。
-> 执行单在最后一节，下一位接手的人照它做就行。
+> 前五节是**判定与设计**（写于动手之前，当时 `backend/app/contracts/**` 一个字节都没动）。
+> **第六、七节是执行记录**：字段已经落地，取值、写入口、压链、验收逐条记在下面；
+> §五 那句"没做"因此只对写它的那一刻成立。
 
 ## 〇、这件事是怎么被提出来的
 
@@ -197,3 +198,167 @@ class Node(BaseModel):
   `openapi.json` / `schema.d.ts`。
 - **留给下一轮的一句话**：这件事已经不是"要不要补"，而是"补的时候别只补字段——
   那句话的下一步动作才是它存在的理由"。
+
+## 六、执行记录（`7c51f06` 之后那一轮）
+
+### 6.1 取值集合：三态，**不加** `imported`；`add_node` 记 `manual` 而不是 `generated`
+
+| 取值 | 定义 | 谁写 |
+| --- | --- | --- |
+| `generated` | 走过生成链路（骨架 → 检索 → 提示词 → 逐字核验） | 生成出口统一刷（不分哪条路） |
+| `manual` | **不属于任何一次生成产物**：用户在界面里加的、编辑轮里 agent 的 `add_node` 加的、第三方格式导入的图（这是**定义**，不是"排除完剩下的"） | `add` op 的执行器、前端两个手动入口 |
+| `unknown` | 不知道（这个字段之前保存的旧图） | 缺省，不用写 |
+
+**为什么没有第四个 `imported`**：导入是**通道**，不是作者。我们自己导出的 JSON 里
+带着 `origin`，搬回来应当逐节点不变（`test_import_our_own_export_keeps_every_origin`
+钉着）；第三方格式（FreeMind / OPML / XMind / Markdown / PUML）的文件里根本没有这个
+概念，读出来就是 `unknown`。加一个 `imported` 会让**同一个节点**因为"被搬过一次"而
+改变取值，而那与"它有没有原文可引"完全无关——正是本文件要消灭的那种谎。
+
+**导入的节点算哪一类**：两条路分开，都不是 `imported`。
+- 我们自己导出的 JSON → 照抄文件里的原值（可能是 `generated` / `manual` / `unknown`，
+  导出那张图里是什么，导回来就是什么）；
+- 第三方格式 → `unknown`。**不猜成 `manual`**：那句话（"不来自生成链路"）也许对，
+  但它是我们编的，不是文件说的；而 `unknown` 恰好是真话。
+
+**`add_node` 为什么不是 `generated`**（这一条推翻了设计稿之外的第一直觉"那是模型
+加的"）：判据不是"谁按的按钮"，而是 **§二 那条收益**——这两类的下一步动作不同。
+`add_node` 落下来的节点没有走过骨架、没有检索、没有 `verify_source_refs`，所以
+"补材料再生成一次"对它无效（重新生成一次这个节点根本不会出现）。记成 `generated`
+会让界面端出一句**指向错误动作**的话；记成 `manual`（不属于任何一次生成产物）则那句
+"本来就没有原文可引——不必处理"永远成立。
+
+代价是名字：`manual` 字面上像"人手打的"。这个代价用契约里的**定义**钉住——
+"`manual` = 不属于任何一次生成产物"，判据是"它有没有被某一次生成写出来"，与那个
+按钮是谁按的无关。写成"没有走过生成链路"是排除法，读者会追问"那排除完还剩什么"；
+写成定义就不需要再解释。真正需要区分"人 vs 模型"的场合是账本（`actor: user | agent`，
+带时间），那里已经有了。
+
+### 6.2 写 `origin` 的地方（逐处，漏一处等于没做）
+
+| # | 位置 | 值 | 覆盖什么 | 漏了会怎样 |
+| --- | --- | --- | --- | --- |
+| 1 | `contracts/mindmap.py::Node.origin = "unknown"` | 缺省 | 旧数据零迁移（同 `expandable` 的先例） | 旧图读不进来 |
+| 2 | `agent/tools.py::_stamp_origin` | `generated`（唯一取值，不留参数） | 打标器本体：`shapes.walk_depths` 走遍三种形状的每棵子树 | — |
+| 3 | `agent/tools.py::_shape_output` | `generated` | **`_generate` 的唯一出口** + 检查点快照（`_generate_deep` 中途落的那份） | 三段式生成的树全是 `unknown` |
+| 4 | `agent/tools.py::_generate_deep` 收尾（`_stamp_expandable` 之后） | `generated` | **分片路整棵树** | 见下面的"★" |
+| 5 | `agent/tools.py::_expand` 里的 `Node(...)` | `generated` | 单节点展开新落的那一批（树上原有节点不动） | 展开出来的子节点是 `unknown` |
+| 6 | `agent/ops.py::_apply_add` | `manual` | `add_node` / `update` 之外的**所有** add op：`mindmap_edit`、`add_edge` 的挂点、前端手加经 op 的路 | 编辑轮加的节点是 `unknown`，界面会说"这张图是旧的" |
+| 7 | `importing/model.py::RawNode.origin` + `json_import._raw_node` + `normalize._node` | 文件值 / `unknown` | 六种导入格式，**唯一**的 `RawNode → Node` 转换点 | 往返用例红，或第三方格式被猜成 `manual` |
+| 8 | `optimization/repair.py::_absorb` / `_merge_siblings` | `inner.origin` / `keep.origin` | 压链与合并 | 每次修复都把来历抹成 `unknown`（见 6.3） |
+| 9 | `frontend/src/mindmap/edits.ts::addChildAt` / `addSibling` | `'manual'` | Tab 加子节点 / Enter 加兄弟 / 空白处双击插入（三个界面入口都归结到这两个构造点） | 用户手加的节点保存后是 `unknown` |
+
+**★ 第 4 处是最容易被漏的一处**，因为分片路的节点**不是**自己 `Node(...)` 建的：
+它把候选子树摊成 `add` 草案、交给 `apply_ops` 落树——而 `apply_ops` 是编辑轮的语言，
+把所有 add 出来的节点记成 `manual`（第 6 处）。不刷这一遍，一张每一支都检索过、
+每条引用都逐字核过的图会得到"不来自生成链路，本来就没有原文可引，不必处理"这句
+**劝用户放弃**的话。`test_deep_generation_is_generated_not_manual` 就是钉它的：
+把那行 `_stamp_origin(content)` 删掉，它立刻红。
+
+### 6.3 压链：继承父亲的还是标 `repair`？
+
+**判：继承存活者自己的**（`_absorb` 取 `inner.origin`，`_merge_siblings` 取
+`keep.origin`）。三条理由：
+
+1. **存活下来的是内层**。压链把外层那句标题并进内层，内层的 id / label / 子节点
+   都留着，外层的身份被溶解了。`origin` 问的是"这个节点从哪来"，那就该问存活的
+   这一个。
+2. **"被谁改过"不是 `origin` 的问题**。压链是一次改动，而撤销数据（`RepairUndo`
+   的 `replaced` / `inner`，两者都是全字段的 `NodeFields`）已经把两个节点的来历
+   各存了一份，撤销时逐字段还原——`test_revert_restores_both_origins` 钉着。
+   若在这里写一个 `repair` 值，字段就同时答"来源"与"改动史"两件事，界面还得为它
+   多编一句解释，而那句解释正是本文件要消灭的那种话。
+3. **下一步动作也对**：合并结果若一条引用都没有，按存活者说"生成时没找到出处"
+   或"不来自生成链路"，正好是用户这一刻该做的那件事。
+
+**这一条动了 `optimization/repair.py`**（两处显式构造 `Node` 的函数），执行单原本
+把该文件列为"别碰"。理由是它属于 §二 最后那条（"压链时上层节点的 origin 怎么传"）：
+不写这两行不会有报错，只会有**每一次压链都静默把来历抹成 `unknown`**——界面上看
+起来像"修完之后这张图变旧了"，一句听起来像能力限制的假话。
+`test_collapse_keeps_the_inner_origin_verbatim`（两条分开断言：**保持原值** +
+**不得为 `unknown`**，分别拦"改回继承外层"与"缺省值生效"）与
+`test_collapse_keeps_a_manual_inner_origin_too`（内层是 `manual` 时同样保持原值，
+防止"恰好等于 `generated`"就过）就是这条的正面锁。
+
+### 6.4 验收（§四 第 6 条的五项，各对应哪几条用例）
+
+| 验收项 | 用例 |
+| --- | --- |
+| ① 三种形状生成出来的节点 origin 对不对 | `test_shape_output_stamps_every_node_generated[tree/flowchart/fishbone]`、`test_fishbone_bones_keep_…`、`test_flow_stages_keep_…`、`test_deep_generation_is_generated_not_manual` |
+| ② 手动加一个节点 → `manual` | `test_add_node_tool_writes_manual`、`test_apply_ops_add_is_manual_and_update_cannot_touch_origin`、`frontend/tests/edits.spec.ts::手动加的节点记 origin = manual` |
+| ③ 导入一张图 → ? | `test_import_our_own_export_keeps_every_origin`（照抄）、`test_import_third_party_format_is_unknown`（`unknown`）、`test_import_json_without_origin_is_unknown`、`test_import_rejects_an_origin_outside_the_set` |
+| ④ 老数据读出来 → `unknown`，界面不崩 | `test_old_payload_without_origin_validates_and_round_trips`、`frontend/tests/app.spec.ts::unknown：不替旧图下结论`；**库里那 24 张真图**另用 `backend/scripts/acc3/probe_origin_old_maps.py` 数了一遍：14 棵树 + 9 张流程 + 1 张鱼骨、1172 个节点，`origin` 全是缺省 `unknown`，三种形状都读得进来（无迁移脚本） |
+| ⑤ 压链一次 → 内外层各是什么 | `test_collapse_chain_keeps_the_inner_origin[4 种组合]`、`test_collapse_keeps_the_inner_origin_verbatim`（原值 + 不为缺省）、`test_collapse_keeps_a_manual_inner_origin_too`、`test_revert_restores_both_origins` |
+| 附加：逐字节基线的例外 | `test_edges.py` 与 `test_agent_diagram_type.py` 那两条基线用例各加一处 `origin` 例外，且**例外本身可验证**（基线那棵树不许出现 `generated`，新树必须整棵都是） |
+
+另外两条守"字段不可伪造"：`AddOp` / `UpdateOp` 都是 `extra="forbid"`，模型在草案里
+写 `origin` 会被整批拒掉（`test_apply_ops_add_is_manual_and_update_cannot_touch_origin`
+的后半段）。
+
+### 6.5 界面现在怎么说话（§3.5 那句的落地）
+
+- **单个节点**（`data-test="ref-empty-why"`，三档）：
+  - `generated` →「它是生成时写的：模型没在材料里找到对应句子。补一份材料、或把主题
+    写得更贴原文，再生成一次就可能带上出处。」
+  - `manual` →「它不来自生成链路，本来就没有原文可引——不必处理。」
+  - `unknown` →「它没有来历记录，界面不判断原因。没有引用不代表内容有错——要出处就
+    把材料加进来再生成一次。」
+- **全图**（`citationSummary`）：`refCoverage` 新增 `uncited: {generated, manual, unknown}`，
+  那句话从"一个数 + 一句免责"改成"一个数 + 按来历拆开的计数"，每一段的结尾都是
+  用户能做的事。**"或者"消失了**——能数出来的东西不该并列。
+
+`manual` 那一句**刻意不写"你自己加的"**：编辑轮里模型 `add_node` 加的节点同样是
+`manual`，写成"人加的"会让那句话在一半场合下是假的，而用户无从分辨。要问"谁加的"
+就去改动记录（`actor: user | agent`，带时间），那是另一个问题、另一处答案。
+
+界面说的是白话「它不来自生成链路」，与契约里的定义「不属于任何一次生成产物」是同一
+件事的两种说法：对用户，"不来自生成链路"比"不属于任何一次生成产物"好读；对读码的
+人，定义那句不需要再解释。两处措辞不同，判据只有一条——由 `origin` 的值决定，不由
+界面猜。
+
+`unknown` 那一句**刻意不写"这张图是旧的"**：`unknown` 有三种来源（见 6.6），界面
+分不出是哪种。给它一个认不出的原因，就是把"不知道"又写成了"归因"——而这一轮要
+消灭的正是后者。
+
+### 6.6 已知边界（这一轮明知道了、没做的）
+
+**演示模式的占位内容仍是 `unknown`**（`generation/service.py::_demo_content`，它确实
+造节点，所以 §边界 那句"除非它造节点"适用）。判：**留在 `unknown`**。三个值里没有
+一个精确对应它——不是模型写的（标 `generated` 是撒谎）、不是用户写的（`manual`
+名义上也不对）、但也不是"我们不知道"（我们知道它是占位）。`manual` 这个名字已经
+被"不来自生成链路"撑得很宽，再塞进"服务端占位"就彻底成了"什么都装"的桶；而
+`unknown` 的文案已经改成不归因，界面不会替它编一句"这张图是旧的"。**代价**：
+演示图上那句会显得含糊——那是诚实的含糊。
+
+**`SourceContextDrawer` 那条并列没改**（§七 第 4 条）：同一类形状、改法也就一行
+判断，但它不在本轮的三条判据里。记在清单里，下次动那块面板时一起做。
+
+## 七、"界面替数据模型道歉"的清单
+
+判据不是"有没有'或者'两个字"，而是：**这一句是不是在替一个数据里不存在的区分作解释，
+而它后面跟着的下一步动作又因为那个区分而不同。**
+
+分三类：**A 补数据就能说清**（字段/计数能把它拆开）、**B 数据永远不会有**（当前契约
+下答不了，除非新增持久化）、**C 根本不该在这里问**（这个面板不是答那个问题的地方）。
+`origin` 这一轮修掉的是 1、2 两条；其余按这条判据逐条判，不顺手改。
+
+| # | 位置 | 现在那句 | 判 | 依据与下一步 |
+| --- | --- | --- | --- | --- |
+| 1 | `App.vue` 覆盖率句 | 「…没在材料里找到对应句子，**或者**这个节点是你自己加的」 | **A（已修）** | 就是本轮主体：`origin` 拆成三类计数 |
+| 2 | `App.vue` 节点无引用句 | 同一句的归因那一半 | **A（已修）** | 三档各说各的（见 6.5） |
+| 3 | `App.vue` 展开按钮 hint（`expandable === 'unknown'`） | 「不确定还能不能再拆（**旧图、或**上次是被额度截断的）；可以试一次。」 | **B** | `unknown` 有三种成因：旧图缺字段、被额度截断、这一支压根没被问过（`skipped` / `failed`）。契约只存 `unknown` 这个结果，不存成因；要拆就得把"截断原因"也持久化。**优先级低**：三种成因的下一步动作完全一样（试一次），所以这句并列不误导 |
+| 4 | `SourceContextDrawer` 无正文句 | 「这份来源没有可回查的原文：它**可能**是一次性粘贴的文本，**或者**已被从知识库里清理。」 | **A（该改，本轮未改）** | 两条腿都能从已有数据判：404 走的是 `error` 分支（另有一句），走到这一句说明读到了空正文——那就只有"这份材料在库里的正文是空的"一个原因。句式与第 1 条同源，改法也就一行判断 |
+| 5 | `SourceContextDrawer` 定位不到 | 「这段引文在这份材料的正文里定位不到（逐字比对不上）。摘录仍然保留，但无法高亮原文。」 | **反例（好句子）** | 单一事实 + 说明了后果（不高亮、摘录仍在）。没有替谁解释 |
+| 6 | `EditLedger` 的「这个节点为什么变成这样」 | 面板里**没有这句**，只有 diff | **C** | 账本答的是"改过什么"，"为什么"归诊断面板（`StructureCheck` 的每条诊断都带 message + 依据）。这一条已经在组件 docstring 里写明——它是"把问题指到该去的地方"，不是道歉 |
+| 7 | `StructureCheck` 补关系空列表 | 「补关系这一层这次没有产出。」+ `status.detail` | **反例** | 把"一条建议都没有"与"这一层没跑"分开，靠的是**记录下来的 `linkStatus`**，不是猜测 |
+| 8 | `AliasResolver` 候选行 | 「两个名字**可能**指不同的事物，合并后它们会共用一条查询路径。」 | **B（正确用法）** | 候选的定义就是"不确定"：合并前无法判定同一性，这是数据性质，不是缺字段。下一步动作明确（核对后再合并） |
+| 9 | `ChatDock` / `failures.ts` 的失败文案 | 「…把主题写得像"要一张什么结构的图"，**或者**直接重试一次。」 | **两个动作，不是两个原因** | 并列的是用户可以选的两条路，不是界面在替数据归因；不违反判据 |
+| 10 | `PrefsPanel` 空态 | 「生成时勾「以后都这样」，**或者**在这里加一条备注。」 | 同上 | 两条等价路径，无需拆 |
+| 11 | `App.vue` 节点正文来源小字（`BODY_SOURCE_NOTE`） | 「这个节点没有生成详情，下面是你以前写的备注」/「…下面是标题全文」 | **反例（好句子）** | 回退链（`detail → note → label`）是数据决定的，说清是哪一档即可——本轮 `NO_CITE_NOTE` 的写法就是照它来的 |
+| 12 | `SourceContextDrawer` 过期报告 / `StructureCheck` 过期提示 | 「这份清单说的是修复当时那一棵」 | **反例** | 记的是版本，不是成因 |
+
+**清单本身的结论**：真正属于"替数据模型道歉"的只有 1、2、4 三条，形状完全一样
+——*一句并列 + 一个不存在的字段*。1、2 已经有数据了；4 的数据本来就在手边，
+只是当年写成了并列。3 是唯一"数据永远不会有"的一条，而它恰好无害（三种成因的
+下一步相同），所以它是**这条判据的反面刻度**：并列本身不是罪，**并列而没有不同的
+下一步**才是。
