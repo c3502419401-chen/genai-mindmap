@@ -58,7 +58,8 @@ REVERSE_SAMPLES: dict[str, str] = {
 
 
 def rules() -> list:
-    return list(claims.RULES) + claims._switch_rules(REAL)
+    return (list(claims.RULES) + claims._switch_rules(REAL)
+            + claims._backlog_rules(REAL))
 
 
 def fresh(**overrides):
@@ -305,3 +306,161 @@ def test_the_pattern_and_the_sentence_set_do_not_disagree() -> None:
         forbidden = rule.when_true if rule.holds(REAL) else rule.when_false
         assert rule.pattern is not None and forbidden
         assert re.search(forbidden[0], _violation_text(rule)), rule.name
+
+
+# ---------------------------------------------------------------- 台账
+#
+# `docs/BACKLOG.md` 是"还剩什么事没做"的唯一入口。它自己也要被证伪，否则台账会退化成
+# 一份"状态随便写、反正没人验"的待办快照——那正是它要取代的东西。
+
+
+def _backlog_text() -> str:
+    return (claims.BACKLOG).read_text(encoding="utf-8")
+
+
+def _entry(number: int) -> object:
+    return {entry.number: entry for entry in (REAL.backlog or ())}[number]
+
+
+def test_the_backlog_parses_every_entry_and_its_own_check_is_green() -> None:
+    """结构、编号、四态、判据锚、状态与 probe —— 一条都不能含糊。"""
+    entries = REAL.backlog or ()
+    assert len(entries) >= 8, entries
+    assert [entry.number for entry in entries] == list(range(1, len(entries) + 1))
+    assert all(entry.status in claims.STATUSES for entry in entries)
+    assert claims.check_backlog(REAL) == [], claims.check_backlog(REAL)
+
+
+def test_every_entry_with_a_probe_has_a_reading_and_a_known_name() -> None:
+    """`probe` 非 `none` 的条目必须有读数；名字必须注册过（写错名字会红，不是跳过）。"""
+    for entry in REAL.backlog or ():
+        if entry.probe == "none":
+            assert entry.status in (claims.STATUS_TODO, claims.STATUS_WONT), entry.number
+            continue
+        assert entry.probe in claims.BACKLOG_PROBE_DOC, entry.probe
+        assert entry.probe in REAL.backlog_probes, entry.probe
+        assert entry.status in claims.NEEDS_PROBE, (entry.number, entry.status)
+
+
+def test_a_wrong_status_is_red() -> None:
+    """**把一条"已做"改成"待做"，台账必须红**（这是这台账本存在的理由）。
+
+    两条红都要在：语义层（`check_backlog`）与块内禁句（`_backlog_rules` 的 `when_true`）。
+    只留一条，另一个方向的漂移就没人管。
+    """
+    text = _backlog_text()
+    wrong = re.sub(
+        r"(- \*\*状态\*\*：)已做(\s*\n- \*\*probe\*\*：`branch_arg_deprecated`)",
+        r"\1待做\2", text, count=1)
+    assert wrong != text, "样例失效：第 1 条不是「已做 + branch_arg_deprecated」"
+    entries, problems = claims.parse_backlog(wrong)
+    assert problems == [], problems
+    facts = copy.deepcopy(REAL)
+    facts.backlog = tuple(entries)
+    facts.problems = []
+    hits = claims.check_backlog(facts)
+    assert any("第 1 条" in hit and "已经在代码里" in hit for hit in hits), hits
+
+    rule = {item.name: item for item in claims._backlog_rules(facts)}["backlog:1"]
+    assert rule.holds(facts)
+    lines = wrong.splitlines()[rule.block[0] - 1:rule.block[1]]
+    caught = [line for line in lines if re.search(rule.when_true[0], line)]
+    assert any("状态" in line for line in caught), caught
+
+
+def test_the_backlog_rule_flips_the_forbidden_sentence() -> None:
+    """**代码翻回去，台账开始禁另一套说法**。
+
+    事实为真（`description` 是"已废弃"）→ 禁"待做/该做"；把事实翻成假之后，同一个块里
+    的"已做"必须被抓。这条固化的就是手工验红②，免得下次只能靠人记得去改一遍代码。
+    """
+    rule = {item.name: item for item in claims._backlog_rules(REAL)}["backlog:1"]
+    assert rule.holds(REAL), "本仓 HEAD 上 branches 的 description 应已改成废止"
+    lines = _backlog_text().splitlines()[rule.block[0] - 1:rule.block[1]]
+    assert not [line for line in lines if re.search(rule.when_true[0], line)]
+
+    flipped = copy.deepcopy(REAL)
+    flipped.backlog_probes["branch_arg_deprecated"] = False
+    rules_flipped = {item.name: item for item in claims._backlog_rules(flipped)}
+    assert not rules_flipped["backlog:1"].holds(flipped)
+    assert any(re.search(rule.when_false[0], line) for line in lines), \
+        "代码翻回去之后，台账没有开始禁止「已做」"
+
+
+def test_the_backlog_probes_read_the_file_not_a_constant(tmp_path: Path) -> None:
+    """六条 probe 里最容易被写死的那条：`description` 的文本必须从文件读。"""
+    def build(root: Path, description: str) -> Path:
+        (root / "agent").mkdir(parents=True)
+        (root / "agent" / "tools.py").write_text(
+            'from pydantic import Field\n'
+            'OUTLINE_FEW_BLOCKS_NOTE = "x"\n'
+            'class GenerateArgs:\n'
+            f'    branches: int = Field(default=5, description="{description}")\n',
+            encoding="utf-8")
+        (root / "contracts").mkdir()
+        (root / "contracts" / "mindmap.py").write_text(
+            'def clip_label(text, limit=16):\n'
+            '    return "".join(text[:_clip_index(text, limit)])\n'
+            'def _clip_index(chars, limit):\n'
+            '    return limit\n'
+            'class Node:\n'
+            '    origin: str = "unknown"\n', encoding="utf-8")
+        (root / "knowledge").mkdir()
+        (root / "knowledge" / "router.py").write_text(
+            'from app.knowledge import graph_resolve\n'
+            'def go():\n'
+            '    return graph_resolve.resolve_entities([])\n', encoding="utf-8")
+        (root / "probe.py").write_text("", encoding="utf-8")
+        return root
+
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text('{"x": {"status": "accepted"}}', encoding="utf-8")
+
+    deprecated = build(tmp_path / "a", "已废弃：一级分支条数由内容决定")
+    values, _ = claims.probe_backlog_facts(
+        app_dir=deprecated, baseline=baseline, scripts_dir=tmp_path / "a")
+    assert values["branch_arg_deprecated"] is True
+    assert values["clip_label_retreats"] is True
+    assert values["node_origin_field"] is True
+    assert values["resolve_has_route"] is True
+
+    alive = build(tmp_path / "b", "一级分支数量上限")
+    values, _ = claims.probe_backlog_facts(
+        app_dir=alive, baseline=baseline, scripts_dir=tmp_path / "b")
+    assert values["branch_arg_deprecated"] is False
+
+
+def test_a_missing_anchor_is_reported_as_lost_evidence_not_as_undone() -> None:
+    """判据被删 ≠ 功能没做。两种红必须报不同的话，否则下一轮会把已做的活重做一遍。
+
+    这条也是那个循环问题的答案：**探针读代码事实，锚只看证据在不在**。所以用例被删
+    时报的是「失去判据」。
+    """
+    text = _backlog_text()
+    broken = text.replace(
+        "`backend/tests/test_node_detail.py::test_clip_label_output_never_ends_inside_a_token`",
+        "`backend/tests/test_node_detail.py::test_this_name_does_not_exist`", 1)
+    assert broken != text
+    entries, _ = claims.parse_backlog(broken)
+    facts = copy.deepcopy(REAL)
+    facts.backlog = tuple(entries)
+    hits = claims.check_backlog(facts)
+    assert any("失去判据" in hit for hit in hits), hits
+    # 只有这一条：不能顺手再报一句"状态写错了"——那就把"证据丢了"读成"活没做"。
+    assert len(hits) == 1, hits
+
+
+def test_a_todo_entry_may_point_at_a_gate_that_does_not_exist_yet() -> None:
+    """「待做」的判据是"它做完了会长什么样"，所以锚可以先不在——但「已做」不行。"""
+    assert "scripts/check_doc_map.py" in _backlog_text()
+    todo = [entry for entry in (REAL.backlog or ()) if entry.number == 10]
+    assert todo and todo[0].status == claims.STATUS_TODO
+    assert claims.check_backlog(REAL) == []
+
+
+def test_the_backlog_is_scanned_even_before_git_tracks_it() -> None:
+    """台账是本闸门自己的输入：没被 `git ls-files` 列出时也必须扫，否则块内禁句空转。"""
+    files, problems = claims.doc_files()
+    assert problems == [], problems
+    names = [path.relative_to(claims.REPO_DIR).as_posix() for path in files]
+    assert claims.BACKLOG_RELATIVE in names, names

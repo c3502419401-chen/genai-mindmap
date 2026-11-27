@@ -84,6 +84,41 @@ c 跑 `TestClient` 打一个受保护端点断言 401/403。
 逐条加注释会把文档淹掉，所以按语境（`曾经`/`旧版`/`已删`…）放行——但放行的每一条都会
 在输出里单独列出，可见，不静默。
 
+## 台账：第三类判据（它不是反句表）
+
+`docs/BACKLOG.md` 记的是"还剩什么事没做"。这类文档最容易烂，烂法固定：**状态写在文档里，
+而对不对靠人记**。所以它也被闸门判，判法与前两节不同：
+
+    `parse_backlog` 读**块结构**（每条 `### N. ` 一个块，块里固定字段），`check_backlog` 判语义
+
+**为什么不进反句表。** 反句表是逐行扫、正则是锚点；台账的十二条里"N 处写着待做"这种句子
+在别的条目里可能正是对的，全文扫必然互串。块给了边界，`_backlog_rules` 的 `scope` /
+`block` 两个字段就是把它交回 `scan` 的通道。
+
+**四态**（待做 / 已做 / 半做 / 不做）而不是三态："离线侧确认、真模型侧没跑"压成"已做"
+会让下一轮以为结案，压成"待做"会让已验过的那半重做一遍。
+
+**判据与状态绑定，三种形态**：
+
+    已做/半做   一条钉住该行为的用例，或一道会红的闸门        → 锚必须**现在就在**
+    不做        一个可量阈值，或一条钉住"不做"的用例            → 必须带触发条件
+    待做        它做完了会长什么样（先写判据，再派人做）        → 锚可以**暂时不在**
+
+**那个循环问题怎么解的。** 账本的状态写在 md 里，而"状态对不对"要靠读代码，看起来是
+自指。拆开就不自指了：
+
+  - **状态↔事实**由 `probe` 判，探针只读**代码事实**（`description` 的文本、`Node` 有没有
+    `origin`、`clip_label` 调不调 `_clip_index`），不读 md；
+  - **判据在不在**由 `_anchor_candidates` 判，它只验"那个 `def` / 那个脚本还在不在"；
+  - 两条**报不同的红**。用例被删掉时报的是「**失去判据**」，不是「这件事没做」——
+    把它读成"没做"就是误报，而这个仓库有先例（`test_fold_tree.py` / `test_generate_evidence.py`
+    都是随功能一起删的；反向的"用例删了、功能还在"一次也没有过，所以这条防线是为将来设的）；
+  - **"这一行属于哪一条"**由块边界定，不由正则猜——误报的空间在这里被结构性消掉。
+
+`probe` 为真 ⇔ 这件事已经在代码里，语义只有这一条，不加极性。所以"已做"必须有 probe
+（**没有机器判据的"已做"不许进表**），`probe: none` 的条目只能是待做/不做，它们单列在
+`--facts` 输出里：可判的判到底，判不了的摆出来，不假装。
+
 ## 跑法
 
     cd backend
@@ -125,6 +160,8 @@ OPENAPI = BACKEND_DIR / "openapi.json"
 FRONTEND = REPO_DIR / "frontend"
 DEPLOY = REPO_DIR / "deploy"
 TIDY_TS = FRONTEND / "src" / "canvas" / "layout" / "tidy.ts"
+BACKLOG = REPO_DIR / "docs" / "BACKLOG.md"
+BACKLOG_RELATIVE = "docs/BACKLOG.md"
 
 #: 自己的设计文档不参与扫描：它整篇在**引用**那些错句当例子，扫它等于自指。
 SELF_DOC = "DOC-CLAIMS.md"
@@ -147,6 +184,45 @@ _FALSE_WORDS = {"关", "关闭", "禁用", "不启用", "0", "false", "no", "off
 
 #: 承认的豁免注释。名字与理由都必填。
 _CLAIMS_OK = re.compile(r"<!--\s*claims-ok\s*:\s*([^>]*?)\s*-->")
+
+# ---------------------------------------------------------------- 台账
+#
+# `docs/BACKLOG.md` 是"还剩什么事没做"的唯一入口，它自己也要被闸门判。判法与
+# 反句表不同：台账是**结构**（每条一个块、块里固定字段），所以不靠正则扫行，靠
+# `parse_backlog` 读块。这样"哪一行属于哪一条"没有歧义，也就没有误报的空间。
+
+#: 四态。三态装不下"离线侧确认、真模型侧没跑"，理由见 `docs/BACKLOG.md` §一。
+STATUS_TODO = "待做"
+STATUS_PART = "半做"
+STATUS_DONE = "已做"
+STATUS_WONT = "不做"
+STATUSES = (STATUS_TODO, STATUS_PART, STATUS_DONE, STATUS_WONT)
+#: 这两态必须给"什么时候回来做"。
+NEEDS_TRIGGER = (STATUS_PART, STATUS_WONT)
+#: 这两态必须有 `probe`：**"已做"不许没有机器判据**。
+NEEDS_PROBE = (STATUS_DONE, STATUS_PART)
+#: 判据锚必须**现在就在**的态。`待做` 允许锚先不存在——"先写判据，再派人做"。
+NEEDS_LIVE_ANCHOR = (STATUS_DONE, STATUS_PART, STATUS_WONT)
+
+#: "这件事还没做"的说法。事实为真（已经做了）时，本块里禁这一族。
+BACKLOG_TAKE_BACK = (
+    r"(?:待做|待改|该做|要做|还没做|尚未做|未做|下一轮)",
+)
+#: "这件事已经做完了"的说法。事实为假时，本块里禁这一族。
+BACKLOG_SETTLED = (
+    r"(?:已完成|已做|已落地|已销账|已接上|做完了|已实现)",
+)
+
+_ENTRY_HEAD = re.compile(r"^###\s+(\d+)\.\s+(.+?)\s*$")
+_ENTRY_FIELD = re.compile(
+    r"^-\s+\*\*(状态|probe|判据|出处|触发条件|凭什么)\*\*\s*[：:]\s*(.*)$")
+#: `路径::用例名`：判据锚的第一种形状。
+_TEST_ANCHOR = re.compile(r"^([A-Za-z0-9_./-]+\.py)::([A-Za-z0-9_]+)$")
+#: `python scripts/x.py ...`：判据锚的第二种形状（相对 `backend/`）。
+_SCRIPT_ANCHOR = re.compile(r"(?:python\s+)?(scripts/[A-Za-z0-9_./-]+\.py)")
+#: "不做"的判据可以是阈值：数字 + 单位。没有锚也要有它。
+_THRESHOLD = re.compile(r"\d+(?:\.\d+)?\s*(?:%|次|条|秒|字|个|处|倍)")
+
 
 
 # ---------------------------------------------------------------- 事实
@@ -179,6 +255,10 @@ class Facts:
     deploy_ready: bool | None = None
     #: `tidy.ts` 里 `Direction` 的取值个数。
     directions: int | None = None
+    #: 台账解析结果（`docs/BACKLOG.md` 的每一条）。`None` 表示没读到。
+    backlog: tuple["Entry", ...] | None = None
+    #: 台账每条 `probe` 的读数。键是探针名，不是条目编号——两个条目共用同一个探针是允许的。
+    backlog_probes: dict[str, bool] = field(default_factory=dict)
     #: 探针自身的问题（读不到、结构变了）。非空即红。
     problems: list[str] = field(default_factory=list)
 
@@ -584,6 +664,334 @@ def probe_directions(facts: Facts, tidy_path: Path | None = None) -> None:
     facts.directions = len(re.findall(r"'[a-z]+'", match.group(1)))
 
 
+@dataclass(frozen=True)
+class Entry:
+    """`docs/BACKLOG.md` 的一条账目。
+
+    台账是**结构**而不是自由文本：每条一个 `### N. ` 块、块里固定字段。所以判它走
+    `parse_backlog` 读块，不走反句表扫行——"这一行属于哪一条"没有歧义，也就没有
+    台账内部互串的可能（`_backlog_rules` 的 `block` 就是为此存在的）。
+    """
+
+    number: int
+    title: str
+    status: str
+    probe: str
+    criterion: str
+    source: str
+    trigger: str
+    #: 标题行与块末行（1-based，含两端）。`scan` 用它把规则限定在自己那一块里。
+    start: int
+    end: int
+
+    @property
+    def where(self) -> str:
+        return f"{BACKLOG_RELATIVE} 第 {self.number} 条"
+
+
+def parse_backlog(text: str) -> tuple[list[Entry], list[str]]:
+    """读台账的块结构 → `(条目, 结构问题)`。只做结构，不做语义（那是 `check_backlog`）。"""
+    lines = text.splitlines()
+    problems: list[str] = []
+    heads: list[tuple[int, re.Match[str]]] = []
+    for index, line in enumerate(lines):
+        match = _ENTRY_HEAD.match(line)
+        if match:
+            heads.append((index, match))
+    if not heads:
+        return [], [f"{BACKLOG_RELATIVE} 里一条账目都没解析到（`### N. ` 的写法变了？）"]
+
+    entries: list[Entry] = []
+    for position, (start, match) in enumerate(heads):
+        stop = heads[position + 1][0] if position + 1 < len(heads) else len(lines)
+        for index in range(start + 1, stop):
+            if lines[index].startswith("## "):
+                stop = index
+                break
+        fields: dict[str, str] = {}
+        current: str | None = None
+        for index in range(start + 1, stop):
+            stripped = lines[index].strip()
+            field = _ENTRY_FIELD.match(stripped)
+            if field:
+                current = field.group(1)
+                fields[current] = field.group(2).strip()
+            elif current and stripped and not stripped.startswith(("-", "#", "<!--")):
+                # 中文续行：字段值跨行时直接接上（中间不加空格）。
+                fields[current] = f"{fields[current]}{stripped}"
+        number = int(match.group(1))
+        entry = Entry(
+            number=number,
+            title=match.group(2),
+            status=fields.get("状态", "").strip(),
+            probe=fields.get("probe", "").strip().strip("`").strip(),
+            criterion=fields.get("判据", "").strip(),
+            source=fields.get("出处", "").strip(),
+            trigger=fields.get("触发条件", "").strip(),
+            start=start + 1,
+            end=stop,
+        )
+        entries.append(entry)
+        missing = [name for name in ("状态", "probe", "判据", "出处")
+                   if not getattr(entry, {"状态": "status", "probe": "probe",
+                                          "判据": "criterion", "出处": "source"}[name])]
+        if missing:
+            problems.append(f"{entry.where} 缺字段：{'、'.join(missing)}")
+        if entry.status and entry.status not in STATUSES:
+            problems.append(f"{entry.where} 的状态 `{entry.status}` 不在四态里"
+                            f"（{'/'.join(STATUSES)}）")
+    numbers = [entry.number for entry in entries]
+    if numbers != list(range(1, len(entries) + 1)):
+        # 跳号会让别处的"第 N 条"失锚——`WIRING-GAPS` §13.3 那种引用就是这么烂掉的。
+        problems.append(f"{BACKLOG_RELATIVE} 的编号不是 1..{len(entries)}：{numbers}")
+    return entries, problems
+
+
+#: 台账探针名 → 它在判什么。名字必须在这里注册；写错名字会红（不是静默跳过）。
+BACKLOG_PROBE_DOC: dict[str, str] = {
+    "branch_arg_deprecated":
+        "两处 `branches` 的 `description` 都以「已废弃」开头，且不含「上限」",
+    "clip_label_retreats":
+        "`clip_label` 的切点经 `_clip_index` 回退，不是裸的 `text[:limit]`",
+    "node_origin_field":
+        "`Node` 上有 `origin` 字段",
+    "resolve_has_route":
+        "`knowledge/router.py` 真的调 `graph_resolve.resolve_entities`",
+    "unwired_no_todo":
+        "`unwired_baseline.json` 里没有 `status=todo` 的条目",
+    "thin_material_offline":
+        "`OUTLINE_FEW_BLOCKS_NOTE` 与薄材料探针脚本都在",
+}
+
+
+def _field_descriptions(tree: ast.Module, field_name: str) -> list[str]:
+    """所有类里 `field_name: X = SomeModel(description="…")` 的 description 字面量。"""
+    out: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for statement in node.body:
+            if not isinstance(statement, ast.AnnAssign) \
+                    or not isinstance(statement.target, ast.Name) \
+                    or statement.target.id != field_name \
+                    or not isinstance(statement.value, ast.Call):
+                continue
+            for keyword in statement.value.keywords:
+                if keyword.arg == "description" and isinstance(keyword.value, ast.Constant) \
+                        and isinstance(keyword.value.value, str):
+                    out.append(keyword.value.value)
+    return out
+
+
+def _calls_named(tree: ast.Module, function: str, called: str) -> bool:
+    """`function` 的函数体里调过 `called` 吗。"""
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                or node.name != function:
+            continue
+        for inner in ast.walk(node):
+            if not isinstance(inner, ast.Call):
+                continue
+            func = inner.func
+            name = func.id if isinstance(func, ast.Name) else (
+                func.attr if isinstance(func, ast.Attribute) else None)
+            if name == called:
+                return True
+    return False
+
+
+def probe_backlog_facts(app_dir: Path | None = None,
+                        baseline: Path | None = None,
+                        scripts_dir: Path | None = None) -> tuple[dict[str, bool], list[str]]:
+    """台账里六条 `probe` 的读数。
+
+    三个参数只为用例存在：喂一份假代码树，读数必须跟着变——否则探针可以硬编码 `True`
+    而永远绿（与 `probe_allowed_literal` 同一条要求）。
+    """
+    app = app_dir or APP
+    values: dict[str, bool] = {}
+    problems: list[str] = []
+
+    def read(path: Path) -> ast.Module | None:
+        try:
+            return _parse(path)
+        except (OSError, SyntaxError) as error:
+            problems.append(f"台账 {_relative(path)}: {error}")
+            return None
+
+    tools = read(app / "agent" / "tools.py")
+    if tools is not None:
+        described = _field_descriptions(tools, "branches")
+        values["branch_arg_deprecated"] = bool(described) and all(
+            "已废弃" in text and "上限" not in text for text in described)
+        has_note = any(
+            isinstance(node, ast.Assign) and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "OUTLINE_FEW_BLOCKS_NOTE"
+            for node in ast.walk(tools)) or any(
+            isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+            and node.target.id == "OUTLINE_FEW_BLOCKS_NOTE"
+            for node in ast.walk(tools))
+        probe_script = (scripts_dir or (BACKEND_DIR / "scripts")) \
+            / "_probe_thin_material_branches.py"
+        values["thin_material_offline"] = has_note and probe_script.exists()
+
+    contracts = read(app / "contracts" / "mindmap.py")
+    if contracts is not None:
+        defines_helper = any(
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "_clip_index" for node in ast.walk(contracts))
+        values["clip_label_retreats"] = defines_helper and _calls_named(
+            contracts, "clip_label", "_clip_index")
+        has_origin = False
+        for node in ast.walk(contracts):
+            if not isinstance(node, ast.ClassDef) or node.name != "Node":
+                continue
+            for statement in node.body:
+                if isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name) \
+                        and statement.target.id == "origin":
+                    has_origin = True
+        values["node_origin_field"] = has_origin
+
+    router = read(app / "knowledge" / "router.py")
+    if router is not None:
+        values["resolve_has_route"] = any(
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "resolve_entities"
+            for node in ast.walk(router))
+
+    baseline_path = baseline or (BACKEND_DIR / "scripts" / "acc3" / "unwired_baseline.json")
+    try:
+        data = json.loads(_read(baseline_path))
+    except (OSError, json.JSONDecodeError) as error:
+        problems.append(f"台账 读不到 {_relative(baseline_path)}: {error}")
+    else:
+        # 基线是 `名字 → 条目` 的字典；容一手数组形态（顺序无关，只数 `status`）。
+        rows = (list(data.items()) if isinstance(data, dict)
+                else [(str(index), row) for index, row in enumerate(data)])
+        todo = [name for name, row in rows
+                if isinstance(row, dict) and row.get("status") == "todo"]
+        values["unwired_no_todo"] = not todo
+
+    for name in BACKLOG_PROBE_DOC:
+        if name not in values:
+            problems.append(f"台账探针 `{name}` 没读到读数")
+    return values, problems
+
+
+def probe_backlog(facts: Facts, path: Path | None = None,
+                  app_dir: Path | None = None) -> None:
+    """读 `docs/BACKLOG.md`：块结构 + 六条 probe 的读数。读不到即红，不静默跳过。"""
+    target = path or BACKLOG
+    try:
+        text = _read(target)
+    except OSError as error:
+        facts.problems.append(f"台账读不到 {_relative(target)}: {error}")
+        return
+    entries, problems = parse_backlog(text)
+    facts.problems.extend(problems)
+    facts.backlog = tuple(entries)
+    values, probe_problems = probe_backlog_facts(app_dir)
+    facts.backlog_probes = values
+    facts.problems.extend(probe_problems)
+
+
+def _anchor_candidates(text: str) -> list[tuple[str, bool]]:
+    """判据里能当锚的反引号片段 → `[(锚, 现在是否存在)]`。
+
+    两种形状：`路径::用例名`（要求那个 `def` 真的在文件里）与
+    `python scripts/x.py …`（要求脚本文件在）。路径引用（`docs/x.md`）不算锚。
+    """
+    out: list[tuple[str, bool]] = []
+    for token in re.findall(r"`([^`]+)`", text):
+        token = token.strip()
+        test = _TEST_ANCHOR.match(token)
+        if test:
+            path = REPO_DIR / test.group(1)
+            exists = path.exists() and test.group(2) in set(
+                _TEST_DEF.findall(_read(path)))
+            out.append((token, exists))
+            continue
+        script = _SCRIPT_ANCHOR.search(token)
+        if script:
+            out.append((token, (BACKEND_DIR / script.group(1)).exists()))
+    return out
+
+
+def pending_anchors(facts: Facts) -> list[str]:
+    """「待做」条目里，判据锚**现在还不存在**的那些。
+
+    这不是红——`待做` 的判据本来就是"它做完了会长什么样"，锚可以晚于条目出现。但必须
+    **可见**：不列出来的话，"待做 + 一个永远不会出现的锚"就成了没人管的一格，那正是
+    这条规矩想防的东西。
+    """
+    out: list[str] = []
+    for entry in facts.backlog or ():
+        if entry.status != STATUS_TODO:
+            continue
+        anchors = _anchor_candidates(entry.criterion)
+        missing = [token for token, exists in anchors if not exists]
+        if missing:
+            out.append(f"第 {entry.number} 条：{missing}")
+    return out
+
+
+def check_backlog(facts: Facts) -> list[str]:
+    """台账的语义校验：判据形态 / 状态与 probe 一致 / 该给的字段给了。
+
+    三种红，话不同，处理方式也不同：
+
+      · **判据缺失**（既没有锚也没有阈值）→ 这条账目永远会漂，不许进表；
+      · **判据锚不在了** → 这条账目失去判据（用例被删、脚本改名），先补判据或改状态；
+        **这不等于"这件事没做"**——把它读成"没做"就是误报；
+      · **状态与事实不符** → 谁对要看证据：`holds` 为假的"已做"可能是代码被翻回去了。
+    """
+    entries = facts.backlog
+    if entries is None:
+        return []
+    problems: list[str] = []
+    for entry in entries:
+        anchors = _anchor_candidates(entry.criterion)
+        live = [token for token, exists in anchors if exists]
+        if not anchors and not _THRESHOLD.search(entry.criterion):
+            problems.append(
+                f"{entry.where} 的判据既没有锚（`路径::用例名` / `python scripts/x.py`）"
+                "也没有可量阈值——没有判据的条目不许进表")
+        elif entry.status in NEEDS_LIVE_ANCHOR and anchors and not live:
+            problems.append(
+                f"{entry.where} 是{entry.status}，但判据锚一个都不在："
+                f"{[token for token, _ in anchors]}（用例被删或脚本改名？"
+                "这是「失去判据」，不是「没做」）")
+        if entry.status in NEEDS_TRIGGER and not entry.trigger:
+            problems.append(f"{entry.where} 是{entry.status}，必须给触发条件"
+                            "（「不做」靠一个可量阈值成立，「以后看情况」不算）")
+        if entry.status in NEEDS_PROBE:
+            if entry.probe == "none":
+                problems.append(f"{entry.where} 是{entry.status}，必须给 probe——"
+                                "「已做」不许没有机器判据")
+            elif entry.probe not in BACKLOG_PROBE_DOC:
+                problems.append(f"{entry.where} 的 probe `{entry.probe}` 没有注册")
+            elif entry.probe in facts.backlog_probes \
+                    and not facts.backlog_probes[entry.probe]:
+                problems.append(
+                    f"{entry.where} 写{entry.status}，但探针 `{entry.probe}` 读出来是假"
+                    f"（{BACKLOG_PROBE_DOC[entry.probe]}）——状态改错，或代码被翻回去了")
+        elif entry.probe != "none":
+            value = facts.backlog_probes.get(entry.probe)
+            if value:
+                # 这一条最要紧：**状态改错**与"代码被翻回去"在这里是同一个读数，
+                # 所以话术只说"两处不一致"，处理方式由人看证据定。
+                problems.append(
+                    f"{entry.where} 写{entry.status}，但探针 `{entry.probe}` 读出来是**真**"
+                    f"（{BACKLOG_PROBE_DOC[entry.probe]}）——这件事已经在代码里，"
+                    "状态写错了（或代码被翻回去了，那要先改代码再改状态）")
+            else:
+                problems.append(
+                    f"{entry.where} 是{entry.status}，probe 必须是 `none`："
+                    "probe 为真 ⇔ 这件事已经在代码里，{待做/不做} 没有可读的事实")
+    return problems
+
+
 def collect() -> Facts:
     facts = Facts()
     probe_allowed_literal(facts)
@@ -593,6 +1001,7 @@ def collect() -> Facts:
     probe_gate(facts)
     probe_deploy(facts)
     probe_directions(facts)
+    probe_backlog(facts)
     return facts
 
 
@@ -620,6 +1029,10 @@ class Rule:
     pattern: re.Pattern[str] | None = None
     #: `True` 表示这一族允许"历史语境"放行（只给开关默认值一族用）。
     history_excused: bool = False
+    #: 非空：这条规则只在**这一份文档**里判。台账一族用（见 `_backlog_rules`）。
+    scope: str = ""
+    #: 非 `(0, 0)` 时只在**这些行**里判（1-based，含两端）。台账的每条一个块。
+    block: tuple[int, int] = (0, 0)
 
 
 def _registry(facts: Facts) -> dict[str, tuple[str, ...]]:
@@ -822,8 +1235,37 @@ def _switch_rules(facts: Facts) -> list[Rule]:
     return rules
 
 
-# ---------------------------------------------------------------- 扫描
+def _backlog_rules(facts: Facts) -> list[Rule]:
+    """C 族：台账的每条一个块，**自动生成**。
 
+    事实 = 该条 `probe` 的读数（读代码）；禁句 = 本块里与事实相反的状态说法。三个
+    `scope` / `block` 字段是这一族存在的理由：`BACKLOG.md` 的十二条里"N 处写着待做"
+    这种句子在别的条目里可能正是对的，全文扫必然误报。
+
+    「已做」那条最要紧：把状态改成"待做"而代码没动，这里就红——这就是
+    `tests/test_doc_claims.py::test_a_wrong_status_is_red` 钉的那个方向。
+    """
+    rules: list[Rule] = []
+    for entry in facts.backlog or ():
+        if entry.probe == "none" or entry.probe not in BACKLOG_PROBE_DOC:
+            # 状态不由代码决定的条目没有"代码事实"可读，硬造一条规则就是自欺。
+            continue
+        rules.append(Rule(
+            name=f"backlog:{entry.number}",
+            evidence=BACKLOG_RELATIVE,
+            kind="observation",
+            holds=lambda _facts, key=entry.probe: bool(_facts.backlog_probes.get(key)),
+            expect=lambda _facts, key=entry.probe: f"探针 {key} = "
+                                                   f"{_facts.backlog_probes.get(key)}",
+            when_true=BACKLOG_TAKE_BACK,
+            when_false=BACKLOG_SETTLED,
+            scope=BACKLOG_RELATIVE,
+            block=(entry.start, entry.end),
+        ))
+    return rules
+
+
+# ---------------------------------------------------------------- 扫描
 
 @dataclass
 class Violation:
@@ -850,6 +1292,10 @@ def doc_files() -> tuple[list[Path], list[str]]:
         names = [path.relative_to(REPO_DIR).as_posix()
                  for path in sorted(REPO_DIR.rglob("*.md"))
                  if ".git" not in path.parts and "node_modules" not in path.parts]
+    # 台账是本闸门自己的输入：它可能刚建、还没被 git 跟踪，那时 `git ls-files` 看不见
+    # 它，`_backlog_rules` 就成了空转（本地会绿、CI 会红——最难查的那种不一致）。
+    if BACKLOG_RELATIVE not in names and (REPO_DIR / BACKLOG_RELATIVE).exists():
+        names.append(BACKLOG_RELATIVE)
     kept = [REPO_DIR / name for name in names
             if not name.startswith(NON_LOCAL_DOC_PREFIXES) and Path(name).name != SELF_DOC]
     return kept, problems
@@ -939,6 +1385,10 @@ def scan(facts: Facts, rules: list[Rule], files: list[Path]) -> list[Violation]:
             for rule in rules:
                 if rule.name not in decided:
                     continue
+                if rule.scope and relative != rule.scope:
+                    continue
+                if rule.block[0] and not rule.block[0] <= index + 1 <= rule.block[1]:
+                    continue
                 holds = decided[rule.name]
                 forbidden = rule.when_true if holds else rule.when_false
                 if not forbidden:
@@ -1023,6 +1473,25 @@ def describe_facts(facts: Facts, rules: list[Rule]) -> None:
             print(f"  · {problem}")
 
 
+def describe_backlog(facts: Facts) -> None:
+    """台账读数。`probe: none` 的条目单列——它们的状态不由代码决定，别混着读。"""
+    entries = facts.backlog or ()
+    if not entries:
+        return
+    print(f"\n台账（{BACKLOG_RELATIVE}，{len(entries)} 条）：")
+    for entry in entries:
+        extra = ""
+        if entry.probe != "none":
+            extra = f"  probe {entry.probe}={facts.backlog_probes.get(entry.probe)}"
+        print(f"  · #{entry.number:>2} [{entry.status}] {entry.title}{extra}")
+    manual = [entry.number for entry in entries if entry.probe == "none"]
+    if manual:
+        print(f"    只有人判（状态不由代码决定）：{manual}")
+    pending = pending_anchors(facts)
+    if pending:
+        print(f"    待做的判据现在还不存在（先写判据、后派人做）：{pending}")
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         description="文档断言与代码一致（设计见本文件 top docstring）")
@@ -1032,9 +1501,10 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
 
     facts = collect()
-    rules = RULES + _switch_rules(facts)
+    rules = RULES + _switch_rules(facts) + _backlog_rules(facts)
     if args.facts:
         describe_facts(facts, rules)
+        describe_backlog(facts)
         return 0 if not facts.problems else 1
 
     files, problems = doc_files()
@@ -1043,6 +1513,8 @@ def main(argv: list[str]) -> int:
     hard = [item for item in violations if not item.excused]
     excused = [item for item in violations if item.excused]
     evidence_problems = check_evidence(rules)
+    backlog_problems = check_backlog(facts)
+
 
     print(f"文档断言与代码一致：{len(rules)} 条事实 / {len(files)} 份文档")
     for rule in rules:
@@ -1051,6 +1523,7 @@ def main(argv: list[str]) -> int:
             print(f"  [{state}] {rule.name:38s} {rule.expect(facts)}")
         except LookupError as error:
             print(f"  [??] {rule.name:38s} 不可判：{error}")
+    describe_backlog(facts)
     print()
 
     if excused:
@@ -1060,7 +1533,7 @@ def main(argv: list[str]) -> int:
                   f"「{item.sentence}」")
         print()
 
-    stopping = bool(hard or facts.problems or evidence_problems)
+    stopping = bool(hard or facts.problems or evidence_problems or backlog_problems)
     if not args.gate:
         for item in hard:
             print(f"{item.path}:{item.line}: {item.sentence} → 事实 {item.rule.name}：{item.expect}")
@@ -1068,6 +1541,8 @@ def main(argv: list[str]) -> int:
             print(f"探针问题：{problem}")
         for problem in evidence_problems:
             print(f"证据问题：{problem}")
+        for problem in backlog_problems:
+            print(f"台账问题：{problem}")
         if not stopping:
             print("没有命中。")
         return 0
@@ -1089,6 +1564,8 @@ def main(argv: list[str]) -> int:
         print(f"  · [探针] {problem}")
     for problem in evidence_problems:
         print(f"  · [证据] {problem}")
+    for problem in backlog_problems:
+        print(f"  · [台账] {problem}")
     print("\n三种处理：改文档让说法与代码一致 / 改代码把事实改回来 / "
           "引用旧说法处加 `<!-- claims-ok: <事实名> 理由 -->`。")
     return 1
