@@ -860,6 +860,9 @@ onNodeDragStop(({ node }) => {
   dragHint.value = null;
   dragEndedAt = performance.now();
 
+  // `preview.ok` 只有**结构**含义（落点允不允许），不含"几何算不算得出"。
+  // 它曾经混着两件事：预演拿不到坐标就报 `ok:false`，于是这里直接 return、
+  // 内容不变、`status` 也不写——用户看到的是"拖了一下，什么都没发生"。
   if (!hint || !hint.preview.ok) {
     settleDraggedNode(node.id);
     return;

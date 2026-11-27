@@ -61,9 +61,11 @@ import {
   MINDMAP_BRANCH_BADGE_MIN_HIDDEN,
   MINDMAP_VISIBLE_NODE_LIMIT,
   foldActionOf,
+  revealedOptions,
   viewTree,
   type FoldInfo,
   type FoldOpenReason,
+  type ViewTreeOptions,
   type ViewTreeResult,
 } from '../canvas/view-collapse';
 import {
@@ -98,6 +100,16 @@ export const TRUNCATE_CHARS = 24;
  * `Node.pos` 也一直不需要被写（见 `docs/NODE-DRAG.md` §1）。
  */
 export interface MovePreview {
+  /**
+   * **这个落点允不允许**（结构层的结论）。
+   *
+   * 它只管"能不能落"，不管"能不能画出来"：`rect` 缺失（几何算不出来）时它仍然是
+   * `true`。这两件事曾经混在一起——预算截断的树上把节点挂深一层，预演拿不到坐标
+   * 就返回 `ok:false, reason:'算不出落点'`，而画布拿 `ok` 当"能不能落"，于是结构
+   * 完全合法的拖动变成死手势（松手什么都不发生、`status` 也不写）。
+   *
+   * 所以读它的地方只有一条判据：`false` ⟹ 不要改内容，把 `reason` 说给用户听。
+   */
   ok: boolean;
   /**
    * 拒绝原因分类。`not-tree` 是"这条图型上这个动作整类不做"。
@@ -126,7 +138,8 @@ export interface MovePreview {
    * 告诉用户会断掉哪条边，那一圈就是这个功能的可读性本身（`docs/NODE-EDIT.md` §一）。
    */
   detachedFrom?: string;
-  /** 落点左上角 + 尺寸，画布据此画那个虚线幽灵框。 */
+  /** 落点左上角 + 尺寸，画布据此画那个虚线幽灵框。**可能缺失**（几何算不出来时
+   * 只给结构结论、不画框），读它的地方必须容忍 `undefined`。 */
   rect?: { x: number; y: number; width: number; height: number };
 }
 
@@ -1837,20 +1850,34 @@ export const useMindMapStore = defineStore('mindmap', () => {
    * 本来就是"一层容器 + 一层节点"的形状，收起没有收益；更要紧的是数量口径要数
    * "内容里真实的节点"，而合成根不在内容里，数出来的上限会凭空虚高一个。
    */
-  function canvasTreeOfContent(current: DiagramContent): {
+  function canvasTreeOfContent(current: DiagramContent, revealId?: string): {
     root: MindNode;
     /** 只有树型才有一份真的折叠表；鱼骨与流程恒为 null（它们不收起）。 */
     folded: ViewTreeResult | null;
   } {
     const tree = canvasTreeOf(current);
     if (diagramTypeOf(current) !== 'tree') return { root: tree.root, folded: null };
-    const folded = viewTree(tree.root, {
+    const folded = viewTree(tree.root, viewOptionsFor(current, revealId));
+    return { root: folded.root, folded };
+  }
+
+  /**
+   * `viewTree` 的那组选项。`revealId` 给定时把那个节点的祖先链并进去（"选中即可见"）。
+   *
+   * 抽出来是为了让**三个读者得到同一份选项**：画布渲染（不带 `revealId`）、拖动预演
+   * （带被拖节点）、以及 `revealInView` 写回状态时的那一次计算。三处各拼一份的话，
+   * 某一天给收起加一档开关，必然有一处漏掉——而漏掉的那一处表现是"幽灵框与落点
+   * 差一个常量"，只有真机上手动对比才看得出来。
+   */
+  function viewOptionsFor(current: DiagramContent, revealId?: string): ViewTreeOptions {
+    const options: ViewTreeOptions = {
       limit: visibleNodeLimit.value,
       expanded: viewExpandedNodes.value,
       collapsed: viewCollapsedNodes.value,
       expandAll: viewExpandAll.value,
-    });
-    return { root: folded.root, folded };
+    };
+    if (!revealId) return options;
+    return revealedOptions(options, pathToIn(current, revealId));
   }
 
   const renderSource = computed<RenderSource | null>(() => {
@@ -3236,8 +3263,15 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 上一轮这里直接调 `layoutTidy`。换成 `layoutDiagram` 之后树型仍然逐像素等于
     // 它（那条分派对树原样透传 `direction`），而流程图与鱼骨图第一次有了正确的
     // 落点几何——用 tidy 去排一张鱼骨，幽灵框会落在主骨上方几十像素的空气里。
+    //
+    // **`revealId` 是缺陷修的**（写手册时撞到）：预算截断的树上（默认画 40 个，
+    // 库里有 136 个真图），把节点挂深一层之后它的 BFS 位次后移、可能掉出可见前缀；
+    // 落地时 `moveNodeTo` 里的 `revealInView` 会把它撑出来，而预演这里是"没撑开"
+    // 的视图 —— 拿不到坐标就报 `missing`，画布拿 `preview.ok` 当"能不能落"，
+    // 于是一次结构完全合法的拖动变成死手势（松手什么都不发生，`status` 都不写）。
+    // 现在两侧用同一份选项（`viewOptionsFor` + `revealedOptions`）。
     const next = planned.next;
-    const canvasRoot = canvasTreeOfContent(next).root;
+    const canvasRoot = canvasTreeOfContent(next, intent.draggedId).root;
     const geometry = layoutDiagram({
       root: canvasRoot,
       edges: canvasStageEdgesOf(next),
@@ -3245,7 +3279,18 @@ export const useMindMapStore = defineStore('mindmap', () => {
       direction: direction.value,
     });
     const center = geometry.positions.get(intent.draggedId);
-    if (!center) return { ok: false, code: 'missing', reason: '算不出落点' };
+    if (!center) {
+      // **几何算不出来 ≠ 这个落点不允许。** 这一层只负责"画在哪儿"，而"能不能落"
+      // 是 `planDrop` 的结论（已经在上面给过了）。以前这里返回
+      // `ok:false, code:'missing', reason:'算不出落点'`，界面上就是一句技术文案 +
+      // 松手什么都不发生——用户既不知道该做什么，也不知道刚才那一下算不算操作。
+      //
+      // 所以这条路径现在返回**允许、但没有坐标**：画布不画幽灵框（`dragOverlay`
+      // 的 `ghost` 允许为 null），跟随光标的标签照样说"成为「甲」的子节点"，松手
+      // 之后落点由布局重新算。真要排查几何为什么缺失，看 `store.status` 之外的东西
+      // ——那是布局的事，不该由一次拖动手势替它报错。
+      return { ok: true, parentId: planned.plan.parentId, index: planned.plan.index };
+    }
     const size = geometry.sizes?.get(intent.draggedId) ?? NODE_SIZE;
 
     return {
@@ -3319,10 +3364,13 @@ export const useMindMapStore = defineStore('mindmap', () => {
     if (!plan.ok) return { ok: false, code: plan.code, reason: plan.reason };
 
     // 与 `previewMove` 逐条同一个理由：落点用**真正落地时同一个**布局函数、同一棵画布树。
-    const canvasRoot = canvasTreeOfContent({ ...current, root: plan.root }).root;
+    // `revealId` 同样要传：断开之后它挂到根的末尾，可能正好落在预算之外（`detachNode`
+    // 里的 `revealInView` 会把它撑出来，预演必须事先算到同一个答案）。
+    const canvasRoot = canvasTreeOfContent({ ...current, root: plan.root }, nodeId).root;
     const geometry = layoutTidy(canvasRoot, { direction: direction.value });
     const center = geometry.positions.get(nodeId);
-    if (!center) return { ok: false, code: 'missing', reason: '算不出落点' };
+    // 同 `previewMove`：几何缺失不是"不允许断开"，`planDetach` 已经答过那一问。
+    if (!center) return { ok: true, parentId: plan.root.id, index: plan.index, detachedFrom: plan.formerParentId };
 
     return {
       ok: true,
@@ -4123,22 +4171,15 @@ export const useMindMapStore = defineStore('mindmap', () => {
     // 已经在画布上：什么都不用做。少了这一句，每次点一个可见的深层节点都会把它的
     // 整条祖先链撑成全展开——点一下，画布上突然多出几十个节点。
     if (flatNodes.value.some(entry => entry.node.id === id)) return;
-    const path = pathToIn(current, id);
-    if (!path || path.length < 2) return;
-    let next: Set<string> | null = null;
-    let rest: Set<string> | null = null;
-    for (const ancestor of path.slice(0, -1)) {
-      if (!ancestor.children.length) continue;
-      if (viewCollapsedNodes.value.has(ancestor.id)) {
-        if (!rest) rest = new Set(viewCollapsedNodes.value);
-        rest.delete(ancestor.id);
-      }
-      if (viewExpandedNodes.value.has(ancestor.id)) continue;
-      if (!next) next = new Set(viewExpandedNodes.value);
-      next.add(ancestor.id);
+    // 判据与 `previewMove` 共用 `revealedOptions`：那一侧要在**松手之前**算出同一个
+    // 结论（否则预演说"算不出落点"、落地却成功，见 `revealedOptions` 的注释）。
+    const options = viewOptionsFor(current, id);
+    if (options.expanded !== viewExpandedNodes.value) {
+      viewExpandedNodes.value = options.expanded ?? new Set<string>();
     }
-    if (rest) viewCollapsedNodes.value = rest;
-    if (next) viewExpandedNodes.value = next;
+    if (options.collapsed !== viewCollapsedNodes.value) {
+      viewCollapsedNodes.value = options.collapsed ?? new Set<string>();
+    }
   }
 
   /**

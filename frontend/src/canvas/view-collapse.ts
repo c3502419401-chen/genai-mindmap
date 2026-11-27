@@ -397,3 +397,54 @@ export function foldActionOf(
   if (reason === 'expanded' || reason === 'all') return 'collapse';
   return 'none';
 }
+
+/**
+ * 把 `path` 的祖先链并进选项里：让路径末端那个节点在 `viewTree` 的结果里有一处
+ * 出口（"选中即可见"的判据本身）。
+ *
+ * **为什么它是一个纯函数、放在这个文件里**：判据有两个读者，而两者必须得到同一个
+ * 答案——
+ *
+ *  - `stores/mindmap.ts::revealInView`（点了引用列表、删完跳父节点、拖动落地之后
+ *    把被拖节点撑出来）；
+ *  - `stores/mindmap.ts::previewMove`（**拖动还没松手时**那个幽灵框）。
+ *
+ * 分开写一次的代价是实测出来的：预算截断（40/136）的树上，把节点挂到第 2 层节点
+ * 下面之后，它的 BFS 位次后移、掉出可见前缀，而预演还在按"没撑开"的视图算几何
+ * ——拿不到坐标，于是整条落点被判成"算不出落点"，松手什么都不发生。真实落地却
+ * 是成功的（`moveNodeTo` 里 `revealInView` 会撑开）。同一个手势，预演说不行、
+ * 落地行——那正是"预演 = 落地"这条承诺的反面。
+ *
+ * 语义与 `revealInView` 逐条对齐：**没有孩子的祖先跳过**（`expanded` 只放行直接
+ * 子节点，给叶子加它没有任何作用，只会让 `expanded` 变成一张噪声表）；**`collapsed`
+ * 里有的先删掉**（用户的显式收起挡在这条路前面，而"选中即可见"是更高优先级的
+ * 意图：他刚刚就在操作这个节点）。
+ *
+ * **不改入参**：没有需要改的条目时原样返回入参对象，于是"没有收起时这条路径一个
+ * 字节都不变"这件事在结构上成立，不靠用例运气。
+ */
+export function revealedOptions(
+  options: ViewTreeOptions,
+  path: readonly MindNode[] | null,
+): ViewTreeOptions {
+  if (!path || path.length < 2) return options;
+  let expanded: Set<string> | null = null;
+  let collapsed: Set<string> | null = null;
+  for (const ancestor of path.slice(0, -1)) {
+    if (!ancestor.children.length) continue;
+    if ((options.collapsed ?? NO_IDS).has(ancestor.id)) {
+      if (!collapsed) collapsed = new Set(options.collapsed ?? NO_IDS);
+      collapsed.delete(ancestor.id);
+    }
+    if ((options.expanded ?? NO_IDS).has(ancestor.id)) continue;
+    if (!expanded) expanded = new Set(options.expanded ?? NO_IDS);
+    expanded.add(ancestor.id);
+  }
+  if (!expanded && !collapsed) return options;
+  return {
+    ...options,
+    ...(expanded ? { expanded } : {}),
+    ...(collapsed ? { collapsed } : {}),
+  };
+}
+

@@ -188,10 +188,16 @@ export function planDrop(root: MindNode, intent: DropIntent): DropPlan {
   // 量一遍是 O(节点数)，与这次拖动已经付掉的代价同一量级。
   const deepest = subtreeHeight(next);
   if (deepest > LIMITS.depth) {
+    // 判据不变，**文案给一条出路**：这句话是用户唯一能读到的反馈，而"最多 8 层"
+    // 只描述了墙、没描述门。他能做的只有三件事（删浅一点 / 换个浅目标 / 先拆支），
+    // 那就把最省事的那两件写出来——不写的话，同一个手势再试一次还是同一句话，
+    // 用户会以为"拖到这个方向坏了"（写手册的人就是这么以为的，实测 2 次之后
+    // 得出了"是不是不支持挂到第 2 层"的结论）。
     return {
       ok: false,
       code: 'too-deep',
-      reason: `拖过去这一支就有 ${deepest} 层了，导图最多 ${LIMITS.depth} 层`,
+      reason: `拖过去这一支就有 ${deepest} 层了，导图最多 ${LIMITS.depth} 层`
+        + '——把这一支里最深的几层删掉，或者换一个浅一点的目标挂',
     };
   }
 
@@ -475,10 +481,12 @@ export function planInsert(root: MindNode, intent: InsertIntent): InsertPlan {
   }
   const depth = (depthOfNode(root, parentId) ?? LIMITS.depth) + 1;
   if (depth > LIMITS.depth) {
+    // 与 `planDrop` 的 `too-deep` 同一条规矩：说清墙在哪儿，也说清怎么绕过去。
     return {
       ok: false,
       code: 'too-deep',
-      reason: `挂到「${shortLabel(parent)}」下就是第 ${depth} 层了，导图最多 ${LIMITS.depth} 层`,
+      reason: `挂到「${shortLabel(parent)}」下就是第 ${depth} 层了，导图最多 ${LIMITS.depth} 层`
+        + `——换一个浅一点的位置双击，或者先把这一支收短一点`,
     };
   }
 
