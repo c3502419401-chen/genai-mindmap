@@ -124,5 +124,25 @@ jobs:
       - name: Test
         run: npm test
 
+      # 「后端加了路由 → client.ts 加了函数 → 没有任何界面代码调用它」这一类静态缺口，
+      # 机器与理由都写在 `scripts/find_unwired.mjs` 的 docstring 里。它是**棘轮**不是
+      # 绝对零：基线（`scripts/unwired_baseline.json`）里的四条各自写着为什么可以零引用，
+      # 闸门只对基线之外的新增报错；基线里的 `evidence` 文件被删掉也会红（豁免的理由
+      # 没了而豁免还在）。
+      #
+      # 为什么这里不需要额外依赖：脚本只 import 标准库（`node:fs` / `node:path` /
+      # `node:url`）加 `typescript`——后者是 devDependencies 里已有的（`vue-tsc` 也靠它），
+      # `npm ci` 之后就在 `frontend/node_modules` 里。`npx` 之类会联网的东西一概没有。
+      #
+      # 为什么它在 CI 上是确定性的：判据是 `src/**`、`tests/**` 与基线 JSON 的**文本**，
+      # 用 `ts.createSourceFile` 数语法树里的标识符（注释里提到函数名不算引用）；不读
+      # 运行时、不读数据库、不读 git 状态或工作区差异，路径一律以 `import.meta.url` 为锚。
+      # 所以在干净 checkout 上与本地逐字节一致（已用一个干净 worktree 对过读数）。
+      #
+      # 顺序：放在 `npm test` 之后、`npm run build` 之前。它比 build 快得多，而失败信息
+      # 比 build 的 TS 报错更贴题（build 只会说"某某没有导出"，说不出"没人调用"）。
+      - name: 零引用棘轮
+        run: node scripts/find_unwired.mjs --gate
+
       - name: Build
         run: npm run build
