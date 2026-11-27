@@ -708,17 +708,43 @@ pytest 那两条是生成物过期。四条新用例的完整清单在
 探针已完整回滚：`contracts/mindmap.py`、`openapi.json`、`schema.d.ts` 三份与 HEAD
 逐字节相同（`git diff --stat` 里只剩本轮真正的两处改动）。
 
-### 11.5 残留（这一轮**不**动的两处，都有理由）
+### 11.5 残留与销账
 
-1. **`mindmap/shape.ts::shapeLabel`**：这里还有一份三值映射
-   （`'鱼骨图' / '流程图' / '思维导图'`），注释自认"与后端 `DIAGRAM_LABELS`
-   **同一份字面量**"。不合并的理由：它的入参是 `ShapeKind`（走 `kindOf()` 的形状
-   判别），不是 `diagram_type` 字段——注释写得很清楚"那条文案只能来自形状，不能来自
-   `diagram_type`"。它的 fallback 是穷尽的 `return '思维导图'`，所以**加第四种图型时
-   它会静默返回错的名字**。这条要跟 `isFishbone` / `isFlow` 一起改（形状判别本身得先
-   认识新形状），不属于"让值域跟生成物走"这件事。
-2. **`contracts/mindmap.py:156` 的注释漂移**：它说 hint 在 `SourceInputs.vue`，实际
-   早在 `stores/options.ts`。
+**已销（本轮）· `mindmap/shape.ts::shapeLabel`**：这里曾有一份三值映射
+（鱼骨图 / 流程图 / 思维导图），注释自认"与后端 `DIAGRAM_LABELS` **同一份字面量**"。
+当时留着的理由是"它的入参是 `ShapeKind`（走 `kindOf()` 的形状判别），不是 `diagram_type`
+字段"——**那条理由仍然成立，但它只证明"判据不能改成读字段"，不证明"文案必须手抄"。**
+中文名的单一源是生成物 `api/diagram-labels.json`（`stores/options.ts` 已经在读它），
+而 `ShapeKind` 与它的键都出自后端 `DiagramKind`，所以 `diagramLabels[kind]` 是**同一个
+键**，不是两次命名撞车。改法：import 生成物，函数体只剩一行索引。
+
+失效形态是**用户可见**且静默的：图形类型下拉读生成物，导入结果面板那句"已导入一张 ___"
+读 `shapeLabel()`。改一个中文名（后端 → `export_diagram_labels.py` → json），下拉跟着变、
+面板不变；而 json 与后端有 `test_diagram_options.py` 对账、`options.ts` 侧有
+`diagram-options-source.spec.ts` —— **两边全绿**。
+
+守卫（两侧各一条，都验过红）：
+
+- `backend/tests/test_shared_constants.py::test_shape_label_reads_the_generated_labels`：
+  读 `shape.ts` 文本，断言 ① import 了生成物 ② 函数体里出现 `diagramLabels[kind]`
+  ③ 函数体不含那三个中文字面量。用"只取函数体一段文本"而不是扫全文，因为全文注释必然
+  在解释这三样东西，正则会被自己的说明绊倒——与同文件 `_literal_assignments` 用 `ast`
+  躲开注释是同一个理由，只是 TypeScript 侧没有现成的解析器（所以配平花括号，并在
+  docstring 里写明这条假设什么时候会失效）。
+- `frontend/tests/diagram-options-source.spec.ts`：断言 `shapeLabel(kind)` 等于下拉里
+  那一项的 `label`（**两个消费点相互相等**——比"都等于 json"更贴近用户看到的东西），
+  以及源码里不再有那三个带引号的字面量。
+
+验红实录（把 json 里 fishbone 改成"因果图"、`shape.ts` 退回手抄，两个文件都由明确
+文件名备份/还原）：`AssertionError: expected '鱼骨图' to be '因果图'`。这就是"同一个
+界面两处叫法不同"的字面形态。
+
+顺带一个改善：原来那个穷尽的 `return '思维导图'` 在加第四种图型时会**静默返回错名字**；
+改成 `diagramLabels[kind]` 之后，那是一句 `npm run type-check` 错误（生成物里还没那个键），
+比用例早也比用例硬。
+
+**残留 · `contracts/mindmap.py:156` 的注释漂移**：它说 hint 在 `SourceInputs.vue`，实际
+早在 `stores/options.ts`。
 
 ## 十二、棘轮进 CI
 
