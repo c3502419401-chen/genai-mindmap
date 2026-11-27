@@ -1,3 +1,4 @@
+import diagramLabels from '../api/diagram-labels.json';
 import type {
   DiagramContent,
   FishboneContent,
@@ -153,17 +154,29 @@ export function containerNoun(kind: ShapeKind): string {
 }
 
 /**
- * 这种形状在界面文案里叫什么图。与后端 `DIAGRAM_LABELS` **同一份字面量**。
+ * 这种形状在界面文案里叫什么图。
  *
- * 后端那份的注释说得很清楚："写成 fishbone 读不出意思，写成'因果图'又与界面上那个
- * 下拉的名字对不上"。这里再写一遍是同一件事的另一端：导入结果面板要说"已导入一张
- * 鱼骨图"，而那条文案只能来自形状（`kindOf`），不能来自 `diagram_type`——理由与
- * 判别那三个函数一样。
+ * **不手写**：值来自生成物 `api/diagram-labels.json`，与图形类型下拉
+ * （`stores/options.ts`）用的是同一个文件。那份生成物由
+ * `backend/scripts/export_diagram_labels.py` 从契约 `DIAGRAM_LABELS` 导出，
+ * 后端 `tests/test_diagram_options.py` 钉住"生成物没过期"。此前这里是三个手写
+ * 字面量，改一个中文名会让下拉跟着变、导入结果面板不变，而且两边都不红。
+ *
+ * 为什么这个函数仍然按形状取值（这条设计不变）：面板那句"已导入一张 ___"的文案
+ * 只能来自形状判别（`kindOf()`），不能来自 `diagram_type` 字段——库里存在"标着
+ * fishbone、形状是树"的历史记录，拿字段分派会让旧图走进不存在的分支。**判据依赖
+ * 形状，取值不必依赖手抄**，两件事分开之后这个函数就是一次索引。
+ *
+ * 键集同源：`ShapeKind` 与生成物的键都出自后端 `DiagramKind` 那个 Literal，所以
+ * `diagramLabels[kind]` 是同一个键，不是两次命名撞车。将来加第四种形状时，这里是
+ * 一次 `npm run type-check` 错误（生成物里还没那个键），而不是"静默返回思维导图"
+ * ——后者正是这份手抄副本最坏的失效形态。
+ *
+ * 守卫：`backend/tests/test_shared_constants.py::test_shape_label_reads_the_generated_labels`
+ * 读本文件，断言函数体里索引生成物、且不含那三个中文字面量。
  */
 export function shapeLabel(kind: ShapeKind): string {
-  if (kind === 'fishbone') return '鱼骨图';
-  if (kind === 'flowchart') return '流程图';
-  return '思维导图';
+  return diagramLabels[kind];
 }
 
 // ---------------------------------------------------------------- 读：容器、遍历、计数

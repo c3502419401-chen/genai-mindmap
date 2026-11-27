@@ -6,7 +6,9 @@ import { describe, expect, it } from 'vitest';
 import schemaSource from '../src/api/schema.d.ts?raw';
 import typesSource from '../src/api/types.ts?raw';
 import storeSource from '../src/stores/options.ts?raw';
+import shapeSource from '../src/mindmap/shape.ts?raw';
 import { DIAGRAM_TYPE_OPTIONS } from '../src/stores/options';
+import { shapeLabel } from '../src/mindmap/shape';
 
 /**
  * 「图型」这三样东西的单一源：**值域、中文名、说明**各走各的路，但每一条都要红。
@@ -98,5 +100,44 @@ describe('下拉与生成物对得上', () => {
     // 后端 `diagram_type` 的类型是 `DiagramKind | None`，None 就是"用户没说"。
     // 发一个字符串 'auto' 出去等于给后端多一种要理解的状态。
     expect(storeSource).not.toMatch(/diagram_type.*'auto'/);
+  });
+});
+
+/**
+ * 中文名的**第二个消费点**：导入结果面板那句"已导入一张 ___"。
+ *
+ * 它走的是 `mindmap/shape.ts::shapeLabel(kindOf(content))`，入参是形状判别的结果
+ * （`ShapeKind`），不是 `diagram_type` 字段——理由在函数注释里（库里存在"标着
+ * fishbone、形状是树"的历史记录）。此前那三个中文名在这里又手抄了一遍，注释还自认
+ * "与后端 `DIAGRAM_LABELS` 同一份字面量"。
+ *
+ * 失效形态是**用户可见**的：改一个中文名（后端 → 导出脚本 → json），下拉跟着变、
+ * 面板不变，同一个界面上两处叫法不同，而 json 与后端有对账、`options.ts` 侧有上面
+ * 那条用例——两边全绿。所以这里要钉的不是"值等于 json"，而是**两个消费点相互相等**：
+ * 那才是用户看到的东西。
+ */
+describe('中文名的第二处：导入结果面板与下拉同源', () => {
+  const KINDS = ['tree', 'flowchart', 'fishbone'] as const;
+
+  it('shapeLabel 对每个形状都等于下拉里那一项的中文名', () => {
+    for (const kind of KINDS) {
+      const option = DIAGRAM_TYPE_OPTIONS.find(item => item.value === kind);
+      expect(option, `下拉里没有 ${kind}`).toBeDefined();
+      expect(shapeLabel(kind)).toBe(option!.label);
+    }
+  });
+
+  it('shape.ts 不再手抄那三个字面量（函数体里只许索引生成物）', () => {
+    // 与 `backend/tests/test_shared_constants.py::test_shape_label_reads_the_generated_labels`
+    // 同一条判据，两侧各钉一遍：后端那条防"改后端忘改前端"，这条防"前端又抄回去"
+    // 且当场能跑（不用等后端 pytest）。
+    expect(shapeSource).toMatch(/from '\.\.\/api\/diagram-labels\.json'/);
+    expect(shapeSource).toMatch(/return diagramLabels\[kind\]/);
+    // 扫**全文**的带引号字面量，不是只扫 `return`：`return label || '思维导图'` 这种
+    // 兜底写法同样是副本，而且更难看出来。注释里提到这些名字不带引号，所以扫全文
+    // 不会误伤——与后端那条用例的正则同一个。
+    for (const label of ['思维导图', '流程图', '鱼骨图']) {
+      expect(shapeSource).not.toMatch(new RegExp(`['"]${label}['"]`));
+    }
   });
 });
