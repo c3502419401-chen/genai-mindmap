@@ -337,7 +337,9 @@ backend/openapi.json            不含 /optimization/repair（快照没被碰）
   （`TestTreeIsByteIdentical` 那一类逐像素用例继续钉着）。
 - **不碰协作者的文件**：`mindmaps/repository.py`、`tests/conftest.py`、`openapi.json`、
   `api/schema.d.ts`、`generation/service.py`、`agent/router.py`、`settings/*.py`、
-  `auth/*`、`knowledge/external.py`、`memory/`。
+  `auth/*`、`knowledge/external.py`、`memory/`。（这是**那一轮**的边界：当时那几份由
+  账号系统那条线在改。`openapi.json` 与 `api/schema.d.ts` 已在加 `kind='repair'` 那一轮
+  重导，见 §7「落地复盘」。）
 - **`stores/mindmap.ts` 只加了一段**（§5.1 那个 `replaceContent` 与它的 export）。
   那一轮它是禁区（账号系统、引用跳转两条线在改同一个文件），所以落点选在
   `applyContent` 紧后面——一处新增，零改动既有行。`api/client.ts` 是新增一段
@@ -349,7 +351,10 @@ backend/openapi.json            不含 /optimization/repair（快照没被碰）
 
 ## 7 自评：「自动修复」与「用户自己改」在账本里该不该分开
 
-**结论：该分开，但分开的维度是 `kind`，不是 `actor`；这一轮不加，下一轮加，代价一行。**
+> **状态：已落地。** 这一节保留下的是当时的判断过程；实际落点与两处补正在末尾
+> 「落地复盘」，口径的完整说明在 `docs/EDIT-LOG.md` 二·七。
+
+**结论：该分开，但分开的维度是 `kind`，不是 `actor`。**
 
 现状：`replaceContent` 走 `applyContent(next, true)`，`pushHistory` 的 `actor` 默认
 `user`，于是这次修复产出的每条事件（`remove` / `add` / `move` / `update(label)`）在
@@ -389,3 +394,41 @@ backend/openapi.json            不含 /optimization/repair（快照没被碰）
 就能撤回；面板上写着"已自动修复 N 处"，`pendingEdits` 里那一批事件共享同一个 `at`
 （`GROUP BY at` 能把它整批认出来）。也就是说，事实没丢，只是暂时只能靠时间戳分组，
 而不是靠一个专门的 `kind`。
+
+---
+
+### 落地复盘（本轮）
+
+三步都按上面走了，只有一处和当时写的不同，另有两处是当时没点到的。
+
+1. **`EditKind` 加 `"repair"`**（`contracts/edits.py`），重导 `openapi.json` +
+   `schema.d.ts`。
+2. **`DiffOptions.kind`**（`mindmap/edit-log.ts`）：给了它就覆盖每条事件的 `kind`。
+   `emit` 里加在 `...event` **之后**，所以它是这个文件里唯一一处"动作名可被外部改写"
+   的位置。三条前端用例钉住"只动 `kind` 这一个字段"（`tests/repair-ledger.spec.ts`）。
+3. **`replaceContent()` 里写死 `{ kind: 'repair' }`**，不给参数。当时写的是
+   "`replaceContent` 加一个参数（`actor` 或 `kind`）"，实际判断是**参数反而更危险**：
+   这个函数的语义就是"修复落地的唯一入口"（唯一调用方是 `applyRepair`），"这一次是
+   规则批量整理"是它的定义，不是它的选项。传参意味着下一个用整体替换落地**别的**动作
+   的人会静默记成 `repair`，或者忘了传、把修复重新记成"用户改的"——而后者正是这一轮
+   修的 bug。写死之后，改它必须改这个函数，而改的人一定读得到那段注释。
+   顺带：`applyContent` 的第三个参数从 `(actor: EditActor)` 换成了
+   `(origin: EditOrigin)` 选项对象（`{ actor?, kind?, runId? }`）——两个都是字符串
+   字面量联合，位置传反编译器只会含糊地报一句"类型不符"。存的形状与原来的
+   `pushHistory('agent', runId)` 等价，`applyContent(patched, true)` 那二十多个调用点
+   一个字都没动。
+
+**当时没点到的两处，都要补：**
+
+- **`by_field` 也要排除 `repair`。** 上一轮只说了 `label_shrunk`。但 `repair` 改文字
+  的事件同样带 `field='label'`，混进 `by_field` 会让"用户最常改哪个字段"被规则自己
+  改出来的样本污染；更硬的理由是——`sum(by_field) == by_kind.update + by_kind.style`
+  那条恒等式会**破掉**，而它是"有没有写入路径绕过契约"的唯一自校验。做法是让
+  `by_field` 的 SQL 只统计这两种 kind（后端 `FIELD_KINDS`）。
+- **`changed_events` / `untouched_runs` 的 kind 集合要一起加 `repair`。** 两个集合
+  必须逐字相同（后端 `CHANGE_KINDS` 一个常量管两处）：漏在两边之外，"模型给了 30 个
+  节点、规则删掉 12 个"会被读成"一字未改"，而那正是整张表最贵的那个数的误报方向。
+
+`removed_depth` / `removed_subtree` **不用改**：它们的条件是 `kind = 'remove'` 精确匹配，
+而修复产出的删除事件 `kind` 已经是 `repair`，天然不进——这正是要的（"用户嫌哪一层
+多余"与"规则把单子链压掉"不是同一件事）。

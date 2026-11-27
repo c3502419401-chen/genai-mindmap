@@ -44,8 +44,9 @@ move。所以 index 变化只有在**该父节点的子 id 集合完全没变**�
 type EditEvent = {
   actor: 'user' | 'agent'
   kind: 'add' | 'remove' | 'update' | 'move' | 'edge' | 'style' | 'accept'
+      | 'generate' | 'repair'
   nodeId?: string          // edge 事件填源节点；title 事件没有节点
-  field?: EditField        // 只在 update / style 上有值
+  field?: EditField        // 只在 update / style 上有值（repair 里改文字的也带）
   before?: string          // 摘要，不是内容
   after?: string
   depth?: number           // 节点层数，根是 1
@@ -58,6 +59,10 @@ type EditEvent = {
 
 `field` 只在 `update` / `style` 上有值，这条规则换来两条恒等式：
 `sum(by_field) == by_kind.update + by_kind.style`、`sum(by_actor) == total`。
+
+`repair` 是唯一的例外形状：它的事件**也带 `field`**（规则改文字时），但 `by_field`
+只统计 `kind in ('update','style')` 的行——所以上面那条恒等式仍是等式，不是不等式。
+理由与 `label_shrunk` 排除 `repair` 相同（见二·七）。
 
 摘要规则：
 
@@ -106,16 +111,19 @@ type EditEvent = {
 
 ```
 分母      generated_nodes  = SUM(node_count) WHERE kind='generate'
-分子      changed_events   = COUNT(*) WHERE kind IN ('update','remove','add','move','style')
+分子      changed_events   = COUNT(*) WHERE kind IN CHANGE_KINDS
+                           CHANGE_KINDS = ('update','remove','add','move','style','repair')
 生成次数  generated_runs   = COUNT(*) WHERE kind='generate'
 零改动    untouched_runs   = 那个 run_id 下一条改动事件都没有的 generate 行数
 ```
 
 `edge` **不进分子**：分母数的是节点，"加了一条关系"算进节点改动会让比例失去意义。
-零改动那边的 kind 集合与分子**逐字相同**——只要一边多认一种，就会出现"既不算改动、
-也不算一字未改"的黑洞，而那条恒等式（`changed_events = 0 ⇒ untouched_runs =
-generated_runs`）正是读这份统计的前提。`run_id` 为空的老 generate 行不算零改动：
-那不是"一字未改"，是"当时没记"。
+`repair` **进分子**：一键修复确实删了/搬了/改了节点，不算进来，"模型给了 30 个节点、
+规则删掉 12 个"会被读成"一字未改"——而 `untouched_runs` 误报的方向恰好是"生成质量
+很好"。零改动那边的 kind 集合与分子**用同一个常量**（后端 `CHANGE_KINDS`）——只要
+一边多认一种，就会出现"既不算改动、也不算一字未改"的黑洞，而那条恒等式
+（`changed_events = 0 ⇒ untouched_runs = generated_runs`）正是读这份统计的前提。
+`run_id` 为空的老 generate 行不算零改动：那不是"一字未改"，是"当时没记"。
 
 `label_shrunk` / `removed_depth` / `removed_subtree` 三个指标没变，只是分母换了人。
 
@@ -129,8 +137,55 @@ generated_runs`）正是读这份统计的前提。`run_id` 为空的老 generat
 是删除规模直方图 `{size_1: 5, size_12: 1, size_unknown: 2}`。加列之前的老数据是
 `NULL`，**不做回填**，只进 `size_unknown`，不进 `removed_depth`——否则那次污染还在。
 
-**③ `label_shrunk` 只看 `user`。** `agent` 的改动是"模型自己又改了一遍"，不是用户的
-偏好。实测 B 图只有 3 条 user 的缩短，不过滤会读成 4 条（多出来的是 agent 的 13→10）。
+**③ `label_shrunk` 只看 `user`，且不看 `repair`。** `agent` 的改动是"模型自己又改了
+一遍"，不是用户的偏好。实测 B 图只有 3 条 user 的缩短，不过滤会读成 4 条（多出来的是
+agent 的 13→10）。`repair` 的 `actor` 是 `user`（扳机是用户按的），所以 `actor` 那条
+过滤拦不住它——见下一节。
+
+## 二·七、`repair`：一键修复不是"用户改的"，也不是"模型改的"
+
+一键修复（`POST /optimization/repair`）把整棵树替换掉，diff 出来的是 `remove` /
+`add` / `move` / `update(label)` 那批动作。整批事件的 `actor` 都曾是 `user`，于是**用户
+回看"我改过什么"会看到一堆自己没做过的改动**。
+
+两条路都走不通，所以第三条：
+
+| 记成 | 后果 |
+|---|---|
+| `actor='user'`（旧） | 用户的账被污染；`label_shrunk` 里混进"不是人写的"样本 |
+| `actor='agent'` | 更糟。`agent` 的语义是"模型算的"，而规则修复**一次模型调用都没有**——塞进去等于让"模型改动"这个分母失去意义 |
+| `kind='repair'`（现在） | `actor` 仍是 `user`，但这一批事件的 `kind` 全部换成 `repair` |
+
+分工是这四条的一句话：**`actor` 回答"谁有能动性"，`kind` 回答"这是一次什么动作"**。
+`generate` 早就证明这套分工撑得住（`actor='agent'`，靠 `kind` 与"它带来的那批节点
+改动"分开）。
+
+落地三处，都不大：
+
+| 位置 | 改什么 |
+|---|---|
+| `backend/app/contracts/edits.py` | `EditKind` 加 `"repair"`（一处 Literal，重导 `openapi.json` + `schema.d.ts`） |
+| `frontend/src/mindmap/edit-log.ts` | `DiffOptions.kind`：给了就覆盖每条事件的 `kind`（`emit` 里一行） |
+| `frontend/src/stores/mindmap.ts` | `replaceContent()` 里写死 `{ kind: 'repair' }`——它只有 `applyRepair` 一个调用方 |
+
+统计的连带影响，三条，都处理了：
+
+- **`by_kind` 多一个桶**：一次修复就是一条 `repair`，不再按 `add` / `remove` / `move`
+  分桶。`sum(by_kind) == total` 照旧成立。**动作粒度没丢**——`field` / `before` /
+  `after` / `depth` / `subtreeSize` 都还在事件行上，只是不能再按 `kind` 分组读。
+- **`label_shrunk` 补 `kind != 'repair'`**：`SINGLE_CHILD` 那条修法**就是改文字**
+  （"外层 / 内层"拼成一个，必然更短）。不过滤，"规则把两层标题拼成一个"会被算成
+  "用户把标题改短"——而这个数字唯一的用途是给生成侧定标题长度，拿规则自己造成的
+  缩短去论证它，是循环论证。
+- **`by_field` / `removed_depth` / `removed_subtree` 自动不受影响**：前者的 SQL 只统计
+  `update` / `style`（后端 `FIELD_KINDS`），后两者是 `kind = 'remove'` 的**精确匹配**，
+  而修复的删除事件 `kind` 已经是 `repair`，自然不进——这正是要的（"用户嫌哪一层多余"
+  与"规则把单子链压掉"不是同一件事）。
+
+> **代价，写在这里**：修复删了多少节点没有专门口径，只能到 `GET /edits` 的明细里按
+> `kind='repair'` + `subtree_size` 数。真图上值得补一个 `repaired_nodes`——等"账本
+> 到底有没有读者"定下来再说，那是账本清单第 3 件（读路径今天在界面上没有入口），
+> 见第七节。
 
 ## 二·六、`parent_id`：让"新节点挂在哪"从猜变成可判
 
@@ -324,10 +379,37 @@ last_event_at "2026-11-17T09:35:11.208Z"
 | 位置 | 内容 |
 |---|---|
 | `frontend/src/mindmap/edit-log.ts` | 类型 + `diffEdits` / `acceptEvent` 纯函数（三条判断与两处"分母"都在这里） |
-| `frontend/src/stores/mindmap.ts` | `pendingEdits` / `pushHistory(actor, runId, accept)` / `collectEdits`；`save()` 里分批提交、成功才清 |
+| `frontend/src/stores/mindmap.ts` | `pendingEdits` / `pushHistory(origin)` / `collectEdits`；`save()` 里分批提交、成功才清；`replaceContent()` 是 `kind='repair'` 的唯一产地 |
 | `frontend/src/api/client.ts` | `saveBody`（空数组不发字段）、`getEditSummary`、`listEditEvents`、`getEditHealth` |
 | `backend/app/contracts/edits.py` | `EditEventIn` / `EditEventRow` / `EditSummary` / `EditHealth` |
 | `backend/app/mindmaps/edits.py` | `record` / `summary` / `health` / `recent` / `clear` |
 | `backend/app/mindmaps/repository.py` | `edit_events` 表、索引与幂等补列（`_ensure_columns`） |
-| `backend/tests/test_edit_events.py` | 36 条：落库、统计、三个关键指标、两处分母、旧表补列、五个边界 |
+| `backend/tests/test_edit_events.py` | 45 条：落库、统计、三个关键指标（含 `repair` 三条过滤）、两处分母、旧表补列、五个边界 |
 | `frontend/tests/edit-log.spec.ts` | 33 条：diff 正确性、actor 区分、子树规模、accept 三条路、只存长度、500 上限、清空时机、撤销不记 |
+| `frontend/tests/repair-ledger.spec.ts` | 3 条：`repair` 覆盖只动 `kind`、保存请求体里就是 `repair`、手工编辑仍是 `update` |
+
+## 七、这个账本今天谁在读
+
+加 `repair` 之前先问一句：**加第 9 种 `kind`，价值在哪？** 三条读路径
+（`GET /edits` 明细、`/edits/summary`、`/edits/health`）今天**在界面上没有入口**——
+`api/client.ts` 里那三个函数零引用。也就是说，这些事件记了但没人看。
+
+判断是：**它有消费者，但不是界面上的那个。**
+
+| 消费者 | 读什么 | 现在成立吗 |
+|---|---|---|
+| 本仓库的实测脚本（`scripts/measure_*.py`）与真图读数 | `summary` 的分母、`label_shrunk`、`removed_*` | 成立：这些数是"生成侧该改哪"的唯一量化依据，也是 `docs/` 里那些结论的来源 |
+| 诊断与规则（`optimization/`） | `parent_ids`（`add` / `move` 的父样本）、`removed_subtree` | 成立：规则的阈值是从这些分布定出来的 |
+| 用户回看"我改过什么" | `GET /edits` 明细 | **不成立**：没有界面入口 |
+
+所以这一轮改的不是"让一个没人看的东西更准"——**准的是上面两行**。修复事件混进
+`label_shrunk`，污染的是"标题该多长"这个上游参数，而它在下一轮调生成侧提示词时
+会被读到；混进用户账，等界面接上时那是第一批错误的历史。
+
+但如果把顺序摆开来问"第 3 件该不该排在这一件之前"，答案是**不该**，两个理由：
+
+1. 记账口径是**不可回溯**的：今天错记的 `user` 行，界面接上之后没法从历史里分辨
+   "这一条是用户改的还是规则改的"（只能靠同一个 `at` 里混着 `remove` 去猜）。补一条
+   过滤 SQL 只要一行，改历史要一次数据手术。
+2. 界面接上之后第一屏就会读 `label_shrunk`。先接界面、后修口径，等于先给用户看一份
+   已知偏高的数字。
