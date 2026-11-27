@@ -2,6 +2,8 @@
 
 > 输入一段文字、一份文档或一张草图，自动生成逻辑清晰、结构完整、可继续编辑的思维导图。
 
+**在线体验：[https://genai-mindmap.rpegio.top/](https://genai-mindmap.rpegio.top/)** —— 打开即用，无需本地部署。输入一段文字即可生成一张能继续编辑的导图。
+
 ---
 
 ## 项目简介
@@ -141,6 +143,8 @@ FastAPI + Pydantic v2，11 组路由（38 个路径 / 43 个端点）统一挂�
 
 - 容器化部署（Docker / Kubernetes）确保扩展性。
 - 压力测试优化系统响应速度（如生成思维导图时间 < 3 秒）。
+
+本项目有在线部署，见 [https://genai-mindmap.rpegio.top/](https://genai-mindmap.rpegio.top/)。
 
 ### 拟解决的关键问题
 
