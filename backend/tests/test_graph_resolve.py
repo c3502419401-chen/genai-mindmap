@@ -207,6 +207,153 @@ def test_length_ratio_floor_keeps_the_institution_full_name_out():
     assert graph_resolve._abbreviation_ratio("发改委", "国家发展和改革委员会") == 0.0
 
 
+# --------------------------------- 1b. 判据在中文与拉丁标识符上的两处失效
+#
+# 前面那一道都是"短名是不是长名的名字的一部分"，它在**加限定词**的构词方式上成立。
+# 有两种名字不按这种构词方式构成，而判据看不出来：
+#
+#   1. **加一个否定/取值字**：`监督学习` 是 `无监督学习` 的子串，但「无」是否定，
+#      两个名字指的是两个对立的东西（半监督学习同理）。英文的 un-/non-/anti- 是
+#      同一种失效方式，只是这次的库里恰好没有那一对；
+#   2. **拉丁标识符**：`mode` / `model`、`revision` / `baserevision`、`ai` / `api`
+#      的差别是一个字符，而那是两个配置项 / 两个接口。标识符不是"取字"构成的，
+#      子序列判据在这里不是"近似成立"，是**根本不成立**。
+
+
+def test_negating_marker_disqualifies_the_pair():
+    """长名比短名多出来的那段字里有否定/取值标记 → 两个名字不是同一事物。
+
+    这一族在真库上是错的：「监督学习 → 无监督学习」与「半监督学习 → 监督学习」
+    都被判成 0.8 的 substring 候选，而它们是机器学习的两种范式。判据落到结构上
+    只有一句话：**多出的那段字如果把意思反过来了，就不是简称**。
+    """
+    for short, long in (
+        ("监督学习", "无监督学习"),
+        ("监督学习", "半监督学习"),
+        ("学校群体", "学校的非正式群体"),
+        ("营利组织", "非营利组织"),
+        ("定期存款", "不定期存款"),
+        ("欧氏几何", "非欧几何"),
+        # 英文靠前缀区分（supervised / unsupervised），子串判据同样中招。
+        ("supervised", "unsupervised"),
+        ("profit", "nonprofit"),
+    ):
+        assert graph_resolve._abbreviation_ratio(short, long) == 0.0, (short, long)
+
+
+def test_latin_identifier_is_never_an_abbreviation_of_another():
+    """两个拉丁标识符只有**归一后完全相同**才算同一个名字。
+
+    真库上这一族现在全是"可选"的错合，而且是最难事后发现的一类：材料里这两个名字
+    总是同时出现（同一段配置、同一个代码块），看出处看不出错。
+    """
+    for short, long in (
+        ("mindmap_llm_mode", "mindmap_llm_model"),
+        ("revision", "baserevision"),
+        ("candidate", "acceptcandidate"),
+        ("ai", "api"),
+        ("ai", "main"),
+        ("note", "runcontext"),
+        ("source", "search_sources"),
+        ("source", "sources.spec.ts"),
+        ("deploy", "deploy.yml"),
+        ("deploy", "docs/deploy.md"),
+        ("rag", "ragflow"),
+        ("sse", "readsse"),
+    ):
+        assert graph_resolve._abbreviation_ratio(short, long) == 0.0, (short, long)
+
+
+def test_identifier_differing_only_by_wrapping_is_the_same_name():
+    """`execute` 与 `execute()` 是同一个函数的两种写法：去掉包尾括号后归一相同。"""
+    assert graph_resolve._abbreviation_ratio("execute", "execute()") == pytest.approx(7 / 9)
+    assert graph_resolve._abbreviation_ratio("Execute", "execute") == pytest.approx(1.0)
+    assert graph_resolve._abbreviation_ratio("deploy", "DEPLOY") == pytest.approx(1.0)
+
+
+def test_generic_latin_abbreviation_does_not_absorb_its_expansions():
+    """`AI` / `API` 这类两三字符的拉丁缩写等同于中文的泛称，不做任何名字的别名。"""
+    for short, long in (
+        ("ai", "ai 伦理"),
+        ("ai", "知犀ai"),
+        ("api", "fastapi"),
+        ("sse", "sse 通道"),
+    ):
+        assert graph_resolve._abbreviation_ratio(short, long) == 0.0, (short, long)
+
+
+def test_the_three_true_abbreviations_survive_the_new_gates():
+    """真库上那三条该合的简称，不能被新闸误杀（它们是多出限定词，不是否定）。"""
+    # 同一个函数的两种写法
+    assert graph_resolve._abbreviation_ratio("execute", "execute()") > 0
+    # 简称 / 全称：多出的是「城市」
+    assert graph_resolve._abbreviation_ratio(
+        "雨污分流改造", "城市雨污分流改造") == pytest.approx(6 / 8)
+    # 简称 / 全称：多出的是「人工」
+    assert graph_resolve._abbreviation_ratio("神经网络", "人工神经网络") == pytest.approx(4 / 6)
+    # 中间删字的旗舰案例照旧
+    assert graph_resolve._abbreviation_ratio(
+        "国家市场监督管理总局", "市场监管总局") == pytest.approx(6 / 10)
+
+
+def test_digit_suffix_and_single_character_swap_are_not_pairs():
+    """数字后缀与等长单字差异：子序列判据天然挡住（等长的不同名必有字对不上）。"""
+    assert graph_resolve._abbreviation_ratio("第1章", "第2章") == 0.0
+    assert graph_resolve._abbreviation_ratio("第一章", "第二章") == 0.0
+    assert graph_resolve._abbreviation_ratio("大学", "中学") == 0.0
+    # 真的单字差异简称：多一个「股份」仍然是同一家公司。
+    assert graph_resolve._abbreviation_ratio("有限公司", "股份有限公司") == pytest.approx(4 / 6)
+
+
+def test_composite_full_name_is_flagged_but_not_rejected():
+    """合称：`碳达峰碳中和` 是两项政策的合称，`碳中和` 不是它的简写。
+
+    这一条**不排除**（`城市雨污分流改造` 同样是「城市」+简称），只给一句提示：
+    把分称并进合称之后，两个概念的材料会混在一条路径上，而材料里本来就同时写着
+    这两个词——事后看不出错，所以必须让人在看候选时就知道。
+    """
+    names = {"碳达峰", "碳中和", "碳达峰碳中和", "雨污分流改造", "城市雨污分流改造"}
+    notice = graph_resolve._composite_notice("碳中和", "碳达峰碳中和", names)
+    assert "合称" in notice and "碳达峰碳中和" in notice
+    assert graph_resolve._composite_notice("雨污分流改造", "城市雨污分流改造",
+                                           names) == ""
+
+
+def test_identifier_path_prefix_is_the_same_file():
+    """同一文件的两种引用（带路径 / 不带路径）是同一个名字；单复数不算。"""
+    assert graph_resolve._abbreviation_ratio(
+        "stores/mindmap.ts", "mindmap.ts") == pytest.approx(10 / 17)
+    # 符号就是符号：`source` 与 `sources` 是两处不同的东西，不做单复数归一。
+    assert graph_resolve._abbreviation_ratio("source", "sources") == 0.0
+    assert graph_resolve._abbreviation_ratio("pydantic", "pydantic v2") == 0.0
+
+
+def test_standard_is_not_a_negation_marker():
+    """「准」不在否定表里：它在「标准」「精准」里出现得比在否定里多得多。
+
+    这条是实测纠错。第一版把「准」当否定标记，于是
+    `可再生能源 ⊂ 可再生能源标准`、`英语教学 ⊂ 高中英语精准教学` 被以**错误的理由**
+    拒掉——真正该挡前者的是文档类型词（「标准」已进 `DOC_TYPE_WORDS`），而不是"否定"。
+    """
+    assert "准" not in graph_resolve.OPPOSING_MARKERS
+    # 多出一个修饰词 ≠ 多出一个否定：这两条都不该被否定闸拦（前一条由类型词闸挡）。
+    assert graph_resolve._opposing_marker("标准") == ""
+    assert graph_resolve._opposing_marker("精准") == ""
+    assert graph_resolve._abbreviation_ratio("可再生能源", "可再生能源标准") == 0.0
+
+
+def test_composite_notice_does_not_fire_on_real_abbreviations():
+    """合称提示不许在真简称上响：
+
+    - `execute` / `execute()` 归一后是同一个标识符，不是"合称"；
+    - `市场监管总局` 与 `国家市场监督管理总局` 之间是抽字关系，不是连续拼接。
+    """
+    names = {"execute", "execute()", "市场监管总局", "国家市场监督管理总局", "市场监管"}
+    assert graph_resolve._composite_notice("execute", "execute()", names) == ""
+    assert graph_resolve._composite_notice(
+        "市场监管总局", "国家市场监督管理总局", names) == ""
+
+
 # ------------------------------------------------------- 2. 并查集与主名（纯函数）
 
 
@@ -295,6 +442,33 @@ def test_threshold_does_not_touch_structural_pairs(monkeypatch):
     assert [(item.canonical, item.aliases) for item in candidates] == [
         ("预算审批流程", ["审批流程"])]
     assert candidates[0].reason == "substring"
+
+
+def test_negated_pairs_never_reach_the_candidate_list(monkeypatch):
+    """真库上错的那两条：判定层就拒了，候选里根本不会出现。
+
+    它们现在之所以没被选中，靠的是"没有可核验出处"那道与语义无关的门——那是运气，
+    不是判据。两条都得在判定这一步消失。
+    """
+    enable_embedding(monkeypatch)
+    install_degrees(monkeypatch, [("无监督学习", 3), ("监督学习", 2), ("半监督学习", 1)])
+    fake_embed(monkeypatch, {})
+
+    assert run(find_merge_candidates()) == []
+
+
+def test_composite_candidate_is_flagged_not_dropped(monkeypatch):
+    """合称留在候选里，但带一句提示：排除它就会误伤「城市」+简称那一类。"""
+    enable_embedding(monkeypatch)
+    install_degrees(monkeypatch, [("碳达峰碳中和", 3), ("碳中和", 2), ("碳达峰", 1)])
+    fake_embed(monkeypatch, {})
+
+    candidates = run(find_merge_candidates())
+
+    assert [(item.canonical, set(item.aliases)) for item in candidates] == [
+        ("碳达峰碳中和", {"碳达峰", "碳中和"})]
+    assert candidates[0].notice.startswith("「碳达峰碳中和」可能是")
+    assert "合称" in candidates[0].notice
 
 
 def test_missing_vector_only_disables_the_cosine_path(monkeypatch):
@@ -712,7 +886,7 @@ def test_resolve_entities_defaults_to_dry_run(monkeypatch):
     assert result["groups"] == 1 and result["aliases"] == 0
     assert result["candidates"] == [
         {"canonical": "甲", "aliases": ["乙"], "similarity": 0.95,
-         "reason": "embedding"}]
+         "reason": "embedding", "notice": ""}]
     assert written == []          # 一次都没调写接口
 
 
@@ -876,7 +1050,8 @@ def test_dry_run_writes_nothing_and_the_real_run_closes_the_island(graph, monkey
     assert dry["candidates"] == [{"canonical": "国家市场监督管理总局",
                                   "aliases": ["市场监管总局"],
                                   "similarity": 0.6,
-                                  "reason": "substring"}]
+                                  "reason": "substring",
+                                  "notice": ""}]
     assert stats()["aliases"] == 0                     # 一条都没写
 
     written = run(resolve_entities(dry_run=False))
