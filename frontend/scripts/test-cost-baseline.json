@@ -1,0 +1,1603 @@
+{
+  "note": "由 scripts/report-test-cost.mjs --baseline 生成；改了测试成本就重跑 `npm run test:cost`",
+  "measuredAt": "2026-11-27T13:23:56.302Z",
+  "measuredUnder": "backend pytest 全量在跑（PID 18264，21:21:23 起，python -m pytest -q）",
+  "machine": {
+    "cores": 16,
+    "cpuMeanPct": 82.1
+  },
+  "entries": [
+    {
+      "file": "layout-clarity.spec.ts",
+      "test": "真图实测 把三套几何的分布写成表（含每档的\"有问题\"比例）",
+      "loadedMs": 8116.4,
+      "idleMs": 7643.5,
+      "soloMs": 888.5,
+      "capMs": 30000
+    },
+    {
+      "file": "view-collapse-canvas.spec.ts",
+      "test": "画布上的收起提示 点「全部展开」：这一屏就是整棵树，那行字改成\"显示全部\"并留一条回程路",
+      "loadedMs": 5436.5,
+      "idleMs": 4938.4,
+      "soloMs": 592,
+      "capMs": 20000
+    },
+    {
+      "file": "view-collapse-canvas.spec.ts",
+      "test": "画布上的收起提示 点「收起到上限」回到 40 个节点",
+      "loadedMs": 4656.4,
+      "idleMs": 3670.1,
+      "soloMs": 1675.7,
+      "capMs": 20000
+    },
+    {
+      "file": "defects.spec.ts",
+      "test": "缺陷三：拖到第 2 层节点下面 预算截断时\"拖到第 2 层节点下面\"整体不再是死手势",
+      "loadedMs": 4313.5,
+      "idleMs": 3653,
+      "soloMs": 635.3,
+      "capMs": 15000
+    },
+    {
+      "file": "branch-digest.spec.ts",
+      "test": "点一枚：整支冒出来 全展开时一枚都没有（那时没有\"还有\"）",
+      "loadedMs": 4050.4,
+      "idleMs": 3120.3,
+      "soloMs": 2047.5,
+      "capMs": 20000
+    },
+    {
+      "file": "view-collapse-canvas.spec.ts",
+      "test": "画布上的收起提示 装 136 节点的真图：顶部说「显示 40 / 136 个节点」，并给一个全部展开的出口",
+      "loadedMs": 3591.6,
+      "idleMs": 3482.9,
+      "soloMs": 314.4,
+      "capMs": 20000
+    },
+    {
+      "file": "branch-digest.spec.ts",
+      "test": "一级分支的概括角标：数字与文案 收起态：136 节点那棵树上有 6 枚，数字等于\"整支没画出来的节点数\"",
+      "loadedMs": 3448.7,
+      "idleMs": 3450.2,
+      "soloMs": 349.1,
+      "capMs": 20000
+    },
+    {
+      "file": "view-collapse-canvas.spec.ts",
+      "test": "画布上的收起提示 展开之后那一处出现「−」，点它收回去（可见数回到 40）",
+      "loadedMs": 2254.9,
+      "idleMs": 1868.5,
+      "soloMs": 1003.6,
+      "capMs": 20000
+    },
+    {
+      "file": "view-collapse-canvas.spec.ts",
+      "test": "画布上的收起提示 每个被截断的节点都有一枚可点的「+N」，点了子节点就出现",
+      "loadedMs": 2082.1,
+      "idleMs": 1433.2,
+      "soloMs": 769,
+      "capMs": 20000
+    },
+    {
+      "file": "branch-digest.spec.ts",
+      "test": "一级分支的概括角标：数字与文案 角标上写的是「还有 N 个 · 概括」，两段都在",
+      "loadedMs": 2072.5,
+      "idleMs": 2223.9,
+      "soloMs": 201.3,
+      "capMs": 20000
+    },
+    {
+      "file": "canvas-edges.spec.ts",
+      "test": "画布上的三种连线 鱼骨：骨线与短线都进了 SVG，点的坐标就是布局算出来的那些",
+      "loadedMs": 1956.3,
+      "idleMs": 1450,
+      "soloMs": 150.7,
+      "capMs": 10000
+    },
+    {
+      "file": "canvas-preview.spec.ts",
+      "test": "画布 DOM 生成过程中画布上真的长出节点，而不是只有右侧面板在动",
+      "loadedMs": 1894,
+      "idleMs": 1564.4,
+      "soloMs": 292.1,
+      "capMs": 10000
+    },
+    {
+      "file": "relation-lines.spec.ts",
+      "test": "关系线在画布上真的画出来 挂载之后出现两个 edge-mindRelation，并带 kind 的中文标签",
+      "loadedMs": 1856.7,
+      "idleMs": 1618.8,
+      "soloMs": 168.6,
+      "capMs": 10000
+    },
+    {
+      "file": "branch-digest.spec.ts",
+      "test": "点一枚：整支冒出来 点角标 → 那一支全部出现、角标消失、别的支一个不多",
+      "loadedMs": 1813.3,
+      "idleMs": 1379.9,
+      "soloMs": 556.1,
+      "capMs": 20000
+    },
+    {
+      "file": "chat-dock.spec.ts",
+      "test": "底部对话框的状态机 空闲：完整对话框（输入框、按钮行、缩略图不在）",
+      "loadedMs": 1397.4,
+      "idleMs": 994.4,
+      "soloMs": 119.1,
+      "capMs": 5000
+    },
+    {
+      "file": "branch-digest.spec.ts",
+      "test": "一级分支的概括角标：数字与文案 只挂在一级分支上：深层节点一枚都没有",
+      "loadedMs": 1350.7,
+      "idleMs": 1369.4,
+      "soloMs": 112.3,
+      "capMs": 20000
+    },
+    {
+      "file": "branch-digest.spec.ts",
+      "test": "没有概括就不画 概括指向一个不存在的 id：那一支不画，其余照画",
+      "loadedMs": 1248.4,
+      "idleMs": 787.1,
+      "soloMs": 390,
+      "capMs": 20000
+    },
+    {
+      "file": "resume.spec.ts",
+      "test": "上次的生成结果 有\"生成了但没保存\"的运行 → 提示一句，不弹窗",
+      "loadedMs": 1208.2,
+      "idleMs": 745.1,
+      "soloMs": 115.9,
+      "capMs": 5000
+    },
+    {
+      "file": "edit-intent.spec.ts",
+      "test": "画布右上角的「改这张图」入口 没有导图时它先当生成入口用，并说明\"写个主题\"",
+      "loadedMs": 1156.9,
+      "idleMs": 644.7,
+      "soloMs": 102,
+      "capMs": 5000
+    },
+    {
+      "file": "diagram-type.spec.ts",
+      "test": "图型选择器 四个选项、按顺序、默认自动判断",
+      "loadedMs": 1124,
+      "idleMs": 710.2,
+      "soloMs": 82.4,
+      "capMs": 5000
+    },
+    {
+      "file": "stage-edges.spec.ts",
+      "test": "画布：阶段内边画成细线 真渲染：阶段内边的 stroke-width 比主轴细，kind 的颜色还在",
+      "loadedMs": 1049.4,
+      "idleMs": 601.2,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "expand-node.spec.ts",
+      "test": "展开按钮的三态 能展开的节点：按钮可点，说明写清结果直接落画布",
+      "loadedMs": 1025.9,
+      "idleMs": 1006.3,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "branch-digest.spec.ts",
+      "test": "没有概括就不画 旧图（内容里没有 branch_digests）：一枚都不出现",
+      "loadedMs": 1022.5,
+      "idleMs": 856,
+      "soloMs": 439.1,
+      "capMs": 20000
+    },
+    {
+      "file": "structure-check.spec.ts",
+      "test": "按 code 通用渲染：后端加码时前端不用改 前端不认识的 code 仍然渲染出来（显示原码，不是空白）",
+      "loadedMs": 1000.4,
+      "idleMs": 1053.6,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "upload.spec.ts",
+      "test": "上传文档生成导图 解析成功仅加入列表，上传使用 multipart",
+      "loadedMs": 999.1,
+      "idleMs": 939.8,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "canvas-keys.spec.ts",
+      "test": "画布的结构键只在画布有焦点时生效 焦点在别的按钮上：Tab / Enter 不改图，也不吞掉默认的焦点移动",
+      "loadedMs": 974.1,
+      "idleMs": 549.1,
+      "soloMs": null,
+      "capMs": 8000
+    },
+    {
+      "file": "intent-input.spec.ts",
+      "test": "三态文案与按钮 没图：输入主题 + 「生成导图」，不显示选区徽标",
+      "loadedMs": 968.3,
+      "idleMs": 971.8,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "user-path-workspace.spec.ts",
+      "test": "用户路径 · 画布（顶栏与侧栏） 改朝向：画布左上角有四个朝向，点了之后朝向跟着变",
+      "loadedMs": 964.9,
+      "idleMs": 956.7,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "shell-actions.spec.ts",
+      "test": "瘦顶栏 只有三件东西：☰、标题、+",
+      "loadedMs": 962.1,
+      "idleMs": 956.5,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "node-toolbar.spec.ts",
+      "test": "节点工具条 没选中节点时不出现在页面上",
+      "loadedMs": 939.9,
+      "idleMs": 726.6,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "user-path-input.spec.ts",
+      "test": "用户路径 · 材料 粘贴正文：展开材料面板后有一个能写正文的框，写进去会变成待添加的草稿",
+      "loadedMs": 911.2,
+      "idleMs": 1036.7,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "settings-panel.spec.ts",
+      "test": "顶栏入口 齿轮是顶栏里一个真按钮，带 `aria-label` 与 `data-test`",
+      "loadedMs": 904.1,
+      "idleMs": 880.5,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "shell-layout.spec.ts",
+      "test": "右栏改成覆盖式抽屉 主区只剩一个 flex 兄弟（画布）：左栏撤掉之后它拿到全宽",
+      "loadedMs": 884.2,
+      "idleMs": 919.1,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "prefs.spec.ts",
+      "test": "预填：偏好决定初始值，用户的选择决定最终值 没显式选时，下拉带上偏好值并标明来源",
+      "loadedMs": 861.5,
+      "idleMs": 943.1,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "app.spec.ts",
+      "test": "App 空输入时按钮是禁用的，并说明「要写一个主题」",
+      "loadedMs": 854.6,
+      "idleMs": 851.5,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "upload.spec.ts",
+      "test": "多来源输入界面 合并长度只算来源：粘贴框里的草稿要点「添加文本到来源」才计入",
+      "loadedMs": 843.5,
+      "idleMs": 853.7,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "smoke-canvas.spec.ts",
+      "test": "画布冒烟 真实 Vue Flow 能挂载出容器",
+      "loadedMs": 797,
+      "idleMs": 820.7,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "user-path-workspace.spec.ts",
+      "test": "用户路径 · 画布（顶栏与侧栏） 加子节点 / 加兄弟 / 删除节点：侧栏三个按钮都在，且真的改树",
+      "loadedMs": 791.1,
+      "idleMs": 949.7,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "destructive-actions.spec.ts",
+      "test": "清空全部别名 确认之后才发 DELETE（整表端点），并说出清掉了几条",
+      "loadedMs": 789.5,
+      "idleMs": 770.6,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "external-search-toggle.spec.ts",
+      "test": "开关本身 没材料时默认开着，并说明它值多少时间",
+      "loadedMs": 766.4,
+      "idleMs": 612.7,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "agent.spec.ts",
+      "test": "静默提示 静默到 10 秒时把阶段文案换成「模型正在思考」，两句话不并存",
+      "loadedMs": 718.9,
+      "idleMs": 576.3,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "settings-panel.spec.ts",
+      "test": "关闭 Tab 圈在面板里：走到最后一个再按 Tab 回到第一个",
+      "loadedMs": 699.4,
+      "idleMs": 523.2,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "expand-node.spec.ts",
+      "test": "点击之后的请求形态 走 /agent/runs/stream：intent=expand、snapshot=当前整棵树、selected_ids 只有一个",
+      "loadedMs": 696.1,
+      "idleMs": 651.8,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "relation-lines.spec.ts",
+      "test": "删掉一条关系 store.deleteRelation 之后画布上那条线消失",
+      "loadedMs": 683.5,
+      "idleMs": 503,
+      "soloMs": 111.4,
+      "capMs": 10000
+    },
+    {
+      "file": "prefs.spec.ts",
+      "test": "预填：偏好决定初始值，用户的选择决定最终值 请求体里带的是**界面上显示的那个值**，并标进 prefs_applied",
+      "loadedMs": 669,
+      "idleMs": 891.1,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "agent.spec.ts",
+      "test": "面板文案与生成结果 工具失败时在对应进度行下方直接显示 code 与 message",
+      "loadedMs": 662.3,
+      "idleMs": 435.3,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "app.spec.ts",
+      "test": "App 点生成把请求打到 agent 路由，结果直接落画布",
+      "loadedMs": 641.9,
+      "idleMs": 794.3,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "delete-actions.spec.ts",
+      "test": "同屏三个删除 三个都在一屏上，各有宾语与 aria-label，没有任何一个只写「删除」",
+      "loadedMs": 641.7,
+      "idleMs": 751,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "edit-intent.spec.ts",
+      "test": "画布右上角的「改这张图」入口 有导图时打字 + 点按钮，发出 intent=edit 且带上当前树",
+      "loadedMs": 636.2,
+      "idleMs": 466.5,
+      "soloMs": 70.9,
+      "capMs": 5000
+    },
+    {
+      "file": "user-path-input.spec.ts",
+      "test": "用户路径 · 材料 添加文本到来源：点一下多出一行材料，并且一个请求都不发",
+      "loadedMs": 631.1,
+      "idleMs": 713.6,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "app.spec.ts",
+      "test": "App 后端返回非 2xx 时展示 message 文案",
+      "loadedMs": 628.5,
+      "idleMs": 716.7,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "settings-panel.spec.ts",
+      "test": "顶栏入口 点击打开，再点关闭；`aria-expanded` 跟着变",
+      "loadedMs": 627.5,
+      "idleMs": 809.1,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "user-path-workspace.spec.ts",
+      "test": "用户路径 · 知识库 实体别名：清单 / 删除一条 / 找出可合并的，三个入口都在",
+      "loadedMs": 598,
+      "idleMs": 561.2,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "intent-input.spec.ts",
+      "test": "点按钮发出什么 有图选了 3 个：请求体里的 selected_ids 正好是这三条，顺序也一样",
+      "loadedMs": 596.2,
+      "idleMs": 658.4,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "external-search-toggle.spec.ts",
+      "test": "开关本身 库里写着 false 时勾是空的，且这一次生成把它记进 prefs_applied",
+      "loadedMs": 591.4,
+      "idleMs": 405.8,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "chat-dock.spec.ts",
+      "test": "底部对话框的状态机 生成完：2 秒后淡出，只剩画布 + 悬浮球",
+      "loadedMs": 563.6,
+      "idleMs": 695.9,
+      "soloMs": 52.8,
+      "capMs": 5000
+    },
+    {
+      "file": "expand-node.spec.ts",
+      "test": "预览 → 落地 ops 批次落进工作树，done 落地后新节点挂在被展开的节点下",
+      "loadedMs": 559.9,
+      "idleMs": 488.6,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "intent-input.spec.ts",
+      "test": "点按钮发出什么 没图：发 create，不带快照，也不带选区",
+      "loadedMs": 557.7,
+      "idleMs": 469.8,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "structure-check.spec.ts",
+      "test": "建议的应用与忽略 「应用」删掉重复节点，而且能撤销",
+      "loadedMs": 555.7,
+      "idleMs": 509.7,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "prefs.spec.ts",
+      "test": "预填：偏好决定初始值，用户的选择决定最终值 用户显式选了之后，偏好不再覆盖，也不再记进 prefs_applied",
+      "loadedMs": 551.7,
+      "idleMs": 615.8,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "node-toolbar.spec.ts",
+      "test": "节点工具条 选中节点后浮出，四个动作都在",
+      "loadedMs": 547.7,
+      "idleMs": 362.1,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "app.spec.ts",
+      "test": "App 打开列表列出已保存的导图，点开后进入该导图",
+      "loadedMs": 542.1,
+      "idleMs": 564.9,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "chat-dock.spec.ts",
+      "test": "底部对话框的状态机 有诊断：成功那行写着条数，按钮能直达明细，而且不淡出",
+      "loadedMs": 529.7,
+      "idleMs": 469.8,
+      "soloMs": 43.7,
+      "capMs": 5000
+    },
+    {
+      "file": "structure-check.spec.ts",
+      "test": "按 code 通用渲染：后端加码时前端不用改 面板底部的「显示原码」一次展开全部诊断，排障不用逐条点",
+      "loadedMs": 526.8,
+      "idleMs": 503.7,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "node-toolbar.spec.ts",
+      "test": "节点工具条 点「改」：对话框回来，输入框预填「关于『提交申请』…」",
+      "loadedMs": 525.9,
+      "idleMs": 471.5,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "app.spec.ts",
+      "test": "App Ctrl+S 保存前让正在输入的控件失焦，草稿才会被提交",
+      "loadedMs": 525,
+      "idleMs": 607.9,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "settings-panel.spec.ts",
+      "test": "打开面板：读的是\"当前生效值\"，密钥只有打码值 密钥框是密码类型、占位符里是打码值，**整个 DOM 里没有明文**",
+      "loadedMs": 509.4,
+      "idleMs": 453.5,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "node-toolbar.spec.ts",
+      "test": "节点工具条 点「展开」把当前材料一起发出去（旧图 + 新材料那条路）",
+      "loadedMs": 507.1,
+      "idleMs": 415.9,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "prefs.spec.ts",
+      "test": "「以后都这样」是主要写入源 勾上之后先写偏好、再生成，于是这一次就记进了 prefs_applied",
+      "loadedMs": 497.5,
+      "idleMs": 417.3,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "edges.spec.ts",
+      "test": "侧栏的附加关系入口 选中节点后能列出相关关系、连一条新的、再删掉它",
+      "loadedMs": 496.5,
+      "idleMs": 271.1,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "edit-intent.spec.ts",
+      "test": "画布右上角的「改这张图」入口 回车也能提交",
+      "loadedMs": 493.5,
+      "idleMs": 353.7,
+      "soloMs": 61.1,
+      "capMs": 5000
+    },
+    {
+      "file": "relation-lines.spec.ts",
+      "test": "关系线在画布上真的画出来 关系线是虚线，且 conflicts 不画箭头",
+      "loadedMs": 485.6,
+      "idleMs": 383,
+      "soloMs": 72.8,
+      "capMs": 10000
+    },
+    {
+      "file": "shell-actions.spec.ts",
+      "test": "瘦顶栏 `+` 把材料、粘贴框草稿与没发出去的那句话一起清掉，并说明清掉了什么",
+      "loadedMs": 479.9,
+      "idleMs": 554.5,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "upload.spec.ts",
+      "test": "上传文档生成导图 截断时明确提示总页数与已处理页数",
+      "loadedMs": 479.2,
+      "idleMs": 461.1,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "shell-actions.spec.ts",
+      "test": "瘦顶栏 撤销把刚清掉的材料与两处草稿原样放回来",
+      "loadedMs": 478.5,
+      "idleMs": 428.6,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "intent-input.spec.ts",
+      "test": "三态文案与按钮 有图 · 没选节点：文案变成「说说你想怎么改」，按钮变成「改这张图」",
+      "loadedMs": 472,
+      "idleMs": 579.2,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "expand-node.spec.ts",
+      "test": "展开中与生成中互斥 展开期间再点生成不会发出第二个请求",
+      "loadedMs": 464.4,
+      "idleMs": 357.2,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "shell-actions.spec.ts",
+      "test": "瘦顶栏 `+` 开新的一轮：清空画布与时间线，并把对话框叫回输入位置",
+      "loadedMs": 464.2,
+      "idleMs": 469.2,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "expand-node.spec.ts",
+      "test": "展开中与生成中互斥 展开期间按钮转「展开中…」并禁用",
+      "loadedMs": 463.6,
+      "idleMs": 380.9,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "settings-panel.spec.ts",
+      "test": "打开面板：读的是\"当前生效值\"，密钥只有打码值 列出地址 / 模型名 / 深度模型名，并标出来源",
+      "loadedMs": 457.9,
+      "idleMs": 417,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "user-path-workspace.spec.ts",
+      "test": "用户路径 · 画布（顶栏与侧栏） 改文字：侧栏有「改文字（F2）」，点了进入内联编辑",
+      "loadedMs": 454.1,
+      "idleMs": 418.1,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "app.spec.ts",
+      "test": "App 点保存把当前导图发给后端，成功后显示版本号",
+      "loadedMs": 452.6,
+      "idleMs": 442.7,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "shell-layout.spec.ts",
+      "test": "右栏改成覆盖式抽屉 抽屉里的「关闭」与 Esc 都能收起来",
+      "loadedMs": 451.4,
+      "idleMs": 411.9,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "user-path-workspace.spec.ts",
+      "test": "用户路径 · 知识库 删除材料：材料行有一个删除入口，点了发出 DELETE",
+      "loadedMs": 450.4,
+      "idleMs": 391.8,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "structure-check.spec.ts",
+      "test": "按 code 通用渲染：后端加码时前端不用改 已知 code 给人话，原码默认收起、点开才露出来",
+      "loadedMs": 444.9,
+      "idleMs": 563.4,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "user-path-input.spec.ts",
+      "test": "用户路径 · 生成 输入主题 → 发送：发出 POST /agent/runs/stream，请求体带主题",
+      "loadedMs": 441.5,
+      "idleMs": 388,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "diagram-panel.spec.ts",
+      "test": "附加关系区块按图型显示 流程图显示：模型会给边，而补错的、删画歪的都要有入口",
+      "loadedMs": 441,
+      "idleMs": 455.6,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "chat-dock.spec.ts",
+      "test": "材料参与生成 缩略图里的材料照旧进请求体（材料没有因为换位置而丢）",
+      "loadedMs": 436.1,
+      "idleMs": 203.4,
+      "soloMs": 104.3,
+      "capMs": 5000
+    },
+    {
+      "file": "shell-actions.spec.ts",
+      "test": "瘦顶栏 标题就是那个可改名的输入框（`#title` 一直在）",
+      "loadedMs": 435.5,
+      "idleMs": 671.3,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "prefs.spec.ts",
+      "test": "偏好面板 能改：点「改」写新值 → PUT 发出去",
+      "loadedMs": 435.2,
+      "idleMs": 356.9,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "user-path-input.spec.ts",
+      "test": "用户路径 · 生成 选拆解方式 / 选图型：两个下拉都在，选了之后请求体带上",
+      "loadedMs": 434.9,
+      "idleMs": 419.3,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "defects.spec.ts",
+      "test": "缺陷一：删除导图 抽屉列表里两段式删除：第一下只进确认态，第二下才发 DELETE",
+      "loadedMs": 424.9,
+      "idleMs": 363,
+      "soloMs": 56.3,
+      "capMs": 5000
+    },
+    {
+      "file": "chat-dock.spec.ts",
+      "test": "底部对话框的状态机 上次没保存的结果独立成一条：成功时不被\"已落到画布\"挤掉",
+      "loadedMs": 424.3,
+      "idleMs": 487.2,
+      "soloMs": 40.5,
+      "capMs": 5000
+    },
+    {
+      "file": "expand-node.spec.ts",
+      "test": "点击之后的请求形态 没带材料也照样发：正文只在会话内存里，找回原文是后端的事",
+      "loadedMs": 424.2,
+      "idleMs": 425.3,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "prefs.spec.ts",
+      "test": "预填：偏好决定初始值，用户的选择决定最终值 没有偏好时一切照旧：不预填、不带 diagram_type、不带 prefs_applied",
+      "loadedMs": 422.5,
+      "idleMs": 372,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "resume.spec.ts",
+      "test": "上次的生成结果 被中断但已经产出结果的那次同样提醒，措辞与\"完成了\"分开",
+      "loadedMs": 421.1,
+      "idleMs": 180.3,
+      "soloMs": 33.6,
+      "capMs": 5000
+    },
+    {
+      "file": "enter-chain.spec.ts",
+      "test": "焦点入口：一处定义，三处用 外壳在页面上时能聚焦并返回成功；不在页面上返回 false 而不抛",
+      "loadedMs": 419.3,
+      "idleMs": 315,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "canvas-edges.spec.ts",
+      "test": "画布上的三种连线 树：父子线仍然是内置的 smoothstep，没有一条鱼骨线",
+      "loadedMs": 418.6,
+      "idleMs": 333.5,
+      "soloMs": 76,
+      "capMs": 10000
+    },
+    {
+      "file": "external-search-toggle.spec.ts",
+      "test": "有材料时它不生效 带够长的材料时也不记进 prefs_applied：那条路根本没走外部检索",
+      "loadedMs": 418.2,
+      "idleMs": 342,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "intent-input.spec.ts",
+      "test": "点按钮发出什么 有图没选节点：发 edit，带整棵树，选区为空",
+      "loadedMs": 418.2,
+      "idleMs": 473.7,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "user-path-workspace.spec.ts",
+      "test": "用户路径 · 检查 应用建议：有可应用的建议时出现「应用」，点了按建议改图",
+      "loadedMs": 417.6,
+      "idleMs": 466.8,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "external-search-toggle.spec.ts",
+      "test": "开关本身 没设过这条偏好时什么都不记：默认开，没有条目可报",
+      "loadedMs": 416.6,
+      "idleMs": 271.3,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "diagram-type.spec.ts",
+      "test": "图型选择器 生成期间禁用：改了也看不到生效，那就不许改",
+      "loadedMs": 411.3,
+      "idleMs": 257.1,
+      "soloMs": 30.1,
+      "capMs": 5000
+    },
+    {
+      "file": "user-path-workspace.spec.ts",
+      "test": "用户路径 · 检查 检查与建议：侧栏有一个「检查与建议」，点了把这一轮送出去做体检",
+      "loadedMs": 409.5,
+      "idleMs": 449.3,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "delete-actions.spec.ts",
+      "test": "同屏三个删除 按 data-test 点：三个动作各发各的端点，顺序与文档位置无关",
+      "loadedMs": 408.1,
+      "idleMs": 485.4,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "intent-input.spec.ts",
+      "test": "只给材料的场景 材料标题能用时：不写主题也能生成，标题写进 goal",
+      "loadedMs": 406.5,
+      "idleMs": 462.8,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "upload.spec.ts",
+      "test": "多来源输入界面 录音结束仅添加语音来源；录音期间不能提前生成",
+      "loadedMs": 405.6,
+      "idleMs": 419,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "node-toolbar.spec.ts",
+      "test": "节点工具条 点「删」真的删掉这个节点（中心主题不允许删）",
+      "loadedMs": 403.9,
+      "idleMs": 325.9,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "app.spec.ts",
+      "test": "App 流里出现 error 事件时显示消息且不崩",
+      "loadedMs": 403.1,
+      "idleMs": 358.5,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "expand-node.spec.ts",
+      "test": "展开按钮的三态 expandable=no：按钮禁用，并说明已经到底了",
+      "loadedMs": 403,
+      "idleMs": 588.5,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "canvas-keys.spec.ts",
+      "test": "画布的结构键只在画布有焦点时生效 焦点在画布上：Tab 加子节点、Enter 加兄弟节点，原来的键盘操作仍在",
+      "loadedMs": 402.6,
+      "idleMs": 277.8,
+      "soloMs": null,
+      "capMs": 8000
+    },
+    {
+      "file": "shell-layout.spec.ts",
+      "test": "右栏改成覆盖式抽屉 选中节点不会自动弹抽屉（那比右栏更挡），但入口按钮会亮",
+      "loadedMs": 400.6,
+      "idleMs": 353,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "user-path-workspace.spec.ts",
+      "test": "用户路径 · 检查 一键修复：可修复时出现「一键修复」，点了发出 POST /optimization/repair",
+      "loadedMs": 399.9,
+      "idleMs": 436.6,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "upload.spec.ts",
+      "test": "上传文档生成导图 超过 10MB 的文件不发请求，直接提示",
+      "loadedMs": 398.8,
+      "idleMs": 526.6,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "diagram-type.spec.ts",
+      "test": "拆解方式选择器 选了就随 create 请求发出去",
+      "loadedMs": 398,
+      "idleMs": 436.8,
+      "soloMs": 41.3,
+      "capMs": 5000
+    },
+    {
+      "file": "intent-input.spec.ts",
+      "test": "三态文案与按钮 有图 · 选了 3 个节点：徽标、placeholder、按钮都跟着数走",
+      "loadedMs": 397.6,
+      "idleMs": 426.5,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "user-path-input.spec.ts",
+      "test": "用户路径 · 生成 取消：生成中那一行状态里有取消，点了之后这一轮被中止",
+      "loadedMs": 397.1,
+      "idleMs": 335.8,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "user-path-input.spec.ts",
+      "test": "用户路径 · 导图 保存：画布上有图时点保存，发出 POST /mindmaps",
+      "loadedMs": 396.4,
+      "idleMs": 349.3,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "user-path-workspace.spec.ts",
+      "test": "用户路径 · 知识库 列表：「知识库」打开面板，发出 GET /knowledge/library",
+      "loadedMs": 395.7,
+      "idleMs": 539.7,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "expand-node.spec.ts",
+      "test": "展开按钮的三态 旧图没有 expandable 字段：仍然可点，并说明只是不确定",
+      "loadedMs": 393,
+      "idleMs": 382.5,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "upload.spec.ts",
+      "test": "多来源输入界面 改图不弹「要不要丢弃未保存的修改」",
+      "loadedMs": 392.6,
+      "idleMs": 334.1,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "intent-input.spec.ts",
+      "test": "三态文案与按钮 只选一个节点时用单数文案",
+      "loadedMs": 391.9,
+      "idleMs": 397.2,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "settings-panel.spec.ts",
+      "test": "顶栏入口 不打开面板时不请求 `/settings/model`：不该为一次没点的功能付一次往返",
+      "loadedMs": 391.5,
+      "idleMs": 321,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "app.spec.ts",
+      "test": "知识库入口 正文读不出来时只影响这一份：列表还在，能重试也能退回",
+      "loadedMs": 389.2,
+      "idleMs": 275,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "external-search-toggle.spec.ts",
+      "test": "开关本身 勾一下就是写偏好（不是发一次性字段），落库之后界面跟着变",
+      "loadedMs": 389.2,
+      "idleMs": 259.9,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "shell-layout.spec.ts",
+      "test": "右栏改成覆盖式抽屉 节点详情、附加关系、本图来源都在抽屉里，一块没少",
+      "loadedMs": 388.6,
+      "idleMs": 358.8,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "shell-layout.spec.ts",
+      "test": "右栏改成覆盖式抽屉 抽屉默认关着，而且是绝对定位的覆盖层（不是流里的第三块）",
+      "loadedMs": 387.3,
+      "idleMs": 509.5,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "external-ref-link.spec.ts",
+      "test": "外部来源的引用链接 metadata.url 非空时渲染成新窗口打开的链接",
+      "loadedMs": 383.7,
+      "idleMs": 650.3,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "user-path-input.spec.ts",
+      "test": "用户路径 · 材料 上传文档 / 上传图片：材料面板里有文件框，接受这两类",
+      "loadedMs": 381.5,
+      "idleMs": 424.7,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "expand-node.spec.ts",
+      "test": "展开中与生成中互斥 生成期间「展开这一支」是禁用的，点了也不会插队",
+      "loadedMs": 380,
+      "idleMs": 455.3,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "node-toolbar.spec.ts",
+      "test": "节点工具条 「色」展开调色板，选一个就把语义色写进节点",
+      "loadedMs": 379,
+      "idleMs": 371.9,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "user-path-input.spec.ts",
+      "test": "用户路径 · 生成 深度思考 / 智能搜索：两个开关都在，深度思考点了会带上推理模型",
+      "loadedMs": 379,
+      "idleMs": 386.1,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "chat-dock.spec.ts",
+      "test": "底部对话框的状态机 失败时对话框留住（他要改一句重来，不该先翻历史）",
+      "loadedMs": 378.7,
+      "idleMs": 389.6,
+      "soloMs": 26,
+      "capMs": 5000
+    },
+    {
+      "file": "settings-panel.spec.ts",
+      "test": "保存：只发用户真改过的字段 填了新密钥才发 `api_key`；留空时绝不发（留空＝不改）",
+      "loadedMs": 378.6,
+      "idleMs": 307.3,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "structure-check.spec.ts",
+      "test": "抽屉里的那块面板 info 默认折叠，点开才逐条列出",
+      "loadedMs": 375.5,
+      "idleMs": 381.6,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "structure-check.spec.ts",
+      "test": "生成落地之后自动跑一次检查 只跑 check（不跑 suggest），并把结果并进状态行",
+      "loadedMs": 373.1,
+      "idleMs": 351.8,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "canvas-edges.spec.ts",
+      "test": "画布上的三种连线 鱼骨：主骨末端的箭头只画一份，且落在它自己那条骨线的组里",
+      "loadedMs": 372,
+      "idleMs": 401.4,
+      "soloMs": 61.6,
+      "capMs": 10000
+    },
+    {
+      "file": "node-detail.spec.ts",
+      "test": "侧栏分区 label 作标题、detail 作正文、note 进「我的备注」输入框",
+      "loadedMs": 370.6,
+      "idleMs": 413.5,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "structure-check.spec.ts",
+      "test": "抽屉里的那块面板 诊断多于 6 条时给一条能走到全部的出路（不把后面几条锁起来）",
+      "loadedMs": 369.5,
+      "idleMs": 314.2,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "node-edit.spec.ts",
+      "test": "节点内联编辑 回车提交新文字",
+      "loadedMs": 369.2,
+      "idleMs": 436.7,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "agent.spec.ts",
+      "test": "部分完成与诊断 带 diagnostics 时面板列出诊断 message，超过三条折成计数",
+      "loadedMs": 368.5,
+      "idleMs": 265.9,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "shell-layout.spec.ts",
+      "test": "右栏改成覆盖式抽屉 顶栏那个开关能打开、也能收起",
+      "loadedMs": 366.9,
+      "idleMs": 396.3,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "branch-digest.spec.ts",
+      "test": "差得太少的支不挂角标 一支只差 2 个节点：不画（读一句概括比直接点开更贵）",
+      "loadedMs": 365.2,
+      "idleMs": 218,
+      "soloMs": 175.2,
+      "capMs": 5000
+    },
+    {
+      "file": "upload.spec.ts",
+      "test": "多来源输入界面 存在失败项时阻止生成，移除后恢复可生成",
+      "loadedMs": 364,
+      "idleMs": 336.3,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "intent-input.spec.ts",
+      "test": "键盘 Enter 提交",
+      "loadedMs": 363.6,
+      "idleMs": 287.5,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "canvas-edges.spec.ts",
+      "test": "画布上的三种连线 流程图：附加边画成 mindEdge（带 kind，能换色/换线型）",
+      "loadedMs": 363,
+      "idleMs": 295.6,
+      "soloMs": 60.5,
+      "capMs": 10000
+    },
+    {
+      "file": "expand-node.spec.ts",
+      "test": "展开的生长预览 node_grow 落在被展开的那个节点下（不是根下）",
+      "loadedMs": 357.4,
+      "idleMs": 316.1,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "resume.spec.ts",
+      "test": "上次的生成结果 点「载入」把上次的结果直接装进画布，可撤销",
+      "loadedMs": 354.3,
+      "idleMs": 294,
+      "soloMs": 23.6,
+      "capMs": 5000
+    },
+    {
+      "file": "shell-actions.spec.ts",
+      "test": "☰ 抽屉：原来那些按钮一件不少 抽屉里能点到：保存、新建、打开、演示示例、知识库、导入、导出、偏好、节点详情",
+      "loadedMs": 352.3,
+      "idleMs": 294.3,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "user-path-workspace.spec.ts",
+      "test": "用户路径 · 画布（节点上的角标） 展开节点：还有没显示的孩子时，节点上有一枚「+N」，点了请外面展开",
+      "loadedMs": 351.8,
+      "idleMs": 291.6,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "structure-check.spec.ts",
+      "test": "建议的应用与忽略 指向有子节点的建议不给「应用」：删掉会丢那一支",
+      "loadedMs": 351.7,
+      "idleMs": 318.6,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "prefs.spec.ts",
+      "test": "「以后都这样」是主要写入源 不勾就不写：一次生成不该在库里留下任何偏好",
+      "loadedMs": 351.5,
+      "idleMs": 453.9,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "edit-intent.spec.ts",
+      "test": "「改这张图」认选区 选中三个节点：请求体里的 selected_ids 正好是这三条",
+      "loadedMs": 350.6,
+      "idleMs": 397,
+      "soloMs": 27.2,
+      "capMs": 5000
+    },
+    {
+      "file": "structure-check.spec.ts",
+      "test": "入口文案与实际请求对得上 「检查与建议」只打一次 /suggest，不再补一次 /check",
+      "loadedMs": 350.2,
+      "idleMs": 317.8,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "settings-panel.spec.ts",
+      "test": "打开面板：读的是\"当前生效值\"，密钥只有打码值 环境变量的值也要能显示（配置不全时用户才知道该填什么）",
+      "loadedMs": 348.7,
+      "idleMs": 391,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "user-path-input.spec.ts",
+      "test": "用户路径 · 生成 添加材料 / 管理材料：面板默认收起，两个入口都能把它打开",
+      "loadedMs": 346.9,
+      "idleMs": 333.6,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "settings-panel.spec.ts",
+      "test": "打开面板：读的是\"当前生效值\"，密钥只有打码值 没换过地址时不该出现那条提示：绝大多数打开都是正常状态",
+      "loadedMs": 346,
+      "idleMs": 264.5,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "chat-dock.spec.ts",
+      "test": "底部对话框的状态机 生成中：整块收成一条细进度，输入框与参数都不渲染",
+      "loadedMs": 345.6,
+      "idleMs": 532,
+      "soloMs": 29.7,
+      "capMs": 5000
+    },
+    {
+      "file": "upload.spec.ts",
+      "test": "上传文档生成导图 中间有页识别失败时提示具体页码，而不是谎报\"仅处理前 N 页\"",
+      "loadedMs": 341.3,
+      "idleMs": 386.1,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "structure-check.spec.ts",
+      "test": "生成落地之后自动跑一次检查 一轮新的生成开始：上一份报告作废（它说的是上一棵树）",
+      "loadedMs": 341,
+      "idleMs": 251.2,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "user-path-input.spec.ts",
+      "test": "用户路径 · 材料 录音：有一个\"录音添加来源\"的入口",
+      "loadedMs": 338.3,
+      "idleMs": 336.5,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "shell-actions.spec.ts",
+      "test": "☰ 抽屉：原来那些按钮一件不少 抽屉里的「演示示例」真的能打开预置图列表",
+      "loadedMs": 337.6,
+      "idleMs": 333.4,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "chat-dock.spec.ts",
+      "test": "底部对话框的状态机 焦点在输入框里就不淡出，失焦且无草稿之后才走完那 2 秒",
+      "loadedMs": 337.5,
+      "idleMs": 354.3,
+      "soloMs": 22.4,
+      "capMs": 5000
+    },
+    {
+      "file": "shell-actions.spec.ts",
+      "test": "☰ 抽屉：原来那些按钮一件不少 抽屉里的「节点详情」把右抽屉打开",
+      "loadedMs": 336,
+      "idleMs": 331.6,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "user-path-input.spec.ts",
+      "test": "用户路径 · 导图 删除导图：抽屉里点删除 → 二次确认 → 发出 DELETE /mindmaps/{id}",
+      "loadedMs": 335.6,
+      "idleMs": 255,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "settings-panel.spec.ts",
+      "test": "打开面板：读的是\"当前生效值\"，密钥只有打码值 地址框下面写明「只支持 OpenAI 兼容格式」：不做 provider 下拉的代价要说出来",
+      "loadedMs": 333.8,
+      "idleMs": 321.9,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "shell-layout.spec.ts",
+      "test": "右栏改成覆盖式抽屉 「明细」按钮把抽屉打开并直接展开本次生成明细",
+      "loadedMs": 331.6,
+      "idleMs": 424.1,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "external-search-toggle.spec.ts",
+      "test": "有材料时它不生效 材料够长：置灰，并写明\"这次带材料，不走联网检索\"",
+      "loadedMs": 330.3,
+      "idleMs": 220,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "user-path-input.spec.ts",
+      "test": "用户路径 · 材料 清空来源：点了之后列表空了，草稿正文留着",
+      "loadedMs": 329.7,
+      "idleMs": 347.5,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "agent.spec.ts",
+      "test": "静默提示 10 秒以内仍显示阶段文案，不额外加括号提示",
+      "loadedMs": 328.2,
+      "idleMs": 241.7,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "settings-panel.spec.ts",
+      "test": "打开面板：读的是\"当前生效值\"，密钥只有打码值 地址换过之后，密钥那一栏要自己说清「重贴一次」，不能只显示「未设置」",
+      "loadedMs": 326.6,
+      "idleMs": 395.7,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "app.spec.ts",
+      "test": "App 开发期示例按钮不经过后端就能装载导图",
+      "loadedMs": 326.3,
+      "idleMs": 241.8,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "settings-panel.spec.ts",
+      "test": "打开面板：读的是\"当前生效值\"，密钥只有打码值 读取失败要说出来，而不是显示一张空表",
+      "loadedMs": 325.7,
+      "idleMs": 299.4,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "shell-actions.spec.ts",
+      "test": "☰ 抽屉：原来那些按钮一件不少 抽屉里的历史列表点一条就能打开那张图",
+      "loadedMs": 324.7,
+      "idleMs": 364.3,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "edit-intent.spec.ts",
+      "test": "画布右上角的「改这张图」入口 空输入不发请求",
+      "loadedMs": 323.2,
+      "idleMs": 212.7,
+      "soloMs": 48.4,
+      "capMs": 5000
+    },
+    {
+      "file": "user-path-input.spec.ts",
+      "test": "用户路径 · 材料 彻底删除：已入库的材料发出 DELETE",
+      "loadedMs": 321.1,
+      "idleMs": 445,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "intent-input.spec.ts",
+      "test": "点按钮发出什么 有图但没写要改什么：按钮同样点不动（改图必须说一句话）",
+      "loadedMs": 317.3,
+      "idleMs": 283.1,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "structure-check.spec.ts",
+      "test": "建议的应用与忽略 节点已经不在了的建议不再显示（报告过期时的产物）",
+      "loadedMs": 317.1,
+      "idleMs": 446.1,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "upload.spec.ts",
+      "test": "上传文档生成导图 连不上后端时说清是网络问题",
+      "loadedMs": 316.3,
+      "idleMs": 260.5,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "edit-intent.spec.ts",
+      "test": "侧栏改样式 下拉框里选颜色、输入框里写图标都写回 content，并可撤销",
+      "loadedMs": 315.1,
+      "idleMs": 316.4,
+      "soloMs": 27.1,
+      "capMs": 5000
+    },
+    {
+      "file": "structure-check.spec.ts",
+      "test": "建议的应用与忽略 鱼骨 / 流程图：不发请求，给一句能读懂的话",
+      "loadedMs": 314.7,
+      "idleMs": 234.7,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "shell-layout.spec.ts",
+      "test": "画布底部那一行 完成后变成结果摘要，并留着「回到生成之前」",
+      "loadedMs": 314.3,
+      "idleMs": 351.5,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "user-path-input.spec.ts",
+      "test": "用户路径 · 导图 删除导图（列表弹窗）：打开… → 弹窗里删除 → 确认 → 发出 DELETE",
+      "loadedMs": 312.4,
+      "idleMs": 291.2,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "app.spec.ts",
+      "test": "知识库入口 Esc 能关掉知识库抽屉，点遮罩也能关",
+      "loadedMs": 311.8,
+      "idleMs": 291.6,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "user-path-input.spec.ts",
+      "test": "用户路径 · 材料 移除：只把这一行从本轮拿掉，不发删除请求",
+      "loadedMs": 310.6,
+      "idleMs": 331.1,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "structure-check.spec.ts",
+      "test": "建议的应用与忽略 节点已经不在了：说真话，不假装应用成功",
+      "loadedMs": 310.5,
+      "idleMs": 294.9,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "node-toolbar.spec.ts",
+      "test": "工具条跟着视口走 缩放之后也重量（0.5 倍时节点变小、位置也变）",
+      "loadedMs": 308.9,
+      "idleMs": 137.1,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "upload.spec.ts",
+      "test": "上传文档生成导图 失败页较多时只列前几个并给出总数",
+      "loadedMs": 308.6,
+      "idleMs": 326.3,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "shell-actions.spec.ts",
+      "test": "材料与左栏 左栏已经撤掉：材料只出现在对话框的缩略图与「+」面板里",
+      "loadedMs": 307.8,
+      "idleMs": 252,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "app.spec.ts",
+      "test": "实体别名入口 展开「实体别名」列出合并结果与依据，删掉那一条",
+      "loadedMs": 306.9,
+      "idleMs": 276.2,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "prefs.spec.ts",
+      "test": "建议：只产出候选，用户点了才写 用户同意：写入时标成 suggestion_accepted",
+      "loadedMs": 303.7,
+      "idleMs": 273.2,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "shell-layout.spec.ts",
+      "test": "画布底部那一行 「上次的生成结果」现在挂在状态行上，不是右栏",
+      "loadedMs": 302.2,
+      "idleMs": 283,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "upload.spec.ts",
+      "test": "多来源输入界面 运行期间冻结来源列表，取消后恢复可编辑",
+      "loadedMs": 301.7,
+      "idleMs": 285.6,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "intent-input.spec.ts",
+      "test": "点按钮发出什么 没写主题时按钮点不动，也不发请求",
+      "loadedMs": 300.4,
+      "idleMs": 236.8,
+      "soloMs": null,
+      "capMs": 5000
+    },
+    {
+      "file": "history.spec.ts",
+      "test": "撤销栈的字节上限 字节超上限时丢最旧的，栈不会一直涨",
+      "loadedMs": 276.8,
+      "idleMs": 373,
+      "soloMs": null,
+      "capMs": 8000
+    },
+    {
+      "file": "history.spec.ts",
+      "test": "撤销栈的字节上限 步数上限仍然生效",
+      "loadedMs": 97.6,
+      "idleMs": 130,
+      "soloMs": null,
+      "capMs": 8000
+    },
+    {
+      "file": "history.spec.ts",
+      "test": "撤销栈的字节上限 撤销会同步减掉字节，不会越用越大",
+      "loadedMs": 39.6,
+      "idleMs": 31.1,
+      "soloMs": null,
+      "capMs": 8000
+    },
+    {
+      "file": "history.spec.ts",
+      "test": "撤销栈的字节上限 清空历史时字节归零",
+      "loadedMs": 9.9,
+      "idleMs": 4.4,
+      "soloMs": null,
+      "capMs": 8000
+    },
+    {
+      "file": "relation-lines.spec.ts",
+      "test": "删掉一条关系 edits.removeRelation 只动 relations，树一个字节不变",
+      "loadedMs": 5,
+      "idleMs": 0.7,
+      "soloMs": 0.7,
+      "capMs": 10000
+    }
+  ]
+}

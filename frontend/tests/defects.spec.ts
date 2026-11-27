@@ -1,4 +1,4 @@
-import { flushPromises, mount } from '@vue/test-utils';
+﻿import { flushPromises, mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -215,7 +215,25 @@ describe('缺陷三：拖到第 2 层节点下面', () => {
     expect(landed!.position.y).toBeCloseTo(preview.rect!.y, 5);
   });
 
-  it('预算截断时"拖到第 2 层节点下面"整体不再是死手势', () => {
+  /**
+   * 上限 15 秒的来历（判 **A 规模型**，且 b / c 都不适用）：
+   *
+   * 成本是"684 次真几何"——在预算截断的那棵 136 节点树上，`store.nodes`（画布上这 40 个）
+   * 里每个 depth≥1 的节点 × 每个 depth=2 的目标，逐个 `previewMove()` 算落点。
+   * 实测（`docs/TEST-LOAD-SENSITIVITY.md` 的表）：
+   *
+   *   单文件串行 635ms ／ 全量并行·空闲 3653ms ／ 全量并行·后端 pytest 同机 4313ms
+   *   → 放大几乎全部来自**全量并行**（6.8×），外部负载只再加 18%。
+   *
+   * 这里**不能减负载（b）**：684 组合就是这条用例的断言前提（"一个都没有 missing"），
+   * 少穷举一半等于放过"另一半组合里还有死手势"。**也不能标成只在空闲跑（c）**：
+   * 它钉的是一笔真实缺陷，必须每轮都执行。
+   *
+   * 15 秒 = 满载 4313 × 3.5，也 = 满载 × 2（下一跳的保险）再留 1.7×。按 CI runner
+   * 比本机满载慢 1.3–2× 折算，仍有 1.7–2.7× 余量；而不给到 30 秒，是为了让真卡死
+   * （死循环、等一个永远不来的 promise）仍然判红。
+   */
+  it('预算截断时"拖到第 2 层节点下面"整体不再是死手势', { timeout: 15_000 }, () => {
     // 缺陷的规模：修之前这 684 种组合里有 **385 种**返回 `missing`（「算不出落点」）。
     // 这里穷举一遍，钉住"一个都没有"——单点回归会漏掉另一半组合。
     const store = useMindMapStore();

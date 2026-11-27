@@ -124,6 +124,20 @@ jobs:
       - name: Test
         run: npm test
 
+      # 用例的成本棘轮：核对每条"贵用例"的超时上限是否还压在满载耗时的 1.5 倍以内
+      # （红线）、2 倍以内（黄线）。三次在负载上翻车（`docs/TEST-LOAD-SENSITIVITY.md`）
+      # 的共同形态是"这一条加宽"，而 CI 只会在下一次 push 时才知道——这里把"哪条其实
+      # 没有余量"提前变成一次静态比对。
+      #
+      # 为什么它是确定性的：判据是 `tests/**/*.spec.ts` 的**文本**（解析 `{ timeout }`）
+      # 加一份落库的基线 `scripts/test-cost-baseline.json`（本机满载实测），
+      # 不跑测试、不读运行时、不读 git 状态；路径以 `import.meta.url` 为锚。
+      # 与后端 job 的 `find_unwired.py --gate` 同一套棘轮语义：基线之外的用例不阻断。
+      #
+      # 放在 `npm test` 之后：先看真实的红，再看"它迟早会红"。
+      - name: 用例成本闸门
+        run: npm run test:cost:gate
+
       # 「后端加了路由 → client.ts 加了函数 → 没有任何界面代码调用它」这一类静态缺口，
       # 机器与理由都写在 `scripts/find_unwired.mjs` 的 docstring 里。它是**棘轮**不是
       # 绝对零：基线（`scripts/unwired_baseline.json`）里的四条各自写着为什么可以零引用，

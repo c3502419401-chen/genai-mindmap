@@ -71,7 +71,22 @@ beforeEach(() => {
   setActivePinia(createPinia());
 });
 
-describe('画布上的三种连线', () => {
+/**
+ * 为什么这一组有 10 秒显式上限（判 **A 规模型**：真挂 `@vue-flow/core` 的固有成本）。
+ *
+ * 实测（`docs/TEST-LOAD-SENSITIVITY.md` 的表，同一天同一份代码）：
+ *
+ *   鱼骨那条：单文件串行 151ms ／ 全量并行·空闲 1450ms ／ 全量并行 + 后端 pytest 1956ms
+ *
+ * 放大 ~13× 几乎全在**全量并行**那一层（单跑 → 全量），不是外部负载。三条用例每条都
+ * `mount(MindMapCanvas)` 一次，Vue Flow 的挂载 + 自己那轮测量是固有成本；这一组测的正是
+ * "真挂上去之后边画出来了没有"，换成 stub 就没有断言了——所以 **b（减负载）已经用完**
+ * （壳早已是最小的 `MindMapCanvas`，不再是 `App` 壳，见 `canvas-preview.spec.ts` 的注释）。
+ *
+ * 10 秒 = 满载 1956 × 5.1（也 = 满载 × 2 的 2.6 倍），与 `canvas-preview.spec.ts` 同一尺度；
+ * 按 CI runner 慢 1.3–2× 折算仍有 2.6–3.9× 余量。
+ */
+describe('画布上的三种连线', { timeout: 10_000 }, () => {
   it('鱼骨：骨线与短线都进了 SVG，点的坐标就是布局算出来的那些', async () => {
     const wrapper = mountCanvas();
     useMindMapStore().preview(fishboneContent, 'right');

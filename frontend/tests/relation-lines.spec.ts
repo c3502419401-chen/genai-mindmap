@@ -126,7 +126,18 @@ describe('关系线的数据通道', () => {
   });
 });
 
-describe('关系线在画布上真的画出来', () => {
+/**
+ * 真挂 `@vue-flow/core` 的那两组给了 10 秒显式上限（判 **A 规模型**，与
+ * `canvas-edges.spec.ts` 同一尺度、同一批读数）。
+ *
+ * 实测：那条"挂载之后出现两个 edge-mindRelation"单文件串行 169ms ／ 全量并行·空闲
+ * 1619ms ／ 全量并行 + 后端 pytest 1857ms —— 放大 ~11× 全在"单跑 → 全量并行"这一层。
+ * 成本是 Vue Flow 挂载本身（一条 `it` 一次 `mount`），而这条用例要证明的正是"真挂上去
+ * 之后 DOM 里有没有那两个 `<g>`"，mock 掉就没有断言了（b 用完，c 不适用：它必须每轮跑）。
+ *
+ * 10 秒 = 满载 1857 × 5.4；按 CI runner 慢 1.3–2× 折算仍有 2.7–4.2× 余量。
+ */
+describe('关系线在画布上真的画出来', { timeout: 10_000 }, () => {
   it('挂载之后出现两个 edge-mindRelation，并带 kind 的中文标签', async () => {
     const wrapper = mountCanvas();
     loadRelations(useMindMapStore());
@@ -165,7 +176,8 @@ describe('关系线在画布上真的画出来', () => {
   });
 });
 
-describe('删掉一条关系', () => {
+// 上限理由同上（这组里第二条真挂载画布）。
+describe('删掉一条关系', { timeout: 10_000 }, () => {
   it('edits.removeRelation 只动 relations，树一个字节不变', () => {
     const content = treeWithRelations();
     // `removeRelation` 收/返的是 `DiagramContent`（三种形状的联合），但这条用例
