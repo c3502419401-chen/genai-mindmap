@@ -11,6 +11,12 @@
 > 三段延迟的实测口径见 [LATENCY-BREAKDOWN.md](LATENCY-BREAKDOWN.md) 与
 > [ACCEPTANCE-REPORT.md](ACCEPTANCE-REPORT.md)。**三处冲突时以实现侧文档为准。**
 >
+> **本期实际交付边界（已交付 / 本期不交付 / 长期不做，逐条带前置条件）见
+> [SCOPE.md](SCOPE.md)。** 读本文件时请与它对照：本文件里写着、而 SCOPE.md 记为
+> 「本期不交付」的段落（如 3.4.1 的多人实时协作与多语言实时翻译），是**本期明确不做**，
+> 不是「待实现」；可直接抄进申报书的替换句见
+> [PROPOSAL-REPLACEMENTS.md](PROPOSAL-REPLACEMENTS.md)。
+>
 > 引用约定：本文件引用申报书原文时，请连"目标值 / 拟解决"这类限定词一起引——
 > 那几张表写的是**目标**，不是实测，也不是承诺。
 
