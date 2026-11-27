@@ -686,7 +686,11 @@ def test_existing_table_gets_the_new_columns(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "kind", ["add", "remove", "update", "move", "edge", "style", "accept", "repair"])
+    "kind",
+    # **必须与 `EditKind` 逐字对齐**：这个用例的语义是"每一种 kind 都能落库并读回"，
+    # 漏一个值就是漏一条契约路径。`generate` 原来也漏在这里（它有自己的
+    # `node_count` 用例，但不代表它不需要 round trip）。
+    ["add", "remove", "update", "move", "edge", "style", "accept", "generate", "repair"])
 def test_all_kinds_round_trip(kind: str):
     map_id = _create([_event(kind=kind)])
     summary = client.get(f"/api/mindmaps/{map_id}/edits/summary").json()
