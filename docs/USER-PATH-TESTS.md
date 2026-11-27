@@ -126,17 +126,22 @@
   模板里出现函数名基本就是接线；
 - 另记一列 `tests=`：**只在用例里被用到、产品代码零引用**，是最可疑的一档。
 
-### 结果：44 个导出函数，4 条零引用
+### 结果：44 个导出函数，1 条零引用（第 3 件已销账三条）
+
+下面这张表是当时的快照。**账本那三条已经接上界面了**（`stores/ledger.ts` +
+`components/EditLedger.vue`，判据与折叠口径见 `EDIT-LOG.md` 七·五），基线里那三条已
+删除，闸门现在只剩 `changePassword` 一条——所以表里保留原判定，好看出"该接"与"已接"
+之间差的是什么：不是决定，只是没人做。
 
 | 函数 | tests= | 判定 |
 | --- | --- | --- |
-| `getEditSummary` | 0 | **该接**。后端 `GET /mindmaps/{id}/edits/summary` 在、`client.ts` 的函数在、界面零入口。`client.ts` 自己的注释说它是"这一版真正的交付物"（`label_shrunk` 回答标题是不是被普遍改短，`removed_depth` 回答删掉的集中在第几层）。 |
-| `listEditEvents` | 0 | **该接**。summary 给分布，它给"那 42 条具体是什么"。没有它，一个反常的平均值只能靠连数据库才查得下去。 |
-| `getEditHealth` | 0 | **该接，但接在哪还没定**。跨图链路健康检查（昨日编辑过的图数 / 昨日保存的图数）是**运维视角**，按现有界面形状更可能该落在管理视图里，而不是画布上。 |
+| `getEditSummary` | 0 | **已接**（第 3 件）：账本标题行那句摘要 + 三条读数就是它。原判「该接」——后端 `GET /mindmaps/{id}/edits/summary` 在、`client.ts` 的函数在、界面零入口；`client.ts` 自己的注释说它是"这一版真正的交付物"。 |
+| `listEditEvents` | 0 | **已接**（第 3 件）：同一个面板的列表，逐条念成人话。原判「该接」——summary 给分布，它给"那 42 条具体是什么"。 |
+| `getEditHealth` | 0 | **已接，但只在异常时露面**（第 3 件）：`chain_suspect` 为真才显示一行琥珀。原判「该接，但接在哪还没定」——它是**运维视角**，判到最后是"接在同一块面板里、正常时一个字都不显示"，而不是另开一个管理视图。 |
 | `changePassword` | 0 | **不该接（有意）**。理由已经写在界面上：`AuthPanel.vue` 已登录那段明写"不再给一个改密码的入口……那是设置页的事"。这一版没有账号设置页，所以入口缺席是决定不是遗漏。等设置页上线，它会变成第一条"该接"。 |
 
-三条 `gap` + 一条 `intentional` 进基线（`frontend/scripts/unwired_baseline.json`），
-每条都写了 `reason` 与 `evidence`。闸门是**棘轮**，不是"零"：
+现在基线里只剩一条 `intentional`（`changePassword`）——那三条 `gap` 随第 3 件一起
+从基线里删掉了。每条都写了 `reason` 与 `evidence`。闸门是**棘轮**，不是"零"：
 
 ```
 node scripts/find_unwired.mjs           # 汇总 + 清单

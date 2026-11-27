@@ -381,26 +381,34 @@ last_event_at "2026-11-17T09:35:11.208Z"
 | `frontend/src/mindmap/edit-log.ts` | 类型 + `diffEdits` / `acceptEvent` 纯函数（三条判断与两处"分母"都在这里） |
 | `frontend/src/stores/mindmap.ts` | `pendingEdits` / `pushHistory(origin)` / `collectEdits`；`save()` 里分批提交、成功才清；`replaceContent()` 是 `kind='repair'` 的唯一产地 |
 | `frontend/src/api/client.ts` | `saveBody`（空数组不发字段）、`getEditSummary`、`listEditEvents`、`getEditHealth` |
+| `frontend/src/stores/ledger.ts` | 账本 store + 纯函数：`foldEvents`（一键修复折叠）、`headlineOf` / `notesOf`（摘要读数）、`healthWarning` |
+| `frontend/src/components/EditLedger.vue` | 右抽屉里那一块「改动记录」，收起时不发请求 |
 | `backend/app/contracts/edits.py` | `EditEventIn` / `EditEventRow` / `EditSummary` / `EditHealth` |
 | `backend/app/mindmaps/edits.py` | `record` / `summary` / `health` / `recent` / `clear` |
 | `backend/app/mindmaps/repository.py` | `edit_events` 表、索引与幂等补列（`_ensure_columns`） |
 | `backend/tests/test_edit_events.py` | 45 条：落库、统计、三个关键指标（含 `repair` 三条过滤）、两处分母、旧表补列、五个边界 |
 | `frontend/tests/edit-log.spec.ts` | 33 条：diff 正确性、actor 区分、子树规模、accept 三条路、只存长度、500 上限、清空时机、撤销不记 |
 | `frontend/tests/repair-ledger.spec.ts` | 3 条：`repair` 覆盖只动 `kind`、保存请求体里就是 `repair`、手工编辑仍是 `update` |
+| `frontend/tests/ledger.spec.ts` | 11 条：真事件形状读成四行、修复折叠与明细反推、摘要三条读数、健康只在异常时说、只看选中节点、换图清空、读不到时说原因 |
 
 ## 七、这个账本今天谁在读
 
 加 `repair` 之前先问一句：**加第 9 种 `kind`，价值在哪？** 三条读路径
-（`GET /edits` 明细、`/edits/summary`、`/edits/health`）今天**在界面上没有入口**——
+（`GET /edits` 明细、`/edits/summary`、`/edits/health`）当时**在界面上没有入口**——
 `api/client.ts` 里那三个函数零引用。也就是说，这些事件记了但没人看。
+
+（**第 3 件已经把这个缺口补上了**：三条都有了界面入口，见七·五。下面这张表记的是
+当时的查实结果，留着是因为"谁在读"这件事每加一种 `kind` 都要重新查一遍。）
 
 把"谁在读"查实（不是照 docstring 抄），只有三类，而且与注释里的说法不完全一样：
 
 | 消费者 | 读什么 | 现在成立吗 |
 |---|---|---|
 | `scripts/` 的三个报告脚本（`memory_corpus_report.py`、`measure_profile_ab.py`、`build_propositions.py`） | **裸 SQL 直读表**：前者 `GROUP BY kind, actor`，中者数 `kind='remove'`，后者用 `edit_events.id` 回指观测 | **成立**。加 `repair` 之后前者会多出一个正确的桶（而不是把规则干的事混进 `(update, user)`），中者的精确匹配天然不受影响 |
-| `GET /mindmaps/{id}/edits/summary`（`edits.summary()`） | 分母、`label_shrunk`、`removed_*` | **端点存在，零调用方**：前端三函数零引用、`scripts/` 零调用。今天只服务"人 curl 一下" |
-| `edits.parent_ids()` | `add` / `move` 的父样本 | **零产品引用**（`tests=6`、`scripts=0`、`app` 内只在注释里出现两次）。docstring 说它"服务 `optimization/link.py` 的候选"，而 `link.py` 并没有调它——**注释过期了** |
+| `GET /mindmaps/{id}/edits/summary`（`edits.summary()`） | 分母、`label_shrunk`、`removed_*` | **成立**（第 3 件接上）：`EditLedger.vue` 展开时读，标题行那句摘要 + "标题平均从 18.3 字改到 9.1 字"三条读数就是它的全部内容 |
+| `GET /mindmaps/{id}/edits`（`edits.recent()`） | 明细：那 42 条具体是什么 | **成立**（第 3 件接上）：同一个面板的列表，逐条念成人话 |
+| `GET /mindmaps/edits/health`（`edits.health()`） | 跨图的链路读数 | **成立，但只在异常时露面**：`chain_suspect` 为真才显示一行，正常时一个字都没有（理由见七·五） |
+| `edits.parent_ids()` | `add` / `move` 的父样本 | **零产品引用（仍是）**：`tests=6`、`scripts=0`、`app` 内只在注释里出现。第 3 件判的是"不接 `link.py`、改注释"——那半句"服务 link.py 的候选"已删，理由与保留依据都写在函数 docstring 里 |
 
 所以这一轮改的不是"让一个没人看的东西更准"。准的对象是三个裸 SQL 报告脚本：它们
 按 `(kind, actor)` 分组读表，修复事件混成 `(update, user)` 之后，那些报告会把"规则干的"
@@ -417,6 +425,69 @@ last_event_at "2026-11-17T09:35:11.208Z"
 3. **接线之后第一屏就会读 `label_shrunk`。** 先接界面、后修口径，等于先给用户看一份
    已知偏高的数字。
 
-顺带一条给清单第 3 件的证据：`parent_ids` 的 docstring 与事实不符（说服务 `link.py`，
-实际零产品引用）。接消费者时要么接上它，要么把那句注释改掉——**留着过期的注释比没有
-注释更坏**，它会让下一个人以为那一列已经有读者。
+顺带说清 `parent_ids` 的结局（清单第 3 件）：docstring 与事实不符（说服务 `link.py`，
+而 `link.py` 的两条父来源都读树、不读事件表），**处理方式是改注释，不是接线**。改完
+之后这一列的身份是"唯一的具名读路径 + 零产品调用方"，保留依据写在函数 docstring 里
+（这一列每次保存都在写；删掉读路径会让它只剩"写"和"测试直查库"两件事）。
+
+## 七·五、界面接上之后：账本回答哪个问题
+
+清单第 3 件把三条读路径接到屏幕上，落点是右抽屉里一块可折叠的「改动记录」
+（`components/EditLedger.vue` + `stores/ledger.ts`）。它是**整图视角**的列表，不是
+节点详情的一部分——判据是数据形状：三条读路径全部以 `map_id` 为键，`summary` 里每
+一个数字（`label_shrunk` / `removed_depth` / `untouched_runs`）都是整图口径。
+
+### 三个用户问题，界面答了哪个
+
+| 问题 | 答了吗 | 在哪 |
+|---|---|---|
+| ① 这张图改过什么（整图审计） | **答了**，这是它唯一的主语 | 列表逐条 + 标题行那句"模型给了 47 个节点 · 图上 6 处改动 · 1 / 2 次生成一字未改" |
+| ② 这个节点为什么变成这样 | **答了一半，而且刻意只答一半** | "改过几次、改成了什么" = 选中节点后勾「只看选中节点」；"为什么"不在账本里（它只有 diff，没有理由），那是 `StructureCheck` 的活 |
+| ③ 模型和规则各改了多少（信任判断） | **答了**，但没做成饼图 | 三种颜色 + 三句人话：`模型生成 · 32 个节点`、`你改短了标题：…`、`规则整理 · 38 处`（下一行：`删了 12 个节点（其中 3 整支）· 改了 21 处文字`） |
+
+② 没答的那一半不是"不需要"，是**账本没有那个数据**。要答"为什么"，缺的是"改之前
+那句话是谁的产物"——`before` 有（`label` 存全文），产物来源没有（`MindNode` 没有
+手动/生成标记，见五、局限）。所以它是"该另做"，落点在诊断与来源引用，不在这块面板：
+把半截答案摆进节点详情，会让人以为那里能归因。
+
+### 三个硬约束
+
+1. **不许出现 `kind` 码。** 文案只从事件行上真有的字段拼：`move` 只有父标签或位次，
+   所以写"换了父节点：主题 → 风险"，不写"把「某节点」移到了「风险」下面"（事件里
+   没有那个节点的名字，硬写就只能从 `node_id` 猜）。认不出的 `kind` 原样显示，与
+   `mindmap/diagnostics.ts` 对未知诊断码的做法一致。
+2. **一次修复折成一条。** 分组键是 `at`（整批替换只取一次时刻），列表按
+   `at DESC, id ASC` 排，所以"同一批"必然相邻。折叠行的摘要从载荷反推
+   （`subtree_size` → 删了子树；有 `field` → 改了那个字段；`"第N位"` → 重排；无
+   `before` 有 `after` → 新增），因为这一批的 `kind` 全被 `repair` 覆盖了——**动作名
+   丢了，载荷还在**，所以能反推，但不能假装读 `kind`。
+3. **`getEditHealth` 只在异常时说话。** `edited_maps` / `saved_maps` 两个跨图数字对
+   "这张图改过什么"没有任何帮助，正常时摆出来只会让人在两个与自己无关的量之间找
+   意义。而 `chain_suspect` 一旦为真，它就是用户唯一能看见的"账本可能没在记"——这张
+   表静默坏过 40 分钟，期间每张图的 `total` 都是 0，看着和"没人改过"一模一样。
+   所以：正常零字，异常一行琥珀。
+
+### 折完之后一张图几行
+
+用五、那组真实跑批换算（37 条事件：`generate` 1 + `update` 20 + `remove` 8 + `add` 4
++ `style` 3 + `move` 1）：**没跑过修复就是 37 行**——一次手工动作一条，本来就该逐条
+读。跑过一次一键修复之后，那一次写进来的几十条折成 **1 行**；一张正常使用的图落在
+10~20 行量级，最上面三行通常是"生成 / 你改了什么 / 规则整理"。
+
+### 那三个裸 SQL 报告该不该也搬上来
+
+`memory_corpus_report.py`（`GROUP BY kind, actor`）、`measure_profile_ab.py`（数
+`kind='remove'`）、`build_propositions.py`（用 `edit_events.id` 回指）——**不搬。
+理由不是"数据同源不该分两处"，而是消费者不在屏幕前**：
+
+- 前两个的产物是**数据集 / 读数文件**，消费者是训练与评测流程；`build_propositions`
+  的产物是命题语料，消费者是另一条构建流水线。界面上没有"我要这份语料"这个动作的
+  位置，搬上来只会多一个点了不知道去哪找产物的导出按钮。
+- 但 `docs/` 里几处结论确实来自它们，所以**它们依赖的那几个数必须能在界面上复算到
+  单图这一层**。这就是 `summary` 那四个字段上界面的原因：`generated_nodes`（分母）、
+  `changed_events`（分子）、`untouched_runs`（"一字未改"）、`label_shrunk`（缩短）；
+  `measure_profile_ab` 那个"删了多少"更已经进了界面（`removed_depth` 那一行）。
+- 差的只有**跨图**那一层（脚本 = 全库之和，界面 = 这张图）。它该有的形态不是"搬
+  脚本"，而是"一个把所有图的 `summary` 求和 / 求分布的只读面板"。它的真消费者现在
+  只有写 docs 的人，频率一周一次——所以判**"该另做，但现在不做"**：等有人第二次要
+  在屏幕前问那个跨图的数，再动。在那之前脚本留在 `scripts/`，输出接 `docs/`。

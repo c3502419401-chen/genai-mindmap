@@ -33,10 +33,11 @@
 
 不成立的部分，三条都是**现在就能验证的**：
 
-- **账本读不回来。** `GET /api/mindmaps/{id}/edits` 有测试（`tests/test_edit_events.py`），
-  也有前端封装（`client.ts::listEditEvents`），但 `src/**` 里引用数为 0——它就在
-  `frontend/scripts/unwired_baseline.json` 的基线里，`status: "gap"`，理由是"界面零入口"。
-  于是"能从账本读出来"这句话的准确版本是"**后端存着**"，不是"界面读得到"。
+- **账本读得回来，但读的不是"这个节点"。** `GET /api/mindmaps/{id}/edits` 有测试
+  （`tests/test_edit_events.py`）、有前端封装（`client.ts::listEditEvents`），第 3 件
+  之后还有界面入口（`components/EditLedger.vue` 的「改动记录」）。但它是**一张图的
+  列表**：要知道"这一个节点是谁加的"，得先在列表里找到它（或勾「只看选中节点」），
+  而那要求那条 `add` 事件存在——见下面两条。
 - **打开旧图时账本是空的。** `stores/mindmap.ts::loadMap(content, record)` 只接
   `content / id / version / updated_at`，`pendingEdits` 不随打开动作回填。三天前保存的
   图里，"这 12 个没引用的节点"里哪些是手动加的——界面此刻没有任何依据。
