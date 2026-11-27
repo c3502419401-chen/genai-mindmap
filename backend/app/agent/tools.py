@@ -201,9 +201,10 @@ DEEP_CONCURRENCY = 10
 DEEP_DEFAULT_DEPTH = mindmap_contract.MAX_TREE_DEPTH
 DEEP_MAX_DEPTH = mindmap_contract.MAX_TREE_DEPTH
 
-# 二级及以下每个父节点最多几个子节点。一级分支由 `GenerateDeepArgs.branches`
-# 控制（上限 `DEEP_MAX_BRANCHES`），往下的每一层必须收窄：20 × 5 × 5 × 5 连 1000
-# 节点的契约都装不下，而且每层 5 个正是"一屏能扫完"的量。
+# 二级及以下每个父节点最多几个子节点。**一级分支的条数由内容决定**（无上限，见
+# `NO_BRANCH_CAP_RULE`；`GenerateDeepArgs.branches` 是无效字段），只由 `DEEP_MAX_BRANCHES`
+# 兜住画布承载。往下的每一层必须收窄：20 × 5 × 5 × 5 连 1000 节点的契约都装不下，
+# 而且每层 5 个正是"一屏能扫完"的量。
 DEEP_FANOUT = 5
 
 # 一级分支的硬上限。参数模型用 `le=DEEP_MAX_BRANCHES` 引用它，骨架那里也用它截断，
@@ -212,12 +213,14 @@ DEEP_MAX_BRANCHES = 20
 
 # ---------------------------------------------------------------- 两级骨架
 #
-# 一级分支多到二十条时，图宽得没法看：`branches` 只把上限从 8 提到 20，把"塞进一支"
-# 换成了"图很宽"，问题没解决。所以骨架阶段先归成几组：**一级是组，二级才是那二十节**。
+# 一级分支多到二十条时，图宽得没法看：当年把 `branches` 的上限从 8 提到 20 只是把
+# "塞进一支"换成了"图很宽"，问题没解决。所以骨架阶段先归成几组：**一级是组，二级才是
+# 那二十节**。
 #
 # `SKELETON_GROUP_THRESHOLD`（N）：**超过它才分两级**。它必须是一个"再看就数不清"的位置，
-# 不是"比默认值大就分"——`branches` 默认 5，若在 6 就分组，普通主题会被硬拆出 2-3 个
-# 分组，而那种主题本来就没有可归纳的上一层。
+# 不是"比某个默认值大就分"——在 6 就分组，普通主题会被硬拆出 2-3 个分组，而那种主题
+# 本来就没有可归纳的上一层。判据读的是**材料的宽度**（目录行数 / 章数 / 图谱补条），
+# 不读任何模型在读到材料之前填的数（`branches` 已不参与，见 §5.1②）。
 #   10 的依据：调色板是 8 色（`NODE_COLORS`），一级色靠"一色一组"分组，8 色刚好一屏；
 #   而画布横向能扫完的一行也在 10 条上下。<=10 条时扁平已经能读，分组只是多一层点击。
 SKELETON_GROUP_THRESHOLD = 10
@@ -1071,18 +1074,26 @@ class ToolRegistry:
 class GenerateDeepArgs(BaseModel):
     """分片生成的入参。
 
-    `branches` 与 `points_per_branch` 是**期望值**而不是硬约束：骨架给多给少一条
-    都继续，展开不足只补那一支。把它们写成严格契约，等于把模型的一次抖动
-    升级成整次失败。
+    `branches` 是**历史遗留的无效字段**（填了不影响产出，见下面那段注释）；
+    `points_per_branch` 是**期望值**而不是硬约束：骨架给多给少一条都继续，
+    展开不足只补那一支。把它写成严格契约，等于把模型的一次抖动升级成整次失败。
     """
 
     model_config = ConfigDict(extra="forbid")
     topic: str = Field(min_length=1, max_length=1000, description="中心主题，用用户的语言")
-    # 上限 20 是按契约反推的，不是拍的：最少每支 2 个要点，一个分支占 3 个节点，
-    # 1000 节点理论能放 333 支；真正限制它的是可读性——超过二十条一级分支，
-    # 图会宽到没法看。原来的 8 没有任何依据，长材料（比如二十几节的讲义）
-    # 天然会有更多一级节点，卡在 8 等于逼模型把不相关的东西塞进同一支。
-    branches: int = Field(default=5, ge=3, le=DEEP_MAX_BRANCHES, description="一级分支数量上限")
+    # **不删字段，只把 description 改成它现在真正的用途（= 没有用途）**。
+    # `docs/BRANCH-CAP.md` §5.1① 记的就是这个字段：一级分支条数改成由内容决定
+    # （`NO_BRANCH_CAP_RULE`）之后，`app/` 里已经没有一处读它（`test_branches_arg_is_inert`
+    # 钉着"填 3 与填 20 产出逐字节相同"）。
+    #
+    # 为什么不是删掉字段（那一节说两种处置都可以）：本模型的 `model_config` 是
+    # `extra="forbid"`，删字段等于**模型凭旧记忆传 `branches` 时整次工具调用校验失败**
+    # ——把"参数是噪音"升级成"参数是故障"。而仓库里四十余处用例与五个度量脚本仍在显式
+    # 传它（它们钉的是别的行为，不读这个值），删字段还要连它们一起改。工具参数不进
+    # `openapi.json`（同节 §2 已核），两种处置都不触发契约变更，所以选不制造新故障的那种。
+    branches: int = Field(
+        default=5, ge=3, le=DEEP_MAX_BRANCHES,
+        description="已废弃：一级分支条数由内容决定，填什么都不会改变结果")
     points_per_branch: int = Field(default=3, ge=2, le=5, description="每条一级分支下至少要有几个要点")
     # 深度同样只是**预算**而不是硬契约：额度不够时会被截短并标 `partial`，
     # 而不是把整次生成判成失败。
@@ -1127,9 +1138,11 @@ class GenerateArgs(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     topic: str = Field(min_length=1, max_length=1000, description="中心主题，用用户的语言")
-    # 与 `GenerateDeepArgs.branches` 同一个区间：它同时是**要求**和**上限**
-    # （骨架给多了会被截到 `DEEP_MAX_BRANCHES`）。
-    branches: int = Field(default=5, ge=3, le=DEEP_MAX_BRANCHES, description="一级分支数量上限")
+    # 与 `GenerateDeepArgs.branches` 同一处置、同一理由（见那一处注释）：条数由内容定
+    # （`NO_BRANCH_CAP_RULE`），这个字段一处都不读，只把 description 改成实话。
+    branches: int = Field(
+        default=5, ge=3, le=DEEP_MAX_BRANCHES,
+        description="已废弃：一级分支条数由内容决定，填什么都不会改变结果")
     diagram_type: Literal["tree", "flowchart", "fishbone"] = Field(
         default="tree",
         description="图型：tree 思维导图（默认）/ flowchart 流程图（可带附加边）/ fishbone 鱼骨图",

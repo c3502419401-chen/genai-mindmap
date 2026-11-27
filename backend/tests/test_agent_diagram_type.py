@@ -312,12 +312,35 @@ class TestRequestWithoutDiagramTypeIsUnchanged:
 
         这一条守的是"老前端看不到任何变化"：参数还在、描述还是那句"diagram_type
         选图型"、没有多出隐藏字段。改描述时最容易在这里露馅。
+
+        **两处例外，且例外本身被断言了**：`branches.description` 从"一级分支数量上限"
+        改成了"已废弃：…填什么都不会改变结果"，`parameters.description`（模型 docstring）
+        里关于它的那半句也跟着改（`docs/BRANCH-CAP.md` §5.2.1）。那个字段早就不控制任何
+        东西（`app/**` 里零读取），旧描述是一句**错话**；改的是它，不是行为。所以下面把
+        这两格归一化之后再整份比——别的任何一格变了、或者这两格被改回旧口径，断言各自会红。
         """
+        def _normalized(schema: dict) -> dict:
+            clone = json.loads(json.dumps(schema, ensure_ascii=False))
+            parameters = clone["function"]["parameters"]
+            parameters["description"] = "<params>"
+            parameters["properties"]["branches"]["description"] = "<inert>"
+            return clone
+
         baseline = _load_baseline_tools()
         old = baseline._TOOL_SPECS["mindmap_generate_deep"]().schema()
         new = _generate_deep_spec().schema()
-        assert json.dumps(new, ensure_ascii=False, sort_keys=True) == \
-               json.dumps(old, ensure_ascii=False, sort_keys=True)
+
+        old_parameters = old["function"]["parameters"]
+        new_parameters = new["function"]["parameters"]
+        assert "期望值" in old_parameters["description"], (
+            "基线那一头的旧口径变了——改了说明基线选错或这处已被人动过")
+        assert "历史遗留的无效字段" in new_parameters["description"]
+        assert old_parameters["properties"]["branches"]["description"] == "一级分支数量上限"
+        new_description = new_parameters["properties"]["branches"]["description"]
+        assert "已废弃" in new_description and "上限" not in new_description
+
+        assert json.dumps(_normalized(new), ensure_ascii=False, sort_keys=True) == \
+               json.dumps(_normalized(old), ensure_ascii=False, sort_keys=True)
 
 
 # ---------------------------------------------------------------- 3. 两处打架
