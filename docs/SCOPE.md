@@ -37,7 +37,7 @@
 | 单作者改动账本 | 申报书外的新增项（F29） | 前端纯函数算 diff → 并进保存请求 → `edit_events`；两条恒等式 `Σ by_actor = 总数`、`Σ by_field = update + style` | **`actor` 只有 `user` / `agent`**（`docs/EDIT-LOG.md:45`）：能区分「人改的」与「模型生成的」，**记不住是哪个用户**。这一条既是协作的前置条件，也是协作至今不成立的原因（见 3.1） |
 | 账号与门禁 | 申报书未单列（部署必需） | 注册 / 登录 / 会话（口令 `hashlib.scrypt` 加盐，token 只存 SHA-256）；`GateMiddleware` 匿名 401，`map_forbidden` 403；用例 `tests/test_auth.py::test_the_gate_is_now_closed_for_anonymous_callers` | 身份到「能看」，权限到「读共享、写限主」（`backend/app/mindmaps/repository.py:167-176`）；没有组织、角色、审计 |
 | 单机部署 | 6.2-4（P19 前半） | `deploy/`（systemd unit + nginx + `install.sh`），ECS 2C2G 已上线；`docs/DEPLOY.md` 第 9 节 | 生产走 systemd。仓库里的 `docker compose` 方案**未在真机完成一次构建与运行验证**（`docs/DOCKER.md:5`）——它不是「交付了」，是「写好了、没验过」 |
-| 可被第三方复验的基础设施 | 验收阶段需要 | 后端 2113 条用例 / 85 个文件，前端 900 条 / 55 个 spec（`FEATURES_AND_OWNERS.md:39`）；文档断言闸门 `backend/scripts/check_doc_claims.py`；检索评测指纹 `backend/scripts/eval_cases_manual.py` | 它不产生产品功能，但它决定了上面八条「凭什么可查」。删掉闸门，这个仓库的文档会在两周内漂回「说得比做得多」 |
+| 可被第三方复验的基础设施 | 验收阶段需要 | 后端与前端各有全量自动化回归，**规模不写数字**（`pytest --collect-only` / `npm test` 现跑，逐项见 `FEATURES_AND_OWNERS.md` 的 F23）；文档断言闸门 `backend/scripts/check_doc_claims.py`（含"文档里不许写会漂的数"那一族）；检索评测指纹 `backend/scripts/eval_cases_manual.py` | 它不产生产品功能，但它决定了上面八条「凭什么可查」。删掉闸门，这个仓库的文档会在两周内漂回「说得比做得多」 |
 
 ## 三、本期不交付（减承诺）
 
