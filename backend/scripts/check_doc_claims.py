@@ -1665,6 +1665,169 @@ DRIFT_SCOPE: tuple[str, ...] = (
 )
 
 
+#: scope 外那张清单的棘轮。`(文件, 命中原文, 出现次数, 状态, 理由)`。
+#:
+#: 为什么要有这张表：`DRIFT_SCOPE` 是**手写名单**，而"scope 外还有几处在漂"这件事
+#: 上一轮之前**没有人量过**。2026-11-28 第一次量：全仓 scope 外 36 处命中、18 份 md。
+#: 名单式 scope 的坏处不是漏（漏了会有人补），是**没人知道漏了多少**——所以这里给的是
+#: 一个枚举棘轮，形状照抄 `scripts/acc3/find_unwired.py`：**存量可见、新增即红、每条
+#: 要理由**。
+#:
+#: 键是 `(文件, 命中原文)` 而不是行号：行号会随别人的正常提交漂，键跟着漂就没法查
+#: （`unwired_baseline.json` 的教训）。`count` 一起登记，出现次数变了也红——同一句
+#: 错话被多抄一遍，形状没变，但那正是要防的事。
+#:
+#: 状态两档，判据只有一句：**这个数会不会因为别人正常提交而变。**
+#:
+#:     accepted  那句写的是那一天的事（版本表、验收留档、实验报告），读者不会当现状
+#:     todo      它在断言现状，已经/即将过期——清单里单列，不红（改它不归这道闸门）
+#:
+#: 进 scope 是另一条路：加进 `DRIFT_SCOPE` 并改写成引用式，那一处就从"清单"变"红"。
+DRIFT_CANDIDATES: tuple[tuple[str, str, int, str, str], ...] = (
+    # ---- 假阳性：形状对上了，但那不是计数
+    ("docs/ACCEPTANCE-EVIDENCE.md", "现在是 422", 1, "accepted",
+     "假阳性：HTTP 422，不是计数（`now_value` 的 `现在是 \\d{2,4}` 撞上状态码）"),
+    ("docs/OPTIMIZATION-REPAIR.md", "5 端点", 1, "accepted",
+     "假阳性：章节号「## 5 端点与…」，不是「5 个端点」"),
+    ("docs/RESEARCH-ASR-LOCAL.md", "8 路径", 1, "accepted",
+     "假阳性：模型能力表里的「无 ONNX/INT8 路径」，`INT8` 的 8 被当成数"),
+    # ---- 版本表与归档：写的是那一版发布时的账
+    ("docs/PLAN.md", "19 个端点", 1, "accepted", "v1.9 版本行：2026-11-07 那天的端点账"),
+    ("docs/PLAN.md", "25 路径", 1, "accepted", "版本行（v1.25 附近）：当天新增的知识库只读接口口径"),
+    ("docs/PLAN.md", "30 路径", 1, "accepted", "版本行（v1.29 附近）：当天的路径账"),
+    ("docs/PLAN.md", "31 路径", 1, "accepted", "版本行（v1.30 附近）：当天的路径账"),
+    ("docs/PLAN.md", "33 路径", 1, "accepted", "版本行（v1.33 附近）：当天的路径账"),
+    ("docs/PLAN.md", "40 个用例", 1, "accepted", "版本行（v1.33 附近）：那一版加的参数化用例数"),
+    ("docs/PLAN.md", "1 组路由", 1, "accepted", "版本行（v1.33 附近）：当天新增的路由组数"),
+    ("docs/PLAN.md", "65 个文件", 1, "accepted", "版本行（v1.39 附近）：当天的测试文件数"),
+    ("docs/archive/NEXT-PLAN.md", "19 个端点", 1, "accepted",
+     "已归档快照的「同步说明（2026-11-07）」：那时是 8 组路由 19 个端点"),
+    ("docs/archive/NEXT-PLAN.md", "8 组路由", 1, "accepted", "同上那句同步说明"),
+    # ---- 验收 / 测量留档：那一轮采集到的读数
+    ("docs/ACCEPTANCE-EVIDENCE.md", "1360 条用例", 1, "accepted",
+     "P15 那一行的验收读数：前端全绿时的用例数"),
+    ("docs/ACCEPTANCE-EVIDENCE.md", "139 个文件", 1, "accepted",
+     "那一轮定向跑的范围说明：全量 139 个文件跑不完"),
+    ("docs/ACCEPTANCE-EVIDENCE.md", "82 个文件", 1, "accepted",
+     "同一份留档里反驳报告的那一句：当轮「全仓 82 个文件」"),
+    ("docs/AGENT_PLAN.md", "20 个测试", 1, "accepted",
+     "原文自己标了「**计划期**的静态枚举值……不代表现在的规模」"),
+    ("docs/AGENT_PLAN.md", "20 个测试文件", 1, "accepted", "同一句里的计划期枚举"),
+    ("docs/BRANCH-DIGEST.md", "72 个文件", 1, "accepted", "「本轮的基线」：前端 72 files / 1177 tests"),
+    ("docs/GRAPH-SCALE.md", "16 份", 3, "accepted", "中批规模实验的材料份数（那一轮跑的就是 16 份）"),
+    ("docs/GRAPH-SCALE.md", "27 份", 1, "accepted", "「这次的材料（共 27 份，合计 83,470 字）」"),
+    ("docs/LIBRARY-IN-GENERATE.md", "51 份", 2, "accepted",
+     "「先量：库里那 51 份」——那一轮入库的份数"),
+    ("docs/MIXED-SKELETON.md", "33 份", 1, "accepted",
+     "引用块里那一轮的读数，且原文自己写着「要复现当天的数得先有当天的库」"),
+    ("docs/PROMPT-IMPERATIVES.md", "104 个文件", 1, "accepted",
+     "B 类占位句扫描的语料规模：库里 104 个文件 / 6175 个节点"),
+    ("docs/TEST-COST-136-NODE.md", "77 个文件", 1, "accepted",
+     "假想语气：「留下会变成第 77 个文件」，不是现有的文件数"),
+    ("docs/TEST-COST-3-CASES.md", "76 个 spec", 1, "accepted", "那一轮的 vitest per-file 成本读数"),
+    ("docs/TEST-COST-3-CASES.md", "76 个文件", 1, "accepted", "同一轮：environment 成本能不能摊薄那个议题"),
+    ("docs/TEST-COST-3-CASES.md", "77 个文件", 1, "accepted", "同一轮的假想语气：留下会变成第 77 个文件"),
+    ("docs/TEST-LOAD-SENSITIVITY.md", "12 个文件", 1, "accepted",
+     "「本轮只对 top 慢用例所在的 12 个文件采了单跑读数」"),
+    ("docs/W1_DAY1.md", "21 个文件", 1, "accepted", "引用块里的 2026-11-10 快照：352 个 vitest 用例（21 个文件）"),
+    ("docs/WIRING-GAPS.md", "107 个文件", 1, "accepted", "那一轮的耗时读数：107 个文件 × 515 名字"),
+    # ---- 真在漂：这两句在断言现状
+    ("docs/EXTERNAL-RELEVANCE.md", "29 条用例", 1, "todo",
+     "「实现完整（29 条用例）」是现在时，那个功能的用例数早不是这个"),
+    ("docs/SCRIPT-HYGIENE.md", "128 份", 1, "todo",
+     "「文档分级」那一行里的 md 份数：它会随每份新文档变，正是 D 族要消灭的形状"),
+)
+
+#: `DRIFT_CANDIDATES` 的合法状态。两档，理由见上面那个常量。
+DRIFT_CANDIDATE_STATUSES = ("accepted", "todo")
+
+
+def drift_candidates(files: list[Path]) -> tuple[dict[tuple[str, str], int], int, list[str]]:
+    """全仓 md 里"数字 + 中文单位"的分布 → `(scope 外计数, scope 内处数, 问题)`。
+
+    scope 内只数处数（那些由 D 族的规则判红，这里不重复判）；scope 外逐条计数，交给
+    `check_drift_candidates` 与 `DRIFT_CANDIDATES` 对表。`claims-ok` 豁免的跳过——
+    同一份豁免表，不另立一套。
+    """
+    found: dict[tuple[str, str], int] = {}
+    in_scope = 0
+    problems: list[str] = []
+    scope = set(DRIFT_SCOPE)
+    for path in files:
+        relative = _relative(path)
+        try:
+            lines = _read(path).splitlines()
+        except OSError as error:
+            problems.append(f"漂移候选：读不到 {relative}: {error}")
+            continue
+        for index, line in enumerate(lines):
+            certificates = _exemptions(line, lines[index - 1] if index else "")
+            for suffix, pattern, _advice in DRIFT_CLASSES:
+                match = re.search(pattern, line)
+                if not match or f"drift:{suffix}" in certificates:
+                    continue
+                if relative in scope:
+                    in_scope += 1
+                else:
+                    key = (relative, match.group(0))
+                    found[key] = found.get(key, 0) + 1
+    return found, in_scope, problems
+
+
+def check_drift_candidates(found: dict[tuple[str, str], int]) -> list[str]:
+    """scope 外清单的棘轮：**新增即红、登记失效也红、出现次数变了也红**。
+
+    三条都是同一个理由：清单不判，就会烂成"别查我"的白名单。新增要过闸（加进
+    `DRIFT_SCOPE` 改写成引用式，或登记理由），删掉的登记要跟着删——`unwired_baseline.json`
+    里"理由还在、结论没了"那种烂账，这里一步都不许有。
+    """
+    registered = {(path, text): (count, status, reason)
+                  for path, text, count, status, reason in DRIFT_CANDIDATES}
+    problems: list[str] = []
+    for (path, text), (count, status, reason) in registered.items():
+        if status not in DRIFT_CANDIDATE_STATUSES:
+            problems.append(f"漂移候选登记 {path}「{text}」的状态 `{status}` 不在 "
+                            f"{'/'.join(DRIFT_CANDIDATE_STATUSES)} 里")
+        if not reason.strip():
+            problems.append(f"漂移候选登记 {path}「{text}」没写理由——清单会烂成白名单")
+        actual = found.get((path, text))
+        if actual is None:
+            problems.append(f"漂移候选登记失效：{path} 里已经没有「{text}」——删掉这一行")
+        elif actual != count:
+            problems.append(f"漂移候选 {path}「{text}」现在出现 {actual} 次，登记的是 "
+                            f"{count} 次（同一句错话被多抄/少抄一遍，形状变了）")
+    for key in found:
+        if key not in registered:
+            path, text = key
+            problems.append(
+                f"新的漂移候选（scope 外）：{path}「{text}」——要么加进 `DRIFT_SCOPE` "
+                "并改写成引用式（那会红），要么在 `DRIFT_CANDIDATES` 里登记理由")
+    return problems
+
+
+def describe_drift_candidates(files: list[Path]) -> list[str]:
+    """把"scope 外还有几处在漂"印出来。**这是本轮新增的那个读数**：以前没人知道它。
+
+    scope 内是红（D 族规则判）；scope 外是清单（不红，但每条要有理由，新增即红）。
+    """
+    found, in_scope, problems = drift_candidates(files)
+    registered = {(path, text) for path, text, _c, _s, _r in DRIFT_CANDIDATES}
+    todo = [row for row in DRIFT_CANDIDATES if row[3] == "todo" and (row[0], row[1]) in found]
+    fresh = [key for key in found if key not in registered]
+    files_out = len({path for path, _text in found})
+    print(f"\n漂移候选枚举（D 族的棘轮）：scope 内 {in_scope} 处（红，由上面那几条判）/ "
+          f"scope 外 {sum(found.values())} 处、{files_out} 份 md")
+    print(f"    清单（不红，可见）：登记 {len(DRIFT_CANDIDATES)} 条"
+          f"（accepted {sum(1 for r in DRIFT_CANDIDATES if r[3] == 'accepted')} / "
+          f"todo {len(todo)}）/ 新增 {len(fresh)}")
+    if todo:
+        print("    真在漂、等改（不在 scope 里，所以不红）：")
+        for row in todo:
+            print(f"      · {row[0]}「{row[1]}」— {row[4]}")
+    problems.extend(check_drift_candidates(found))
+    return problems
+
+
 def _drift_rules() -> list[Rule]:
     """D 族：文档里会漂的数。`holds` 恒为真——这一族**没有事实可读**。
 
@@ -1950,18 +2113,20 @@ def main(argv: list[str]) -> int:
 
     facts = collect()
     rules = RULES + _switch_rules(facts) + _backlog_rules(facts) + _drift_rules()
+    files, problems = doc_files()
+    facts.problems.extend(problems)
     if args.facts:
         describe_facts(facts, rules)
         describe_backlog(facts)
+        facts.problems.extend(describe_drift_candidates(files))
         return 0 if not facts.problems else 1
 
-    files, problems = doc_files()
-    facts.problems.extend(problems)
     violations = scan(facts, rules, files)
     hard = [item for item in violations if not item.excused]
     excused = [item for item in violations if item.excused]
     evidence_problems = check_evidence(rules)
     backlog_problems = check_backlog(facts)
+    drift_problems = describe_drift_candidates(files)
 
 
     print(f"文档断言与代码一致：{len(rules)} 条事实 / {len(files)} 份文档")
@@ -1981,7 +2146,8 @@ def main(argv: list[str]) -> int:
                   f"「{item.sentence}」")
         print()
 
-    stopping = bool(hard or facts.problems or evidence_problems or backlog_problems)
+    stopping = bool(hard or facts.problems or evidence_problems or backlog_problems
+                    or drift_problems)
     if not args.gate:
         for item in hard:
             print(f"{item.path}:{item.line}: {item.sentence} → 事实 {item.rule.name}：{item.expect}")
@@ -1991,6 +2157,8 @@ def main(argv: list[str]) -> int:
             print(f"证据问题：{problem}")
         for problem in backlog_problems:
             print(f"台账问题：{problem}")
+        for problem in drift_problems:
+            print(f"漂移候选：{problem}")
         if not stopping:
             print("没有命中。")
         return 0
@@ -2014,6 +2182,8 @@ def main(argv: list[str]) -> int:
         print(f"  · [证据] {problem}")
     for problem in backlog_problems:
         print(f"  · [台账] {problem}")
+    for problem in drift_problems:
+        print(f"  · [漂移候选] {problem}")
     print("\n三种处理：改文档让说法与代码一致 / 改代码把事实改回来 / "
           "引用旧说法处加 `<!-- claims-ok: <事实名> 理由 -->`。")
     return 1

@@ -716,8 +716,64 @@ def test_the_drift_probe_reads_the_wiring_not_a_constant(tmp_path: Path) -> None
     assert values["doc_drift_guard"] is False
 
 
+def test_a_new_drift_candidate_outside_the_scope_is_red(tmp_path: Path) -> None:
+    """scope 外**新增**一处裸数字 → 红。清单不许烂成"别查我"的白名单。
+
+    这一族的意义全在这一条上：`DRIFT_SCOPE` 是手写名单，漏出去的地方以前**没人知道漏了
+    多少**。枚举之后存量可见、新增即红、每条要理由——与 `find_unwired.py` 的棘轮同形。
+    """
+    document = tmp_path / "SOMEWHERE.md"
+    document.write_text("后端 4321 条用例，全部通过。\n", encoding="utf-8")
+    found, in_scope, problems = claims.drift_candidates([document])
+    assert problems == [], problems
+    assert in_scope == 0, "临时文件不在 DRIFT_SCOPE 里"
+    assert found == {(claims._relative(document), "4321 条用例"): 1}, found
+    hits = claims.check_drift_candidates(found)
+    assert any("新的漂移候选" in hit for hit in hits), hits
+
+
+def test_a_registered_candidate_that_vanished_is_red() -> None:
+    """登记了而文档里已经没有 → 红。理由还在、结论没了，就是 `unwired_baseline` 那种烂账。"""
+    hits = claims.check_drift_candidates({})
+    assert any("登记失效" in hit for hit in hits), hits
+    # 反过来：本仓真实读数是干净的（存量都登记了，没有新增）。
+    files, _ = claims.doc_files()
+    found, _in_scope, problems = claims.drift_candidates(files)
+    assert problems == [], problems
+    assert claims.check_drift_candidates(found) == [], claims.check_drift_candidates(found)
+
+
+def test_the_enumeration_counts_what_the_scope_does_not_cover() -> None:
+    """那个"scope 外还有多少"的数以前没人量——现在每次 `--gate` 都打印它。
+
+    断言的是**这件事有读数**，不是"应当是几处"：处数会随别人的正常提交变，写死它就成了
+    D 族要消灭的那种数。
+    """
+    files, _ = claims.doc_files()
+    found, in_scope, _problems = claims.drift_candidates(files)
+    assert in_scope >= 0
+    assert sum(found.values()) > 0, "一份 md 都没枚举到，说明枚举本身空转了"
+    outside = {path for path, _text in found}
+    assert not [path for path in outside if path in claims.DRIFT_SCOPE], outside
+
+
+def test_the_status_distribution_is_printed_not_stored(capsys) -> None:
+    """分布由闸门现取并打印；`docs/BACKLOG.md` 里不许再手抄一份。
+
+    上一版 §七 手抄过两行汇总，两轮就漂了，而且没有闸门判它。这条钉住的是"分布有地方
+    出、而且只有一处"：打印里有，文档里没有。
+    """
+    claims.describe_backlog(REAL)
+    printed = capsys.readouterr().out
+    assert "状态分布：" in printed
+    assert "机器判据：" in printed
+    assert "卡点（blocker 真 = 还卡着）：" in printed
+    text = _backlog_text()
+    assert "状态分布：" not in text, "分布又被手抄进文档了——它会漂，交回给 `--facts`"
+
+
 def test_the_drift_family_is_green_on_this_repo() -> None:
-    """本仓 HEAD 上这五份文档里没有裸数字了——这是"改成引用式"这一轮的直接读数。"""
+    """本仓 HEAD 上 scope 里那几份文档没有裸数字——"改成引用式"这一轮的直接读数。"""
     files, _ = claims.doc_files()
     scoped = [path for path in files
               if path.relative_to(claims.REPO_DIR).as_posix() in claims.DRIFT_SCOPE]
