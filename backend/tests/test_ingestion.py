@@ -32,6 +32,57 @@ class TextSourceTest(unittest.TestCase):
             parse_text("x", SourceKind.document)
 
 
+class TextDocumentPassthroughTest(unittest.TestCase):
+    """`.md` / `.adoc` 直通：**不进 Docling**。
+
+    这是"文件上传卡在正在解析"那条缺陷的回归用例（`docs/ACCEPTANCE-WALKTHROUGH-2026-11-28.md`
+    §四.2 的现场：548 字 `.md`，40 秒仍在解析）。断言方式不是"跑得快"——CI 机器的
+    速度不可控，而且那种断言会在fast 机器上漏掉回归。这里钉的是**结构**：把
+    `_get_converter` 换成"一被调用就炸"的桩，正常返回即证明这条路绕开了 Docling
+    的冷启动（实测 102.6 秒）与 `_parse_lock` 串行队列。
+    """
+
+    def test_markdown_never_initializes_docling(self):
+        from unittest.mock import patch
+
+        import app.ingestion.service as service
+
+        raw = "# 产品需求评审会纪要\n\n## 一、评审范围\n拖拽改父级。\n".encode()
+        with patch.object(service, "_get_converter",
+                          side_effect=AssertionError("`.md` 不该初始化 Docling")):
+            source = parse_document_bytes("产品需求评审会.md", raw)
+        self.assertEqual(source.status, "parsed")
+        self.assertEqual(source.kind, SourceKind.document)
+        self.assertEqual(source.filename, "产品需求评审会.md")
+        self.assertIn("拖拽改父级", source.text)
+
+    def test_asciidoc_takes_the_same_path(self):
+        from unittest.mock import patch
+
+        import app.ingestion.service as service
+
+        raw = "= 标题\n\n== 小节\n正文一段。\n".encode()
+        with patch.object(service, "_get_converter",
+                          side_effect=AssertionError("`.adoc` 不该初始化 Docling")):
+            source = parse_document_bytes("笔记.adoc", raw)
+        self.assertIn("正文一段", source.text)
+
+    def test_paragraph_breaks_survive(self):
+        """Docling 的 `export_to_markdown()` 会把段落间的单换行合并成一行；
+        直通必须保住它们——每一行就是导图里的一个知识点。"""
+        source = parse_document_bytes("s.md", "第一段\n第二段\n第三段\n".encode())
+        self.assertEqual(source.text, "第一段\n第二段\n第三段")
+
+    def test_gbk_source_is_decoded_not_rejected(self):
+        """中文 Windows 上「另存为 UTF-8」经常得到 GB18030；那不是坏文件。"""
+        source = parse_document_bytes("纪要.md", "产品评审会\n".encode("gb18030"))
+        self.assertIn("产品评审会", source.text)
+
+    def test_blank_text_document_rejected(self):
+        with self.assertRaises(NotSupportedSource):
+            parse_document_bytes("空.md", "  \n\n  \n".encode())
+
+
 class MarkdownCleanupTest(unittest.TestCase):
     """解析结果转文本时的清洗规则。"""
 

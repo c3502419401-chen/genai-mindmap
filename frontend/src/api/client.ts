@@ -525,23 +525,74 @@ export async function repairOptimization(content: DiagramContent): Promise<Repai
 // ---- 文档上传 ----
 
 /**
+ * 上传的超时（毫秒）。**不是性能预算，是"别让界面永远等下去"的那条线。**
+ *
+ * 取 180 秒的理由：后端解析 Word/PPT 要先用 Docling（进程内单例，冷启动实测
+ * 102.6 秒），而 `_parse_lock` 是串行的——第二个并发上传还要排在后面。所以超时
+ * 必须宽到不误杀第一次的冷启动，又要窄到用户不会对着"正在解析…"看十分钟。
+ *
+ * `.md` / `.adoc` 现在走文本直通（0.6 ms），不受这条线影响；它保护的是真会慢的
+ * 那几档（docx/pdf/扫描件）。
+ */
+export const UPLOAD_TIMEOUT_MS = 180_000;
+
+/** 把两个信号合成一个：任一 abort 就 abort。`AbortSignal.any` 出了 ES2024，不指望。 */
+function anySignal(signals: Array<AbortSignal | undefined>): AbortSignal {
+  const fused = new AbortController();
+  for (const signal of signals) {
+    if (!signal) continue;
+    if (signal.aborted) {
+      fused.abort();
+      break;
+    }
+    signal.addEventListener('abort', () => fused.abort(), { once: true });
+  }
+  return fused.signal;
+}
+
+/**
  * 上传文档，由后端解析成文本来源。
  *
  * 不走 request()：它固定带 `Content-Type: application/json`，而 multipart 的
  * boundary 必须由浏览器自己生成。手动设头的结果是后端拆不出 file 字段，
  * 所以这里只给 method 和 body，让 fetch 自己填类型。
+ *
+ * **带超时**：这条 fetch 曾经是裸的。后端的 Docling 第一次解析要 102 秒，而前端
+ * 除了「正在解析…N 秒」之外什么都不说、永远不放弃——用户看到的是一颗永远不会亮的
+ * 「生成导图」和一句没有下文的等待（`docs/ACCEPTANCE-WALKTHROUGH-2026-11-28.md`
+ * §四.2，3 次实测 2 次卡在这里）。超时之后抛一个**可分辨**的错误码，调用方据此
+ * 落到「重试解析」，而不是停在 `parsing` 上不动。
  */
-export async function uploadDocument(file: File, signal?: AbortSignal): Promise<Source> {
+export async function uploadDocument(
+  file: File,
+  signal?: AbortSignal,
+  timeoutMs: number = UPLOAD_TIMEOUT_MS,
+): Promise<Source> {
   const form = new FormData();
   form.append('file', file);
+
+  const timeout = new AbortController();
+  const timer = setTimeout(() => timeout.abort(), timeoutMs);
+  const fused = anySignal([signal, timeout.signal]);
 
   let response: Response;
   try {
     response = await fetch(`${BASE}/ingestion/files`, {
-      method: 'POST', body: form, signal, credentials: 'include',
+      method: 'POST', body: form, signal: fused, credentials: 'include',
     });
   } catch {
+    if (timeout.signal.aborted) {
+      throw new ApiError(
+        0,
+        'upload_timeout',
+        `上传超过 ${Math.round(timeoutMs / 1000)} 秒还没有结果，这次解析没有完成。`
+        + '第一次解析 Word / PDF / PPT 要先加载解析器，可能要等一两分钟；'
+        + '也有可能这个文件太大。可以点「重试解析」，或者换一份更小的文件。',
+      );
+    }
     throw new ApiError(0, 'network_error', '无法连接后端，请确认服务已启动。');
+  } finally {
+    clearTimeout(timer);
   }
 
   if (!response.ok) throw await toApiError(response);

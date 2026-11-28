@@ -70,14 +70,32 @@ MAX_PAGES = 300
 
 # 接受解析的文档扩展名。
 #
-# 分三类，走三条不同的解析链路：
+# 分四类，走四条不同的解析链路：
 #   PDF                      视觉提取（逐页渲染 → 多模态模型）
-#   DOCX/PPTX/XLSX/HTML/MD   Docling 读结构化格式，不需要版面模型
+#   MD/ASCIIDOC              纯文本直通（解码 + 规整，**不碰 Docling**）
+#   DOCX/PPTX/XLSX/HTML      Docling 读结构化格式，不需要版面模型
 #   DOC/PPT/XLS              旧版二进制：前两者经 LibreOffice 转 PDF 后走视觉提取，
 #                            .xls 用 xlrd 直读单元格
 DOCUMENT_SUFFIXES = {".pdf", ".docx", ".pptx", ".xlsx",
                      ".html", ".htm", ".md", ".asciidoc", ".adoc",
                      ".doc", ".ppt", ".xls"}
+
+# 纯文本族的文档：正文就是文件本身，不需要任何版面/结构推断。
+#
+# **它们曾经走 Docling，原因是"Markdown 是结构化格式"**。实测（2026-11-28，
+# 548 字的 `S08.md`）那个决定在两个方向上都亏：
+#
+#   1. 速度：冷启动第一次上传 **102.6 秒**（Docling 的 torch/模型初始化），之后再传
+#      只要 30 ms；而 `_parse_lock` 是进程级串行的，第二个用户同时传要一起排队。
+#      `docs/ACCEPTANCE-WALKTHROUGH-2026-11-28.md` 里"3 次实测 2 次卡在正在解析…38 秒"
+#      就是这条冷启动尾巴——前端没有超时，于是它一直等下去。
+#   2. 质量：`export_to_markdown()` 把段落之间的单换行合并成一行（同一份文件
+#      550 字、整段挤成一行），而导图最需要的恰恰是这些行边界（每一行是一个知识点）。
+#      直通解码得到 570 字且段落完整。
+#
+# 直通只需 0.6 ms。`.md` 是手册里"点 + 传文件"的第一条路径，它不该排在一个
+# 400MB 解析器的冷启动后面。
+TEXT_DOCUMENT_SUFFIXES = {".md", ".asciidoc", ".adoc"}
 
 # 需要先经 LibreOffice 渲染成 PDF 的旧格式
 LEGACY_RENDER_SUFFIXES = {".doc", ".ppt"}
@@ -357,6 +375,35 @@ def _parse_xls_source(filename: str | None, raw: bytes) -> Source:
                   status="parsed")
 
 
+def _parse_text_document(filename: str | None, raw: bytes) -> Source:
+    """Markdown / AsciiDoc 直通：解码 → 规整，一行代码都不经过 Docling。
+
+    理由见 `TEXT_DOCUMENT_SUFFIXES` 的注释（冷启动 102 秒 + 段落被合并）。
+    走的仍是同一条出口形状（`kind=document`、带 `filename` 与元数据）：调用方拿到的
+    `Source` 与 Docling 那条完全同构，只是快三个数量级且保住了换行。
+    """
+    try:
+        decoded = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        # 中文 Windows 上"另存为 UTF-8"常被存成 GB18030/GBK。它们不是乱码，
+        # 只是编码不同；再试一次比让用户自己去查编码便宜。
+        try:
+            decoded = raw.decode("gb18030")
+        except UnicodeDecodeError as exc:
+            raise NotSupportedSource(
+                "这个文件的编码既不是 UTF-8 也不是 GB18030，请另存为 UTF-8 后再上传") from exc
+
+    text = _normalize_markdown(decoded)
+    if not text:
+        raise NotSupportedSource(
+            "这份文档没有解析出任何文字，可能是空文件或只有图片链接")
+
+    return Source(kind=SourceKind.document, filename=filename, text=text,
+                  span=None, parsed_pages=None, truncated=False,
+                  metadata=source_metadata.extract(filename, raw),
+                  status="parsed")
+
+
 def parse_document_bytes(filename: str | None, raw: bytes) -> Source:
     """解析上传的文档，返回带正文的 Source。
 
@@ -369,6 +416,10 @@ def parse_document_bytes(filename: str | None, raw: bytes) -> Source:
 
     if not raw:
         raise NotSupportedSource("文件内容为空")
+
+    # 纯文本族排在最前：它们既不需要 Docling 的能力，也不该等它的冷启动。
+    if suffix in TEXT_DOCUMENT_SUFFIXES:
+        return _parse_text_document(filename, raw)
 
     if suffix == ".pdf":
         return _parse_pdf_source(filename, raw)

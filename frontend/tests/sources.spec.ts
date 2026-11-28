@@ -2,6 +2,7 @@ import { createPinia, disposePinia, setActivePinia, type Pinia } from 'pinia';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Source } from '../src/api/types';
+import { UPLOAD_TIMEOUT_MS } from '../src/api/client';
 import { MAX_AUDIO_BYTES, MAX_INPUT_CHARS, MAX_SOURCES, MAX_UPLOAD_BYTES, TOPIC_MAX_CHARS, fileTitle, materialTitle, mergedCharCount, sourceInputError, textSource } from '../src/sources/input';
 import { useMindMapStore } from '../src/stores/mindmap';
 import { useSourcesStore } from '../src/stores/sources';
@@ -502,5 +503,96 @@ describe('链接材料', () => {
 
     expect(store.items).toEqual([]);
     expect(store.parsing).toBe(false);
+  });
+});
+
+/**
+ * 上传卡在「正在解析…N 秒」——手册第一条上手路径上那处（验收记录 §四.2 / §五）。
+ *
+ * 这一组钉的不是"跑得快"（CI 机器的速度不可控），而是**每一条出口都必须落到终态**：
+ * 一份材料进了 `parsing` 之后，要么 ready，要么 failed + 一句能照做的话。停在
+ * `parsing` 就是用户看到的那一幕——秒数在涨、按钮一直灰、没有出口。
+ *
+ * 现场的机制是请求本身慢（后端把 `.md` 交给 Docling，冷启动 8.9 秒；进程级
+ * `_parse_lock` 串行，多份一起进门还要排队），而前端那条 fetch **没有超时**：
+ * 响应迟到多久它就等多久，等到用户以为坏了。所以这里的第一条用例就是那条线。
+ */
+describe('上传解析的出口', () => {
+  /** 真 fetch 在 signal abort 时拒绝；桩不照做的话超时根本走不到 catch。 */
+  function hangingFetch() {
+    return vi.fn((_url: string, init?: RequestInit) => new Promise<Response>((_ok, fail) => {
+      init?.signal?.addEventListener('abort', () => {
+        fail(new DOMException('aborted', 'AbortError'));
+      });
+    }));
+  }
+
+  it('请求挂住超过上限：落 failed，并给出可照做的下一步', async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('fetch', hangingFetch());
+    const store = useSourcesStore();
+
+    const task = store.addFiles([file('方案.md')]);
+    expect(store.items[0].state).toBe('parsing');
+    expect(store.parsing).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(UPLOAD_TIMEOUT_MS + 1);
+    await task;
+
+    expect(store.items[0].state).toBe('failed');
+    // 文案要能照做：说清等了多久、为什么可能这么慢、下一步点哪里。
+    expect(store.items[0].error).toContain('重试解析');
+    expect(store.items[0].error).toContain(`${Math.round(UPLOAD_TIMEOUT_MS / 1000)} 秒`);
+    expect(store.parsing).toBe(false);
+    vi.useRealTimers();
+  });
+
+  it('清空后撤销：那一行落到可重试的失败态，不会停在「正在解析」', async () => {
+    const second = deferred<Response>();
+    let n = 0;
+    // 第一次请求被 `restore` 里的 abort 打断，第二次（用户点重试之后）才回包。
+    vi.stubGlobal('fetch', vi.fn((_url: string, init?: RequestInit) => {
+      n += 1;
+      if (n > 1) return second.promise;
+      return new Promise<Response>((_ok, fail) => {
+        init?.signal?.addEventListener('abort', () => fail(new DOMException('aborted', 'AbortError')));
+      });
+    }));
+    const store = useSourcesStore();
+
+    const task = store.addFiles([file('方案.md')]);
+    const saved = store.snapshot();
+    // `restore` 用 `map(...)` 造新对象：列表里那一行不再是 `parseItem` 闭包里抓住
+    // 的那个对象，而且它会 abort 掉在途的那一条。落点必须是**当下这一行**，
+    // 否则界面停在「正在解析…」不动（验收记录 §四.2 那张 H0 截图）。
+    store.restore(saved);
+    await task;
+    await flush();
+
+    expect(store.items[0].state).toBe('failed');
+    expect(store.items[0].error).toContain('重试');
+    expect(store.parsing).toBe(false);
+
+    const retry = store.retry(store.items[0].key);
+    second.resolve(json({ source: parsed('s-restored') }));
+    await retry;
+    await flush();
+
+    expect(store.items[0].state).toBe('ready');
+    expect(store.readySources.map(source => source.id)).toEqual(['s-restored']);
+    expect(store.parsing).toBe(false);
+  });
+
+  it('解析成功但正文是空的：落 failed，不留一个"就绪"的空来源', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+      json({ source: parsed('blank', { text: '   ', status: 'parsed' }) }),
+    ));
+    const store = useSourcesStore();
+
+    await store.addFiles([file('扫描件.pdf')]);
+
+    expect(store.items[0].state).toBe('failed');
+    expect(store.items[0].error).toContain('没有解析出可用文字');
+    expect(store.readySources).toEqual([]);
   });
 });

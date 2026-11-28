@@ -263,18 +263,34 @@ export const useSourcesStore = defineStore('sources', () => {
     const timer = setInterval(() => { item.seconds = Math.floor((Date.now() - started) / 1000); }, 1000);
     try {
       const source = await uploadDocument(file, controller.signal);
+      // 取**当下这一行**再写（`rowOf` 的 docstring）：解析期间列表可能被整块替换
+      // （撤销「清空」走 `restore`，它 `items.value = saved.items.map(...)` 造的是
+      // 新对象），闭包里那个 `item` 已经不在列表里，写它等于什么都没发生。
+      const row = rowOf(item.key);
       // 已移除/清空的条目不能被迟到的响应重新加回来。
-      if (controller.signal.aborted || !files.has(item.key)) return;
+      if (!row) return;
+      if (controller.signal.aborted || !files.has(item.key)) {
+        // **不许把状态留在 `parsing`**：`finally` 会把计时器清掉，界面就冻在
+        // 「正在解析…38 秒」那一帧——秒数不再涨、按钮一直灰、没有任何出口。
+        // 这正是验收记录 §四.2 里那张 H0 截图的形状。
+        row.state = 'failed';
+        row.error = row.error || '这份材料没解析完就被移出了，重新添加一次即可。';
+        return;
+      }
       if (source.status !== 'parsed' || !source.text?.trim()) {
         throw new Error(source.error?.trim() || '这个来源没有解析出可用文字，请重试或移除。');
       }
-      item.source = source;
-      item.kind = source.kind;
-      item.state = 'ready';
+      row.source = source;
+      row.kind = source.kind;
+      row.state = 'ready';
     } catch (cause) {
-      if (controller.signal.aborted || !files.has(item.key)) return;
-      item.state = 'failed';
-      item.error = cause instanceof Error ? cause.message : '上传失败，请重试。';
+      const row = rowOf(item.key);
+      if (!row) return;
+      row.state = 'failed';
+      // 被主动取消（移除 / 清空）不是失败，也不该留下"上传失败"这种指控式文案。
+      row.error = controller.signal.aborted
+        ? '这次解析被取消了，可以重试。'
+        : cause instanceof Error ? cause.message : '上传失败，请重试。';
     } finally {
       clearInterval(timer);
       active.delete(item.key);
@@ -328,7 +344,17 @@ export const useSourcesStore = defineStore('sources', () => {
     draining = Promise.all([
       runLane('document', DOCUMENT_CONCURRENCY),
       runLane('media', MEDIA_CONCURRENCY),
-    ]).then(() => undefined).finally(() => { draining = null; });
+    ]).then(() => undefined).finally(() => {
+      draining = null;
+      // **补一轮**：worker 的退出条件是 `find()` 返回 undefined，一旦 return 就不会
+      // 再醒。而 `addFiles` 在"上一轮还在结算"的窗口里推进来的条目，拿到的
+      // `await drain()` 是那条旧 promise——没有任何 worker 会去接它，条目就永远停在
+      // 「等待解析…」（`drain` 复用的那个竞态）。
+      //
+      // 判据必须带 `files.has`：没有本地文件的异常条目会被 worker 跳过并标进
+      // `skipped`，不带这句的话每轮都发现"还有 queued"，无限重开。
+      if (items.value.some(item => item.state === 'queued' && files.has(item.key))) void drain();
+    });
     return draining;
   }
 
