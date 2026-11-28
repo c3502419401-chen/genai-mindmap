@@ -197,5 +197,32 @@ jobs:
       - name: 零引用棘轮
         run: node scripts/find_unwired.mjs --gate
 
+      # 第三档静态缺口：**后端有路由、`client.ts` 一行都没有**。
+      #
+      # 上面那道闸看的是"client.ts 的函数没人调用"，它看不见"函数根本不存在"这一档；
+      # 后端 `find_unwired.py` 看的是"路由没人调"，同样看不见。撞出来的五处
+      # （`/knowledge/search` 桩、`link.suggest`、账本三条、实体消解、relations 生成端，
+      # 外加 `memory` 整块 4 个操作）全是人工发现的——这一道把弯折处变成机器判据。
+      #
+      # 判据是两份**文本**求双向差集：`backend/openapi.json` 的 path+method，与
+      # `src/api/client.ts` 语法树里所有请求路径（`request()` / `fetch()` / `postSse()`
+      # 的第 0 个实参）的归一化形式。归一化的全部规则、以及为什么不让 `{}` 通配字面段，
+      # 写在 `scripts/check_route_coverage.mjs` 的 docstring 里。
+      #
+      # 为什么它在 CI 上是确定性的：只读两个已提交的文件加一份基线 JSON，不读运行时、
+      # 不读数据库、不读 git 状态，路径一律以 `import.meta.url` 为锚；唯一的外部依赖是
+      # `typescript`（devDependencies 里已有，`npm ci` 之后就在）。
+      #
+      # 为什么是棘轮而不是绝对零：第一天就有 9 条断链，绝对判据会立刻红、然后被关掉。
+      # 基线（`scripts/route_coverage_baseline.json`）逐条写着这条断链属于哪一类
+      # （gap 该接没接 / stub 桩 / intentional 有意不接 / observability 运维面）以及
+      # 为什么，闸门只对基线之外的新增报错；条目里的 `evidence` 文件被删掉也会红。
+      #
+      # 放在 `契约类型` 之后：那一步保证快照与后端一致，这一步才有意义。
+      # 放在 `Build` 之前：它比 build 快得多，而失败信息比 TS 报错更贴题
+      # （build 只会说"某某没有导出"，说不出"这个端点从来没人请求"）。
+      - name: 断链棘轮（路由 → client）
+        run: node scripts/check_route_coverage.mjs --gate
+
       - name: Build
         run: npm run build
