@@ -68,7 +68,14 @@ npm test
 npm run build
 ```
 
-当前基线（2026-11-27 本机复核，两个数字都是现跑的）：后端 `pytest -q` 全绿，收集 **3435 条用例 / 153 个测试文件**（`integration` 那一批要本机 Neo4j，没配会自动 skip）；前端 `npm test` **93 个文件 / 1462 条用例全绿**。CI（`.github/workflows/ci.yml`）跑的是同一组命令（Python 3.12 / Node 24），PR 上两个 job 必须双绿。**别把这里的数字当断言用**——它随提交变，要断言就现跑一次。
+两个套件都必须全绿：后端 `pytest -q`（`integration` 那一批要本机 Neo4j，没配会自动 skip）；前端 `npm test`。CI（`.github/workflows/ci.yml`）跑的是同一组命令（Python 3.12 / Node 24），PR 上两个 job 必须双绿。
+
+**用例数与文件数这里一个都不写。** 它们随每次提交变，写在这里必然过期，而过期不会让任何用例变红。要数字就现跑：
+
+```powershell
+cd backend  ; python -m pytest --collect-only -q | tail -1
+cd frontend ; npm test -- --run     # 末尾那行就是用例数与文件数
+```
 
 本机跑后端测试时如果出现 `LegacyOfficeTest::test_xls_cell_formatting` 失败、报 `No module named 'xlrd'`，是本地依赖没装齐（`.xls` 直读要用它），`pip install xlrd` 即可，不是代码问题。
 
@@ -85,7 +92,7 @@ npm run build
 ```
 backend/
   app/
-    main.py            应用装配，注册 11 组路由（43 个路径 / 53 个端点）
+    main.py            应用装配；路由组见 `include_router`，路径与端点数以 `openapi.json` 为准
     contracts/         数据契约（改这里要通知另一个人）
       mindmap.py       ContentBase 与三个子类（树 / 流程图 / 鱼骨图）、Node、请求响应模型
       source.py        Source / SourceUsage / SourceRef（节点引用）
@@ -104,7 +111,7 @@ backend/
     agent/             AI 代理（工具循环 / op 执行器 / SSE v2 / 运行台账，生成与编辑的唯一入口）
     export/            导出 puml / markdown / opml / json
     mindmaps/          保存 / 读取 / 版本冲突 / 改动日志
-  tests/               3435 条用例 / 153 个文件（2026-11-27 复核）
+  tests/               后端用例与文件数现跑 `python -m pytest --collect-only -q`
 frontend/
   src/
     App.vue            工作台（画布居中、左侧材料、右侧对话与详情，含保存、打开、冲突弹层、导出、来源面板）
@@ -134,7 +141,7 @@ frontend/
     stores/settings.ts Pinia：模型服务配置（读 / 存 / 测试连接）
     demo/presets.ts    三张预置演示导图（生产也带，点按钮才加载）
     dev/samples.ts     开发期布局示例（仅 `npm run dev` 动态加载）
-  tests/               1462 条 vitest 用例 / 93 个文件（2026-11-27 复核；纯函数 / 布局 / store / 编辑 / 保存 / 界面 / 引用 / agent / 对话 / 记忆 / 导入 / 三种图型 / 偏好与体检 / 模型设置）
+  tests/               vitest 用例与文件数现跑 `npm test -- --run`（覆盖面：纯函数 / 布局 / store / 编辑 / 保存 / 界面 / 引用 / agent / 对话 / 记忆 / 导入 / 三种图型 / 偏好与体检 / 模型设置）
 docs/
   FLOW.md              端到端流程 ← 先读这个
   API.md               每条路由实现到什么程度
@@ -145,7 +152,7 @@ docs/
   HANDOFF.md           需要对方知悉或确认的跨人决策（待确认 / 已确认）
   FILE-OWNERSHIP.md    文件占用与交接（协作文件，动共用文件前先看这里）
   W1_DAY1.md           W1 逐日开工清单
-  FEATURES_AND_OWNERS.md    26 项功能追踪与 A/B 分工
+  FEATURES_AND_OWNERS.md    功能追踪与 A/B 分工（条数与状态以该文件为准）
   PROJECT-STATUS.md    现状总览（比这份指南更权威）
   ONE-CALL.md          生成四步为什么这么切（当前主路径的实测与红线判定）
   ONE-PATH.md          删 `full` 形态那次决策留档（★ 文件头有订正块，引用前先读）
@@ -185,7 +192,7 @@ docs/archive/          已失效、只作留档的文档（每份在 `docs/INDEX
 
 ---
 
-## 5 接口一览（43 个路径 / 53 个端点）
+## 5 接口一览（路径与端点数以 `backend/openapi.json` 为准，本节只列路由与用途）
 
 ```
 基础

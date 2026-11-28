@@ -94,15 +94,20 @@ library_sources     材料（不是记忆）
 
 ### 测试与提交
 
-```
-后端    2123 passed / 36 skipped（36 skip 需要 Neo4j 或网络）
-前端     900 passed / 55 files
-ruff    All checks passed
-vue-tsc 0 error
-CI      GitHub Actions 两个 job 双绿
+四个套件都必须全绿：后端 `pytest`、前端 `npm test`、`ruff`、`vue-tsc`；CI 的两个 job 双绿。
+skip 的那一批是 `integration`（要本机 Neo4j 或网络）。
+
+**pass 数 / 文件数 / skip 数一个都不写在这里。** 它们随每次提交变，而写死在文档里过期
+不会让任何用例变红。现取：
+
+```bash
+cd backend  ; python -m pytest --collect-only -q | tail -1
+cd frontend ; npm test -- --run     # 末尾那行就是用例数与文件数
 ```
 
-### 功能清单（26 条，详见 `FEATURES_AND_OWNERS.md`）
+### 功能清单（条数与状态以 `FEATURES_AND_OWNERS.md` 为准）
+
+下面这一版分组是 **2026-11-18 的快照**（快照可以留，别当现状读）：
 
 ```
 已实现    3 条   F01 F04 F09

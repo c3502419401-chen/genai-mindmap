@@ -1469,13 +1469,26 @@ DRIFT_CLASSES: tuple[tuple[str, str, str], ...] = (
 
 #: 这一族只管**断言现状**的文件。历史留档不进来——它们写的是"那一天是多少"，是正确的
 #: 过去时（`docs/PLAN.md` 的版本表、`docs/AGENT_PLAN.md` 的计划期数字、`docs/TODO.md`
-#: 的快照）。加一份 = 加一行；还没搬进来的见 `docs/BACKLOG.md` 第 12 条。
+#: 的快照）。加一份 = 加一行。
+#:
+#: 2026-11-28 从 5 份扩到 8 份：`TEAM-GUIDE.md` / `docs/PROJECT-STATUS.md` /
+#: `docs/USER-PATH-TESTS.md` 也在断言现状（"50 个动作 / 39 条用例""后端 2123 passed"
+#: "44 个导出函数"），而它们不在 scope 里，等于给自己留了一块没人扫的地方——台账第 12 条
+#: 的触发条件原本写"再漂一次或涨到 5 份"，但真读下来它们**现在就在漂**，不必等下一次。
+#:
+#: 三份里确实有历史留档段落（`USER-PATH-TESTS.md` 第一节"3311 条用例没抓到四种缺陷"是
+#: 那一轮的读数、`PROJECT-STATUS.md` 的"这一周的实测数字"是 11-18 那天的表）。这些段落
+#: **不搬进 scope 之外**，而是就地加 `claims-ok: drift:* 历史留档：…` —— 与 B 族的历史
+#: 语境放行同一条道理：那不是错话，是错误的过去时，逐份文档放行比逐条注释更容易被看见。
 DRIFT_SCOPE: tuple[str, ...] = (
     "README.md",
+    "TEAM-GUIDE.md",
+    "docs/BACKLOG.md",
     "docs/FEATURES_AND_OWNERS.md",
     "docs/PLAN-REWORDING.md",
+    "docs/PROJECT-STATUS.md",
     "docs/SCOPE.md",
-    "docs/BACKLOG.md",
+    "docs/USER-PATH-TESTS.md",
 )
 
 
