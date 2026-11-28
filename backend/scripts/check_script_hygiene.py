@@ -19,10 +19,10 @@ lint 不在 CI 里，本地也只有想得起来的时候才跑。
 
 | 对象 | 归属 | 保护 |
 |---|---|---|
-| 脚本 `scripts/**/*.py` | 留在 repo | 必须**能加载**（下文 A）+ import 目标必须存在（B） |
+| 脚本 `scripts/**/*.py` | 留在 repo | 必须**能加载**（A）+ import 目标必须存在（B）+ 依赖在 CI 上装得出来（F） |
 | 产物 `scripts/**/_*.json` | 默认不进 repo | 已跟踪的必须在 `docs/` 里被引用（D），否则它就是没有引用的裸文件 |
 
-## 五条检查，为什么是这五条
+## 六条检查，为什么是这六条
 
 **A · 能不能真的加载（`load`）**
 
@@ -70,6 +70,23 @@ lint 不在 CI 里，本地也只有想得起来的时候才跑。
 `REMEMBER_ENV = "MINDMAP_X"` 之后 `os.getenv(REMEMBER_ENV)`；只认 `os.getenv("MINDMAP_X")`
 会把 23 个声明里的 18 个判成没人读（实测过）。
 
+**F · 这些 import 在 CI 上装得出来吗（`deps`）**
+
+`load` 与 `imports` 都在**本机**跑，而本机不是 CI。2026-11 五连红修到最后一条时才
+看清这一点：那六个 `_two_arch_*.py` 修好之后，CI 上剩下的是另外四类——
+
+    scripts/_fix_ps1_bom.py                  ← 硬编码 D:\\genai-mindmap\\...（本机路径恰好对得上）
+    scripts/acc2/probe_ui_colors.py          ← 本机装了 playwright，requirements 没声明
+    scripts/asr_local_poc.py:231             ← 本机装了 sherpa_onnx（soundfile 同）
+    scripts/measure_fishbone_categories.py   ← winreg，Windows 专属，CI 是 Ubuntu
+
+所以"干净 checkout"只对齐了**树**，没对齐**机器**。这一档补机器：平台专属模块
+（`_PLATFORM_ONLY`）不在 `try` 里就红；第三方模块不在 `requirements.txt` 直接声明里、
+也不在 `_DEPS_ALLOWED` 白名单里、且不在 `try` 里就红。白名单只放"CI 实测可导入"的
+传递依赖（PIL / pptx / torch / transformers），每条注明依据。
+
+这条的判据是**声明**，不是"我这台机器上有没有"——后者永远为真，所以永远查不出东西。
+
 ## 跑法
 
     cd backend
@@ -77,10 +94,16 @@ lint 不在 CI 里，本地也只有想得起来的时候才跑。
     python scripts/check_script_hygiene.py --gate     # 闩门：有违规退出码 1
     python scripts/check_script_hygiene.py --only imports,docs
 
-`--gate` 是**零容忍**，不是棘轮：这五条检查的基线当前就是全绿（43 个探针脚本全部
-可加载、121 个脚本的 import 目标全部还在、83 处文档引用全部落得到文件、9 个产物全部
-各就各位、23 个环境变量全部有人在读），所以不存在"历史欠账要挂 baseline"。真出现
-需要长期豁免的东西，再加白名单并写明理由——但默认姿态是"这条规矩现在成立，破了就红"。
+`--gate` 是**零容忍**，不是棘轮：这六条检查的基线当前就是全绿（46 个探针脚本全部
+可加载、129 个脚本的 import 目标全部还在、1553 处 import 在 CI 上装得出来、101 处
+文档引用全部落得到文件、9 个产物全部各就各位、23 个环境变量全部有人在读），所以
+不存在"历史欠账要挂 baseline"。真出现需要长期豁免的东西，再加白名单并写明理由——
+但默认姿态是"这条规矩现在成立，破了就红"。
+
+`--gate` 时 `load` 档还会**自己物化一棵干净 checkout** 再加载（见
+`_materialize_clean_tree`）：这条闸问的是"CI 上能不能加载"，而开发机上有
+`.gitignore` 覆盖的 `backend/data/`。连红五次的直接成因就是判据取在了那棵有
+`data/` 的树上。
 """
 from __future__ import annotations
 
@@ -150,6 +173,42 @@ _ENV_NAME = re.compile(r"""["']([A-Z][A-Z0-9_]{2,})["']""")
 
 #: 变量名去这两棵树里找。不含 `tests/`：用例里出现一个变量名不代表产品会读它。
 _ENV_SOURCES = ("app", "scripts")
+
+#: `.env.example` 之外，第三方依赖的声明处。
+_REQUIREMENTS = BACKEND_DIR / "requirements.txt"
+
+#: **只在某个操作系统上存在的标准库模块。** 它们在开发机与 CI 之间不对称（开发机
+#: Windows、CI Ubuntu），所以必须包在 `try:` 或平台判断里。判据确定性拉满：这些名字
+#: 在另一个平台上必然 `ModuleNotFoundError`，而"我这里有"只是因为我在那个平台上。
+_PLATFORM_ONLY: dict[str, str] = {
+    "winreg": "仅 Windows", "msvcrt": "仅 Windows", "_winapi": "仅 Windows",
+    "winsound": "仅 Windows", "nt": "仅 Windows",
+    "termios": "仅 POSIX", "fcntl": "仅 POSIX", "pwd": "仅 POSIX",
+    "grp": "仅 POSIX", "resource": "仅 POSIX", "posix": "仅 POSIX",
+}
+
+#: 第三方模块里"`requirements.txt` 没直接声明、但 CI 上确实能导入"的，白名单 + 理由。
+#: 它们靠 requirements 的**传递依赖**存在，所以裸导入此刻不会红——但那是耦合，不是
+#: 保证：`docling` 哪天不再依赖它们，脚本会在 CI 上红而本地照旧绿。白名单里的每一条
+#: 都注明"CI 实测可导入"的依据，别往里加没验过的名字。
+_DEPS_ALLOWED: dict[str, str] = {
+    "PIL": "Pillow，docling 的传递依赖。2026-11-28 的 CI 日志里 `imports` 档没报它。",
+    "pptx": "python-pptx，docling 的传递依赖。同上。",
+    "torch": "docling-ibm-models 的传递依赖。同上。",
+    "transformers": "docling 的间接依赖。同上。",
+}
+
+#: 可选依赖的**脚本内登记**：`# requires-optional: sherpa_onnx, soundfile`。
+#: 放在 docstring 之后、第一个语句之前。给机器查，`docs/OPTIONAL-DEPS.md` 给人读。
+_OPTIONAL_DECL = re.compile(r"^#\s*requires-optional:\s*(.+)$", re.M)
+
+#: 可选依赖的**人类可读登记处**。脚本里声明了却不在这份文档里，等于只有本文件知道。
+_OPTIONAL_DOC = DOCS / "OPTIONAL-DEPS.md"
+
+#: CI 的 Python 版本（`.github/workflows/ci.yml` 的 `setup-python`）。本地可能是更晚的
+#: 版本，所以"本地能解析"不等于"CI 能解析"：`ast.parse(feature_version=...)` 把这一维
+#: 也变成确定性判据。
+CI_PYTHON = (3, 12)
 
 
 @dataclass
@@ -375,9 +434,22 @@ def check_imports(report: Report) -> None:
             # `utf-8-sig`：`audit_self_check.py` / `measure_external_rank.py` 带 UTF-8 BOM。
             # Python 自己执行带 BOM 的源文件没问题（PEP 263 会跳过），但把字节按 `utf-8`
             # 解成 str 之后 BOM 就是一个 U+FEFF 字符，`ast.parse` 会当它非法。
-            tree = ast.parse(path.read_text(encoding="utf-8-sig"), filename=str(path))
+            source = path.read_text(encoding="utf-8-sig")
+            tree = ast.parse(source, filename=str(path))
         except SyntaxError as exc:
             report.add("imports", rel, f"语法错误：{exc.msg}（第 {exc.lineno} 行）")
+            continue
+        # 本地 Python 可能比 CI 新。同一份源码在新版本上合法、在 CI 上 SyntaxError，
+        # 是"本地绿而 CI 红"的又一条静默通道（PEP 701 的嵌套引号 f-string 就是这样：
+        # 3.12 起合法，3.11 及以下直接 SyntaxError）。按 CI 的版本再解析一遍。
+        try:
+            ast.parse(source, filename=str(path), feature_version=CI_PYTHON)
+        except SyntaxError as exc:
+            report.add(
+                "imports", f"{rel}:{exc.lineno}",
+                f"这条语法 CI 的 Python {CI_PYTHON[0]}.{CI_PYTHON[1]} 不认"
+                f"（{exc.msg}）。本机版本比 CI 新，所以本地能解析不代表 CI 能。",
+            )
             continue
         for lineno, module, symbol in _iter_imports(tree):
             if not _module_exists(module):
@@ -542,11 +614,189 @@ def check_env(report: Report) -> None:
             )
 
 
+# --------------------------------------------------------------------------- F
+
+
+def _declared_requirements() -> set[str]:
+    """`requirements.txt` 里直接声明的包名，归一化成 import 名。
+
+    `python-multipart` → `python_multipart`、`uvicorn[standard]` → `uvicorn`：
+    版本约束与 extras 都切掉，只留 import 时会用的那一段。
+    """
+    if not _REQUIREMENTS.is_file():
+        return set()
+    out: set[str] = set()
+    for line in _REQUIREMENTS.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        name = re.split(r"[=<>!\[;\s]", line, maxsplit=1)[0]
+        if name:
+            out.add(name.lower().replace("-", "_"))
+    return out
+
+
+def _try_imports(tree: ast.AST) -> list[tuple[int, str]]:
+    """`try:` 块里的 (行号, 模块名)——也就是被 `_iter_imports` 放过的那一批。
+
+    这批正是"可选依赖"的候选：包在 `try` 里意味着"没有它也要能加载"。但**加载得动
+    不等于跑得动**，所以它们必须被登记（见 `check_deps` 的后三条判据）。
+    """
+    found: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try):
+            continue
+        for child in ast.walk(node):
+            if child is node:
+                continue
+            if isinstance(child, ast.Import):
+                found.extend((child.lineno, alias.name) for alias in child.names)
+            elif isinstance(child, ast.ImportFrom) and child.module and not child.level:
+                found.append((child.lineno, child.module))
+    return sorted(set(found))
+
+
+def _optional_registrar(module_root: str, declared: set[str],
+                        local_modules: set[str]) -> str | None:
+    """这个模块算不算"外部可选依赖"。是就返回理由，不是就 `None`。
+
+    与 `check_deps` 的前两条判据同一把尺子：平台专属、或者不在 `requirements.txt`
+    直接声明里的第三方模块。`app.*` 与 `scripts/` 内的本地模块不算——包在 `try` 里
+    是因为循环导入或类型存在性，与"要装什么"无关。
+    """
+    if module_root in _PLATFORM_ONLY:
+        return _PLATFORM_ONLY[module_root]
+    if module_root in sys.stdlib_module_names:
+        return None
+    if module_root in ("app", "scripts") or module_root in local_modules:
+        return None
+    if module_root.lower().replace("-", "_") in declared or module_root in _DEPS_ALLOWED:
+        return None
+    return "不在 requirements.txt 的直接声明里"
+
+
+def check_deps(report: Report) -> None:
+    """`scripts/` 的 import 里，哪些在 CI 上装不出来。
+
+    ## 为什么这条必须单独有一档
+
+    `load` 档与 `imports` 档都在**本机**跑。本机装了 `playwright` / `soundfile` /
+    `sherpa_onnx`（`pip install` 过，但不在 `requirements.txt` 里），也有 `winreg`
+    （Windows 专属）。于是本地两侧全绿，而 CI 上：
+
+        scripts/_fix_ps1_bom.py       ← FileNotFoundError: 'D:\\genai-mindmap\\check-neo4j.ps1'
+        scripts/acc2/probe_ui_colors.py  ← ModuleNotFoundError: No module named 'playwright'
+        scripts/asr_local_poc.py:231  ← 模块不存在：sherpa_onnx
+        scripts/measure_fishbone_categories.py:57 ← 模块不存在：winreg
+
+    那是"干净 checkout"之外的第二族差异：**干净树 ≠ 干净机器**。物化树只能对齐
+    "git 里有什么"，对不齐"这台机器上装了什么、是什么操作系统"。这一档补的就是后者。
+
+    判据两条，都是确定性的：
+
+    - 平台专属标准库模块（`_PLATFORM_ONLY`）不在 `try` 里 → 红。它在另一个平台上
+      必然不存在，没有歧义。
+    - 第三方模块不在 `requirements.txt` 的直接声明里、也不在 `_DEPS_ALLOWED` 里、
+      且不在 `try` 里 → 红。"本地装了"不是依据，"声明过"才是。
+
+    ## 但 `try` 不是终点
+
+    `try: import X except ImportError: X = None` 只让**加载**不崩，它不回答"这个脚本
+    缺什么才能跑"。而这些都是被 `docs/` 当复算入口引用的脚本，引用者最需要的恰恰
+    是"我该先装什么"。绿得越干净，缺的东西越看不见。
+
+    所以再加三条，把"可选依赖"从隐含变成可查：
+
+    - `try:` 里的外部模块必须在本文件写 `# requires-optional: X`；
+    - 那个名字必须在 `docs/OPTIONAL-DEPS.md` 里出现过（给人读的登记处）；
+    - `# requires-optional:` 里的名字必须真的在 `try` 里 import 过（守过期声明——
+      它比没有更糟，会让人以为那个依赖还在用）。
+    """
+    declared = _declared_requirements()
+    report.stats["deps_declared"] = len(declared)
+    local_modules = {path.stem for path in SCRIPTS.rglob("*.py")}
+    optional_doc = (
+        _OPTIONAL_DOC.read_text(encoding="utf-8", errors="replace")
+        if _OPTIONAL_DOC.is_file() else ""
+    )
+    if not optional_doc:
+        report.add(
+            "deps", "docs/OPTIONAL-DEPS.md",
+            "这份文档不在。可选依赖没有人类可读的登记处——`# requires-optional:` 里的"
+            "名字就只剩脚本自己知道，而复算的人要的正是那一份清单。",
+        )
+    checked = 0
+    registered = 0
+    for path in sorted(SCRIPTS.rglob("*.py")):
+        if path.name == "__init__.py":
+            continue
+        rel = path.relative_to(BACKEND_DIR).as_posix()
+        text = path.read_text(encoding="utf-8-sig")
+        try:
+            tree = ast.parse(text, filename=str(path))
+        except SyntaxError:
+            continue  # `imports` 档已经报过语法错误
+        for lineno, module, _symbol in _iter_imports(tree):
+            root = module.split(".")[0]
+            checked += 1
+            reason = _optional_registrar(root, declared, local_modules)
+            if reason is None:
+                continue
+            if root in _PLATFORM_ONLY:
+                report.add(
+                    "deps", f"{rel}:{lineno}",
+                    f"{module} 只在 {_PLATFORM_ONLY[root]} 上存在。包进 "
+                    f"`try: import ... except ImportError:` 并给出替代行为（返回空值），"
+                    f"否则 CI 上这一档必红。",
+                )
+            else:
+                report.add(
+                    "deps", f"{rel}:{lineno}",
+                    f"{module} {reason}，也没包在 try/except 里——本地装了不代表 CI "
+                    f"装了。要么声明依赖，要么当可选依赖处理（`try` + "
+                    f"`# requires-optional:`）。",
+                )
+
+        optional_roots = {module.split(".")[0] for _line, module in _try_imports(tree)}
+        required = {root for root in optional_roots
+                    if _optional_registrar(root, declared, local_modules)}
+        written = {
+            name.strip()
+            for line in _OPTIONAL_DECL.findall(text)
+            for name in line.split(",")
+            if name.strip()
+        }
+        registered += len(written)
+        for root in sorted(required - written):
+            report.add(
+                "deps", rel,
+                f"`try:` 里 import 了 {root}，本文件却没有 `# requires-optional: {root}`。"
+                f"包在 try 里只让加载不崩；「它缺什么才能跑」必须写下来。",
+            )
+        for name in sorted(written):
+            if name not in optional_roots:
+                report.add(
+                    "deps", rel,
+                    f"`# requires-optional: {name}` 是过期声明——本文件没有任何 "
+                    f"`try: import {name}`。过期声明比没有更糟：它会让下一个人以为"
+                    f"那个依赖还在用。",
+                )
+            if optional_doc and f"`{name}`" not in optional_doc:
+                report.add(
+                    "deps", rel,
+                    f"`# requires-optional: {name}` 没登记进 docs/OPTIONAL-DEPS.md"
+                    f"——只有本文件知道的依赖不算登记。",
+                )
+    report.stats["deps_checked"] = checked
+    report.stats["deps_optional"] = registered
+
+
 # --------------------------------------------------------------------------- main
 
 CHECKS = {
     "load": check_load,
     "imports": check_imports,
+    "deps": check_deps,
     "docs": check_docs,
     "artifacts": check_artifacts,
     "env": check_env,

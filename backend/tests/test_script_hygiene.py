@@ -351,3 +351,172 @@ def test_env_check_is_quiet_when_the_file_is_missing(
     report = hygiene.Report()
     hygiene.check_env(report)
     assert report.of("env") == []
+
+
+# ------------------------------------------------ deps：这些 import 在 CI 上装得出来吗
+
+
+def test_deps_check_catches_a_platform_only_module(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`import winreg` 裸写在顶层：Windows 上绿，CI（Ubuntu）上加载就崩。
+
+    这是 2026-11 五连红修到最后一条时剩下的那族：`load` 与 `imports` 都在本机跑，
+    而本机是 Windows。判据不含"我这台机器上有没有"——那个永远为真。
+    """
+    _fake_repo(tmp_path, monkeypatch)
+    (tmp_path / "backend" / "scripts" / "probe_registry.py").write_text(
+        "import winreg\n", encoding="utf-8",
+    )
+    report = hygiene.Report()
+    hygiene.check_deps(report)
+    found = report.of("deps")
+    assert len(found) == 1
+    assert "winreg" in found[0].why
+    assert "仅 Windows" in found[0].why
+
+
+def test_deps_check_catches_a_package_requirements_does_not_declare(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`playwright` 本机装了、`requirements.txt` 没声明：CI 上是 ModuleNotFoundError。"""
+    _fake_repo(tmp_path, monkeypatch)
+    (tmp_path / "backend" / "requirements.txt").write_text(
+        "fastapi==0.115.0\nhttpx>=0.27\n", encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        hygiene, "_REQUIREMENTS", tmp_path / "backend" / "requirements.txt")
+    (tmp_path / "backend" / "scripts" / "probe_ui.py").write_text(
+        "from playwright.sync_api import sync_playwright\n", encoding="utf-8",
+    )
+    report = hygiene.Report()
+    hygiene.check_deps(report)
+    found = report.of("deps")
+    assert len(found) == 1
+    assert "playwright" in found[0].why
+    assert "本地装了不代表 CI 装了" in found[0].why
+
+
+def test_deps_check_accepts_optional_dependencies_in_try(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """包在 `try: import ... except ImportError:` 里，并且登记了，才算过。
+
+    那正是这次修 `playwright` / `soundfile` / `sherpa_onnx` / `winreg` 用的形态：
+    缺依赖时由 `main()` 打印明确消息并退出，而不是让模块加载就崩。**但 `try` 不是
+    终点**——登记行与 `docs/OPTIONAL-DEPS.md` 是另外两件（见下面三条用例）。
+    """
+    _fake_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        hygiene, "_REQUIREMENTS", tmp_path / "backend" / "requirements.txt")
+    (tmp_path / "backend" / "scripts" / "probe_optional.py").write_text(
+        "# requires-optional: winreg, playwright\n"
+        "try:\n"
+        "    import winreg\n"
+        "except ImportError:\n"
+        "    winreg = None\n"
+        "try:\n"
+        "    from playwright.sync_api import sync_playwright\n"
+        "except ImportError:\n"
+        "    sync_playwright = None\n",
+        encoding="utf-8",
+    )
+    report = hygiene.Report()
+    hygiene.check_deps(report)
+    assert report.of("deps") == []
+
+
+def test_deps_requires_try_imports_to_be_registered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`try` 里 import 了却没写 `# requires-optional:`：`try` 会变成藏依赖的口袋。
+
+    闸门绿了，而"这个脚本缺什么才能跑"这个事实消失了——绿得越干净，缺的东西越
+    看不见。这是"包在 try 里就放过"这个口子的代价。
+    """
+    _fake_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        hygiene, "_REQUIREMENTS", tmp_path / "backend" / "requirements.txt")
+    (tmp_path / "backend" / "scripts" / "probe_unregistered.py").write_text(
+        "try:\n"
+        "    from playwright.sync_api import sync_playwright\n"
+        "except ImportError:\n"
+        "    sync_playwright = None\n",
+        encoding="utf-8",
+    )
+    report = hygiene.Report()
+    hygiene.check_deps(report)
+    found = report.of("deps")
+    assert len(found) == 1
+    assert "# requires-optional: playwright" in found[0].why
+
+
+def test_deps_rejects_a_stale_optional_declaration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """登记了 `sherpa_onnx`，代码里却没有 `try: import sherpa_onnx`。
+
+    过期声明比没有更糟：下一个人会以为那个依赖还在用。
+    """
+    _fake_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        hygiene, "_REQUIREMENTS", tmp_path / "backend" / "requirements.txt")
+    (tmp_path / "backend" / "scripts" / "probe_stale.py").write_text(
+        "# requires-optional: sherpa_onnx\nx = 1\n", encoding="utf-8",
+    )
+    report = hygiene.Report()
+    hygiene.check_deps(report)
+    found = report.of("deps")
+    assert len(found) == 1
+    assert "过期声明" in found[0].why
+
+
+def test_deps_requires_the_optional_doc_to_list_the_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """脚本里登记了，`docs/OPTIONAL-DEPS.md` 里没有：只有本文件知道的依赖不算登记。
+
+    复算入口的引用者最需要的正是那一份"我该先装什么"的清单。
+    """
+    _fake_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        hygiene, "_REQUIREMENTS", tmp_path / "backend" / "requirements.txt")
+    doc = tmp_path / "docs" / "OPTIONAL-DEPS.md"
+    doc.write_text("# 可选依赖\n\n这里一条都没写。\n", encoding="utf-8")
+    monkeypatch.setattr(hygiene, "_OPTIONAL_DOC", doc)
+    (tmp_path / "backend" / "scripts" / "probe_undocumented.py").write_text(
+        "# requires-optional: playwright\n"
+        "try:\n"
+        "    from playwright.sync_api import sync_playwright\n"
+        "except ImportError:\n"
+        "    sync_playwright = None\n",
+        encoding="utf-8",
+    )
+    report = hygiene.Report()
+    hygiene.check_deps(report)
+    found = report.of("deps")
+    assert len(found) == 1
+    assert "OPTIONAL-DEPS.md" in found[0].why
+
+
+# ------------------------------------------ imports：本机能解析 ≠ CI 能解析
+
+
+def test_imports_check_rejects_syntax_newer_than_ci_python(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """本机 Python 比 CI 新时，新版本语法会在本地通过、在 CI 上 SyntaxError。
+
+    判据用 `ast.parse(feature_version=CI_PYTHON)`，所以不依赖本机装的是哪个版本：
+    这里把 `CI_PYTHON` 调成 (3, 8)，`match`（3.10 起才有）就必须红。
+    """
+    _fake_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(hygiene, "CI_PYTHON", (3, 8))
+    (tmp_path / "backend" / "scripts" / "measure_new_syntax.py").write_text(
+        "match 1:\n    case 1:\n        pass\n", encoding="utf-8",
+    )
+    report = hygiene.Report()
+    hygiene.check_imports(report)
+    found = report.of("imports")
+    assert len(found) == 1
+    assert "CI 的 Python 3.8 不认" in found[0].why
