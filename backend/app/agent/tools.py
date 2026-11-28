@@ -8474,6 +8474,52 @@ GRAPH_RELATION_RULES = (
     "**不要**把它放进 root 里面（root 里只有 id / label / children 这些节点字段）。\n"
 )
 
+# 交叉指认（**非图谱路**的 `relations` 规则）。与 `GRAPH_RELATION_RULES` 是同一件事的
+# 两份，差别在视野：图谱路一次写出整张图 + 六类语义（依赖/因果/冲突/部分/细化/引用），
+# 这一份只解决"同一件事被写了两遍"。
+#
+# 为什么必须有两份而不是共用一份：图谱路的六个 kind 有图谱支撑（材料里明写了谁依赖谁），
+# 而三条路（三段式 / 全塞 / 分片）根本没有图，让模型去判"依赖 / 因果"只会得到凭空的线；
+# 它们真正需要的只有"这个条目在别处也出现过"。
+#
+# 为什么非要有这一段：`_SKELETON_BODY` 对它说"需要交叉指认时……**直接指向已有节点**"，
+# 而"指向"的写法（`relations`）此前只在 `graph_mode` 下追加（见 `_generate` 末尾那句
+# `if graph_mode: system += GRAPH_RELATION_RULES`）。于是那条禁令**不可执行**，模型只剩
+# 两条路——删掉一支该有的内容，或者复制一个节点并把 detail 改写成另一个说法。
+# 实测（`docs/CROSS-BRANCH-DUPLICATES.md` §4.1）：S02 那 9 处重复里 detail 被改写成
+# 材料里根本没有的"考核比重"（重叠 0.46–0.78 而不是接近 1）——**判据的压力制造了改写，
+# 改写又制造了捏造**。所以这一段写的不是"别复制"，而是"不复制的时候怎么写"。
+#
+# 上限 8 而不是 `GRAPH_MAX_RELATIONS`(30)：三段式的树是给定骨架的填充，一屏里能读懂的
+# 交叉指认就那么几处；**超过 8 条时正确的动作是合并节点**，不是再加线——这一句要写进
+# 提示词，因为"给个上限"只能让模型收敛，说清"超了该干什么"才会让它改结构。
+CROSS_REFERENCE_MAX = 8
+
+CROSS_REFERENCE_RULES = (
+    "\n**同一件事需要在两条分支下都提到时，用关系指认，不要复制节点**："
+    "在输出对象里加一个 `relations` 数组"
+    '（形如 {"source":"节点id","target":"节点id","kind":"references",'
+    '"why":"这两处为什么是同一件事"}）。\n'
+    "什么时候写：一个条目在材料里属于 A，而 B 处也非提它不可"
+    "（「课程内容」里的章节名又要在「学时分配」里出现；「设计要求」里的验收项"
+    "又要在「里程碑」里被引用）。这时**A 下写节点、B 下不写同一个节点**，"
+    "只加一条关系。\n"
+    "`kind` 只用两个值：references（B 处提到的东西就是 A 处那个）/ "
+    "part_of（B 是 A 的一部分）。别的语义（依赖、因果、冲突）在这条路上没有依据，不要写。\n"
+    "`why` 必填，一句话（不超过 60 字）说清**为什么这两处是同一件事**"
+    "（「学时分配表里的第 3 章就是课程内容里的第 3 章」）。写不出这句理由，"
+    "说明它们其实不是同一件事——那就各写各的，不要连线。\n"
+    "`source` / `target` 写**节点 id**（你在这份响应里给节点写的那个 id），不要写标题。\n"
+    f"最多 {CROSS_REFERENCE_MAX} 条；没有就写空数组 []。"
+    "**超过这个数说明你该合并节点，而不是再加关系**：两条分支各有一半内容在指同一件事时，"
+    "正确的动作是把它们并成一处、另一处用一条关系指过去——加第九条线不解决任何问题。\n"
+    # 位置这一句与 `GRAPH_RELATION_RULES` 末尾那段逐字同源，理由也同源：说"与 root
+    # 同级"时模型会把 relations 塞进 root 里面，而 `Node` 是 `extra="forbid"`。
+    "**位置**：`relations` 与 `title`、`root` 放在**同一个对象**里（最外层），"
+    '形如 {"title":"…","root":{…},"relations":[…]}；'
+    "**不要**把它放进 root 里面（root 里只有 id / label / children 这些节点字段）。\n"
+)
+
 # 第一段 user 消息的收尾要求。与 `_plan_ask` 的分工相同（重点在 user、规则在 system），
 # 但内容不同：这里要的是"整棵树 + 关系"，不是"几条分支"。
 _GRAPH_ASK_TAIL = (
@@ -11007,6 +11053,11 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
         # 换成判据）。不再调 `detail_prompt(...)`：它的每一个分支都带一个数，而这一轮要的就是
         # “提示词里一个数都不出现”。
         base_system = DETAIL_PROMPT_OPEN
+        # 这一次到底有没有把**结构那一段**（`shape_rules`）给出去。下面的交叉指认规则
+        # 要跟着它走：无材料的降级路径不给 `shape_rules`（没有分支要摆），那条 system 里
+        # 也就没有"不要跨支重复"这条禁令需要兑现——在那种 system 里教它"用关系指代"，
+        # 等于让它去指一棵没被告知形状的树。默认 True，只有最后那个 `else` 会翻。
+        structure_rules_given = True
         if sections and full_text:
             # 全塞：引用规则换成"这是全文"那一套。**不能复用 `BRANCHED_EVIDENCE_RULES`**
             # ——它开头就说"已经按一级分支各做过一次检索"，与这次真的没检索相矛盾；
@@ -11042,6 +11093,9 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
                 # 挑"的规则，少了它模型拿到的是一张没有图谱的普通整树提示词，而 user 里
                 # 那段实体清单会被它当成参考信息随手引用。
                 system += shape_rules
+            # 三段式走这一支时 system 里没有结构规则，交叉指认也就无从谈起（见下面那句
+            # `elif structure_rules_given`）。
+            structure_rules_given = graph_mode
         if library_section and sources:
             # 既有本次材料、又有库片段（薄材料那种：300–3000 字）。上面那几支的引用
             # 规则都只说"从本组抄 / 从正文抄"，库那一节没有归属，要单独补一句。
@@ -11050,6 +11104,15 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             # 关系规则放在**最后**：它与输出形状（`relations` 数组）绑在一起，而模型对
             # 紧挨着输出位置的那段话最敏感（同 `_detail_ask` 末尾那句自查）。
             system += GRAPH_RELATION_RULES
+        elif structure_rules_given:
+            # 非图谱路（S02 这类：第三档骨架拿到 `GRAPH_OUTLINE_UNAVAILABLE` 之后退回
+            # 三段式）此前**只有禁令、没有手段**：`_SKELETON_BODY` 对它说"需要交叉指认
+            # 时……直接指向已有节点"，而"指向"的写法只在上面那个 `graph_mode` 分支里
+            # 追加。位置与上面那句完全相同，理由也相同——它必须紧挨输出形状。
+            #
+            # 与 `GRAPH_RELATION_RULES` 互斥：两段式已经有六类 kind 那一份了，再加这一份
+            # 会让同一个 `relations` 字段收到两套规矩（上限 30 与 8、六值与前两个值）。
+            system += CROSS_REFERENCE_RULES
 
         if not ctx.reserve_model_call():
             return _fail("budget_exhausted", "本次运行的模型调用额度已用完，无法生成导图内容。")
@@ -11071,15 +11134,18 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     # **硬拒**——模型写错一个 id 就会把整棵树判废，而正确的处理是丢掉那条边。
     # 摘出来的关系在裁剪之后清洗（那时节点 id 才定型）。
     #
-    # **两处都要摘**：模型经常把 `relations` 塞进 `root` 里面（它把 root 当成"主体"，
+    # **三处都要摘**：模型经常把 `relations` 塞进 `root` 里面（它把 root 当成"主体"，
     # 于是"与 root 同级"被理解成"和 root 的字段同级"）。实测第一次跑就是这样，
     # 而 `Node` 是 `extra="forbid"`，那一次生成直接判废——提示词已经补了位置说明，
     # 但这件事不能只靠提示词兜。
     #
-    # 三段式不动：它原本不允许模型写 relations（写了会被同一处校验硬拒），这条规矩
-    # 不变——两条路对"模型多写一个字段"的容忍度不同，是刻意的。
+    # **三段式也摘**（此前不摘，因为那条路没有关系规则，模型本来不该写）：现在
+    # `CROSS_REFERENCE_RULES` 明确要求它在结构那一轮写 `relations`，而这条路的端点
+    # 写着写着就会写成标题或写错 id——不在这里摘走，`_validate_relations` 会对
+    # dangling 端点硬拒，**一条连错的关系换掉整张图**。摘出来交给 `_relations_from`
+    # 按同一套过滤收下：认不出端点的丢一条、没写 why 的丢一条，树一个字不动。
     raw_relations: Any = []
-    if graph_mode and isinstance(raw, dict):
+    if isinstance(raw, dict):
         raw_relations = raw.pop("relations", []) or []
         root_raw = raw.get("root")
         if isinstance(root_raw, dict):
@@ -11185,8 +11251,15 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     # `_relations_from` 的第一道过滤就是"端点不在树里就丢"——拿一张旧表建，
     # 留下来的会是几条指向已消失节点的虚线，而契约会因此拒收整张图。
     relation_drops: dict[str, int] = {}
-    if graph_mode:
-        relations, relation_drops = _relations_from(raw_relations, content)
+    #: 这一次收关系的上限：两段式 30（画布能放多少），三段式 8（规则里那个数，
+    #: `CROSS_REFERENCE_MAX`——超过 8 条正确的动作是合并节点）。放在这里而不是在
+    #: 调用处各写一遍：`data` 里的 `relation_limit` 与诊断里那句话必须同源。
+    relation_limit = GRAPH_MAX_RELATIONS if graph_mode else CROSS_REFERENCE_MAX
+    # 条件里带 `raw_relations`：三段式没写关系时**不进这里**（既不建空数组，也不
+    # 报一条"写了 0 条收下 0 条"的诊断——那是噪声）。
+    if graph_mode or raw_relations:
+        relations, relation_drops = _relations_from(
+            raw_relations, content, limit=relation_limit)
         if relations:
             content = content.model_copy(update={"relations": relations})
         if sum(relation_drops.values()):
@@ -11200,10 +11273,11 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             ]
             declared = len(raw_relations) if isinstance(raw_relations, list) else 0
             diagnostics.append(Diagnostic(
-                level=DiagnosticLevel.warn, code="GRAPH_RELATION_DROPPED",
+                level=DiagnosticLevel.warn,
+                code="GRAPH_RELATION_DROPPED" if graph_mode else "CROSS_REFERENCE_DROPPED",
                 message=(
-                    f"模型写了 {declared} 条跨分支关系，收下 {len(relations)} 条"
-                    f"（上限 {GRAPH_MAX_RELATIONS}）："
+                    f"模型写了 {declared} 条交叉指认，收下 {len(relations)} 条"
+                    f"（上限 {relation_limit}）："
                     + "、".join(f"{name} {count} 条" for name, count in breakdown if count)
                     + "。被丢掉的不影响树，只是画布上少一根虚线"
                 ),
@@ -11973,7 +12047,21 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             "queries": titles[:GRAPH_QUERY_LIMIT],
             "relations": len(content.relations),
             "relation_drops": {k: v for k, v in relation_drops.items() if v},
-            "relation_limit": GRAPH_MAX_RELATIONS,
+            "relation_limit": relation_limit,
+            "relation_kinds": sorted({
+                relation.kind.value for relation in content.relations
+                if relation.kind is not None
+            }),
+        }
+    if not graph_mode and raw_relations:
+        # 三段式的交叉指认账（`CROSS_REFERENCE_RULES`）。**只在模型真写过时才出现**：
+        # 一个恒为 0 的键会让"这条路有没有关系规则"与"模型这次没写"看起来一样。
+        # 与上面 `graph` 那个键互斥（`not graph_mode`），键集不会重叠。
+        data["cross_reference"] = {
+            "declared": len(raw_relations) if isinstance(raw_relations, list) else 0,
+            "relations": len(content.relations),
+            "relation_drops": {k: v for k, v in relation_drops.items() if v},
+            "relation_limit": relation_limit,
             "relation_kinds": sorted({
                 relation.kind.value for relation in content.relations
                 if relation.kind is not None
@@ -12075,24 +12163,35 @@ def _cross_branch_duplicates(root: Node) -> list[tuple[str, list[str]]]:
 
     只报不删：留哪一处是用户的决定。
     """
-    found: dict[str, list[tuple[str, ...]]] = {}
-    stack: list[tuple[Node, tuple[str, ...]]] = [(child, ()) for child in root.children]
+    # 每条链带两份：`ids` 判"在不在同一条祖先链上"，`labels` 输出给人看。
+    #
+    # **判链必须用 id**：同名节点不止一种含义（父子同名、兄弟同名），而 label 前缀
+    # 相同不代表同一条链——两支下各有一处「第 3 章」时，按 label 判会把它们当成同链
+    # 放过，那正是这条判据要报的东西。第一版实现比的是**父元组**（`place[:-1]`），
+    # 于是父子同名被判成跨支（S07「力矩与转动定律」：父与子同名，两处的祖先链是
+    # 前缀关系），docstring 承诺的"同一条祖先链上的两处不算跨支"没做到。
+    found: dict[str, list[tuple[tuple[str, ...], tuple[str, ...]]]] = {}
+    stack: list[tuple[Node, tuple[str, ...], tuple[str, ...]]] = [
+        (child, (), ()) for child in root.children
+    ]
     while stack:
-        node, chain = stack.pop()
-        label = re.sub(r"\s+", "", node.label or "")
-        if label:
-            found.setdefault(label, []).append((*chain, node.label))
+        node, ids, labels = stack.pop()
+        key = re.sub(r"\s+", "", node.label or "")
+        if key:
+            found.setdefault(key, []).append((ids, (*labels, node.label)))
         for child in node.children:
-            stack.append((child, (*chain, node.label)))
+            stack.append((child, (*ids, node.id), (*labels, node.label)))
     duplicates: list[tuple[str, list[str]]] = []
     for label, places in found.items():
         if len(places) < 2:
             continue
-        # 同一条祖先链上的两处不算跨支（父子同一句话是另一类问题，`check()` 管）。
-        parents = {place[:-1] for place in places}
-        if len(parents) < 2:
+        # 同一条祖先链上的两处不算跨支（父子同一句话是另一类问题，`check()` 管）：
+        # "同一条链"= 全部落在那条最长的链上。判据用 id 元组的前缀关系，见上面那段。
+        longest = max((ids for ids, _ in places), key=len)
+        if all(longest[: len(ids)] == ids for ids, _ in places):
             continue
-        duplicates.append((label, sorted("/".join(place[:-1]) or "根" for place in places)))
+        duplicates.append((label, sorted(
+            "/".join(labels[:-1]) or "根" for _, labels in places)))
     return duplicates
 
 
