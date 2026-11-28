@@ -1,0 +1,29 @@
+{
+  "$comment": "check_reachability.mjs 的棘轮基线。entries 里每条写着一个 src/** 模块为什么可以从入口（src/main.ts）走不到。class 只能是 a/b/c/d/e（含意见脚本 docstring）；a 是真缺口，除了 reason 还必须留 ack（署名）。evidence 路径相对仓库根，文件被删掉而条目还在，闸门就红。",
+  "root": "src/main.ts",
+  "entries": {
+    "src/api/types.ts": {
+      "class": "c",
+      "reason": "后端契约的镜像类型。整个文件只有 `import type { components } from './schema'` 与 `export type …`，编译成空模块——浏览器里不会加载它，走不到它不是缺口。被 `import type` 引用的地方有 40 余处，类型边在编译后整条消失，所以它本来就不该出现在可达集里。",
+      "evidence": [
+        "frontend/src/api/types.ts"
+      ]
+    },
+    "src/api/schema.d.ts": {
+      "class": "c",
+      "reason": "`npm run gen:api` 从 backend/openapi.json 生成的声明文件，由 `types.ts` 用 `import type` 消费。`.d.ts` 不产生任何可执行代码；CI 里另有一道闸（重新生成后 `git diff --exit-code`）保证它与后端一致。",
+      "evidence": [
+        "frontend/src/api/schema.d.ts",
+        "frontend/package.json"
+      ]
+    },
+    "src/api/contract-check.ts": {
+      "class": "c",
+      "reason": "编译期契约断言：`export const checks = { … true satisfies SameKeys<镜像, 生成类型> }`，靠 tsconfig 的 include 被 vue-tsc 检查，打包时被摇掉。它**故意不被任何模块 import**（文件自己的 docstring 第 26–27 行写着这条约定），所以「谁都不 import」是设计而不是缺口。跑 `npm run type-check` 就能看到它在工作。",
+      "evidence": [
+        "frontend/src/api/contract-check.ts",
+        "frontend/tsconfig.json"
+      ]
+    }
+  }
+}
