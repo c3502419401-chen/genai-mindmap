@@ -2,7 +2,13 @@
 
 只做一件事：保证报告里的数字可以逐条回溯到评审证据。改数字前先看
 `docs/TWO-ARCH-COMPARISON.md` 第 3 节的判据，别在这里调。
+
+**落盘发生在 `main()` 里，不放模块顶层。** 这不是洁癖：`check_script_hygiene.py`
+的 `load` 档会在每次 `--gate` 时把这个文件加载一遍，顶层写文件就意味着**跑一次闸门
+就重写一遍 `data/two-arch-judge/` 下的四份证据**——而「跑闸门」不该改动任何数据。
 """
+from __future__ import annotations
+
 import json
 from pathlib import Path
 
@@ -19,10 +25,17 @@ SETS = {
                    ("图22", 71, 2), ("图23", 76, 3), ("图24", 73, 2)],
 }
 
-JUDGE.mkdir(parents=True, exist_ok=True)
-for name, items in SETS.items():
-    (JUDGE / f"{name}.json").write_text(json.dumps(
-        [{"图": anon, "节点数": nodes, "多余重复处数": count}
-         for anon, nodes, count in items], ensure_ascii=False, indent=1),
-        encoding="utf-8")
-print("写了", ", ".join(sorted(path.name for path in JUDGE.glob("*.json"))))
+
+def main() -> int:
+    JUDGE.mkdir(parents=True, exist_ok=True)
+    for name, items in SETS.items():
+        (JUDGE / f"{name}.json").write_text(json.dumps(
+            [{"图": anon, "节点数": nodes, "多余重复处数": count}
+             for anon, nodes, count in items], ensure_ascii=False, indent=1),
+            encoding="utf-8")
+    print("写了", ", ".join(sorted(path.name for path in JUDGE.glob("*.json"))))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
