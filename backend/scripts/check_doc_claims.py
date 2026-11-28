@@ -783,6 +783,9 @@ BACKLOG_PROBE_DOC: dict[str, str] = {
         "`OUTLINE_FEW_BLOCKS_NOTE` 与薄材料探针脚本都在",
     "doc_drift_guard":
         "D 族（会漂的数）真的被 `--gate` 跑：`_drift_rules` 在，且 `main()` 拼进了 rules",
+    "cross_reference_wired":
+        "`CROSS_REFERENCE_RULES` 在，`_generate` 里它与 `GRAPH_RELATION_RULES` 是 "
+        "if/else 互斥，且收 `relations` 那一支不再只属于 `graph_mode`",
 }
 
 
@@ -850,6 +853,68 @@ def _drift_guard_wired(script: Path) -> bool:
     return False
 
 
+def _mentions(nodes: list[ast.AST], name: str) -> bool:
+    """这棵子树里出现过 `name` 吗（`Name.id` 或 `Attribute.attr`）。"""
+    for node in nodes:
+        for item in ast.walk(node):
+            if isinstance(item, ast.Name) and item.id == name:
+                return True
+            if isinstance(item, ast.Attribute) and item.attr == name:
+                return True
+    return False
+
+
+def _relation_gate_accepts(test: ast.AST) -> bool:
+    """这个 `if` 的条件会在"只有模型写了、且不是 graph_mode"时成立吗。
+
+    两种写法都算：`graph_mode or raw_relations`（Or 且两个名字都在）与彻底解耦的
+    （条件里没有 `graph_mode`）。`graph_mode and raw_relations` **不算**——那与
+    `if graph_mode:` 一样，非图谱路一条都收不到，只是看起来像修好了。
+    """
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or):
+        names = {node.id for node in ast.walk(test) if isinstance(node, ast.Name)}
+        if "raw_relations" in names and "graph_mode" in names:
+            return True
+    return not _mentions([test], "graph_mode")
+
+
+def _cross_reference_wired(tree: ast.Module) -> bool:
+    """交叉指认真的接上了吗：常量在 + 与图谱那份互斥 + 非 graph_mode 也会收 `relations`。
+
+    三件事分开判，因为它们分别会单独坏掉，而坏掉之后**表现完全一样**（模型写了
+    `relations`，画布上是一根线都没有，或者整棵树判废）：
+
+      - 常量被删 / 改名：`_generate` 里 `system += ` 一个不存在的名字会 NameError，
+        这条不用探针也能发现；但"常量还在、没人引用"就是零引用，必须判；
+      - 两条关系规则**不是** if/else：同一个 `relations` 字段会收到两套上限（30 / 8）
+        与两套 kind（六值 / 两个值），模型二选一地违背其中一份；
+      - 收 `relations` 的那一支还锁在 `graph_mode` 里：这正是上一版的形状——
+        规则写了，非图谱路一条都收不到。
+
+    `if graph_mode or raw_relations:` 这个 test 是第三件事的判据：它的条件里出现了
+    `raw_relations`（不是只有 `graph_mode`），说明"模型写了就收"。
+    """
+    if not _mentions([tree], "CROSS_REFERENCE_RULES"):
+        return False
+    exclusive = False
+    receives = False
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                or node.name != "_generate":
+            continue
+        for inner in ast.walk(node):
+            if not isinstance(inner, ast.If):
+                continue
+            if (_mentions(inner.body, "GRAPH_RELATION_RULES")
+                    and _mentions(inner.orelse, "CROSS_REFERENCE_RULES")):
+                exclusive = True
+            if (_mentions([inner.test], "raw_relations")
+                    and _relation_gate_accepts(inner.test)
+                    and _mentions(inner.body, "_relations_from")):
+                receives = True
+    return exclusive and receives
+
+
 def probe_backlog_facts(app_dir: Path | None = None,
                         baseline: Path | None = None,
                         scripts_dir: Path | None = None,
@@ -886,6 +951,7 @@ def probe_backlog_facts(app_dir: Path | None = None,
         probe_script = (scripts_dir or (BACKEND_DIR / "scripts")) \
             / "_probe_thin_material_branches.py"
         values["thin_material_offline"] = has_note and probe_script.exists()
+        values["cross_reference_wired"] = _cross_reference_wired(tools)
 
     contracts = read(app / "contracts" / "mindmap.py")
     if contracts is not None:

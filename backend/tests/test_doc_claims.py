@@ -431,6 +431,51 @@ def test_the_backlog_probes_read_the_file_not_a_constant(tmp_path: Path) -> None
     assert values["branch_arg_deprecated"] is False
 
 
+def test_the_cross_reference_probe_follows_the_wiring(tmp_path: Path) -> None:
+    """台账第 9 条的探针读三件事，任何一件被翻回去都要红。
+
+    它守的正是这一轮修的那个形状：**规则写了但没人收**。所以探针不能只判"常量在"，
+    还要判"两段式那份与三段式那份是 if/else 互斥"与"收 relations 的那一支不再只属于
+    `graph_mode`"。三条各给一个反例——只判一条的探针在另外两条翻回去时仍然是绿的。
+    """
+    wired = (
+        'CROSS_REFERENCE_RULES = "x"\n'
+        'GRAPH_RELATION_RULES = "y"\n'
+        'def _generate():\n'
+        '    if graph_mode:\n'
+        '        system += GRAPH_RELATION_RULES\n'
+        '    elif structure_rules_given:\n'
+        '        system += CROSS_REFERENCE_RULES\n'
+        '    raw_relations = raw.pop("relations", [])\n'
+        '    if graph_mode or raw_relations:\n'
+        '        relations, drops = _relations_from(raw_relations, content)\n'
+        '    return system\n')
+
+    def values_for(source: str, name: str) -> dict[str, bool]:
+        root = tmp_path / name
+        (root / "agent").mkdir(parents=True)
+        (root / "agent" / "tools.py").write_text(source, encoding="utf-8")
+        for folder in ("contracts", "knowledge"):
+            (root / folder).mkdir()
+        (root / "contracts" / "mindmap.py").write_text("", encoding="utf-8")
+        (root / "knowledge" / "router.py").write_text("", encoding="utf-8")
+        read, _ = claims.probe_backlog_facts(app_dir=root, scripts_dir=root)
+        return read
+
+    assert values_for(wired, "ok")["cross_reference_wired"] is True
+    # ① 常量在，但 `_generate` 不再引用它（零引用）
+    unused = wired.replace("        system += CROSS_REFERENCE_RULES\n",
+                           "        pass\n")
+    assert values_for(unused, "unused")["cross_reference_wired"] is False
+    # ② 两份关系规则不再是 if/else：同一个字段会收到两套上限与两套 kind
+    both = wired.replace("    elif structure_rules_given:\n", "    if True:\n")
+    assert values_for(both, "both")["cross_reference_wired"] is False
+    # ③ 收 relations 那一支又锁回 graph_mode：模型写了也收不到（上一版的形状）
+    locked = wired.replace("if graph_mode or raw_relations:",
+                           "if graph_mode and raw_relations:")
+    assert values_for(locked, "locked")["cross_reference_wired"] is False
+
+
 def test_a_missing_anchor_is_reported_as_lost_evidence_not_as_undone() -> None:
     """判据被删 ≠ 功能没做。两种红必须报不同的话，否则下一轮会把已做的活重做一遍。
 

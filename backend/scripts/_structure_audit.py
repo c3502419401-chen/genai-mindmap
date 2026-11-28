@@ -15,14 +15,23 @@
     E 无 detail 的节点 ≤5%    说明是导图的可读性的一半
     F label 都在可读上限内    超了在画布上被截成半句（实测出现过「最短路径 Dijkstra 与」）
 
-★ D 的口径是**全局同名计数、不分层级、不看父**：跨支同名（同一个说法挂在两条分支
-  下）也计入。这个口径不是随手写的——跨支同名在界面上就是"读者要问两次是不是同一
-  件事"，而生成端普通三段式那条路不写 `relations`，两支之间什么关系都没有。但它是
-  **三件事混在一个数里**：真重复（该合并）、交叉引用（两支都要看得到，只是缺一条
-  关系线）、同名不同指（如"候选人 A / 候选人 C"下的「弱项」，那是规范写法）。
-  分档规则、17 处的逐条判定与"该改哪一头"见 `docs/CROSS-BRANCH-DUPLICATES.md`，
-  复算用 `scripts/measure_cross_branch_duplicates.py --triage`。本文件这一行**暂不改**
-  ——它是验收口径，改它会把所有历史数据（85% 那类）一起改掉，该单独一批。
+★ D 的口径**本轮换过**，这里留两行：
+
+  **旧口径（`dup`，仍在返回值里，作对照）**：全局同名计数、不分层级、不看父。它把
+  三件事混在一个数里——真重复（该合并）、交叉引用（两支都要看得到，只是缺一条关系
+  线）、同名不同指（如"候选人 A / 候选人 C"下的「弱项」，那是规范写法）。旧树 17 处
+  里后两类占 11 处（8 amber + 3 grey），把它们归零等于要求模型不许在两种视角下写
+  同一个需求名，那不是产品想要的。
+
+  **现口径（`dup_red`，进 `checks`）**：只数 **red**（跨支同名 **且** 两处 detail 讲
+  同一件事，2-gram 重叠 ≥0.5；同链 / 同模板的不同实例算 grey，不计）。三档判定的
+  规则与逐条判据在 `scripts/measure_cross_branch_duplicates.py::triage`，用例钉在
+  `tests/test_cross_branch_triage.py`。判据算不出来时（老树、坏树不能过契约）退回
+  旧口径并如实标出来，不静默取 0——`dup_red` 为 `None` 就是这个意思。
+
+  历史数（85%、17/20）是按旧口径测的，**不改**：它们是那次测量的结果，改了就变成
+  另一份测量的赝品。新口径的复算是 `measure_cross_branch_duplicates.py --triage`
+  最后那一行"按三档重算"，旧树 19/20。
 
 ★ F 的那个数是**从代码里取的**（`optimization/repair.py::READABLE_LABEL_CHARS`），
   不在这里写死。它是渲染线的数：`frontend/src/stores/mindmap.ts` 的
@@ -70,6 +79,9 @@ from pathlib import Path
 BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
+SCRIPTS = Path(__file__).resolve().parent
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
 
 from app.optimization.repair import READABLE_LABEL_CHARS  # noqa: E402  （要先补 sys.path）
 
@@ -77,6 +89,8 @@ DATA = BACKEND / "data"
 #: 可读上限与修复那一侧同源，见文件头 ★。
 LABEL_LIMIT = READABLE_LABEL_CHARS
 LABEL_CHECK = "F label ≤%d 字" % LABEL_LIMIT
+#: D 的两条口径（见文件头 ★）：`dup` 是旧的全局同名计数，`dup_red` 是现口径。
+D_CHECK = "D 跨支重复（red）≤1"
 #: 修复前的基线快照（`gitignore` 里的 `data/acc_trees-before-fix/`）。
 BEFORE_DIR = DATA / "acc_trees-before-fix"
 
@@ -87,6 +101,29 @@ def walk(node, depth=1):
         yield from walk(child, depth + 1)
 
 
+def red_duplicates(content: dict) -> int | None:
+    """D 的现口径：只数 **red**（跨支同名 + 两处 detail 讲同一件事）。
+
+    复用 `measure_cross_branch_duplicates.analyse` 而不是在这里再写一份：三档规则有
+    用例钉着（`tests/test_cross_branch_triage.py`），复制一份迟早会漂，而漂了之后
+    两个数都还在、没人知道哪个对。
+
+    **算不出来时返回 `None`**，不返回 0：老树 / 坏树过不了契约校验很常见（这个脚本
+    读的是产物目录里任意一份 json），而"0 处重复"与"没量"在验收表里长得一样。
+    """
+    try:
+        from app.contracts.mindmap import MindMapContent
+        from measure_cross_branch_duplicates import analyse
+    except Exception:  # noqa: BLE001 — 脚本目录不在 sys.path 时也不该炸整份报告
+        return None
+    try:
+        parsed = MindMapContent.model_validate(content)
+        groups = analyse(parsed)["groups"]
+    except Exception:  # noqa: BLE001 — 同上：校验不了的树就是量不了
+        return None
+    return sum(group["extra"] for group in groups if group["band"] == "red")
+
+
 def audit(content: dict) -> dict:
     root = content.get("root") or {}
     pairs = list(walk(root))
@@ -95,6 +132,7 @@ def audit(content: dict) -> dict:
     top = root.get("children") or []
     depth = max((d for _, d in pairs), default=0)
     dup = len([label for label in labels if label]) - len({label for label in labels if label})
+    red = red_duplicates(content)
     empty_top = sum(1 for node in top if not (node.get("children") or []))
     no_detail = sum(1 for detail in details if not detail)
     long_labels = [label for label in labels if len(label) > LABEL_LIMIT]
@@ -102,13 +140,14 @@ def audit(content: dict) -> dict:
         "A 一级分支 3-8": 3 <= len(top) <= 8,
         "B 深度 3-6": 3 <= depth <= 6,
         "C 无空一级分支": empty_top == 0,
-        "D 重复 label ≤1": dup <= 1,
+        # 现口径；量不了时退回旧口径（宁可判得严，也不静默放行）
+        D_CHECK: (dup if red is None else red) <= 1,
         "E 无 detail ≤5%": (no_detail / len(details)) <= 0.05 if details else False,
         LABEL_CHECK: not long_labels,
     }
     return {
         "nodes": len(pairs), "depth": depth, "top": len(top),
-        "dup": dup, "empty_top": empty_top, "no_detail": no_detail,
+        "dup": dup, "dup_red": red, "empty_top": empty_top, "no_detail": no_detail,
         "long_labels": long_labels[:5],
         "long_count": len(long_labels),
         "checks": checks,
@@ -187,8 +226,10 @@ def main(argv: list[str]) -> int:
         marks = "" if item["pass"] else "　失败项：" + "；".join(item["failed"])
         extra = ""
         if item.get("nodes"):
+            red = item.get("dup_red")
             extra = (f"　节点 {item['nodes']} 深 {item['depth']} 一级 {item['top']} "
-                     f"重复 {item['dup']} 无说明 {item['no_detail']}"
+                     f"重复 {item['dup']}（red {('—' if red is None else red)}）"
+                     f" 无说明 {item['no_detail']}"
                      f" 覆盖 {item['must_rate']} 引用 {item['ref_coverage']}"
                      f" 超长 {item['long_count']}")
         origin = f"　［{item['origin']}］" if item.get("origin") else ""
