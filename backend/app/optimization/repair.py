@@ -131,6 +131,10 @@ MANUAL_ONLY: dict[str, str] = {
     "SHALLOW_BRANCH": "补什么内容要模型：这一支缺的是信息，不是排版",
     "MISSING_DETAIL": "写什么说明要模型",
     "DEPTH_LIMIT": "没有可执行的动作：契约禁止第 9 层（见 service.NOT_SUGGESTED）",
+    # 两个修法都自洽，选哪个取决于**材料里这件事出现了几次**——那是这一层拿不到的
+    # 信息。合并会丢一个视角（材料本身两处时），加一条关系则保留那个视角。判据只
+    # 负责把"这一对没被指认"说出来，取舍留给用户（见 service.NOT_SUGGESTED）。
+    "CROSS_BRANCH_UNLINKED": "并成一处还是加一条关系，要看材料里这件事出现了几次：这一层拿不到",
 }
 
 #: 契约里 `Node.source_refs` 的 `max_length`。写在这里是因为契约把它写成字面量，

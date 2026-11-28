@@ -74,6 +74,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import unicodedata
 from dataclasses import dataclass, field
 from typing import Iterator
@@ -221,6 +222,13 @@ NOT_SUGGESTED: dict[str, str] = {
         "「已到 8 层」不是一个可执行的动作：契约禁止第 9 层，所以没有"
         "「再展开一层」可做；而「减一层」要删的是整条中间层，那是重写一支，"
         "不是对某个节点的编辑"
+    ),
+    "CROSS_BRANCH_UNLINKED": (
+        "两个动作都可能对，而选哪个要看**材料里这件事出现了几次**——那是这一层"
+        "拿不到的信息（判据只看得见树上写了什么）。并成一处会丢一个视角（材料本身"
+        "两处时），加一条关系则保留了那个视角但要求读者读一根虚线。"
+        "交给人：诊断把「这一对没被指认」说出来就够了，"
+        "`docs/CROSS-BRANCH-DUPLICATES.md` §一 有 a / b / c 三档的判法"
     ),
 }
 
@@ -470,6 +478,153 @@ def _missing_detail_diagnostics(root: Node) -> list[Diagnostic]:
     )]
 
 
+# ---------------------------------------------------------------- 跨支同核（未指认）
+#
+# 「同一件事被写成两处」有两种形态，判据不同、读者不同：
+#
+#   · **逐字同名**（只差空白）→ `CROSS_BRANCH_DUPLICATE`（`agent/tools.py` 的
+#     `_cross_branch_duplicates`）。它说的是"这句话在图里出现了两遍"。
+#   · **近义改写**（「概述 4 学时」/「第一部分 概述」/「概述4学时」）→ **本段**。
+#     它说的是"这两处你打算怎么处理，图上读不出来"。
+#
+# 为什么非要第二条：三次真跑（`docs/CROSS-BRANCH-DUPLICATES.md` §八）里，加了交叉
+# 指认规则之后 red 从 6 降到 0，而 red 归零**不是**因为第二处消失了——模型把 label
+# 改写成近义（逐字判据当场失明），再补一条 `relations` 说"这两处是一回事"。于是
+# "red = 0"与"仍有两份同一件事"同时成立，那是最容易被读成成功的一种假进步。这一条
+# 判据就是那个空洞的探针，所以它**只报被改写过的那一档**：逐字那档已经有人报，
+# 两条码不许落在同一对上（`test_cross_branch_duplicate_and_unlinked_do_not_overlap`）。
+#
+# 判据的形态是"剥掉序号前缀与量化尾缀后相等"，不是相似度阈值。阈值版（2-gram
+# Dice ≥ 0.5）在库里 28 棵树上实测过：假阳性 210 对、真命中 22 对——「第二章 8
+# 学时」与「第五章 6 学时」、「WebSocket」与「Socket 编程」都被判成同一件事。
+# 剥前缀/尾缀这一版同一批树下沉到 8 对，且与人判逐条对得上（S02 8 处、S08 3 处、
+# S17 1 处、S05 1 处，见 §一 的 17 处分类）。
+#
+# 为什么在**原始 label** 上剥而不是在 `_normalize_label` 之后：归一化会删掉所有标点
+# （顿号、冒号、括号），而序号前缀全靠那些标点划界。「一、本次评审范围」剥完标点变成
+# "一本次评审范围"，再想剥"一、"就只剩一个裸"一"字，那会把「一般原理」剥成「般原理」。
+_CORE_PREFIX = re.compile(
+    r"^\s*(?:"
+    r"第\s*[一二三四五六七八九十百零〇0-9]+\s*(?:部分|章|编|节|讲|单元|模块|课)"
+    r"|[一二三四五六七八九十]+\s*[、.．]"
+    r"|M\s*[0-9]+\s*[:：.．]"
+    r")\s*"
+)
+
+# 量化尾缀：**数字 + 单位**，可带括号、可连续多个（「各 8 学时」「（7 次实验）」）。
+# 单位表只收"这件事的量"，不收"这件事是什么"：漏掉一个单位只是少配一对（判据是提示
+# 不是判决），而多收一个字（比如把「的分配」也当尾缀）会把「总学时 40 的分配」剥成空。
+_CORE_SUFFIX = re.compile(
+    r"(?:\s*[（(]?\s*[0-9０-９]+(?:\.[0-9]+)?\s*"
+    r"(?:学时|课时|小时|次|个|人|天|周|月|年|页|分|％|%|元|万元)"
+    r"\s*[)）]?\s*)+$"
+)
+
+# core 的下限。**2**，不是 3：`MIN_FUZZY_CHARS` 那个 3 是编辑距离比较用的（2 个字之间
+# 换一个字就换掉一半，那是两个概念），而这里剥完只剩 core，不再做模糊比较。压到 3 会
+# 漏掉「概述」这种 2 字标题——S02 那 8 处里第一处就是它。
+MIN_CORE_CHARS = 2
+
+
+def _core_label(text: str) -> str:
+    """剥掉序号前缀与量化尾缀之后的"核心词"。剥完再归一化（标点/空白/全半角）。
+
+    **剥空了就退回归一化的原文**，不返回空串：整串都是"序号 + 数量"的标题（「第二章
+    8 学时」）剥完什么都不剩，而空串与空串相等——那会让「第二章 8 学时」与「第五章
+    6 学时」被判成同一件事，恰好是相似度判据栽的那个坑。退回原文之后它们各自是
+    「第二章8学时」/「第五章6学时」，不同。
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return ""
+    prev = None
+    while prev != stripped:
+        prev = stripped
+        stripped = _CORE_PREFIX.sub("", stripped)
+        stripped = _CORE_SUFFIX.sub("", stripped)
+    core = _normalize_label(stripped)
+    return core or _normalize_label((text or "").strip())
+
+
+def _declared_pairs(content: MindMapContent) -> set[frozenset[str]]:
+    """`relations` 已经指认过的节点对（**方向无关**：指认就是指认）。"""
+    pairs: set[frozenset[str]] = set()
+    for relation in content.relations:
+        if relation.source and relation.target:
+            pairs.add(frozenset((relation.source, relation.target)))
+    return pairs
+
+
+def _cross_branch_unlinked_diagnostics(content: MindMapContent) -> list[Diagnostic]:
+    """跨支"同一件事"但没有任何 `relations` 指认 → 一条汇总 warn。
+
+    三条边界，每条都对应一种真实的误报：
+
+      1. **同父不算跨支**：同级的重复是 `DUPLICATE_LABEL` / `NEAR_DUPLICATE_LABEL`
+         的地盘，两条判据落在同一对上是重复报。
+      2. **同一条祖先链不算跨支**：父子同名是"父节点既当条目又当分组"（S07 的
+         「力矩与转动定律」），要改的是层级，不是加一条关系。
+      3. **归一化后逐字相同的不报**：那一档归 `CROSS_BRANCH_DUPLICATE`。这一条是
+         本判据存在的理由（只报"被改写成近义"的那一档），所以它必须真的只管那一档。
+
+    聚合一条而不是逐对报：S02 那种材料上一次能出 8 对，逐对报会把整个面板淹掉
+    （与 `MISSING_DETAIL` 同一条取舍）。
+    """
+    declared = _declared_pairs(content)
+    buckets: dict[str, list[tuple[Node, Node | None, frozenset[str]]]] = {}
+    order: list[str] = []
+
+    def walk(node: Node, parent: Node | None, ancestors: frozenset[str]) -> None:
+        core = _core_label(node.label)
+        if len(core) >= MIN_CORE_CHARS:
+            if core not in buckets:
+                buckets[core] = []
+                order.append(core)
+            buckets[core].append((node, parent, ancestors))
+        below = ancestors | {node.id}
+        for child in node.children:
+            walk(child, node, below)
+
+    walk(content.root, None, frozenset())
+
+    found: list[tuple[Node, Node]] = []
+    seen: set[frozenset[str]] = set()
+    for core in order:
+        group = buckets[core]
+        for index, (left, left_parent, left_anc) in enumerate(group):
+            for right, right_parent, right_anc in group[index + 1:]:
+                if left_parent is not None and left_parent is right_parent:
+                    continue
+                if right.id in left_anc or left.id in right_anc:
+                    continue
+                if (_normalize_label(left.label) == _normalize_label(right.label)):
+                    continue          # 逐字同名：CROSS_BRANCH_DUPLICATE 的地盘
+                pair = frozenset((left.id, right.id))
+                if pair in declared or pair in seen:
+                    continue
+                seen.add(pair)
+                found.append((left, right))
+
+    if not found:
+        return []
+    shown = "；".join(
+        f"「{left.label.strip()}」与「{right.label.strip()}」" for left, right in found[:5]
+    )
+    return [Diagnostic(
+        level=DiagnosticLevel.warn,
+        code="CROSS_BRANCH_UNLINKED",
+        node_id=None,
+        message=(
+            f"有 {len(found)} 处同一件事写在了两条分支下，而图里没有一条关系指认它们"
+            f"（{shown}{'…' if len(found) > 5 else ''}）：读者要自己判断这两处是不是"
+            "一回事。要么并成一处，要么加一条 references 并在 why 里说清它们的关系"
+        ),
+        evidence=" ".join(
+            node_id for left, right in found[:MAX_EVIDENCE_IDS] for node_id in (left.id, right.id)
+        ),
+    )]
+
+
 def check(content: MindMapContent, sources: list[Source] | None = None) -> list[Diagnostic]:
     """结构诊断；只有显式提供原文时才执行引用校验。
 
@@ -483,6 +638,7 @@ def check(content: MindMapContent, sources: list[Source] | None = None) -> list[
     diagnostics.extend(_near_duplicate_diagnostics(root))
     diagnostics.extend(_shallow_branch_diagnostics(root))
     diagnostics.extend(_missing_detail_diagnostics(root))
+    diagnostics.extend(_cross_branch_unlinked_diagnostics(content))
     if sources is not None:
         diagnostics.extend(verify_source_refs(content, sources))
     return diagnostics
