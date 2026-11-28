@@ -1857,14 +1857,22 @@ DRIFT_CLASSES: tuple[tuple[str, str, str], ...] = (
 #: 那一轮的读数、`PROJECT-STATUS.md` 的"这一周的实测数字"是 11-18 那天的表）。这些段落
 #: **不搬进 scope 之外**，而是就地加 `claims-ok: drift:* 历史留档：…` —— 与 B 族的历史
 #: 语境放行同一条道理：那不是错话，是错误的过去时，逐份文档放行比逐条注释更容易被看见。
+#:
+#: 2026-11-28 又从 8 份扩到 10 份，加的是 `docs/EXTERNAL-RELEVANCE.md` 与
+#: `docs/SCRIPT-HYGIENE.md`。这两份本来就是 `DRIFT_CANDIDATES` 里状态 `todo` 的两条
+#: （「实现完整（29 条用例）」「都 128 份」），**当轮实测各是 30 与 129**——清单让它们
+#: 可见但不红，就等于给自己留了一句"知道它在漂、但不许它红"的话。改成引用式之后加进
+#: scope：从此它们由红管，不再由一张理由表管。
 DRIFT_SCOPE: tuple[str, ...] = (
     "README.md",
     "TEAM-GUIDE.md",
     "docs/BACKLOG.md",
+    "docs/EXTERNAL-RELEVANCE.md",
     "docs/FEATURES_AND_OWNERS.md",
     "docs/PLAN-REWORDING.md",
     "docs/PROJECT-STATUS.md",
     "docs/SCOPE.md",
+    "docs/SCRIPT-HYGIENE.md",
     "docs/USER-PATH-TESTS.md",
 )
 
@@ -1935,11 +1943,10 @@ DRIFT_CANDIDATES: tuple[tuple[str, str, int, str, str], ...] = (
      "「本轮只对 top 慢用例所在的 12 个文件采了单跑读数」"),
     ("docs/W1_DAY1.md", "21 个文件", 1, "accepted", "引用块里的 2026-11-10 快照：352 个 vitest 用例（21 个文件）"),
     ("docs/WIRING-GAPS.md", "107 个文件", 1, "accepted", "那一轮的耗时读数：107 个文件 × 515 名字"),
-    # ---- 真在漂：这两句在断言现状
-    ("docs/EXTERNAL-RELEVANCE.md", "29 条用例", 1, "todo",
-     "「实现完整（29 条用例）」是现在时，那个功能的用例数早不是这个"),
-    ("docs/SCRIPT-HYGIENE.md", "128 份", 1, "todo",
-     "「文档分级」那一行里的 md 份数：它会随每份新文档变，正是 D 族要消灭的形状"),
+    # ---- 真在漂的那两条已经从这张清单里毕业：
+    # `docs/EXTERNAL-RELEVANCE.md`「29 条用例」与 `docs/SCRIPT-HYGIENE.md`「128 份」
+    # 改成引用式后进了 `DRIFT_SCOPE`（8 → 10 份），从此由 D 族的红管，不再由这张理由表
+    # 管。清单里留着一句"知道它在漂、但不许它红"，本身就是要消灭的那种话。
 )
 
 #: `DRIFT_CANDIDATES` 的合法状态。两档，理由见上面那个常量。

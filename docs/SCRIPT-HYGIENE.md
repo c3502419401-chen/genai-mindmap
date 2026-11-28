@@ -287,7 +287,7 @@ def _read(name: str):
 | `ruff check .` | `backend/` 全部 `.py` | 有 | 都 passed | 无。反方向：本地多扫未跟踪文件，只会更严 |
 | 探针脚本卫生 | `scripts/`、`docs/`、`.env.example`、git 索引 | 有 | 修前 0 条 vs **6 条**；修后都 0 条（六档） | **已修**：`load` 档物化干净树；新增 `deps` 档查"本机有、CI 没有" |
 | 文档断言与代码一致 | `app/**`、`conftest.py`、`openapi.json`、`deploy/`、`tidy.ts`、`git ls-files '*.md'` | 有 | 都 64 条判定，通过 | 无（它只读 git 里的文本） |
-| 文档分级 | `docs/`、`README.md`、`INDEX.md`、`git ls-files '*.md'`；`git log` 只打印归档日期 | 有（**需 `fetch-depth: 0`**） | 都 128 份，通过 | 已配 `fetch-depth: 0`。日期不参与判据，否则每次重跑都要改文档 |
+| 文档分级 | `docs/`、`README.md`、`INDEX.md`、`git ls-files '*.md'`；`git log` 只打印归档日期 | 有（**需 `fetch-depth: 0`**） | 份数按 `git ls-files '*.md'` 现数，两侧同数、通过 | 已配 `fetch-depth: 0`。日期不参与判据，否则每次重跑都要改文档 |
 | 诊断码两侧覆盖 | `app/**/*.py` 字面量 + `DIAGNOSTIC-TWO-SIDES.md`；可选跑 `data/acc_trees*` 72 棵真树 | 静态有；**真树没有** | 都通过，但**输出不同**：本地跑运行期 5 码 / 12 判定，CI 打印"运行期未测量" | 已诚实降级，但 **CI 少测一半**。要补就把运行期那半固化成 golden JSON 入库，CI 比对 |
 | Test（pytest 全量） | 见下三行 | 大部分有 | **3470 passed / 37 skipped / 29 subtests，两侧逐条相同** | 无。`conftest.py` 清 23 个环境变量、库落 `tmp_path`、网络闸拦真请求 |
 | 零引用函数棘轮 | `app/`、`tests/`、`scripts/` 文本 + 基线 JSON | 有 | 都 8 条在基线内 | 无 |
