@@ -106,10 +106,27 @@
 
 ### 9. 跨支重复 label 17 处
 
-- **状态**：待做
-- **probe**：`none`
-- **判据**：`backend/tests/test_generate_auto_repair.py::test_cross_branch_duplicates_are_judged_before_the_repair` —— 先写判据：它钉住"判定在哪、判定在修复之前"；**归零的标准**是重跑验收测量后 `docs/ACCEPTANCE-REPORT.md` §6.1 那张表里"跨支重复 label"这一行等于 0（2026-11-27 那次测量是 17，S02 一个样本占 9；现值以那张表为准）
-- **出处**：`docs/ACCEPTANCE-REPORT.md` §6.4 第 2 条
+- **状态**：半做
+- **probe**：`cross_reference_wired`
+- **判据**：三条一起看，**都不再是"=0"**（理由见 `docs/CROSS-BRANCH-DUPLICATES.md` §五：
+  17 处里 8 处 amber 删了会丢信息、3 处 grey 是误报）：
+  1. **三档可复算**：`python scripts/measure_cross_branch_duplicates.py --triage` 出
+     `red 6 / amber 8 / grey 3`（旧树），且 `python scripts/_structure_audit.py` 的 D 只数
+     red（`D 跨支重复（red）≤1`）——首口径 **19/20 = 95%**，与 `--triage` 最后一行逐字一致；
+     用例 `backend/tests/test_cross_branch_triage.py`（6 条）钉住三档与"同链不报、跨支仍报"。
+  2. **每棵 red ≤1**：旧树 20 棵合计 red 6（全在 S02），重跑三次 S02 全为 **0**。
+  3. **amber 有出口**：`agent/tools.py::CROSS_REFERENCE_RULES` 在**非 graph_mode 的结构
+     那一段**（system 末尾，紧挨输出形状）追加，上限 8 条；真实生成时 `relations` 非空。
+     现状：三次采样 `relations` 8/8/8（基线 0），但"一支写节点、另一支只写关系"**没有**
+     发生——8 条线的两端都还在（见 §八）。
+  4. **缝有探针**：不另立近义判据（`NEAR_DUPLICATE_LABEL` 实测 40 对 0 对真近义，没有可用
+     阈值），改为把 `relations` 当缝的探针——它显式说出"这两处指同一件事"，r2/r3 那 6 对
+     学时改写被逐字判据全瞎、被 `relations` 全看见。
+- **触发条件**：第 3 条要么由一条更硬的措辞（"第二处不要写节点"的独立一行 / 反例）补上，
+  要么承认"用关系标注同义"就是这条路的上限；第 4 条等 `relations` 接进 `--triage` 的
+  amber 证据栏之后再谈"归零"这个词
+- **出处**：`docs/CROSS-BRANCH-DUPLICATES.md` §4.3（落地与核查四问+第五问）、§5.3（四条）、
+  §八（三次采样）
 
 ### 10. `docs/` 的分级（哪份是入口、哪份是存档、哪份只给 AI 看）
 

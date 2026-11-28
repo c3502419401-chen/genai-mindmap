@@ -239,7 +239,6 @@ D 的意图是"交付物上有没有让读者第二次读到同一句话"，这�
 改写又制造了捏造**。
 
 ### 4.2 设计（未动代码，等确认）
-
 三处改动，按性价比：
 
 1. **生成侧（`backend/app/agent/tools.py`，必须先出设计再动手）**
@@ -260,6 +259,57 @@ D 的意图是"交付物上有没有让读者第二次读到同一句话"，这�
    `CROSS_BRANCH_DUPLICATE` 把 red 与 amber 混在一句里（"18 个节点跨分支重复……重复的
    节点没有被删"）。改成两句：`CROSS_BRANCH_DUPLICATE`（red，该改）与
    `CROSS_REFERENCE`（amber，建议用关系指认）。
+
+### 4.3 落地了什么（本轮）
+
+**① 生成侧：`CROSS_REFERENCE_RULES`（`tools.py`，`CROSS_REFERENCE_MAX = 8`）**
+
+位置与 `GRAPH_RELATION_RULES` 同一条逻辑：**system 的最末尾**，紧挨输出形状。追加条件
+是 `not graph_mode and structure_rules_given`——两段式已经有六类 kind 那一份（30 条上限），
+再加一份等于让同一个字段收到两套规矩；无材料的降级路径没给 `shape_rules`（也就没有
+"不要跨支重复"这条禁令要兑现），同样不加。
+
+规则说五件事，每件都对应"禁令不可执行"的那一半：
+
+| 说什么 | 为什么必须说 |
+|---|---|
+| 什么时候写（一个条目在 A 属于、B 也非提不可） | 模型原来的理解是"重复了要删一个"，而正确答案常常是"两处都要出现" |
+| 写在哪个字段（`relations` 数组 + 完整位置说明） | 说"与 root 同级"时模型会把 relations 塞进 root 里，而 `Node` 是 `extra="forbid"` |
+| `kind` 只用 references / part_of 两个值 | 这条路没有图，`depends_on` / `causes` 没有依据 |
+| `why` 必填，一句话说清"为什么这两处是同一件事" | 写不出理由就说明它们不是同一件事——这条是**反捏造**的把手 |
+| 上限 8 条，**超过说明该合并节点** | 只给上限模型会收敛，说清"超了该干什么"它才会改结构 |
+
+**② 接线（这一条是本次真正的坑）**
+
+核查"写了之后会不会又一次没人用"时，前四问全部通过、第五问塌了：
+
+| 问题 | 答 |
+|---|---|
+| 契约里有 `relations` 吗？ | 有。落在 `ContentBase`（`contracts/mindmap.py:845`），`MindMapContent` / `FlowContent` / `FishboneContent` 三种形状都有，`_validate_relations` 三处调用（939 / 1045 / 1170） |
+| 前端渲染吗？ | 渲染。`canvas/MindRelation.vue` 是第三种渲染器，`MindMapCanvas.vue:1062` 有 `#edge-mindRelation`，`stores/mindmap.ts:2521` 的 `contentRelations` 从 `content.relations` 取 |
+| 后端校验吗？ | 校验。`Relation.kind` 是 `RelationKind` 枚举（六值，非法值直接 ValidationError）、dangling 端点在 `_validate_relations` 里**硬拒**、`why` 在契约层可空但生成侧 `_relations_from` 丢掉没写的 |
+| 落库后重开还在吗？ | 在。`mindmaps.repository` 存的是整份 `content.model_dump_json()`，`get_map` 读回来走 `migrate_content`，`relations` 跟着走。用例 `tests/test_cross_reference_rules.py::test_relations_survive_a_save_and_a_reopen` 钉住 |
+| ★ **生成端收吗？** | **不收。** `raw_relations = raw.pop(...)` 与 `_relations_from(...)` 都在 `if graph_mode` 里面。非 graph_mode 写了 `relations` 时，那个键会留在 raw 里交给 `MindMapContent.model_validate` → `_validate_relations` 对 dangling 端点硬拒 → **整棵树判废**（一条连错的关系换掉一张图） |
+
+第五问才是"写了没人用"在这件事上的真实形态：**不是渲染缺，是生成端根本不接**。已修：
+`raw` 与 `root` 两处都摘（`root` 里的那份是模型把"与 root 同级"读错时的兜底），条件从
+`if graph_mode` 改成 `if isinstance(raw, dict)`；收下时 `limit` 按路分（两段式 30 /
+三段式 8），诊断码也分开（`GRAPH_RELATION_DROPPED` / `CROSS_REFERENCE_DROPPED`）。
+
+**③ 顺带修的判据 bug（`_cross_branch_duplicates`）**
+
+docstring 一直写着"同一条祖先链上的两处不算跨支"，实现比的却是**父元组**
+（`{place[:-1] for place in places}`）。父子同名的两条链是前缀关系、父元组却不同
+（`()` 与 `(父,)`），于是 S07 的「力矩与转动定律」被算成跨支。现在按**节点 id** 的前缀
+关系判（`longest[:len(ids)] == ids` 全成立才算同链），旧树 34 → **32** 个节点。
+用例双向钉住：同链不报、两支同名仍报（`tests/test_cross_branch_triage.py`）。
+
+**④ D 的口径（`_structure_audit.py`）**
+
+只数 red（`dup_red`），旧口径 `dup` 留在返回值里作对照；量不了时（老树过不了契约）
+退回旧口径并标 `None`，不静默取 0。历史数（85%、17/20）不改——它们是那次测量的结果。
+复算：旧树 17/20 → 首口径 **19/20 = 95%**，与 `--triage` 最后一行"按三档重算"逐字一致。
+
 
 ---
 
@@ -294,16 +344,23 @@ D 的意图是"交付物上有没有让读者第二次读到同一句话"，这�
 
 ### 5.3 结案标准（"这条做完了"怎么算）
 
-不是"§6.1 表里跨支重复 = 0"。四条一起满足才算：
+不是"§6.1 表里跨支重复 = 0"。四条一起满足才算，**本轮四条的状态**：
 
-1. **判据出三档**：`§6.1` 那一行从 `17` 改成 `red 6 / amber 8 / grey 3`，并注明口径
-   （三档规则、阈值、复算命令）。A–F 的 D 只数 red（阈值 ≤1），复算 19/20。
-2. **red 的归零对象是 red**：重跑验收后每棵 red ≤1（本轮 3 棵已达标：0/1/0）。
-3. **amber 有出口**：生成侧那条 `CROSS_REFERENCE_RULES` 落地，且真实生成一棵 S08 时
-   `relations` 非空、`cross_branch_duplicates` 从 3 降到 ≤2（这证明"用关系代替复制"
-   真的发生，而不是模型学会了删内容）。
-4. **缝有探针**：`measure_self_check_live.py` 那 8 条语义重复应是独立指标；"跨支重复
-   归零"若不带这一条，只说明模型学会了换说法。
+| # | 标准 | 状态 |
+|---|---|---|
+| 1 | **判据出三档**：`§6.1` 那一行从 `17` 改成 `red 6 / amber 8 / grey 3`，并注明口径；A–F 的 D 只数 red（阈值 ≤1），复算 19/20 | ✅ 本轮落地：`_structure_audit.py` 的 D 换成 `dup_red`，旧口径 `dup` 留作对照；首口径 **19/20 = 95%**，与 `--triage` 最后一行一致 |
+| 2 | **red 的归零对象是 red**：重跑验收后每棵 red ≤1 | ✅ 三次采样 S02 全为 red 0（基线 6）；旧树全 20 棵 red 合计 6，全在 S02 |
+| 3 | **amber 有出口**：生成侧 `CROSS_REFERENCE_RULES` 落地，真实生成时 `relations` 非空、`cross_branch_duplicates` 下降 | ⚠️ **一半**：`relations` 三次都是 8 条（顶满上限），`D` 从 9 → 3/0/0；但"一支写节点、另一支只写关系"**没有**发生——8 条线的两端都还存在。见 §八 |
+| 4 | **缝有探针**："跨支重复归零"若不带这一条，只说明模型学会了换说法 | ⚠️ **本轮不做，但有了代理**：`relations` 自己就是缝的探针（它显式说出"这两处是同一件事"，而逐字判据看不见），见 §八.3 |
+
+前两条是本轮成果，第三条是"半成"，第四条是**判断后押后**——理由不能说成"成本"：
+
+- `NEAR_DUPLICATE_LABEL` 在真实数据上是 40 对里 0 对真近义（§5.1 表），说明"近义改写"
+  这条判据**目前没有可用阈值**；现在做探针会得到一根不可信的指标，而一根不可信的指标
+  比没有指标更糟（它会被人引用）。
+- 反过来，`relations` 已经是缝的**可核**读数：模型自己声明"这两处指同一件事"，那句话
+  可以被数、被判据消费，也可以被人抽检。所以第四条的入口不是新判据，而是把 `relations`
+  接进 `measure_cross_branch_duplicates.py` 的三档里（当作 amber 的**证据**而不是猜测）。
 
 ---
 
@@ -332,14 +389,79 @@ python scripts/measure_cross_branch_duplicates.py --triage \
 | 路径 | 是什么 |
 |---|---|
 | `acc_trees/` | **旧树，已恢复原样**（2026-11-27 产物）。重跑会覆盖它，本轮跑完已还原 |
-| `acc_trees-旧产物-20261128/` | 重跑前备份的 S02/S08/S17 旧树 |
-| `acc_trees-rerun-20261128/` | 本轮 5 份重跑产物：`S02.r1/r2`、`S08.r1/r2`、`S17.r1` + 期间追加的 jsonl 行 |
-| `acc_structure.jsonl` | 已还原（重跑追加的 5 行在上一项里） |
+| `acc_trees-旧产物-20261128/` | 重跑前备份的 S02/S08/S17 旧树；本轮另存 `S02-baseline-before-crossref.json`（加规则前那一棵，`relations` = 0） |
+| `acc_trees-rerun-20261128/` | 上一轮 5 份重跑产物：`S02.r1/r2`、`S08.r1/r2`、`S17.r1` + 期间追加的 jsonl 行 |
+| `acc_trees-s02-crossref/` | **本轮三次采样**：`S02-r1/r2/r3.json`（加 `CROSS_REFERENCE_RULES` 之后） |
+| `acc_structure.jsonl` | 已还原（两轮重跑追加的行都在各自目录里；备份 `acc_structure.crossref-backup.jsonl`） |
 | `cross_branch_duplicates.json` | 旧树 17 处的逐条明细（含父链、节点 id、detail 全文、档位） |
+
+复算本轮的两次读数：
+
+```
+cd backend
+python scripts/measure_cross_branch_duplicates.py --triage                    # 旧树：red 6 / amber 8 / grey 3
+python scripts/measure_cross_branch_duplicates.py --triage \
+    --trees data/acc_trees-s02-crossref                                      # 三次采样：red 0 / amber 3 / grey 0
+python scripts/_structure_audit.py                                           # D 换口径后：19/20 = 95%
+python -m pytest tests/test_cross_reference_rules.py tests/test_cross_branch_triage.py -q
+```
 
 ## 七、与台账第 9 条的关系
 
 台账那条写的归零标准是"重跑验收测量后 §6.1 表里'跨支重复 label'这一行等于 0"。
 **这个标准本身要改**，理由在 §一与 §五：17 处里 8 处（amber）删了会丢信息、3 处（grey）
 是误报，把它们归零等于要求模型不许在"评审范围"与"讨论要点"下写同一个需求名——那不
-是产品想要的。建议改成 §5.3 那四条。
+是产品想要的。已改成 §5.3 那四条（台账同步改了判据与结案标准）。
+
+---
+
+## 八、本轮三次采样实测（S02）
+
+同一份材料（`scripts/acc_samples.json` 的 S02，操作系统课程大纲）连跑三次，
+每次都是真模型、真检索、真三段式。基线是加规则之前那一棵（68 节点，`relations` 0）。
+
+| 采样 | 节点 | `relations` | kinds | 端点两处都写 | 端点写的是近义改写 | red | D（逐字同名） | "比重/权重"类 detail |
+|---|---|---|---|---|---|---|---|---|
+| 基线 | 68 | **0** | — | — | — | 6 | 9 | 3（旧记录） |
+| r1 | 66 | **8** | 全 references | 3 | 5 | **0** | 3 | 0 |
+| r2 | 56 | **8** | 全 references | 0 | 8 | **0** | 0 | 0 |
+| r3 | 64 | **8** | 全 references | 0 | 8 | **0** | 0 | 1（"学时权重"） |
+
+三件事可以下结论，两件事不能：
+
+**① `relations` 从 0 变成 8（三次都顶到上限）。** 这条路以前一个字段都不写，现在每次都写满
+——"手段"确实到手了。
+
+**② red 从 6 变成 0/0/0，"考核比重"式捏造基本消失（0/0/1）。** 唯一的 1 处是 r3 的「总学时
+40 的分配」写了"学时权重反映出进程与线程、内存管理是两大重点"——数字（各 8 学时）在材料
+里，它是**排序推断**，不是旧树那种"实验考核中占主要比重"（材料里没有这件事）。
+
+**③ 但"一支写节点、另一支只写关系"没有发生。** 三次采样里，8 条关系线的两端**全都还是
+两个已存在的节点**：
+
+```
+r2 / r3（各 6 条，形态一致）：
+  概述4学时  → 第一部分 概述（4 学时）  references  "学时分配表中的第一部分概述就是课程内容里的第一部分概述"
+  …
+r1（3 条）：内核模块编写 4 次 → 内核模块编写 4 次   references  "实验安排与考核中的内核模块编写是同一项 4 次实验"
+```
+
+模型学会的是**把同一性说出来**（这本身是净收益：这些话可以被数、被判据消费），而不是
+**删掉其中一处**。规则里"A 下写节点、B 下不写同一个节点"那一句没有生效。
+
+**不能说的第一件事：red 6 → 0 不能全归功于这条规则。** S02 的基线本身不稳——§3.3 记着
+上一轮重跑两次都没复现"9 处"那个形态。所以可比的口径只有一个：`relations` 0 → 8
+（那是硬接线，不是采样波动），以及这里有一条**新出现**的形状。
+
+**不能说第二件事："跨支重复归零"了。** r2/r3 的 `D` 是 0，但那是因为模型把 label 改写成了
+近义（"概述4学时" vs "第一部分 概述（4 学时）"）——**逐字判据看不见它们，而它们就是缝**
+（§5.2 预告的下一步，现在发生了）。这也是为什么第 3 条只算"一半"：
+
+> 规则把模型从"复制节点 + 改写 detail"推到了"改写 label + 写一条 relation"。
+> 前者被 red 抓（判据看得见），后者被 `relations` 自己声明（判据看不见，但**不再需要猜**）。
+
+**这是本轮最有价值的发现**：`relations` 不只是"重复的出口"，它是**缝的探针**——模型自己
+标注了"这两处指同一件事"，那 6 对学时在 r2/r3 里逐字判据全瞎，`relations` 全看见了。
+
+产物：`backend/data/acc_trees-s02-crossref/S02-r1/r2/r3.json`。三次采样节点数 56/64/66
+（基线 68），波动与上一轮同量级（68/54/111），**任何跨样本的节点数比较都不该做**。
