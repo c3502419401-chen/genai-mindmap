@@ -1,0 +1,94 @@
+{
+  "_comment": "路由→client 断链的棘轮基线。三档语义：entries 是『已知断链』，逐条写清它属于哪一类（gap 该接而没接 / stub 桩 / intentional 有意不接 / observability 运维面）与为什么；whitelist 是『client 有、后端快照没有』的显式豁免；param_cover 是唯一一种放宽——一条 client 模板串覆盖后端多条字面路径，必须在这里点名它覆盖了谁，脚本绝不自作主张把 {} 当成通配。闸门只对基线之外的新增报错；条目里的 evidence 文件被删掉也会红（豁免的理由没了而豁免还在）。判定理由的完整论证在 docs/CHECK-INTERFACE-GAP.md 的『八、九』两节。",
+  "entries": {
+    "GET /ingestion/formats": {
+      "status": "gap",
+      "reason": "该接而没接。后端这条端点的 docstring 就是对着前端许的愿——『列出当前支持的文件类型与上传上限，前端可据此限制文件选择框』——而前端把它抄成了一份硬编码常量 frontend/src/sources/input.ts::FILE_ACCEPT（20 个扩展名）。两份清单现在一致，但一致是人工对出来的：后端加一种格式（比如 AUDIO_SUFFIXES 里补 .mp3），前端 accept 不会跟着变，用户选不到后端明明支持的文件；反向则要等用户选了才吃 422。这是本批里最便宜的一条真缺口——一个 GET 换掉一份手抄清单。",
+      "evidence": [
+        "backend/app/ingestion/router.py",
+        "frontend/src/sources/input.ts"
+      ]
+    },
+    "POST /knowledge/search": {
+      "status": "gap",
+      "reason": "该接而没接。知识库面板已经接了三条（listLibrary / readLibrarySource / deleteLibrarySource：看清单、点开正文、删），唯独没有『在库里找』——而这条端点的 docstring 明确写着它是给界面用的（『空结果有两种原因，界面必须分开说：hits 为空而库里有材料 → 没检索到；库本身是空的 → 先去用一份材料生成一张图』）。也就是说『没检索到』与『库里没东西』这两句文案的判据就在调用方，而调用方至今不存在。库小的时候列表能替代它，库一大（prune 的口径是 90 天 / 200 条）就只能翻。",
+      "evidence": [
+        "backend/app/knowledge/router.py",
+        "frontend/src/App.vue"
+      ]
+    },
+    "POST /agent/tasks": {
+      "status": "stub",
+      "reason": "不该接。后端自己写着『当前只返回阶段骨架，不产生导图』（agent/router.py:71 的 docstring 与模块头『/tasks 是早期留下的阶段规划桩，保留给旧调用方』）。把它接到界面上就是接一个假按钮：点了有响应、画布没有变化。真正的生成入口是 /agent/runs/stream，那条早就接了。等它产出真图再接，接的那一轮顺手把桩删掉。",
+      "evidence": [
+        "backend/app/agent/router.py"
+      ]
+    },
+    "POST /ingestion/text": {
+      "status": "intentional",
+      "reason": "不该接，而且现在这条不接是对的。后端 parse_text 的全部实现是『strip() → Source(kind, text, status=parsed)』（ingestion/service.py:106），而前端 sources/input.ts::textSource 造的是同一个形状、同一个 strip，本地零往返。ChatDock 的粘贴分流（>120 字自动变成材料卡，可一键撤回）依赖的就是这份本地即时性；改走网络等于为了一个 strip 换一次往返加一个加载态。留一条机器判据在这里而不是留个印象：如果哪天后端 parse_text 开始做真事（正规化、切分、字数闸），这条要重新判——那时它就从 intentional 变成 gap。",
+      "evidence": [
+        "backend/app/ingestion/service.py",
+        "frontend/src/sources/input.ts",
+        "frontend/src/stores/sources.ts"
+      ]
+    },
+    "GET /prefs/{}": {
+      "status": "intentional",
+      "reason": "接在别处，界面不需要它。后端加这条端点的理由只有一条，且和界面无关：『/api/prefs/{pref_key} 之前只挂了 PUT / DELETE，于是 GET /api/prefs/style 会命中这条路径却被判成方法不允许（405）——405 的字面意思是「这个资源存在，但这个方法不行」，而实际含义是「根本没有这个偏好」』（prefs/router.py:65）。界面走的是 listPrefs() 一次拿全部（面板本来就要全列），单条读对它是多余的一次往返。★ 这条是 method 级判据新抓出来的：上一轮按『路径是否出现过』数，PUT/DELETE 用的同一串 `/prefs/${key}` 把它盖住了，所以那一轮报 8 条。",
+      "evidence": [
+        "backend/app/prefs/router.py",
+        "frontend/src/stores/prefs.ts"
+      ]
+    },
+    "GET /memory": {
+      "status": "observability",
+      "reason": "接在别处：真正的消费方是生成管道，不是界面。记忆在每次生成时由 agent/service.py 调 memory_store.prompt_for(...) 检索注入（app/agent/service.py:1150），而 HTTP 面那四条的存在理由是让这条链**可观察**——memory/router.py 的模块 docstring 明写手工入口是为了把『空表 → 总结 0 条 → 检索 0 条』这条本来要等几周的链从中间接上，『三件本来要等很久才能观察的事，现在一次请求就能看到』；GET /search 的理由是『让人能当场回答这条为什么没进 top_k』；这条 GET /memory 自己则被写成『死表探测器』。三条证据合起来：这是运维/调试面，不是用户功能。★ 并且它解释不了 memory_items 的条数——见 docs 里那一节：写入源是 summarize 的会话总结与 propositions 的归纳（summarize.py:592 / propositions.py:834），一次都不经过 HTTP。",
+      "evidence": [
+        "backend/app/memory/router.py",
+        "backend/app/memory/store.py",
+        "backend/app/agent/service.py"
+      ]
+    },
+    "POST /memory": {
+      "status": "observability",
+      "reason": "同 GET /memory。手工写一条是给开发者把链路从中间接上的手段（『写一条进去，立刻就能用 GET /search 看它有没有被检索到、score 是多少、衰减有没有生效』），source 字段把 user_explicit 与 summary 分开正是为了让它能替代观察而不是污染数据。界面要真给用户写记忆，该给的不是这条端点，而是『我记住了你什么 + 能删』的一个面板——那是产品决定，不是接线。",
+      "evidence": [
+        "backend/app/memory/router.py"
+      ]
+    },
+    "DELETE /memory/{}": {
+      "status": "observability",
+      "reason": "同 GET /memory。它是手工入口的配套（『用户想改内容就删了重写——DELETE 就在隔壁』），并带 owner 边界：别人的记忆回 404 而不是 403，因为『这个 id 存在但不属于你』本身就是不该泄漏的事实。接界面之前要先有那个面板；有面板时这条才变成 gap。",
+      "evidence": [
+        "backend/app/memory/router.py"
+      ]
+    },
+    "GET /memory/search": {
+      "status": "observability",
+      "reason": "同 GET /memory，且理由最硬：它返回 cosine / decay / score / age_days 四个中间量，为的是让『这条为什么没进 top_k』当场可读——这是调参视角，不是使用视角。前端零引用（除生成的 schema.d.ts）。生成链路用的是同一份 store.recall，只是不经过 HTTP。",
+      "evidence": [
+        "backend/app/memory/router.py",
+        "backend/app/memory/store.py"
+      ]
+    }
+  },
+  "whitelist": {
+    "POST /optimization/repair": {
+      "reason": "后端有这条路由，但挂着 include_in_schema=False（optimization/router.py 末尾写着为什么：那一轮 openapi.json 与 schema.d.ts 由另一条线在改，不能重导），所以它不在快照里。基于快照的判据必然把它误报成『前端请求了后端没有的路径』。等快照能重导的那一轮，这个参数与这条白名单要一起删掉——client.ts::repairOptimization 的 docstring 里也写着这件事。",
+      "evidence": [
+        "backend/app/optimization/router.py",
+        "frontend/src/api/client.ts"
+      ]
+    }
+  },
+  "param_cover": {
+    "POST /export/{}": {
+      "reason": "client.ts 里四种导出是同一条动态路径 `` `${BASE}/export/${format}` ``（exportMindMap，格式是参数），后端则是四条字面路径 /export/{puml,markdown,opml,json}。按段严格比较会报 4 条断链，那是误报：一条模板串确实覆盖了它们。这类覆盖必须在基线里点名——脚本不会让 `{}` 自动匹配任意字面段，因为那会让 `/memory/{}` 顺手吞掉 `/memory/search`，真断链藏起来而读数变漂亮。",
+      "evidence": [
+        "frontend/src/api/client.ts",
+        "backend/openapi.json"
+      ]
+    }
+  }
+}
