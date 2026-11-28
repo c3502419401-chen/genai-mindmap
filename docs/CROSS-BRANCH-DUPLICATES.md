@@ -697,7 +697,7 @@ python -m pytest tests/test_cross_reference_quota.py tests/test_cross_reference_
 
 | 档 | 判据 | 现读数 |
 |---|---|---|
-| 带锚 | 注释里有 `scripts/x.py` / `tests/x.py::test_y` —— 有人能复算 | 15 |
+| 带锚 | 注释里指得出一个真脚本或一条 `::test_` 锚 —— 有人能复算 | 15 |
 | 诚实 | 明写"拍的 / 没测过 / 没有依据" | 11 |
 | **可疑** | 写了一个像结论的理由（像素宽、一屏、经验值），却指不出任何能复算它的东西 | **145** |
 
