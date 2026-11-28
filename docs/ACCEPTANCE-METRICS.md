@@ -155,16 +155,17 @@ POST /api/agent/runs/stream       → intent=create, diagram_type=tree, sources=
 
 修法（两半，第二半是这次才补的）：
 
-- **拼接有可读预算**：`optimization/repair.py::READABLE_LABEL_CHARS = 24`，与渲染层
-  `frontend/src/stores/mindmap.ts::TRUNCATE_CHARS = 24` 同源（两行盒子放得下的字数，
-  **不是契约**，所以不写进 `contracts/`）。放不下时 label 归**内层**（`_absorb` 的语义
-  本来就是"外层是标题、内层是内容"），外层那句写进 `detail` 第一行（`原上级：…`）：
-  **不截断、不丢内容**，只是从画布挪到悬停卡片里。
+- **拼接有可读预算**：`optimization/label_length.py::READABLE_LABEL_CHARS = 24`（`repair.py`
+  里是 import 别名），与渲染层 `frontend/src/stores/mindmap.ts::TRUNCATE_CHARS = 24` 同源
+  （两行盒子放得下的字数，**不是契约**，所以不写进 `contracts/`）。放不下时 label 归
+  **内层**（`_absorb` 的语义本来就是"外层是标题、内层是内容"），外层那句写进 `detail`
+  第一行（`原上级：…`）：**不截断、不丢内容**，只是从画布挪到悬停卡片里。
 - **修完也要量**：收尾新增两条 warn——`LABEL_OVERLONG_IN_DELIVERY`（交付树上有节点会
-  在画布上被截成半句）与 `STRUCTURE_FEW_BRANCHES_AFTER_REPAIR`（合并同名一级分支把
-  一级分支数压到 `MIN_BRANCHES` 以下）。`scripts/_structure_audit.py` 的 F 判据改成
-  从同一个常量取值，并同时报"基线快照 / 当前产物"两档，把"旧拼接逻辑拼长的"与
-  "本次改动引入的"分开。
+  在画布上被截成半句；这条码后来搬进了 `check()`，用户点「检查与建议」也看得见，见
+  `docs/DIAGNOSTIC-TWO-SIDES.md` §4.2）与 `STRUCTURE_FEW_BRANCHES_AFTER_REPAIR`（合并
+  同名一级分支把一级分支数压到 `MIN_BRANCHES` 以下）。`scripts/_structure_audit.py` 的
+  F 判据改成从同一个常量取值，并同时报"基线快照 / 当前产物"两档，把"旧拼接逻辑拼长的"
+  与"本次改动引入的"分开。
 
 复算（只重跑 F 红的 11 条，其余 9 条保留；`python scripts/_structure_audit.py`）：
 
