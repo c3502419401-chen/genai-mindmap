@@ -116,6 +116,7 @@
 | reference | `docs/IMPORT.md` | 导入：把别人的导图变成我们的三种图型之一 | — |
 | entry | `docs/INDEX.md` | 文档索引：人读前两节，机器读第三节 | — |
 | reference | `docs/INPUT-EXTRACT.md` | 输入先读成「意图 + 主题」：那一段话不该直接进 主题： 那一行 | — |
+| reference | `docs/JOURNEY-SPEC.md` | journey.spec：第一道问「能不能用」的闸 | — |
 | reference | `docs/LABEL-CLIP-VERDICT.md` | label 的 16 字硬切：三处判定摆在一起之后 | — |
 | reference | `docs/LABEL-JOIN-ADMISSION.md` | 压链拼标题的准入条件：「放得下」不是「读得懂」 | — |
 | reference | `docs/LATENCY-BREAKDOWN.md` | 一次生成到底慢在哪：分段实测与开关建议 | — |
