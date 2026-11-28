@@ -449,6 +449,46 @@ def test_verbatim_cross_branch_names_stay_with_the_other_code():
         _node("b", "实验考核", [_leaf("b1", "内核模块编写4次")]),
     ]))
     assert _of_code(check(content), "CROSS_BRANCH_UNLINKED") == []
+    # 让位不能变成"两边都不报"：逐字那一档必须由另一条码接住，而那条码现在也在
+    # `check()` 里（见下面那条用例）。
+    assert len(_of_code(check(content), "CROSS_BRANCH_DUPLICATE")) == 1
+
+
+def test_verbatim_cross_branch_names_are_visible_from_check():
+    """逐字同名（只差空白）跨两支 → **`check()` 自己**要报得出来。
+
+    它原先只在生成链路里报：`agent/tools.py` 的 `_cross_branch_duplicates` 算好、
+    由 `_generate` 追加一条诊断。于是同一张图，生成时能发现的问题，用户点
+    「检查与建议」（`/optimization/suggest` → `check()`）时**一点都看不见**——
+    而那个按钮是他唯一能主动点的自查入口。
+
+    判据搬家的唯一验收点就是这一条：`check()` 得把它说出来。
+    """
+    content = _map(_node("r", "根", [
+        _node("a", "实验安排", [_leaf("a1", "内核模块编写 4 次")]),
+        _node("b", "实验考核", [_leaf("b1", "内核模块编写4次")]),
+    ]))
+    found = _of_code(check(content), "CROSS_BRANCH_DUPLICATE")
+    assert len(found) == 1
+    assert found[0].level is DiagnosticLevel.warn
+    # 汇总一条（与 `MISSING_DETAIL` 同一条取舍），不落单个节点：跨支这一对没有
+    # "哪一个节点错了"这回事。
+    assert found[0].node_id is None
+    assert "内核模块编写 4 次" in found[0].message
+    assert "重复的节点没有被删" in found[0].message
+
+
+def test_cross_branch_judgement_has_exactly_one_implementation():
+    """跨支逐字判据**只有一份**：生成链路与事后检查调的是同一个函数对象。
+
+    没有这条，"两套判据分居两处"会安静地回来——而它回来时的表现就是
+    「生成时能发现、事后检查看不见」，正是这条账要修的东西。`is` 断言比"两边
+    结果一致"硬：结果一致可以用两份实现凑出来，同一个对象不能。
+    """
+    from app.agent import tools
+    from app.optimization import cross_branch
+
+    assert tools._cross_branch_duplicates is cross_branch.cross_branch_duplicates
 
 
 def test_same_parent_and_ancestor_chain_are_not_cross_branch():
