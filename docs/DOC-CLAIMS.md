@@ -303,17 +303,23 @@ case 的问法与 `relevant` 锚点都不在改动的句子上（`ARCHITECTURE.m
 | `probe` | 事已在代码里 | 已做 / 半做 | 状态写错了，或代码被翻回去了 |
 | `blocker_probe` | **卡点还在** | 半做必填；待做可给；已做/不做不许给 | 「可以转『已做』，但要先真跑一遍」——**不自动转** |
 
-不自动转是刻意的：卡点消失 ≠ 活干完。第 9 条要重跑一次采样、第 11 条要拿生产 `runs` 表
-真归因，两者都得有人跑。自动转就是把"卡点消失"当"活干完"，同一个病换个方向。
+不自动转是刻意的：卡点消失 ≠ 活干完。第 9 条要重跑一次采样才叫做完。自动转就是把
+"卡点消失"当"活干完"，同一个病换个方向。
 
-**两种可判形态，选哪种由卡点的性质定：**
+**这一栏现在只剩一种可判形态：内容型**——卡点是"某次测量要按新代码重跑" → 读**两个数是不是
+同一个**：`docs/CROSS-BRANCH-DUPLICATES.md` 里记的「采样时的上限：N」与
+`agent/tools.py::CROSS_REFERENCE_MAX`。真 = 生成侧改过、采样没重跑。
 
-- **代码事实型**（第 11 条 `style_branch_attribution_absent`）：卡点是"某个机制一行都还没
-  写" → 读代码里有没有它（`measure_branch_budget.py` 有没有 `style_profile` 切分、
-  `style.py` 的 `branches` 是不是仍走单值 `_number`）。假 = 归因写出来了。
-- **时序型**（第 9 条 `cross_reference_quota_sampling_stale`）：卡点是"某次测量要按新代码
-  重跑" → 读**产物与补丁的提交时间先后**（`tools.py` 的最后提交 vs
-  `CROSS-BRANCH-DUPLICATES.md` 的最后提交）。真 = 生成侧改过、采样没重跑。
+原本还有第二种"代码事实型"（第 11 条 `style_branch_attribution_absent`：读
+`measure_branch_budget.py` 里有没有 `style_profile` 切分、`style.py` 的 `branches` 是不是
+仍走单值 `_number`）。它随第 11 条一起退场了，而且退场的方式值得记一笔：**卡点的前提本身
+是错的**——测量脚本从不写 `runs` 表，`branches` 不读任何脚本产物，那两格也不是脚本的产物
+（取证在 `docs/BRANCH-CAP.md` §4.4）。一个"读代码里有没有它"的探针架在错误前提上，只会
+**读真**（继续挡着一条本来不成立的账目）或**读假**（然后被改述成别的东西）。判据错了，
+留着比没有更坏——所以那条 blocker 连同它的实现与用例一起删了。
+
+时序型也一起换掉了：它比"`tools.py` 的最后提交晚于那份文档"，于是任何一次无关提交都会让
+卡点复活，而真改了规则又顺手改文档时它读到假。
 
 **为什么用提交时间而不是文件 mtime。** 上一轮想的是"`acc_structure.jsonl` 的 mtime 是否
 晚于补丁提交"，那条判据在干净 checkout 上**永远为真**：CI 的 mtime 就是 checkout 那一刻。

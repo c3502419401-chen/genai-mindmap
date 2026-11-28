@@ -948,10 +948,12 @@ BLOCKER_PROBE_DOC: dict[str, str] = {
         "重跑，「这个数够不够」仍是按旧数字量出来的。假=可以重判配额并结案。"
         "（原先是时序型：tools.py 的最后提交晚于那份文档。时序判据的毛病是任何一次"
         "无关提交都会让它复活，而真改了规则又顺手改文档时它读到假）",
-    "style_branch_attribution_absent":
-        "`scripts/measure_branch_budget.py` 里没有任何 `style_profile` 归因切分，且 "
-        "`app/prefs/style.py` 的 `branches` 仍是单值汇总 → 那两格无从归因。"
-        "假=归因写出来了，可以真跑",
+    # 这里原来还有一条 `style_branch_attribution_absent`（"归因一行代码都没有"）。
+    # 第 11 条结案时连同实现与用例一起删了：切开后发现**卡点的前提本身是错的**——
+    # 测量脚本从不写 `runs` 表（唯一写入口是 `app/agent/runs.py`），而 `style.observe()`
+    # 是不读库的纯函数，`branches` 只来自 `runs.candidate`。一个读"脚本里有没有
+    # `style_profile` 字样"的探针架在错误前提上，只会读真（继续挡路）或读假（被改述）。
+    # 取证在 `docs/BRANCH-CAP.md` §4.4；台账侧的理由在 `docs/BACKLOG.md` §三之二。
 }
 
 
@@ -1337,15 +1339,16 @@ def _sampling_stale(app: Path, record: Path | None = None) -> tuple[bool | None,
     return int(recorded.group(1)) != declared, ""
 
 
-def probe_blockers(app_dir: Path | None = None,
-                   scripts_dir: Path | None = None) -> tuple[dict[str, bool], list[str]]:
+def probe_blockers(app_dir: Path | None = None) -> tuple[dict[str, bool], list[str]]:
     """台账里 `blocker_probe` 的读数：**真 = 卡点还在**（与 `probe` 极性相反）。
 
-    两条都是**内容型**：一条读文档里记的采样上限与常量是否一致，一条读脚本事不事先
-    归因。没有一条依赖提交时间或文件 mtime——那类判据在一次干净 checkout 上永远为真。
+    内容是**内容型**的：读文档里记的采样上限与代码里的常量是不是同一个数。没有一条
+    依赖提交时间或文件 mtime——那类判据在一次干净 checkout 上永远为真。
+
+    第 11 条那条（`style_branch_attribution_absent`）已随条目结案删掉，理由在
+    `BLOCKER_PROBE_DOC` 的注释里。
     """
     app = app_dir or APP
-    scripts = scripts_dir or (BACKEND_DIR / "scripts")
     values: dict[str, bool] = {}
     problems: list[str] = []
 
@@ -1355,29 +1358,6 @@ def probe_blockers(app_dir: Path | None = None,
     elif stale is not None:
         # 数字对不上 ⇒ 采样是按旧代码量的 ⇒「这个数够不够」没按现状量过。
         values["cross_reference_quota_sampling_stale"] = stale
-
-    budget = scripts / "measure_branch_budget.py"
-    style = app / "prefs" / "style.py"
-    try:
-        attributed = "style_profile" in _read(budget)
-    except OSError as error:
-        problems.append(f"台账 blocker `style_branch_attribution_absent` 读不到 "
-                        f"{_relative(budget)}: {error}")
-    else:
-        try:
-            tree = _parse(style)
-        except (OSError, SyntaxError) as error:
-            problems.append(f"台账 blocker `style_branch_attribution_absent` 读不到 "
-                            f"{_relative(style)}: {error}")
-        else:
-            # `branches` 还是单值汇总（`_number("branches", [...])`）：归因没有分桶。
-            single = any(
-                isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                and node.func.id == "_number" and node.args
-                and isinstance(node.args[0], ast.Constant)
-                and node.args[0].value == "branches"
-                for node in ast.walk(tree))
-            values["style_branch_attribution_absent"] = (not attributed) and single
 
     for name in BLOCKER_PROBE_DOC:
         if name not in values:
@@ -2352,10 +2332,11 @@ def describe_backlog(facts: Facts) -> None:
     if manual:
         print(f"    只有人判（状态不由代码决定）：{manual}")
     blockers = [entry for entry in entries if entry.blocker_probe]
-    if blockers:
-        print(f"    卡点（blocker 真 = 还卡着）：{len(blockers)} 条，"
-              f"其中卡点仍在 "
-              f"{sum(1 for e in blockers if facts.backlog_blockers.get(e.blocker_probe))}")
+    # 无条件是刻意的：一条 blocker 都没有的时候，这一行写「0 条」比整行消失更诚实——
+    # 消失了读的人分不清"这一栏没被统计"与"这一栏现在是空的"。
+    print(f"    卡点（blocker 真 = 还卡着）：{len(blockers)} 条，"
+          f"其中卡点仍在 "
+          f"{sum(1 for e in blockers if facts.backlog_blockers.get(e.blocker_probe))}")
     pending = pending_anchors(facts)
     if pending:
         print(f"    待做的判据现在还不存在（先写判据、后派人做）：{pending}")

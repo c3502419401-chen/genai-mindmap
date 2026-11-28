@@ -730,17 +730,17 @@ def test_a_half_done_entry_without_a_blocker_probe_is_red() -> None:
 def test_a_vanished_blocker_is_reported_as_ready_not_as_done() -> None:
     """卡点消失**不是红**，也不是"已做"——只提示"可以转已做，但要先真跑一遍"。
 
-    自动转就把"卡点消失"当成了"活干完"，那是同一个病换个方向：第 9 条那种采样、第 11 条
-    那两格的归因，都必须有人真跑一次才叫做完。
+    自动转就把"卡点消失"当成了"活干完"，那是同一个病换个方向：第 9 条那种采样必须有人
+    按新代码真跑一次才叫做完。
 
-    同样不依赖台账此刻停在哪一条：拿第 9 条（它有触发条件与机器判据）改成半做，
+    不依赖台账此刻停在哪一条：拿第 9 条（它有触发条件与机器判据）改成半做，
     把卡点读数置假。
     """
     entry = dataclasses.replace(_entry(9), status=claims.STATUS_PART,
-                                blocker_probe="style_branch_attribution_absent")
+                                blocker_probe="cross_reference_quota_sampling_stale")
     facts = copy.deepcopy(REAL)
     facts.backlog = (entry,)
-    facts.backlog_blockers = {"style_branch_attribution_absent": False}
+    facts.backlog_blockers = {"cross_reference_quota_sampling_stale": False}
     assert claims.check_backlog(facts) == []
     hints = claims.blocker_hints(facts)
     assert any("第 9 条" in hint and "可以转" in hint for hint in hints), hints
@@ -775,44 +775,6 @@ def test_the_quota_blocker_compares_two_numbers_instead_of_two_timestamps(
     # 常量被改名/删了 → 也不可判
     missing, problem = probe("OTHER = 10\n", "采样时的上限：10\n")
     assert missing is None and "读不到" in problem
-
-
-def test_the_style_blocker_reads_the_code_not_a_constant(tmp_path: Path) -> None:
-    """第 11 条那条是**代码事实型**：脚本开始读画像 / `branches` 分桶 → 卡点消失。"""
-    def fake_code(root: Path, budget: str, style: str) -> Path:
-        (root / "scripts").mkdir(parents=True, exist_ok=True)
-        (root / "prefs").mkdir(parents=True, exist_ok=True)
-        (root / "agent").mkdir(parents=True, exist_ok=True)
-        (root / "scripts" / "measure_branch_budget.py").write_text(budget, encoding="utf-8")
-        (root / "prefs" / "style.py").write_text(style, encoding="utf-8")
-        # 第 9 条那条探针也读这个目录里的常量，缺了它 `problems` 会有噪声——
-        # 这条用例只关心第 11 条，所以给它一个能读到的常量。
-        (root / "agent" / "tools.py").write_text(
-            "CROSS_REFERENCE_MAX = 10\n", encoding="utf-8")
-        return root
-
-    single = 'def _number(k, v):\n    return v\n\ndef go(xs):\n    return {"branches": _number("branches", [x for x in xs])}\n'
-    bucketed = "style_profile = 1\n"
-    budget_plain = "ARMS = {}\n"
-    budget_attributed = "style_profile = 'x'\nARMS = {}\n"
-
-    code = fake_code(tmp_path / "code", budget_plain, single)
-    values, problems = claims.probe_blockers(
-        app_dir=code, scripts_dir=code / "scripts")
-    assert problems == [], problems
-    assert values["style_branch_attribution_absent"] is True
-
-    # 归因切分出现了（脚本开始读画像）→ 卡点消失。
-    fake_code(tmp_path / "code2", budget_attributed, single)
-    values, _ = claims.probe_blockers(
-        app_dir=tmp_path / "code2", scripts_dir=tmp_path / "code2" / "scripts")
-    assert values["style_branch_attribution_absent"] is False
-
-    # `branches` 不再单值汇总（分桶了）→ 卡点也消失。
-    fake_code(tmp_path / "code3", budget_plain, bucketed)
-    values, _ = claims.probe_blockers(
-        app_dir=tmp_path / "code3", scripts_dir=tmp_path / "code3" / "scripts")
-    assert values["style_branch_attribution_absent"] is False
 
 
 # ---------------------------------------------------------------- 会漂的数（D 族）
