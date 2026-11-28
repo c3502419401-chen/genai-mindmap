@@ -67,6 +67,10 @@ export const DIAGNOSTIC_LABELS: Record<string, string> = {
   // ——两处挂在不同的父下面，而上面那三条（重名 / 近义 / 缺失）都只说内容。
   CROSS_BRANCH_DUPLICATE: '跨分支重名',
   CROSS_BRANCH_UNLINKED: '跨分支同核未指认',
+  // 渲染口径（后端 `optimization/label_length.py`，生成收尾与 `check()` 同一个码）。
+  // 它说的是"这个标题在画布上会被 `line-clamp-2` 截成半句"，不是结构缺陷——所以
+  // 标题里带「标题」，与上面那些说内容的码分得开。
+  LABEL_OVERLONG_IN_DELIVERY: '标题会截成半句',
   // 引用核验（optimization/source_refs.py）
   EVIDENCE_UNUSED: '引文没被用上',
   UNSOURCED_NODE: '没有可核验的引用',

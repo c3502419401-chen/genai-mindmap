@@ -272,6 +272,12 @@ describe('按 code 通用渲染：后端加码时前端不用改', () => {
     expect(diagnosticLabel('SINGLE_CHILD')).toBe('单子节点');
     expect(diagnosticLabel('BRAND_NEW_CODE')).toBe('BRAND_NEW_CODE');
   });
+
+  it('标题超长那条有中文名：它是用户主动点「检查与建议」时看得见的码之一', () => {
+    // 后端 `optimization/label_length.py` 一个判据、两个出口（生成收尾与 `check()`）。
+    // 「检查与建议」是用户唯一能主动点的自查入口，他在这里看到的不该是裸码。
+    expect(diagnosticLabel('LABEL_OVERLONG_IN_DELIVERY')).toBe('标题会截成半句');
+  });
 });
 
 // ---------------------------------------------------------------- 判据

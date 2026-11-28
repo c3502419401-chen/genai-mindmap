@@ -91,6 +91,7 @@ from app.contracts.mindmap import MAX_TREE_DEPTH, MindMapContent, Node
 from app.contracts.source import Source
 from app.optimization.cross_branch import duplicate_diagnostics as cross_branch_duplicates
 from app.optimization.cross_branch import normalize_label as _normalize_label
+from app.optimization.label_length import READABLE_LABEL_CHARS, overlong_labels
 from app.optimization.source_refs import verify_source_refs
 
 logger = logging.getLogger(__name__)
@@ -236,6 +237,14 @@ NOT_SUGGESTED: dict[str, str] = {
         "节点下**的一对（它删掉一个、把内容并进保留者），而跨支的两处挂在两个父下面，"
         "要删的是其中一整块位置——删哪一处会改变哪条分支的内容量，那是编辑决定，"
         "不是去重。诊断把「哪几句写了两遍」摆出来，留哪一处由用户定"
+    ),
+    "LABEL_OVERLONG_IN_DELIVERY": (
+        "两个修法都要改写用户自己的标题，而这一层**分不出该改哪一段**：` / ` 是压链"
+        "拼接用的（`repair.LABEL_JOINER`），也正是中文标题里常用的那个斜杠——产物上"
+        "没有标记说明哪一段是修复拼的。「把后半句挪进 detail」会动用户手写的标题，"
+        "「拆回两层」要新建节点、改写一整支。压链那一侧的正确修法在拼接**之前**就做了"
+        "（`repair._absorb` 第三档：拼不下先把外层标题降级进 detail）。这条码事后只"
+        "负责说清「这几个标题会被截成半句，缩一下、或者把后半句挪进说明」"
     ),
 }
 
@@ -623,6 +632,44 @@ def _cross_branch_unlinked_diagnostics(content: MindMapContent) -> list[Diagnost
     )]
 
 
+MAX_OVERLONG_PREVIEWS = 3
+"""超长标题最多预览几个。
+
+**3**：这类节点会成片出现（拼接是批量行为，一次压链就一屏），全列会把 `message`
+变成一堵墙；而只给个数（"有 7 个节点超长"）等于让用户自己在全树上找那 7 个。
+前三个足以让他认出这是哪一批——剩下的他可以顺着画布上被截的位置找。
+"""
+
+
+def _overlong_label_diagnostics(content: MindMapContent) -> list[Diagnostic]:
+    """交付的树上有节点会被画布截成半句。
+
+    判据与文案都是**生成侧那一段搬过来的**（`agent/tools.py::_generate` 收尾），逐字
+    保留：一条判据、一个码、一句话，两个出口。原先只有生成侧有它，于是用户点
+    「检查与建议」时一条都看不见——同一张图、同一个缺陷，两种时刻两种答案。
+
+    为什么值得进 `check()`：`docs/DIAGNOSTIC-TWO-SIDES.md` 的三条闸全过。它是纯
+    函数；只量 label 字数（产物上就有）；而画布 `line-clamp-2` 把超长的截成半句，
+    用户看得出"标题被截了"，看不出"那半句本可以不断"。
+
+    **不给建议**（动作）的理由在 `NOT_SUGGESTED` 里：事后分不出这段是压链拼的还是
+    用户手写的斜杠标题，两个修法都要改写用户的标题内容。
+    """
+    overlong = overlong_labels(content)
+    if not overlong:
+        return []
+    preview = "、".join(f"「{label}」" for _, label in overlong[:MAX_OVERLONG_PREVIEWS])
+    return [Diagnostic(
+        level=DiagnosticLevel.warn, code="LABEL_OVERLONG_IN_DELIVERY",
+        message=(
+            f"{len(overlong)} 个节点的标题超过 {READABLE_LABEL_CHARS} 字，画布上"
+            f"会被截成半句（{preview}"
+            f"{'…' if len(overlong) > MAX_OVERLONG_PREVIEWS else ''}）；"
+            "完整标题在悬停提示里，长内容应该在 detail 里"
+        ),
+    )]
+
+
 def check(content: MindMapContent, sources: list[Source] | None = None) -> list[Diagnostic]:
     """结构诊断；只有显式提供原文时才执行引用校验。
 
@@ -642,6 +689,10 @@ def check(content: MindMapContent, sources: list[Source] | None = None) -> list[
     # 看不见它；口径与四条边界现在在 `optimization/cross_branch.py` 一次写完。
     diagnostics.extend(cross_branch_duplicates(root))
     diagnostics.extend(_cross_branch_unlinked_diagnostics(content))
+    # 渲染口径放在**最后**：它不改树形（结构是对的，是盒子装不下），读的人该先看到
+    # 结构问题。与生成侧同一个码、同一句话（`optimization/label_length.py` 是唯一的
+    # 判据，`test_the_overlong_judgement_has_exactly_one_implementation` 钉着）。
+    diagnostics.extend(_overlong_label_diagnostics(content))
     if sources is not None:
         diagnostics.extend(verify_source_refs(content, sources))
     return diagnostics

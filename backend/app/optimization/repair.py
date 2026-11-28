@@ -115,6 +115,7 @@ from app.contracts.mindmap import (
     MindMapContent,
     Node,
 )
+from app.optimization.label_length import READABLE_LABEL_CHARS, overlong_labels
 from app.optimization.service import check
 
 # ---------------------------------------------------------------- 可控修的码
@@ -140,6 +141,14 @@ MANUAL_ONLY: dict[str, str] = {
     # 跨支的两处挂在两个父下面，要删的是其中一整块位置，删哪一处会改变哪条分支的
     # 内容量——那是编辑决定，不是去重（见 service.NOT_SUGGESTED）。
     "CROSS_BRANCH_DUPLICATE": "跨父合并要人定留哪一处：删掉的那一块会改变该分支的内容量",
+    # 压链拼出来的长标题：改哪个标题、留哪一段是编辑决定。事后**分不出**树上那个
+    # `A / B` 是压链拼的还是用户自己写的斜杠标题（`LABEL_JOINER` 就是中文里常用的
+    # 那个斜杠，产物上没有标记），自动拆会改写用户的内容。压链那一侧已经在拼接
+    # **之前**判过（`_absorb` 第三档：拼不下先把外层标题降进 detail）。
+    "LABEL_OVERLONG_IN_DELIVERY": (
+        "改哪个标题、留哪一段是编辑决定：事后的 `A / B` 分不出是压链拼的还是用户"
+        "手写的斜杠标题，自动拆会改写用户的内容"
+    ),
 }
 
 #: 契约里 `Node.source_refs` 的 `max_length`。写在这里是因为契约把它写成字面量，
@@ -152,17 +161,14 @@ MAX_SOURCE_REFS = 20
 #: 撤销前后看到的是同一批名词。
 LABEL_JOINER = " / "
 
-#: **画布上一个节点盒子两行装得下的字数**，不是契约上限。
+#: 画布口径 `READABLE_LABEL_CHARS` 与"哪些节点超了" `overlong_labels` 都在
+#: `optimization/label_length.py`：`service.check()` 也要用它们，而 service 不能反向
+#: import 本模块（本模块依赖 `check`）。公开面不变——那两项在这里是 import 别名，
+#: `repair.overlong_labels is service.overlong_labels` 有一条用例钉着。
 #:
-#: 契约给的是 `MAX_NODE_LABEL_CHARS = 200`（`contracts/mindmap.py:82`），渲染层给的是
-#: 这个数：`frontend/src/stores/mindmap.ts:90 TRUNCATE_CHARS = 24` 把超出的部分截成
-#: `…`，`canvas/MindNode.vue:536` 的 `line-clamp-2` 只留两行。两处是同一个数字的
-#: 两个侧面，所以压链拼接的天花板取它——**不是**契约。
-#:
-#: 为什么放在 `repair.py` 而不是契约：它是**这一条修复的生成预算**，不是"什么算合法
-#: 的图"。放契约里会让别处（模型输出、导入）也被判 24 字，那是另一件事。
-#: `scripts/_structure_audit.py` 的 F 判据从这里导入同一个数（口径同源，不各写一份）。
-READABLE_LABEL_CHARS = 24
+#: 为什么放在 `repair.py` 之外而不是留在这里：它是**两个时刻共用的口径**，不是这一条
+#: 修复的私产。放在这里时 `check()` 想量它就得反向 import，那正是循环。
+#: `scripts/_structure_audit.py` 的 F 判据仍从这里导入同一个数（口径同源，不各写一份）。
 
 #: 两段标题**允许共享的连续汉字**上限。超过就判"在说同一件事"，不拼。
 #:
@@ -866,30 +872,6 @@ def revert(content: MindMapContent, items: Sequence[RepairItem]) -> MindMapConte
         if undo.parent_id is None:
             work.root = siblings[0]
     return work
-
-
-def overlong_labels(content: MindMapContent, *,
-                    limit: int = READABLE_LABEL_CHARS) -> list[tuple[str, str]]:
-    """`(node_id, label)`：画布上会被截成半句的那些节点。
-
-    ## 为什么这是一个**独立于 check()** 的量
-
-    `check()` 的七条码里没有"标题太长"：那不是结构缺陷（树形是对的），是**渲染缺陷**
-    （两行盒子装不下）。而它偏偏是收尾自动修复**唯一可能自己造出来**的缺陷——压链要
-    把两层的标题放进一个盒子，放不下就会拼出 `A / B / C` 这种 30 字的半句。
-    修复前后都没有人量它，所以它一直躺在产物里（`docs/OFF-TOPIC-AND-FEW-BRANCHES.md`
-    记的 9/20 条只差 F）。
-
-    契约侧的量已经有了：生成入口把 label 截到 `GENERATED_LABEL_MAX_CHARS` 并报
-    `LABEL_CLIPPED_TO_GENERATED`（`generation/service.py`）。那是**修复之前**的口径；
-    这个函数是**修复之后**的那一份。两处都跑、分别报，因为"模型原本写了长的"与
-    "修复把它拼长了"是两个不同的失效，混成一条就再也分不开。
-
-    口径（`limit`）与渲染层同源：`frontend/src/stores/mindmap.ts` 的 `TRUNCATE_CHARS`
-    超了就截成 `…`。`scripts/_structure_audit.py` 的 F 判据从这个常量取，不各写一份。
-    """
-    return [(node.id, label) for node, _, _ in _iter_nodes(content.root)
-            if len(label := node.label.strip()) > limit]
 
 
 def repair_summary(result: RepairResult) -> str:

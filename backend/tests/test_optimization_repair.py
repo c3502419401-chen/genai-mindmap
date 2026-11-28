@@ -689,6 +689,24 @@ def test_overlong_labels_matches_the_renderer_limit():
     assert overlong_labels(padded) == []
 
 
+def test_a_long_label_is_measured_but_never_auto_repaired():
+    """量得到，但不自动修：事后分不出「这段是压链拼的」还是用户手写的斜杠标题。
+
+    `_absorb` 的第三档已经在拼接**之前**把外层标题降级进 detail；事后树上只剩一个
+    `A / B` 形状的 label，而 `LABEL_JOINER`（` / `）就是中文标题里常用的那个斜杠
+    ——产物上没有标记，自动拆就会改写用户自己写的内容。所以改哪个标题、留哪一段
+    是编辑决定，落在 `MANUAL_ONLY` 里。
+    """
+    long_label = "字" * (READABLE_LABEL_CHARS + 1)
+    content = _map(_node("r", "根", [_leaf("a", long_label), _normal()]))
+
+    assert overlong_labels(content) == [("a", long_label)]
+    result = repair(content)
+    assert result.applied == []
+    assert _dump(result.content) == _dump(content)
+    assert "斜杠" in MANUAL_ONLY["LABEL_OVERLONG_IN_DELIVERY"]
+
+
 # ---------------------------------------------------------------- 6. 摘要与序列化
 
 

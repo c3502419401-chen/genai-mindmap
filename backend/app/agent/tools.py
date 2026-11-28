@@ -145,7 +145,6 @@ from app.optimization import verify as verify_step
 # （`/optimization/suggest` -> `check()`）看不见这一档，那是这条账要修的东西。
 from app.optimization.cross_branch import cross_branch_duplicates as _cross_branch_duplicates
 from app.optimization.repair import AUTO_REPAIRABLE_CODES
-from app.optimization.repair import READABLE_LABEL_CHARS, overlong_labels
 from app.optimization.repair import repair as repair_structure
 from app.optimization.service import check
 from app.prefs import profile as profile_rank
@@ -11597,20 +11596,14 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
     #
     # 两处都跑、分别报，而不是把生成入口那条挪到后面：
     #   生成入口那条（`LABEL_CLIPPED_TO_GENERATED`）说的是"**模型**写了超过 16 字的
-    #   标题，已截短"；这一条说的是"**交付的这棵树上**有节点会被截成半句"。合成一条
-    #   就再也分不开"模型写长了"与"修复拼长了"这两种失效。
+    #   标题，已截短"；交付树上那条（`LABEL_OVERLONG_IN_DELIVERY`）说的是"**这棵树
+    #   上**有节点会被截成半句"。合成一条就再也分不开"模型写长了"与"修复拼长了"。
+    #
+    # ★ `LABEL_OVERLONG_IN_DELIVERY` 已经搬进 `check()`（判据在
+    # `optimization/label_length.py`）：它是纯函数、只量 label 字数，而用户点
+    # 「检查与建议」时也必须看得见它。所以这里**不再自己量一遍**——本函数末尾那句
+    # `check(content)` 会把它带出来，两处都量就会在同一个列表里出现两条一样的码。
     if isinstance(content, MindMapContent):
-        overlong = overlong_labels(content)
-        if overlong:
-            preview = "、".join(f"「{label}」" for _, label in overlong[:3])
-            diagnostics.append(Diagnostic(
-                level=DiagnosticLevel.warn, code="LABEL_OVERLONG_IN_DELIVERY",
-                message=(
-                    f"{len(overlong)} 个节点的标题超过 {READABLE_LABEL_CHARS} 字，画布上"
-                    f"会被截成半句（{preview}{'…' if len(overlong) > 3 else ''}）；"
-                    "完整标题在悬停提示里，长内容应该在 detail 里"
-                ),
-            ))
         # 修复把一级分支压到下限以下：生成入口那道闸判的是修复**之前**的树，所以
         # "合并两个同名一级分支"这条唯一能让它再掉一档的动作，修完没人复核。
         branches_after = len(content.root.children)

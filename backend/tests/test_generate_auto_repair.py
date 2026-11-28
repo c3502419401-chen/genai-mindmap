@@ -259,16 +259,20 @@ def test_a_delivered_long_label_is_reported_after_the_repair():
     （`GENERATED_LABEL_MAX_CHARS`），所以这条闸在正常路径上已经打不着东西了——
     它防的是下一次有人改 `_joined_label` 时再拼出长句。判据用真函数、只是把一个
     节点喂进去，接线走完整条 `_generate`。
+
+    **patch 点在 `optimization.service`**：这条码已经搬进 `check()`（判据在
+    `optimization/label_length.py`），生成收尾不再自己量一遍——打桩打在生成侧那个
+    旧别名上会失效，而且 `len(reported) == 1` 现在钉的是"**没有两份产生处**"。
     """
     overlong = [("b2-0", "字" * (READABLE_LABEL_CHARS + 6))]
     ctx = _ctx()
-    with patch("app.agent.tools.overlong_labels", return_value=overlong):
+    with patch("app.optimization.service.overlong_labels", return_value=overlong):
         result = _run(ctx, _chat(_tree()))
     assert result.ok, result.content
 
     reported = [item for item in result.data["diagnostics"]
                 if item["code"] == "LABEL_OVERLONG_IN_DELIVERY"]
-    assert len(reported) == 1, "一条说清，不许逐节点刷屏"
+    assert len(reported) == 1, "一条说清，不许逐节点刷屏，也不许两处各报一遍"
     assert reported[0]["level"] == "warn"
     assert str(READABLE_LABEL_CHARS) in reported[0]["message"]
     assert "截成半句" in reported[0]["message"]
