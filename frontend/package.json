@@ -11,6 +11,7 @@
     "test:cost": "node scripts/measure-test-cost.mjs --label idle --out _test-cost-idle.json",
     "test:cost:report": "node scripts/report-test-cost.mjs --idle scripts/_test-cost-idle.json --loaded scripts/_test-cost-loaded.json --solo scripts/_test-cost-solo.json --baseline scripts/test-cost-baseline.json --md docs/TEST-LOAD-SENSITIVITY-TABLE.md",
     "test:cost:gate": "node scripts/check-test-cost.mjs --gate",
+    "test:journey": "node ../docs/acceptance-scripts/journey.spec.mjs",
     "type-check": "vue-tsc --noEmit",
     "gen:api": "npx --yes --prefer-offline openapi-typescript@7.13.0 ../backend/openapi.json -o src/api/schema.d.ts"
   },
@@ -27,6 +28,7 @@
     "@vue/compiler-sfc": "^3.5.44",
     "@vue/test-utils": "^2.5.1",
     "jsdom": "^30.1.3",
+    "playwright-core": "^1.65.1",
     "tailwindcss": "^4.3.3",
     "typescript": "^6.0.3",
     "vite": "^7.3.7",
