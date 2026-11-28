@@ -108,6 +108,7 @@
 
 - **状态**：半做
 - **probe**：`cross_reference_wired`
+- **blocker_probe**：`cross_reference_quota_sampling_stale` —— 卡的不是"没做完"，是**「8 条够不够」还按旧代码量**：`backend/app/agent/tools.py` 的最后提交晚于 `docs/CROSS-BRANCH-DUPLICATES.md`（§八 那三次采样的记录），所以那批读数是旧规则下的。探针读的就是这两个提交时间的先后：真 = 卡点仍在，假 = 可以重判配额并结案（读到假时闸门只说"可以转已做"，不自动转）
 - **判据**：三条一起看，**都不再是"=0"**（理由见 `docs/CROSS-BRANCH-DUPLICATES.md` §五：
   17 处里 8 处 amber 删了会丢信息、3 处 grey 是误报）：
   1. **三档可复算**：`python scripts/measure_cross_branch_duplicates.py --triage` 出
@@ -152,6 +153,7 @@
 
 - **状态**：待做
 - **probe**：`none`
+- **blocker_probe**：`style_branch_attribution_absent` —— 卡的不是"没人看"，是**归因这件事一行代码都没有**：`scripts/measure_branch_budget.py` 里没有任何 `style_profile` 切分（它量的是预算与分支数，不读画像），而 `app/prefs/style.py` 的 `branches` 仍是 `_number("branches", …)` 单值汇总——没有按 `runs.request` 的 `sources` 长度分桶，所以那两格无从归因。真 = 卡点仍在，假 = 归因写出来了，可以拿生产 `runs` 表真跑
 - **判据**：`python scripts/measure_branch_budget.py --help` 存在的复算口径是主库那条单行命令（`docs/BRANCH-CAP.md` §4.2）；切法写在一句话里：按 `runs.request` 的 `sources` 长度与 `goal` 字面把 3 与 12 那两格归因，`_dedupe` 之后它们应当归零或带出处
 - **出处**：`docs/BRANCH-CAP.md` §6 第 3 条
 

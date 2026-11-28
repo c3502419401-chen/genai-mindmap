@@ -235,7 +235,7 @@ BACKLOG_SETTLED = (
 
 _ENTRY_HEAD = re.compile(r"^###\s+(\d+)\.\s+(.+?)\s*$")
 _ENTRY_FIELD = re.compile(
-    r"^-\s+\*\*(状态|probe|判据|出处|触发条件|凭什么)\*\*\s*[：:]\s*(.*)$")
+    r"^-\s+\*\*(状态|probe|blocker_probe|判据|出处|触发条件|凭什么)\*\*\s*[：:]\s*(.*)$")
 #: `路径::用例名`：判据锚的第一种形状。
 _TEST_ANCHOR = re.compile(r"^([A-Za-z0-9_./-]+\.py)::([A-Za-z0-9_]+)$")
 #: `python scripts/x.py ...`：判据锚的第二种形状（相对 `backend/`）。
@@ -279,6 +279,8 @@ class Facts:
     backlog: tuple["Entry", ...] | None = None
     #: 台账每条 `probe` 的读数。键是探针名，不是条目编号——两个条目共用同一个探针是允许的。
     backlog_probes: dict[str, bool] = field(default_factory=dict)
+    #: 台账每条 `blocker_probe` 的读数：**真 = 卡点还在**（与 `probe` 的极性相反）。
+    backlog_blockers: dict[str, bool] = field(default_factory=dict)
     #: 探针自身的问题（读不到、结构变了）。非空即红。
     problems: list[str] = field(default_factory=list)
 
@@ -700,13 +702,29 @@ class Entry:
     criterion: str
     source: str
     trigger: str
+    #: 「卡点还在不在」的探针名。**极性反着**：真 = 卡点仍在，假 = 可以转已做了。
+    #: 半做必填（另一半卡在什么必须能机器判），待做可给，已做/不做不许给。
+    blocker_probe: str = ""
     #: 标题行与块末行（1-based，含两端）。`scan` 用它把规则限定在自己那一块里。
-    start: int
-    end: int
+    start: int = 0
+    end: int = 0
 
     @property
     def where(self) -> str:
         return f"{BACKLOG_RELATIVE} 第 {self.number} 条"
+
+
+def _blocker_name(raw: str) -> str:
+    """`- **blocker_probe**：`名字` —— 为什么卡在这里` → `名字`。
+
+    后半句是给人读的（卡点凭什么成立），会被 `parse_backlog` 的续行逻辑接进同一个字段值，
+    所以名字从**反引号**里取：那一栏允许带解释，名字不允许有歧义。
+    """
+    text = raw.strip()
+    match = re.match(r"`([A-Za-z0-9_]+)`", text)
+    if match:
+        return match.group(1)
+    return text.split()[0] if text else ""
 
 
 def parse_backlog(text: str) -> tuple[list[Entry], list[str]]:
@@ -748,6 +766,7 @@ def parse_backlog(text: str) -> tuple[list[Entry], list[str]]:
             criterion=fields.get("判据", "").strip(),
             source=fields.get("出处", "").strip(),
             trigger=fields.get("触发条件", "").strip(),
+            blocker_probe=_blocker_name(fields.get("blocker_probe", "")),
             start=start + 1,
             end=stop,
         )
@@ -789,6 +808,33 @@ BACKLOG_PROBE_DOC: dict[str, str] = {
     "cross_reference_wired":
         "`CROSS_REFERENCE_RULES` 在，`_generate` 里它与 `GRAPH_RELATION_RULES` 是 "
         "if/else 互斥，且收 `relations` 那一支不再只属于 `graph_mode`",
+}
+
+
+#: `blocker_probe` 的名字 → 它读的**是哪一处卡点**，以及"卡点消失"长什么样。
+#:
+#: 这一族与 `BACKLOG_PROBE_DOC` **极性相反**，这不是笔误：
+#:
+#:     probe          真 ⇔ 这件事已经在代码里          （所以"已做"必须为真）
+#:     blocker_probe  真 ⇔ **卡点还在**                 （所以"半做"必须为真）
+#:
+#: 为什么需要它：`probe` 只答"已验的那一半在不在"，而"半做"的含义是**另一半卡在某个
+#: 具体的东西上**。上一轮那两条半做暴露了缺口——第 6 条把卡点写成"缺
+#: `MINDMAP_LLM_API_KEY`"，而那个 key 一直在 `run-backend.bat` 里（`.env` 里没有，
+#: bat 里有）。也就是说：**卡点本身是一句可以被机器否掉的话**，而当时没人判它，于是
+#: 一条本来可以推进的账目在"缺凭证"这个错误前提上停了两轮。
+#:
+#: 判据只有一句：**"卡点在不在"是代码事实，"活干完没有"要人跑。** 前者可机器判，
+#: 后者不可——所以 `blocker_probe` 读出假时，闸门只说"可以转已做了"，**不自动转**。
+BLOCKER_PROBE_DOC: dict[str, str] = {
+    "cross_reference_quota_sampling_stale":
+        "`backend/app/agent/tools.py` 的最后一次提交**晚于** "
+        "`docs/CROSS-BRANCH-DUPLICATES.md` 的 → 生成侧规则改过、采样记录没跟着重跑，"
+        "「8 条够不够」仍是按旧代码量出来的。假=可以重判配额并结案",
+    "style_branch_attribution_absent":
+        "`scripts/measure_branch_budget.py` 里没有任何 `style_profile` 归因切分，且 "
+        "`app/prefs/style.py` 的 `branches` 仍是单值汇总 → 那两格无从归因。"
+        "假=归因写出来了，可以真跑",
 }
 
 
@@ -1041,9 +1087,81 @@ def probe_backlog_facts(app_dir: Path | None = None,
     return values, problems
 
 
+def _last_commit_seconds(repo_dir: Path, relative: str) -> int | None:
+    """`relative` 在 `repo_dir` 里的最后一次提交时间（unix 秒）。读不到 → `None`。
+
+    用**提交时间**而不是文件 mtime：干净 checkout 上 mtime 是 checkout 那一刻，"产物
+    比补丁新"会永远为真——那是假绿，比没有判据更坏。提交时间在本地与 CI 上一致（CI
+    的 `fetch-depth: 0` 正是为这类判据配的）。
+    """
+    try:
+        done = subprocess.run(  # noqa: S603 - argv 固定
+            ["git", "log", "-1", "--format=%ct", "--", relative],  # noqa: S607
+            cwd=str(repo_dir), capture_output=True, text=True, encoding="utf-8", timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    text = (done.stdout or "").strip()
+    return int(text) if text.isdigit() else None
+
+
+def probe_blockers(app_dir: Path | None = None,
+                   scripts_dir: Path | None = None,
+                   repo_dir: Path | None = None) -> tuple[dict[str, bool], list[str]]:
+    """台账里 `blocker_probe` 的读数：**真 = 卡点还在**（与 `probe` 极性相反）。
+
+    `repo_dir` 只给时序型那条用：git 只认仓库相对路径，所以它必须是一个真 git 仓库。
+    """
+    app = app_dir or APP
+    scripts = scripts_dir or (BACKEND_DIR / "scripts")
+    repo = repo_dir or REPO_DIR
+    values: dict[str, bool] = {}
+    problems: list[str] = []
+
+    tools_commit = _last_commit_seconds(repo, "backend/app/agent/tools.py")
+    record_commit = _last_commit_seconds(repo, "docs/CROSS-BRANCH-DUPLICATES.md")
+    if tools_commit is None or record_commit is None:
+        problems.append(
+            "台账 blocker `cross_reference_quota_sampling_stale` 读不到提交时间"
+            "（不是 git 仓库，或 checkout 没有 `fetch-depth: 0`）——"
+            "它是时序型判据，读不到就是不可判，不许当成卡点已消失")
+    else:
+        # 生成侧规则晚于采样记录 ⇒ 采样是按旧代码做的 ⇒ 「8 条够不够」没按现状量过。
+        values["cross_reference_quota_sampling_stale"] = tools_commit > record_commit
+
+    budget = scripts / "measure_branch_budget.py"
+    style = app / "prefs" / "style.py"
+    try:
+        attributed = "style_profile" in _read(budget)
+    except OSError as error:
+        problems.append(f"台账 blocker `style_branch_attribution_absent` 读不到 "
+                        f"{_relative(budget)}: {error}")
+    else:
+        try:
+            tree = _parse(style)
+        except (OSError, SyntaxError) as error:
+            problems.append(f"台账 blocker `style_branch_attribution_absent` 读不到 "
+                            f"{_relative(style)}: {error}")
+        else:
+            # `branches` 还是单值汇总（`_number("branches", [...])`）：归因没有分桶。
+            single = any(
+                isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "_number" and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == "branches"
+                for node in ast.walk(tree))
+            values["style_branch_attribution_absent"] = (not attributed) and single
+
+    for name in BLOCKER_PROBE_DOC:
+        if name not in values:
+            problems.append(f"台账 blocker `{name}` 没读到读数")
+    return values, problems
+
+
 def probe_backlog(facts: Facts, path: Path | None = None,
                   app_dir: Path | None = None) -> None:
-    """读 `docs/BACKLOG.md`：块结构 + 七条 probe 的读数。读不到即红，不静默跳过。"""
+    """读 `docs/BACKLOG.md`：块结构 + probe 与 blocker_probe 的读数。读不到即红。"""
     target = path or BACKLOG
     try:
         text = _read(target)
@@ -1056,6 +1174,9 @@ def probe_backlog(facts: Facts, path: Path | None = None,
     values, probe_problems = probe_backlog_facts(app_dir)
     facts.backlog_probes = values
     facts.problems.extend(probe_problems)
+    blockers, blocker_problems = probe_blockers(app_dir)
+    facts.backlog_blockers = blockers
+    facts.problems.extend(blocker_problems)
 
 
 def _anchor_candidates(text: str) -> list[tuple[str, bool]]:
@@ -1098,6 +1219,57 @@ def pending_anchors(facts: Facts) -> list[str]:
     return out
 
 
+def _blocker_problems(facts: Facts, entry: Entry) -> list[str]:
+    """`blocker_probe` 的形态校验。**不判极性**——卡点消失不是红，是提示。
+
+    三条红，都是"这条账目没法自己报状态"的形状：
+
+      · 半做却没有 `blocker_probe` → 另一半卡在什么**不可机器判**，下一轮只能靠人重读；
+      · 名字没注册 → 写错名字会静默通过，等于没给；
+      · 已做/不做却给了 → 那两态没有"卡点"可言，这一栏会退化成一句永远为真的备注。
+    """
+    problems: list[str] = []
+    name = entry.blocker_probe
+    if not name:
+        if entry.status == STATUS_PART:
+            problems.append(
+                f"{entry.where} 是{STATUS_PART}，必须给 `blocker_probe`——"
+                "半做的另一半卡在什么，要能机器判（上一轮第 6 条把卡点写成「缺 "
+                "`MINDMAP_LLM_API_KEY`」，而那个 key 一直在 `run-backend.bat` 里："
+                "卡点本身是一句可以被否掉的话）")
+        return problems
+    if entry.status in (STATUS_DONE, STATUS_WONT):
+        problems.append(
+            f"{entry.where} 是{entry.status}，不该有 `blocker_probe`："
+            "这两态没有卡点，写上去就是一句永远为真的备注")
+        return problems
+    if name not in BLOCKER_PROBE_DOC:
+        problems.append(f"{entry.where} 的 blocker_probe `{name}` 没有注册"
+                        f"（已注册：{'/'.join(sorted(BLOCKER_PROBE_DOC))}）")
+        return problems
+    if name not in facts.backlog_blockers:
+        problems.append(f"{entry.where} 的 blocker_probe `{name}` 没读到读数")
+    return problems
+
+
+def blocker_hints(facts: Facts) -> list[str]:
+    """卡点**已经消失**的条目：可以转已做了，但**不自动转**。
+
+    为什么只提示：`blocker_probe` 答的是"卡点还在不在"，而"已做"要人真跑一遍
+    （第 9 条那种采样、第 11 条那两格的归因）。把提示写成自动转就是把"卡点消失"
+    当成"活干完"，那正是这台台账要治的病换了个方向。
+    """
+    out: list[str] = []
+    for entry in facts.backlog or ():
+        if not entry.blocker_probe or entry.status == STATUS_DONE:
+            continue
+        value = facts.backlog_blockers.get(entry.blocker_probe)
+        if value is False:
+            out.append(f"第 {entry.number} 条的卡点已消失（`{entry.blocker_probe}` 读到假）"
+                       f"——可以转「已做」，但要先真跑一遍再改状态")
+    return out
+
+
 def check_backlog(facts: Facts) -> list[str]:
     """台账的语义校验：判据形态 / 状态与 probe 一致 / 该给的字段给了。
 
@@ -1127,6 +1299,7 @@ def check_backlog(facts: Facts) -> list[str]:
         if entry.status in NEEDS_TRIGGER and not entry.trigger:
             problems.append(f"{entry.where} 是{entry.status}，必须给触发条件"
                             "（「不做」靠一个可量阈值成立，「以后看情况」不算）")
+        problems.extend(_blocker_problems(facts, entry))
         if entry.status in NEEDS_PROBE:
             if entry.probe == "none":
                 problems.append(f"{entry.where} 是{entry.status}，必须给 probe——"

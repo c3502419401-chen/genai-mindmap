@@ -21,7 +21,9 @@ from __future__ import annotations
 import copy
 import dataclasses
 import importlib.util
+import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -539,6 +541,115 @@ def test_the_backlog_is_scanned_even_before_git_tracks_it() -> None:
     assert problems == [], problems
     names = [path.relative_to(claims.REPO_DIR).as_posix() for path in files]
     assert claims.BACKLOG_RELATIVE in names, names
+
+
+# ---------------------------------------------------------------- 台账：blocker_probe
+#
+# `probe` 答的是"已验的那一半在不在"，而"半做"的另一半**卡在什么**，过去只有一句人写的
+# 自述。第 6 条那句自述是错的（写"缺 MINDMAP_LLM_API_KEY"，而 key 一直在
+# `run-backend.bat` 第 5 行），条目因此在错误前提上停了两轮。这一组钉住"卡点必须能机器判"，
+# 以及它的极性：**真 = 卡点还在**。
+
+
+def test_a_half_done_entry_without_a_blocker_probe_is_red() -> None:
+    """半做没有 `blocker_probe` → 红。另一半卡在什么，不许只留一句人写的自述。"""
+    text = _backlog_text()
+    broken = re.sub(r"- \*\*blocker_probe\*\*：[^\n]*\n", "", text, count=1)
+    assert broken != text, "样例失效：台账里没有 blocker_probe 那一行"
+    entries, problems = claims.parse_backlog(broken)
+    assert problems == [], problems
+    facts = copy.deepcopy(REAL)
+    facts.backlog = tuple(entries)
+    hits = claims.check_backlog(facts)
+    assert any("必须给 `blocker_probe`" in hit for hit in hits), hits
+
+
+def test_a_vanished_blocker_is_reported_as_ready_not_as_done() -> None:
+    """卡点消失**不是红**，也不是"已做"——只提示"可以转已做，但要先真跑一遍"。
+
+    自动转就把"卡点消失"当成了"活干完"，那是同一个病换个方向：第 9 条那种采样、第 11 条
+    那两格的归因，都必须有人真跑一次才叫做完。
+    """
+    facts = copy.deepcopy(REAL)
+    facts.backlog_blockers["cross_reference_quota_sampling_stale"] = False
+    assert claims.check_backlog(facts) == []
+    hints = claims.blocker_hints(facts)
+    assert any("第 9 条" in hint and "可以转" in hint for hint in hints), hints
+    entry = next(item for item in facts.backlog or () if item.number == 9)
+    assert entry.status == claims.STATUS_PART, "闸门不许自己改状态"
+
+
+def test_the_blocker_probes_read_the_code_and_the_history_not_a_constant(
+        tmp_path: Path) -> None:
+    """两条 blocker 探针各喂一份假输入，读数必须跟着变。
+
+    第 9 条是**时序型**（产物与补丁的提交先后），第 11 条是**代码事实型**。前者用提交时间
+    而不是 mtime：干净 checkout 上 mtime 是 checkout 那一刻，那会永远为真。
+    """
+    def fake_repo(root: Path, first: str, second: str) -> Path:
+        """建一个真 git 仓库：`first` 先提交、`second` 后提交（时间显式隔开）。"""
+        root.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.email", "a@b.c"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.name", "a"], cwd=root, check=True)
+        for index, name in enumerate((first, second)):
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("x\n", encoding="utf-8")
+            env = {**os.environ,
+                   "GIT_AUTHOR_DATE": f"@{1_800_000_000 + index * 3600}",
+                   "GIT_COMMITTER_DATE": f"@{1_800_000_000 + index * 3600}"}
+            subprocess.run(["git", "add", name], cwd=root, check=True, env=env)
+            subprocess.run(["git", "commit", "-q", "-m", name], cwd=root, check=True, env=env)
+        return root
+
+    def fake_code(root: Path, budget: str, style: str) -> Path:
+        (root / "scripts").mkdir(parents=True, exist_ok=True)
+        (root / "prefs").mkdir(parents=True, exist_ok=True)
+        (root / "scripts" / "measure_branch_budget.py").write_text(budget, encoding="utf-8")
+        (root / "prefs" / "style.py").write_text(style, encoding="utf-8")
+        return root
+
+    tools = "backend/app/agent/tools.py"
+    record = "docs/CROSS-BRANCH-DUPLICATES.md"
+    # 生成侧后提交（规则改过、采样没重跑）→ 卡点仍在。
+    stale = fake_repo(tmp_path / "stale", record, tools)
+    # 采样记录后提交（按新规则重跑过）→ 卡点消失。
+    fresh_repo = fake_repo(tmp_path / "fresh", tools, record)
+
+    single = 'def _number(k, v):\n    return v\n\ndef go(xs):\n    return {"branches": _number("branches", [x for x in xs])}\n'
+    bucketed = "style_profile = 1\n"
+    budget_plain = "ARMS = {}\n"
+    budget_attributed = "style_profile = 'x'\nARMS = {}\n"
+
+    code = fake_code(tmp_path / "code", budget_plain, single)
+    values, problems = claims.probe_blockers(
+        app_dir=code, scripts_dir=code / "scripts", repo_dir=stale)
+    assert problems == [], problems
+    assert values["cross_reference_quota_sampling_stale"] is True
+    assert values["style_branch_attribution_absent"] is True
+
+    values, _ = claims.probe_blockers(
+        app_dir=code, scripts_dir=code / "scripts", repo_dir=fresh_repo)
+    assert values["cross_reference_quota_sampling_stale"] is False
+
+    # 归因切分出现了（脚本开始读画像）→ 卡点消失。
+    fake_code(tmp_path / "code2", budget_attributed, single)
+    values, _ = claims.probe_blockers(
+        app_dir=tmp_path / "code2", scripts_dir=tmp_path / "code2" / "scripts", repo_dir=stale)
+    assert values["style_branch_attribution_absent"] is False
+
+    # `branches` 不再单值汇总（分桶了）→ 卡点也消失。
+    fake_code(tmp_path / "code3", budget_plain, bucketed)
+    values, _ = claims.probe_blockers(
+        app_dir=tmp_path / "code3", scripts_dir=tmp_path / "code3" / "scripts", repo_dir=stale)
+    assert values["style_branch_attribution_absent"] is False
+
+    # 读不到 git（不是仓库）→ 不可判，**不当成卡点已消失**。
+    values, problems = claims.probe_blockers(
+        app_dir=code, scripts_dir=code / "scripts", repo_dir=tmp_path / "not-a-repo")
+    assert "cross_reference_quota_sampling_stale" not in values
+    assert any("读不到提交时间" in item for item in problems), problems
 
 
 # ---------------------------------------------------------------- 会漂的数（D 族）
