@@ -12,7 +12,7 @@
     "test:cost:report": "node scripts/report-test-cost.mjs --idle scripts/_test-cost-idle.json --loaded scripts/_test-cost-loaded.json --solo scripts/_test-cost-solo.json --baseline scripts/test-cost-baseline.json --md docs/TEST-LOAD-SENSITIVITY-TABLE.md",
     "test:cost:gate": "node scripts/check-test-cost.mjs --gate",
     "type-check": "vue-tsc --noEmit",
-    "gen:api": "npx --yes openapi-typescript@7.13.0 ../backend/openapi.json -o src/api/schema.d.ts"
+    "gen:api": "npx --yes --prefer-offline openapi-typescript@7.13.0 ../backend/openapi.json -o src/api/schema.d.ts"
   },
   "dependencies": {
     "@dagrejs/dagre": "^3.1.3",

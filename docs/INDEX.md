@@ -135,6 +135,7 @@
 | archive | `docs/ONE-PATH.md` | 只剩一条生成路：删掉 full 形态与整树生成 | [ONE-CALL.md](ONE-CALL.md) |
 | reference | `docs/OPTIMIZATION-CROSS-MAP.md` | 跨图参照：节点向量索引实测，以及为什么没装 Milvus | — |
 | reference | `docs/OPTIMIZATION-REPAIR.md` | 自动修复：只做"修法唯一"的那三条 | — |
+| reference | `docs/OPTIONAL-DEPS.md` | 可选依赖：哪个脚本缺什么就跑不起来 | — |
 | reference | `docs/PDF-PARSER-SELECTION.md` | PDF 解析方案选型报告 | — |
 | reference | `docs/PLAN-REWORDING.md` | 计划书纠错：可直接贴进申报书的替换句 | — |
 | reference | `docs/PLAN-VS-IMPLEMENTATION.md` | 计划书与实现的逐项核对 | — |

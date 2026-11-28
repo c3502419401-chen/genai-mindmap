@@ -62,7 +62,7 @@ jobs:
       # 但它不核对 `from app.x import 名字` 里那个名字还在不在——那是探针脚本跟着
       # `app/**` 重构漂掉的主要形态。这里补上"能不能加载"与"import 目标还在不在"，
       # 外加"docs 引用的脚本是否存在""临时产物有没有悄悄落库""部署文档里的开关还有
-      # 没有人在读"。五档的机制与取舍都在 `scripts/check_script_hygiene.py` 的 docstring 里。
+      # 没有人在读"。六档的机制与取舍都在 `scripts/check_script_hygiene.py` 的 docstring 里。
       #
       # **`load` 档自己物化一棵干净树再跑**（`git ls-files` 复制到临时目录）：它问的是
       # "这台 CI 上能不能加载"，而开发机上有 `.gitignore` 覆盖的 `backend/data/`。
@@ -178,6 +178,18 @@ jobs:
           node-version: "24"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
+
+      # 十六道闸里**唯一需要联网**的一步是下面的 `gen:api`：它走
+      # `npx --yes --prefer-offline openapi-typescript@7.13.0`。为什么没提进
+      # devDependencies：那个版本的 peer 是 `typescript: ^5.x`，而本仓库钉
+      # `typescript ^6.0.3`（2026-11-28 实测：`npm install -D` 直接 ERESOLVE，
+      # 硬装要 `--legacy-peer-deps`，等于在不受支持的组合上跑生成器）。所以改为
+      # 缓存 npx 的包目录：常态下命中缓存不联网，未命中时照旧去拉。
+      - name: 缓存 npx（`gen:api` 的生成器）
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm/_npx
+          key: npx-openapi-typescript-7.13.0
 
       - name: Install
         run: npm ci
