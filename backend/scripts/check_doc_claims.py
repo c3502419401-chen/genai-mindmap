@@ -244,6 +244,110 @@ _SCRIPT_ANCHOR = re.compile(r"(?:python\s+)?(scripts/[A-Za-z0-9_./-]+\.py)")
 _THRESHOLD = re.compile(r"\d+(?:\.\d+)?\s*(?:%|次|条|秒|字|个|处|倍)")
 
 
+# --------------------------------------------------- probe 的三种读数
+#
+# 二值读数是这一族最大的误诊来源：一个 `False` 同时装了两件事，而这两件事的处理方式
+# 完全相反——
+#
+#   原料缺失（missing）  是**闸门自己的问题**：目标符号改名了、文件读不到、锚点搬了家。
+#                        这时探针什么都没测到，它的读数不是关于代码的话。
+#   事实为假（absent）   是**被测对象的问题**：原料都在，读下来这件事确实不在代码里。
+#
+# 混在一起报，闸门就会把"我的判据失效了"报成"代码被翻回去了"：后者会让人去翻 git、
+# 去重做已经做完的活，而真相在自己身上。形状与 `find_unwired` 的 evidence 缺失同源
+# ——**判据没了，不等于被测的东西没了。**
+#
+# 判据只有一句：**原料在不在管闸门，事实成不成立管代码。** 所以 `MISSING` 不参与
+# "状态该写什么"的推理——它没有读数，它只红，而且话术与另外两档完全不同。
+PRESENT = "present"   # 原料在 + 事实成立 → 状态该是「已做」
+ABSENT = "absent"     # 原料在 + 事实为假 → 状态该是「待做」
+MISSING = "missing"   # 原料读不到     → 判据失效
+PROBE_STATES = (PRESENT, ABSENT, MISSING)
+
+#: 判据失效的标记词。文案里必须带它：用例按这个词断言，人按这个词分诊。
+MISSING_MARK = "【判据失效】"
+
+#: 每条 probe 的**原料**：判据必须在场才能读数。这张表是给人读的清单，探针里每条各
+#: 给一份可执行的 `Material`，两边由 `test_every_probe_declares_its_raw_material` 对表
+#: ——表里多一条、代码里少一条都会红。**"原料"不等于"事实"**：`OUTLINE_FEW_BLOCKS_NOTE`
+#: 在不在是事实（absent 就够），而 `_clip_index` 在不在是判据的地基（不在就 missing）。
+PROBE_MATERIAL: dict[str, tuple[str, ...]] = {
+    "branch_arg_deprecated": (
+        "`backend/app/agent/tools.py` 里 `branches` 那个字段",),
+    "thin_material_offline": (
+        "`backend/app/agent/tools.py` 可读",),
+    "cross_reference_wired": (
+        "`backend/app/agent/tools.py::CROSS_REFERENCE_RULES`",
+        "`backend/app/agent/tools.py::_generate`"),
+    "unwired_no_todo": (
+        "`backend/scripts/acc3/unwired_baseline.json` 能读成 JSON",),
+    "doc_drift_guard": (
+        "`backend/scripts/check_doc_claims.py::_drift_rules`",
+        "`backend/scripts/check_doc_claims.py::main`"),
+    "doc_map_gate": (
+        "`backend/scripts/check_doc_map.py::check`",
+        "`backend/scripts/check_doc_map.py::main`"),
+    "clip_label_retreats": (
+        "`backend/app/contracts/mindmap.py::_clip_index`",
+        "`backend/app/contracts/mindmap.py::clip_label`"),
+    "node_origin_field": (
+        "`backend/app/contracts/mindmap.py::class Node`",),
+    "resolve_has_route": (
+        "`backend/app/knowledge/router.py` 可读",
+        "`backend/app/knowledge/graph_resolve.py::resolve_entities`"),
+}
+
+
+@dataclass(frozen=True)
+class Material:
+    """一条 probe 赖以读数的**原料**：某个文件，或文件里的某个符号。
+
+    `kind` 决定"在场"怎么算：`def` / `class` / `field` / `assign` 查定义，`file` 只要
+    文件能读（那条 probe 的原料就是整份文件），`json` 还要求能解析成 JSON。
+    """
+
+    path: Path
+    kind: str
+    symbol: str = ""
+
+
+def _is_assignment_of(node: ast.AST, name: str) -> bool:
+    """`name = …` 或 `name: T = …` 吗。"""
+    if isinstance(node, ast.Assign):
+        return len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) \
+            and node.targets[0].id == name
+    return isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) \
+        and node.target.id == name
+
+
+def _defines(tree: ast.Module | None, name: str, kind: str) -> bool:
+    """这棵树里定义过 `name` 吗。`kind` 是 `def` / `class` / `field` / `assign`。"""
+    if tree is None:
+        return False
+    for node in ast.walk(tree):
+        if kind == "def" and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and node.name == name:
+            return True
+        if kind == "class" and isinstance(node, ast.ClassDef) and node.name == name:
+            return True
+        if kind == "assign" and _is_assignment_of(node, name):
+            return True
+        if kind == "field" and isinstance(node, ast.AnnAssign) \
+                and isinstance(node.target, ast.Name) and node.target.id == name:
+            return True
+    return False
+
+
+def _missing_problem(name: str, gaps: list[str]) -> str:
+    """判据失效的报错。**话术里不许出现"状态写错"或"代码被翻回去了"。**
+
+    那条话术是给 `absent` 准备的。判据失效时说它是误诊：读者会去查 git、去重做已经
+    做完的活，而该修的是这条探针自己。
+    """
+    return (f"{MISSING_MARK} 台账探针 `{name}` 的原料读不到，这条探针现在什么都没测，"
+            f"读数**不是**「事实为假」：{'；'.join(gaps)}。"
+            "先修判据（符号改名了就跟进、文件搬了就改路径、基线丢了就找回），再看读数")
+
 
 # ---------------------------------------------------------------- 事实
 
@@ -277,8 +381,11 @@ class Facts:
     directions: int | None = None
     #: 台账解析结果（`docs/BACKLOG.md` 的每一条）。`None` 表示没读到。
     backlog: tuple["Entry", ...] | None = None
-    #: 台账每条 `probe` 的读数。键是探针名，不是条目编号——两个条目共用同一个探针是允许的。
-    backlog_probes: dict[str, bool] = field(default_factory=dict)
+    #: 台账每条 `probe` 的读数，取值是 `PROBE_STATES` 之一（`present` / `absent` /
+    #: `missing`）。键是探针名，不是条目编号——两个条目共用同一个探针是允许的。
+    #: **刻意不是 `bool`**：`False` 会把"判据失效"与"事实为假"压成同一个读数，见
+    #: `MISSING_MARK` 那一段。
+    backlog_probes: dict[str, str] = field(default_factory=dict)
     #: 台账每条 `blocker_probe` 的读数：**真 = 卡点还在**（与 `probe` 的极性相反）。
     backlog_blockers: dict[str, bool] = field(default_factory=dict)
     #: 探针自身的问题（读不到、结构变了）。非空即红。
@@ -838,9 +945,11 @@ BLOCKER_PROBE_DOC: dict[str, str] = {
 }
 
 
-def _field_descriptions(tree: ast.Module, field_name: str) -> list[str]:
+def _field_descriptions(tree: ast.Module | None, field_name: str) -> list[str]:
     """所有类里 `field_name: X = SomeModel(description="…")` 的 description 字面量。"""
     out: list[str] = []
+    if tree is None:
+        return out
     for node in ast.walk(tree):
         if not isinstance(node, ast.ClassDef):
             continue
@@ -857,8 +966,10 @@ def _field_descriptions(tree: ast.Module, field_name: str) -> list[str]:
     return out
 
 
-def _calls_named(tree: ast.Module, function: str, called: str) -> bool:
+def _calls_named(tree: ast.Module | None, function: str, called: str) -> bool:
     """`function` 的函数体里调过 `called` 吗。"""
+    if tree is None:
+        return False
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
                 or node.name != function:
@@ -874,16 +985,17 @@ def _calls_named(tree: ast.Module, function: str, called: str) -> bool:
     return False
 
 
-def _drift_guard_wired(script: Path) -> bool:
+def _drift_guard_wired(tree: ast.Module | None) -> bool:
     """D 族真的被 `--gate` 跑吗：模块里定义 `_drift_rules`，且 `main()` 把它拼进 rules。
 
     这与 `find_unwired.py` 判的是同一件事——**代码在、没接上**。`_drift_rules` 写好了
     却忘了拼进 `main()`，这一类就一行都不扫，而本地与 CI 都是绿的。所以台账第 12 条
     的 probe 读的不是常量，是这层接线。
+
+    收树而不是收路径：原料（`_drift_rules` / `main` 两个符号在不在）由
+    `probe_backlog_facts` 统一判，这里只答"接上没有"。
     """
-    try:
-        tree = _parse(script)
-    except (OSError, SyntaxError):
+    if tree is None:
         return False
     if not any(isinstance(node, ast.FunctionDef) and node.name == "_drift_rules"
                for node in tree.body):
@@ -913,7 +1025,7 @@ def _mentions(nodes: list[ast.AST], name: str) -> bool:
     return False
 
 
-def _doc_map_gate_wired(script: Path) -> bool:
+def _doc_map_gate_wired(tree: ast.Module | None) -> bool:
     """分级闸门真的在判吗：有 `--gate` 开关，`main()` 调了 `check()`，`check()` 里接了
     `reachable()`（"入口两跳可达"那一条）。
 
@@ -922,9 +1034,7 @@ def _doc_map_gate_wired(script: Path) -> bool:
     判据没接上**：`--write` 照样能跑，`--gate` 什么都不判，于是本地与 CI 全绿，而那份清单
     悄悄退化成一张没人校验的手写目录——正是这条账目当初想消灭的东西。
     """
-    try:
-        tree = _parse(script)
-    except (OSError, SyntaxError):
+    if tree is None:
         return False
     has_gate = False
     calls_check = False
@@ -965,7 +1075,7 @@ def _relation_gate_accepts(test: ast.AST) -> bool:
     return not _mentions([test], "graph_mode")
 
 
-def _cross_reference_wired(tree: ast.Module) -> bool:
+def _cross_reference_wired(tree: ast.Module | None) -> bool:
     """交叉指认真的接上了吗：常量在 + 与图谱那份互斥 + 非 graph_mode 也会收 `relations`。
 
     三件事分开判，因为它们分别会单独坏掉，而坏掉之后**表现完全一样**（模型写了
@@ -981,7 +1091,7 @@ def _cross_reference_wired(tree: ast.Module) -> bool:
     `if graph_mode or raw_relations:` 这个 test 是第三件事的判据：它的条件里出现了
     `raw_relations`（不是只有 `graph_mode`），说明"模型写了就收"。
     """
-    if not _mentions([tree], "CROSS_REFERENCE_RULES"):
+    if tree is None or not _mentions([tree], "CROSS_REFERENCE_RULES"):
         return False
     exclusive = False
     receives = False
@@ -1002,84 +1112,157 @@ def _cross_reference_wired(tree: ast.Module) -> bool:
     return exclusive and receives
 
 
+def _branch_arg_deprecated(tree: ast.Module | None) -> bool:
+    """两处 `branches` 的 `description` 都以「已废弃」开头，且不含「上限」。"""
+    described = _field_descriptions(tree, "branches")
+    return bool(described) and all(
+        "已废弃" in text and "上限" not in text for text in described)
+
+
+def _clip_label_retreats(tree: ast.Module | None) -> bool:
+    """`clip_label` 的切点经 `_clip_index` 回退，不是裸的 `text[:limit]`。"""
+    return _defines(tree, "_clip_index", "def") and _calls_named(
+        tree, "clip_label", "_clip_index")
+
+
+def _node_has_origin(tree: ast.Module | None) -> bool:
+    """`Node` 这个类上有 `origin` 字段吗（只查 `Node` 自己的类体，不端继承来的）。"""
+    if tree is None:
+        return False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef) or node.name != "Node":
+            continue
+        for statement in node.body:
+            if isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name) \
+                    and statement.target.id == "origin":
+                return True
+    return False
+
+
+def _router_has_route(tree: ast.Module | None) -> bool:
+    """`knowledge/router.py` 真的调了 `graph_resolve.resolve_entities` 吗。"""
+    if tree is None:
+        return False
+    return any(
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "resolve_entities"
+        for node in ast.walk(tree))
+
+
 def probe_backlog_facts(app_dir: Path | None = None,
                         baseline: Path | None = None,
                         scripts_dir: Path | None = None,
-                        script: Path | None = None) -> tuple[dict[str, bool], list[str]]:
-    """台账里六条 `probe` 的读数。
+                        script: Path | None = None) -> tuple[dict[str, str], list[str]]:
+    """台账里每条 `probe` 的读数：`present` / `absent` / `missing`。
 
-    三个参数只为用例存在：喂一份假代码树，读数必须跟着变——否则探针可以硬编码 `True`
-    而永远绿（与 `probe_allowed_literal` 同一条要求）。
+    二值读数把两件事塞进一个 `False`——**判据自己坏了**与**被测的事实不成立**。这里把
+    它们拆开，判据只有一句：**原料在不在管闸门，事实成不成立管代码**。
+
+        missing  原料（目标符号 / 文件）读不到 → 判据失效，红，话术见 `MISSING_MARK`
+        absent   原料在、事实为假            → 状态该是「待做」
+        present  原料在、事实成立            → 状态该是「已做」
+
+    四个参数只为用例存在：喂一份假代码树，读数必须跟着变——否则探针可以硬编码
+    `present` 而永远绿。另一种硬编码同样要防：**把 missing 写成 absent**，那会让
+    "判据失效"伪装成"事实为假"，改名反例就钉这个方向。
     """
     app = app_dir or APP
-    values: dict[str, bool] = {}
+    scripts = scripts_dir or (BACKEND_DIR / "scripts")
+    values: dict[str, str] = {}
     problems: list[str] = []
+    parsed: dict[Path, ast.Module | None] = {}
+    unreadable: dict[Path, str] = {}
 
-    def read(path: Path) -> ast.Module | None:
-        try:
-            return _parse(path)
-        except (OSError, SyntaxError) as error:
-            problems.append(f"台账 {_relative(path)}: {error}")
-            return None
+    def tree(path: Path) -> ast.Module | None:
+        """同一份文件只读一次（`_relative` 与错误文案都要用）。"""
+        if path not in parsed:
+            try:
+                parsed[path] = _parse(path)
+            except (OSError, SyntaxError) as error:
+                parsed[path] = None
+                unreadable[path] = f"{type(error).__name__}: {error}"
+        return parsed[path]
 
-    tools = read(app / "agent" / "tools.py")
-    if tools is not None:
-        described = _field_descriptions(tools, "branches")
-        values["branch_arg_deprecated"] = bool(described) and all(
-            "已废弃" in text and "上限" not in text for text in described)
-        has_note = any(
-            isinstance(node, ast.Assign) and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-            and node.targets[0].id == "OUTLINE_FEW_BLOCKS_NOTE"
-            for node in ast.walk(tools)) or any(
-            isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
-            and node.target.id == "OUTLINE_FEW_BLOCKS_NOTE"
-            for node in ast.walk(tools))
-        probe_script = (scripts_dir or (BACKEND_DIR / "scripts")) \
-            / "_probe_thin_material_branches.py"
-        values["thin_material_offline"] = has_note and probe_script.exists()
-        values["cross_reference_wired"] = _cross_reference_wired(tools)
+    def gaps(materials: tuple[Material, ...]) -> list[str]:
+        """原料读不到的部分。空列表 = 原料都在，这时的读数才是关于代码的话。"""
+        out: list[str] = []
+        for item in materials:
+            source = tree(item.path)
+            if source is None:
+                out.append(f"读不到 {_relative(item.path)}（{unreadable[item.path]}）")
+            elif item.kind != "file" and not _defines(source, item.symbol, item.kind):
+                out.append(f"{_relative(item.path)} 里没有 `{item.symbol}`"
+                           "（改名了、搬走了，还是被删了？）")
+        return out
 
-    contracts = read(app / "contracts" / "mindmap.py")
-    if contracts is not None:
-        defines_helper = any(
-            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == "_clip_index" for node in ast.walk(contracts))
-        values["clip_label_retreats"] = defines_helper and _calls_named(
-            contracts, "clip_label", "_clip_index")
-        has_origin = False
-        for node in ast.walk(contracts):
-            if not isinstance(node, ast.ClassDef) or node.name != "Node":
-                continue
-            for statement in node.body:
-                if isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name) \
-                        and statement.target.id == "origin":
-                    has_origin = True
-        values["node_origin_field"] = has_origin
+    def grade(name: str, materials: tuple[Material, ...],
+              fact: Callable[[], bool]) -> None:
+        """给一条 probe 定读数。原料缺失**先判**：它短路的不是代码，是判据。"""
+        absent = gaps(materials)
+        if absent:
+            values[name] = MISSING
+            problems.append(_missing_problem(name, absent))
+            return
+        values[name] = PRESENT if fact() else ABSENT
 
-    router = read(app / "knowledge" / "router.py")
-    if router is not None:
-        values["resolve_has_route"] = any(
-            isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "resolve_entities"
-            for node in ast.walk(router))
+    tools = app / "agent" / "tools.py"
+    contracts = app / "contracts" / "mindmap.py"
+    router = app / "knowledge" / "router.py"
+    resolver = app / "knowledge" / "graph_resolve.py"
+    probe_script = scripts / "_probe_thin_material_branches.py"
+    drift_script = script or Path(__file__).resolve()
+    doc_map_script = scripts / "check_doc_map.py"
 
+    def note_present() -> bool:
+        return _defines(tree(tools), "OUTLINE_FEW_BLOCKS_NOTE", "assign") \
+            and probe_script.exists()
+
+    grade("branch_arg_deprecated",
+          (Material(tools, "field", "branches"),),
+          lambda: _branch_arg_deprecated(tree(tools)))
+    grade("thin_material_offline",
+          (Material(tools, "file"),),
+          note_present)
+    grade("cross_reference_wired",
+          (Material(tools, "assign", "CROSS_REFERENCE_RULES"),
+           Material(tools, "def", "_generate")),
+          lambda: _cross_reference_wired(tree(tools)))
+    grade("clip_label_retreats",
+          (Material(contracts, "def", "_clip_index"),
+           Material(contracts, "def", "clip_label")),
+          lambda: _clip_label_retreats(tree(contracts)))
+    grade("node_origin_field",
+          (Material(contracts, "class", "Node"),),
+          lambda: _node_has_origin(tree(contracts)))
+    grade("resolve_has_route",
+          (Material(router, "file"),
+           Material(resolver, "def", "resolve_entities")),
+          lambda: _router_has_route(tree(router)))
+    grade("doc_drift_guard",
+          (Material(drift_script, "def", "_drift_rules"),
+           Material(drift_script, "def", "main")),
+          lambda: _drift_guard_wired(tree(drift_script)))
+    grade("doc_map_gate",
+          (Material(doc_map_script, "def", "check"),
+           Material(doc_map_script, "def", "main")),
+          lambda: _doc_map_gate_wired(tree(doc_map_script)))
+
+    # 基线是数据不是代码：JSON 读不出来同样只说明**判据没了**，不说明 `todo` 还在。
     baseline_path = baseline or (BACKEND_DIR / "scripts" / "acc3" / "unwired_baseline.json")
     try:
         data = json.loads(_read(baseline_path))
     except (OSError, json.JSONDecodeError) as error:
-        problems.append(f"台账 读不到 {_relative(baseline_path)}: {error}")
+        values["unwired_no_todo"] = MISSING
+        problems.append(_missing_problem(
+            "unwired_no_todo",
+            [f"读不到 {_relative(baseline_path)}（{type(error).__name__}: {error}）"]))
     else:
         # 基线是 `名字 → 条目` 的字典；容一手数组形态（顺序无关，只数 `status`）。
         rows = (list(data.items()) if isinstance(data, dict)
                 else [(str(index), row) for index, row in enumerate(data)])
         todo = [name for name, row in rows
                 if isinstance(row, dict) and row.get("status") == "todo"]
-        values["unwired_no_todo"] = not todo
-
-    values["doc_drift_guard"] = _drift_guard_wired(script or Path(__file__).resolve())
-    values["doc_map_gate"] = _doc_map_gate_wired(
-        (scripts_dir or (BACKEND_DIR / "scripts")) / "check_doc_map.py")
+        values["unwired_no_todo"] = ABSENT if todo else PRESENT
 
     for name in BACKLOG_PROBE_DOC:
         if name not in values:
@@ -1273,12 +1456,16 @@ def blocker_hints(facts: Facts) -> list[str]:
 def check_backlog(facts: Facts) -> list[str]:
     """台账的语义校验：判据形态 / 状态与 probe 一致 / 该给的字段给了。
 
-    三种红，话不同，处理方式也不同：
+    四种红，话不同，处理方式也不同：
 
       · **判据缺失**（既没有锚也没有阈值）→ 这条账目永远会漂，不许进表；
       · **判据锚不在了** → 这条账目失去判据（用例被删、脚本改名），先补判据或改状态；
         **这不等于"这件事没做"**——把它读成"没做"就是误报；
-      · **状态与事实不符** → 谁对要看证据：`holds` 为假的"已做"可能是代码被翻回去了。
+      · **判据失效**（probe 读到 `missing`：目标符号/文件读不到）→ 闸门自己的问题。
+        这条**不许**说"状态写错"或"代码被翻回去了"：那两句是给 `absent` 准备的，
+        混用会把"我的判据坏了"报成"代码回退了"；
+      · **状态与事实不符**（probe 读到 `present` / `absent`）→ 谁对要看证据：
+        `absent` 的"已做"可能是代码被翻回去了。
     """
     entries = facts.backlog
     if entries is None:
@@ -1300,27 +1487,37 @@ def check_backlog(facts: Facts) -> list[str]:
             problems.append(f"{entry.where} 是{entry.status}，必须给触发条件"
                             "（「不做」靠一个可量阈值成立，「以后看情况」不算）")
         problems.extend(_blocker_problems(facts, entry))
+        state = facts.backlog_probes.get(entry.probe)
         if entry.status in NEEDS_PROBE:
             if entry.probe == "none":
                 problems.append(f"{entry.where} 是{entry.status}，必须给 probe——"
                                 "「已做」不许没有机器判据")
             elif entry.probe not in BACKLOG_PROBE_DOC:
                 problems.append(f"{entry.where} 的 probe `{entry.probe}` 没有注册")
-            elif entry.probe in facts.backlog_probes \
-                    and not facts.backlog_probes[entry.probe]:
+            elif state == MISSING:
                 problems.append(
-                    f"{entry.where} 写{entry.status}，但探针 `{entry.probe}` 读出来是假"
-                    f"（{BACKLOG_PROBE_DOC[entry.probe]}）——状态改错，或代码被翻回去了")
+                    f"{entry.where} 写{entry.status}，但探针 `{entry.probe}` 的读数"
+                    f"**不可用**（{MISSING_MARK}）——这既不是「状态写错」，也不是「代码"
+                    "被翻回去了」：判据自己坏了，读数什么都没测。先修判据再看状态")
+            elif state == ABSENT:
+                problems.append(
+                    f"{entry.where} 写{entry.status}，但探针 `{entry.probe}` 读出来是"
+                    f"「事实为假」（{BACKLOG_PROBE_DOC[entry.probe]}）——"
+                    "状态改错，或代码被翻回去了")
         elif entry.probe != "none":
-            value = facts.backlog_probes.get(entry.probe)
-            if value:
+            if state == MISSING:
+                problems.append(
+                    f"{entry.where} 写{entry.status}，但探针 `{entry.probe}` 的读数"
+                    f"**不可用**（{MISSING_MARK}）——判据自己坏了；这一条的状态仍是"
+                    "「待做/不做」不矛盾，红的是判据，先修它")
+            elif state == PRESENT:
                 # 这一条最要紧：**状态改错**与"代码被翻回去"在这里是同一个读数，
                 # 所以话术只说"两处不一致"，处理方式由人看证据定。
                 problems.append(
                     f"{entry.where} 写{entry.status}，但探针 `{entry.probe}` 读出来是**真**"
                     f"（{BACKLOG_PROBE_DOC[entry.probe]}）——这件事已经在代码里，"
                     "状态写错了（或代码被翻回去了，那要先改代码再改状态）")
-            else:
+            elif state is None:
                 problems.append(
                     f"{entry.where} 是{entry.status}，probe 必须是 `none`："
                     "probe 为真 ⇔ 这件事已经在代码里，{待做/不做} 没有可读的事实")
@@ -1582,17 +1779,24 @@ def _backlog_rules(facts: Facts) -> list[Rule]:
 
     「已做」那条最要紧：把状态改成"待做"而代码没动，这里就红——这就是
     `tests/test_doc_claims.py::test_a_wrong_status_is_red` 钉的那个方向。
+
+    **`missing` 的条目不生成规则。** 这一族靠 `holds` 决定武装哪一侧禁句，而 `missing`
+    没有可读的事实——硬给它一侧，等于把"判据坏了"翻译成"事实为假"（那就是本轮要拆掉的
+    那个误诊）。它由 `check_backlog` 单独报红，话术是「判据失效」。
     """
     rules: list[Rule] = []
     for entry in facts.backlog or ():
         if entry.probe == "none" or entry.probe not in BACKLOG_PROBE_DOC:
             # 状态不由代码决定的条目没有"代码事实"可读，硬造一条规则就是自欺。
             continue
+        if facts.backlog_probes.get(entry.probe) == MISSING:
+            continue
         rules.append(Rule(
             name=f"backlog:{entry.number}",
             evidence=BACKLOG_RELATIVE,
             kind="observation",
-            holds=lambda _facts, key=entry.probe: bool(_facts.backlog_probes.get(key)),
+            holds=lambda _facts, key=entry.probe:
+                _facts.backlog_probes.get(key) == PRESENT,
             expect=lambda _facts, key=entry.probe: f"探针 {key} = "
                                                    f"{_facts.backlog_probes.get(key)}",
             when_true=BACKLOG_TAKE_BACK,
@@ -2085,9 +2289,15 @@ def describe_backlog(facts: Facts) -> None:
                                         for name, count in counts.items() if count)
           + f"（合计 {len(entries)}）")
     judged = [e for e in entries if e.probe != "none"]
-    true_probes = sum(1 for e in judged if facts.backlog_probes.get(e.probe))
-    print(f"    机器判据：probe 非 none {len(judged)} 条（读数真 {true_probes} / "
-          f"假 {len(judged) - true_probes}）；只有人判 {len(entries) - len(judged)} 条")
+    tally = {state: sum(1 for e in judged if facts.backlog_probes.get(e.probe) == state)
+             for state in PROBE_STATES}
+    print(f"    机器判据：probe 非 none {len(judged)} 条（"
+          + " / ".join(f"{state} {count}" for state, count in tally.items() if count)
+          + f"）；只有人判 {len(entries) - len(judged)} 条")
+    if tally[MISSING]:
+        ruined = [e.number for e in judged if facts.backlog_probes.get(e.probe) == MISSING]
+        print(f"    {MISSING_MARK} 判据失效的条目：{ruined}"
+              "——这几位**没有读数**，它们的状态既没被证实也没被否掉，先修判据")
     manual = [entry.number for entry in entries if entry.probe == "none"]
     if manual:
         print(f"    只有人判（状态不由代码决定）：{manual}")

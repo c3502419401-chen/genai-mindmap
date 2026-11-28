@@ -413,6 +413,9 @@ def test_the_backlog_probes_read_the_file_not_a_constant(tmp_path: Path) -> None
             'from app.knowledge import graph_resolve\n'
             'def go():\n'
             '    return graph_resolve.resolve_entities([])\n', encoding="utf-8")
+        (root / "knowledge" / "graph_resolve.py").write_text(
+            'def resolve_entities(items):\n'
+            '    return items\n', encoding="utf-8")
         (root / "probe.py").write_text("", encoding="utf-8")
         return root
 
@@ -422,15 +425,15 @@ def test_the_backlog_probes_read_the_file_not_a_constant(tmp_path: Path) -> None
     deprecated = build(tmp_path / "a", "已废弃：一级分支条数由内容决定")
     values, _ = claims.probe_backlog_facts(
         app_dir=deprecated, baseline=baseline, scripts_dir=tmp_path / "a")
-    assert values["branch_arg_deprecated"] is True
-    assert values["clip_label_retreats"] is True
-    assert values["node_origin_field"] is True
-    assert values["resolve_has_route"] is True
+    assert values["branch_arg_deprecated"] == claims.PRESENT
+    assert values["clip_label_retreats"] == claims.PRESENT
+    assert values["node_origin_field"] == claims.PRESENT
+    assert values["resolve_has_route"] == claims.PRESENT
 
     alive = build(tmp_path / "b", "一级分支数量上限")
     values, _ = claims.probe_backlog_facts(
         app_dir=alive, baseline=baseline, scripts_dir=tmp_path / "b")
-    assert values["branch_arg_deprecated"] is False
+    assert values["branch_arg_deprecated"] == claims.ABSENT
 
 
 def test_the_cross_reference_probe_follows_the_wiring(tmp_path: Path) -> None:
@@ -453,7 +456,7 @@ def test_the_cross_reference_probe_follows_the_wiring(tmp_path: Path) -> None:
         '        relations, drops = _relations_from(raw_relations, content)\n'
         '    return system\n')
 
-    def values_for(source: str, name: str) -> dict[str, bool]:
+    def values_for(source: str, name: str) -> dict[str, str]:
         root = tmp_path / name
         (root / "agent").mkdir(parents=True)
         (root / "agent" / "tools.py").write_text(source, encoding="utf-8")
@@ -464,18 +467,18 @@ def test_the_cross_reference_probe_follows_the_wiring(tmp_path: Path) -> None:
         read, _ = claims.probe_backlog_facts(app_dir=root, scripts_dir=root)
         return read
 
-    assert values_for(wired, "ok")["cross_reference_wired"] is True
+    assert values_for(wired, "ok")["cross_reference_wired"] == claims.PRESENT
     # ① 常量在，但 `_generate` 不再引用它（零引用）
     unused = wired.replace("        system += CROSS_REFERENCE_RULES\n",
                            "        pass\n")
-    assert values_for(unused, "unused")["cross_reference_wired"] is False
+    assert values_for(unused, "unused")["cross_reference_wired"] == claims.ABSENT
     # ② 两份关系规则不再是 if/else：同一个字段会收到两套上限与两套 kind
     both = wired.replace("    elif structure_rules_given:\n", "    if True:\n")
-    assert values_for(both, "both")["cross_reference_wired"] is False
+    assert values_for(both, "both")["cross_reference_wired"] == claims.ABSENT
     # ③ 收 relations 那一支又锁回 graph_mode：模型写了也收不到（上一版的形状）
     locked = wired.replace("if graph_mode or raw_relations:",
                            "if graph_mode and raw_relations:")
-    assert values_for(locked, "locked")["cross_reference_wired"] is False
+    assert values_for(locked, "locked")["cross_reference_wired"] == claims.ABSENT
 
 
 def test_a_missing_anchor_is_reported_as_lost_evidence_not_as_undone() -> None:
@@ -531,7 +534,7 @@ def test_the_doc_map_entry_is_settled_and_its_gate_has_a_reading() -> None:
     assert entry is not None
     assert entry.status == claims.STATUS_DONE
     assert entry.probe == "doc_map_gate"
-    assert REAL.backlog_probes.get("doc_map_gate") is True
+    assert REAL.backlog_probes.get("doc_map_gate") == claims.PRESENT
     assert claims.check_backlog(REAL) == []
 
 
@@ -706,14 +709,14 @@ def test_the_drift_probe_reads_the_wiring_not_a_constant(tmp_path: Path) -> None
     wired = tmp_path / "wired.py"
     wired.write_text(script, encoding="utf-8")
     values, _ = claims.probe_backlog_facts(script=wired)
-    assert values["doc_drift_guard"] is True
+    assert values["doc_drift_guard"] == claims.PRESENT
 
     unwired = tmp_path / "unwired.py"
     replaced = script.replace("+ _drift_rules()", "", 1)
     assert replaced != script, "样例失效：`main()` 里找不到 `+ _drift_rules()`"
     unwired.write_text(replaced, encoding="utf-8")
     values, _ = claims.probe_backlog_facts(script=unwired)
-    assert values["doc_drift_guard"] is False
+    assert values["doc_drift_guard"] == claims.ABSENT
 
 
 def test_a_new_drift_candidate_outside_the_scope_is_red(tmp_path: Path) -> None:
