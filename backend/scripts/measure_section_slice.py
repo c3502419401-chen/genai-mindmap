@@ -36,6 +36,7 @@
 凭据与开关沿用 `measure_two_tier.py` 的约定：进程环境里没有就从用户级
 （`HKCU\\Environment`）补；外部检索与库检索关掉（它们要外网，会污染对比）。
 """
+# requires-optional: winreg
 from __future__ import annotations
 
 import argparse
@@ -70,7 +71,10 @@ DEFAULT_ARMS = ("full", "slice")
 
 
 def _user_env(name: str) -> str:
-    import winreg
+    try:
+        import winreg
+    except ImportError:  # 仅 Windows 有：Linux/CI 上没有 HKCU\Environment 这一层可读
+        return ""
 
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:

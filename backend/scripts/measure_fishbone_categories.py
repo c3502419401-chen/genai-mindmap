@@ -22,6 +22,7 @@
 
 凭据与外部检索的处理与 `scripts/measure_shapes.py` 完全一致（同一个理由）。
 """
+# requires-optional: winreg
 from __future__ import annotations
 
 import argparse
@@ -54,7 +55,10 @@ CASES = (
 
 
 def _user_env(name: str) -> str:
-    import winreg
+    try:
+        import winreg
+    except ImportError:  # 仅 Windows 有：Linux/CI 上没有 HKCU\Environment 这一层可读
+        return ""
 
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:

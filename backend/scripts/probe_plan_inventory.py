@@ -23,6 +23,7 @@
 `--save` 写 JSON（每臂每次的分支数 / 判废原因 / 骨架 raw 前 600 字），自评要用的
 原文全在里面。
 """
+# requires-optional: winreg
 from __future__ import annotations
 
 import argparse
@@ -45,7 +46,10 @@ TOPIC = "碳中和与碳达峰"
 
 def _fill_env_from_registry() -> None:
     """凭据从 HKCU\\Environment 补（DSH 的 shell 不继承用户级环境变量）。"""
-    import winreg
+    try:
+        import winreg
+    except ImportError:  # 仅 Windows 有：Linux/CI 上没有 HKCU\Environment 这一层可读
+        return
 
     names = ("MINDMAP_LLM_MODE", "MINDMAP_LLM_BASE_URL", "MINDMAP_LLM_API_KEY",
              "MINDMAP_LLM_MODEL", "MINDMAP_LLM_MODEL_DEEP",

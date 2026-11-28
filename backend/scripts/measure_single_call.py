@@ -23,6 +23,7 @@ CI 的 shell 是进程级作用域，未必继承了用户级那几项，`subpro
 `--material` 会临时把 `MINDMAP_DB_PATH` 指到 `data/measure.db`（外部来源要入库才
 能拿到持久 id），跑完可以直接删。
 """
+# requires-optional: winreg
 from __future__ import annotations
 
 import argparse
@@ -75,7 +76,10 @@ DEFAULT_MATERIAL = (
 
 
 def _user_env(name: str) -> str:
-    import winreg
+    try:
+        import winreg
+    except ImportError:  # 仅 Windows 有：Linux/CI 上没有 HKCU\Environment 这一层可读
+        return ""
 
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:

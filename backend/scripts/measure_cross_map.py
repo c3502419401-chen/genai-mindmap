@@ -23,6 +23,7 @@
 `--embed` 会把向量写进 `data/_measure_cross_map_vectors.json`（**不进仓库**），
 第二次跑就是缓存命中。3856 个节点大约 8 分钟，56 个节点的一张图约 6 秒。
 """
+# requires-optional: pymilvus
 from __future__ import annotations
 
 import argparse

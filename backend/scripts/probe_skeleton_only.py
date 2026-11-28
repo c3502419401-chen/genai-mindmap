@@ -20,6 +20,7 @@ prompt，它调用产 prompt 的那个函数。
     python scripts/probe_skeleton_only.py --repeat 5
     python scripts/probe_skeleton_only.py --repeat 5 --corpus     # 那 15 份，验不退化
 """
+# requires-optional: winreg
 from __future__ import annotations
 
 import argparse
@@ -37,7 +38,10 @@ TOPIC_CORPUS = "机器学习在各领域的应用与研究"
 
 
 def _fill_env_from_registry() -> None:
-    import winreg
+    try:
+        import winreg
+    except ImportError:  # 仅 Windows 有：Linux/CI 上没有 HKCU\Environment 这一层可读
+        return
 
     for name in ("MINDMAP_LLM_MODE", "MINDMAP_LLM_BASE_URL", "MINDMAP_LLM_API_KEY",
                  "MINDMAP_LLM_MODEL", "MINDMAP_LLM_MODEL_DEEP"):

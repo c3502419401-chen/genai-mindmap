@@ -13,12 +13,17 @@
 用法：
     python scripts/acc2/probe_ui_layout.py
 """
+# requires-optional: playwright
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright
+try:  # 可选依赖：UI 探针才需要，故意不进 requirements.txt（CI 不装浏览器）
+    from playwright.sync_api import sync_playwright
+except ImportError:  # pragma: no cover — 没装时由 main() 报错退出
+    sync_playwright = None
 
 HERE = Path(__file__).resolve().parent
 SHOTS = HERE / "shots"
@@ -26,6 +31,10 @@ URL = "http://127.0.0.1:5173"
 
 
 def main() -> int:
+    if sync_playwright is None:
+        print("错误：这个探针要 playwright（pip install playwright && playwright install chromium）。",
+              file=sys.stderr)
+        return 2
     SHOTS.mkdir(exist_ok=True)
     report: dict = {"url": URL}
     with sync_playwright() as p:

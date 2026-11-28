@@ -18,6 +18,7 @@
 外部检索默认**关**（`MINDMAP_EXTERNAL_KNOWLEDGE=0`）：这一组量的是提示词能不能
 产出形状，外部检索只会把噪声与等待时间带进来。
 """
+# requires-optional: winreg
 from __future__ import annotations
 
 import argparse
@@ -40,7 +41,10 @@ CREDENTIALS = (
 
 
 def _user_env(name: str) -> str:
-    import winreg
+    try:
+        import winreg
+    except ImportError:  # 仅 Windows 有：Linux/CI 上没有 HKCU\Environment 这一层可读
+        return ""
 
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:

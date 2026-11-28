@@ -61,6 +61,7 @@
     python scripts/measure_two_arch.py --dump-blind     # 出盲评包（不含臂标签）
     python scripts/measure_two_arch.py --offline-repair # 零模型：修复对两臂各做了什么
 """
+# requires-optional: winreg
 from __future__ import annotations
 
 import argparse
@@ -142,7 +143,10 @@ _LIBRARY: list = []
 
 
 def _user_env(name: str) -> str:
-    import winreg
+    try:
+        import winreg
+    except ImportError:  # 仅 Windows 有：Linux/CI 上没有 HKCU\Environment 这一层可读
+        return ""
 
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:

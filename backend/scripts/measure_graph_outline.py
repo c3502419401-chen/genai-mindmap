@@ -36,6 +36,7 @@
 `--save` 会把每组的树、四个口径、一级分支的逐条命中情况、以及 B 组用到的图谱块
 一起写进 JSON——**自评那一节要用的原文全在里面**。
 """
+# requires-optional: winreg
 from __future__ import annotations
 
 import argparse
@@ -77,7 +78,10 @@ def _fill_env_from_registry() -> None:
     与 `measure_graph_two_pass.py` / `measure_single_call.py` 同一个做法（读
     `HKCU\\Environment`），不在这里另发明一套读法。
     """
-    import winreg
+    try:
+        import winreg
+    except ImportError:  # 仅 Windows 有：Linux/CI 上没有 HKCU\Environment 这一层可读
+        return
 
     names = (
         "MINDMAP_LLM_MODE", "MINDMAP_LLM_BASE_URL", "MINDMAP_LLM_API_KEY",

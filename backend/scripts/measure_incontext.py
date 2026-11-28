@@ -29,6 +29,7 @@
 `measure_single_call.py`）。**不走代理**：本机代理对 `api.deepseek.com` 不通时，
 一次 15 万字的请求会挂在超时上，而报错长得像"模型不支持长上下文"。
 """
+# requires-optional: winreg
 from __future__ import annotations
 
 import argparse
@@ -200,7 +201,10 @@ def build_material(target_chars: int) -> tuple[str, dict]:
 
 
 def _user_env(name: str) -> str:
-    import winreg
+    try:
+        import winreg
+    except ImportError:  # 仅 Windows 有：Linux/CI 上没有 HKCU\Environment 这一层可读
+        return ""
 
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:

@@ -73,6 +73,7 @@
 16kHz/16bit/mono），**不是真人录音**——参考文本来自合成时喂进去的自报文本，
 不是人工转写。这对 CER 的可信度影响很大，报告第 8.3 节专门写了这个偏差。
 """
+# requires-optional: sherpa_onnx, soundfile
 from __future__ import annotations
 
 import argparse
@@ -228,7 +229,10 @@ class Engine:
     load_seconds: float = 0.0
 
     def load(self) -> None:
-        import sherpa_onnx
+        try:
+            import sherpa_onnx
+        except ImportError as exc:  # 可选依赖：本地 ASR PoC 才要，不在 requirements.txt
+            raise ImportError("需要 sherpa_onnx（pip install sherpa-onnx）") from exc
 
         t0 = time.perf_counter()
         self._rec = sherpa_onnx.OfflineRecognizer.from_sense_voice(
@@ -250,7 +254,10 @@ class Engine:
         （实测第二个请求返回 `begin_ms: 8578`，而音频只有 4.36 秒）。重建
         detector 是唯一能把它归零的公开手段，代价见报告里的 VAD 建立耗时。
         """
-        import sherpa_onnx
+        try:
+            import sherpa_onnx
+        except ImportError as exc:  # 可选依赖：本地 ASR PoC 才要，不在 requirements.txt
+            raise ImportError("需要 sherpa_onnx（pip install sherpa-onnx）") from exc
 
         cfg = sherpa_onnx.VadModelConfig()
         cfg.silero_vad = sherpa_onnx.SileroVadModelConfig(
@@ -326,7 +333,10 @@ class Engine:
 
 def read_wav_bytes(raw: bytes) -> tuple[object, int, int]:
     """(float32 单声道, sample_rate, channels)。用 soundfile，非 16k 由调用方拒绝。"""
-    import soundfile as sf
+    try:
+        import soundfile as sf
+    except ImportError as exc:  # 可选依赖：本地 ASR PoC 才要，不在 requirements.txt
+        raise ImportError("需要 soundfile（pip install soundfile）") from exc
 
     audio, sr = sf.read(io.BytesIO(raw), dtype="float32")
     channels = 1 if audio.ndim == 1 else audio.shape[1]
@@ -338,7 +348,10 @@ def read_wav_bytes(raw: bytes) -> tuple[object, int, int]:
 def read_wav_file(path: str) -> tuple[object, int]:
     with wave.open(path, "rb") as fh:
         sr = fh.getframerate()
-    import soundfile as sf
+    try:
+        import soundfile as sf
+    except ImportError as exc:  # 可选依赖：本地 ASR PoC 才要，不在 requirements.txt
+        raise ImportError("需要 soundfile（pip install soundfile）") from exc
 
     audio, sr = sf.read(path, dtype="float32")
     if audio.ndim > 1:

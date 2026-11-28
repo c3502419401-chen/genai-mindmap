@@ -16,6 +16,7 @@
 **它不经过 HTTP、不占游客配额**（直接调工具），但**会真的花模型额度**：一次
 约 1–3 分钟、十几万 token 输入。跑之前先想清楚要对比哪两组。
 """
+# requires-optional: winreg
 from __future__ import annotations
 
 import argparse
@@ -62,7 +63,10 @@ NEO4J = ("MINDMAP_NEO4J_URI", "MINDMAP_NEO4J_USER", "MINDMAP_NEO4J_PASSWORD")
 
 
 def _user_env(name: str) -> str:
-    import winreg
+    try:
+        import winreg
+    except ImportError:  # 仅 Windows 有：Linux/CI 上没有 HKCU\Environment 这一层可读
+        return ""
 
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
