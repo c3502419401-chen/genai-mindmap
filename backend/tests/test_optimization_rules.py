@@ -120,6 +120,11 @@ def _closure_codes() -> set[str]:
         _chain(8),
         # 同级近义
         _map(_node("r", "根", [_leaf("a", "数据处理"), _leaf("b", "数据预处理")])),
+        # 跨支同核但没被 relations 指认
+        _map(_node("r", "根", [
+            _node("s1", "课程内容", [_leaf("s11", "第二部分 进程与线程（8 学时）")]),
+            _node("s2", "学时分配", [_leaf("s21", "进程与线程 8 学时")]),
+        ])),
     ]
     codes: set[str] = set()
     for content in contents:
@@ -141,6 +146,7 @@ def test_every_emitted_code_is_mapped_or_has_a_written_reason():
     explicit = {
         "HEADING_ONLY_BRANCH", "SINGLE_CHILD", "DUPLICATE_LABEL",
         "SHALLOW_BRANCH", "MISSING_DETAIL", "NEAR_DUPLICATE_LABEL", "DEPTH_LIMIT",
+        "CROSS_BRANCH_UNLINKED",
     }
     assert explicit <= codes, codes
 
@@ -384,6 +390,119 @@ def test_note_counts_as_a_body_so_a_user_written_note_is_not_called_empty():
     missing = _of_code(check(content), "MISSING_DETAIL")
     assert len(missing) == 1
     assert missing[0].evidence.split() == ["d", "e", "f"]
+
+
+# ------------------------------------------------ 3.5 跨支同核（未指认）
+
+# 这一节的来历：`docs/CROSS-BRANCH-DUPLICATES.md` §八 的三次真跑里，加了交叉指认
+# 规则之后 red 从 6 降到 0 —— 而 red 归零**不是**因为第二处消失了，是模型把 label
+# 改写成近义再补一条 relations。逐字判据当场失明，"成功"于是成立。这一节的用例钉的
+# 就是那个空洞：`CROSS_BRANCH_UNLINKED` 只在"改写过、且没指认"这一档说话。
+
+
+def _rels(*pairs: tuple[str, str]) -> list[dict]:
+    return [
+        {"id": f"rel_{index}", "source": source, "target": target,
+         "kind": "references", "why": "这两处是同一件事", "provenance": "ai"}
+        for index, (source, target) in enumerate(pairs, start=1)
+    ]
+
+
+def _map_with_rels(root: dict, pairs: tuple[tuple[str, str], ...] = ()) -> MindMapContent:
+    return MindMapContent.model_validate(
+        {"title": "图", "root": root, "relations": _rels(*pairs)})
+
+
+def test_cross_branch_same_thing_without_relation_is_reported():
+    """同一件事写成近义两处、又没有一条关系指认 → 一条 warn 汇总。"""
+    content = _map(_node("r", "根", [
+        _node("a", "课程内容", [_leaf("a1", "第一部分 概述（4 学时）")]),
+        _node("b", "学时分配", [_leaf("b1", "概述 4 学时")]),
+    ]))
+    found = _of_code(check(content), "CROSS_BRANCH_UNLINKED")
+    assert len(found) == 1
+    assert found[0].level is DiagnosticLevel.warn
+    assert found[0].node_id is None            # 汇总一条，不落单个节点
+    assert "1 处" in found[0].message
+    assert "概述" in found[0].message
+    assert found[0].evidence.split() == ["a1", "b1"]
+
+
+def test_a_declared_relation_silences_it_in_both_directions():
+    """有 relations 就是"指认过了"，方向无关 —— 反向那条也算。"""
+    root = _node("r", "根", [
+        _node("a", "课程内容", [_leaf("a1", "第二部分 进程与线程（8 学时）")]),
+        _node("b", "学时分配", [_leaf("b1", "进程与线程 8 学时")]),
+    ])
+    assert _of_code(check(_map_with_rels(root, (("a1", "b1"),))), "CROSS_BRANCH_UNLINKED") == []
+    assert _of_code(check(_map_with_rels(root, (("b1", "a1"),))), "CROSS_BRANCH_UNLINKED") == []
+
+
+def test_verbatim_cross_branch_names_stay_with_the_other_code():
+    """逐字同名（只差空白）归 `CROSS_BRANCH_DUPLICATE`，两条码不许落在同一对上。
+
+    两个检查器分工：那条说"这句话出现了两遍"，这条说"这两处你打算怎么处理，图上
+    读不出来"。同报一次等于让用户看两条说同一件事的诊断。
+    """
+    content = _map(_node("r", "根", [
+        _node("a", "实验安排", [_leaf("a1", "内核模块编写 4 次")]),
+        _node("b", "实验考核", [_leaf("b1", "内核模块编写4次")]),
+    ]))
+    assert _of_code(check(content), "CROSS_BRANCH_UNLINKED") == []
+
+
+def test_same_parent_and_ancestor_chain_are_not_cross_branch():
+    """同父是 DUPLICATE/NEAR 的地盘；同一条祖先链是层级问题。两者都不算跨支。"""
+    same_parent = _map(_node("r", "根", [
+        _leaf("a", "第一部分 概述"), _leaf("b", "概述 4 学时"),
+    ]))
+    assert _of_code(check(same_parent), "CROSS_BRANCH_UNLINKED") == []
+
+    # 父子同名（S07 的「力矩与转动定律」）：父既当条目又当分组
+    chain = _map(_node("r", "根", [
+        _node("a", "第二部分 刚体转动", [
+            _node("a1", "力矩与转动定律", [_leaf("a11", "转动惯量")]),
+        ]),
+        _node("b", "另一支", [_leaf("b1", "力矩与转动定律")]),
+    ]))
+    assert _of_code(check(chain), "CROSS_BRANCH_UNLINKED") == []
+
+
+def test_unlinked_is_one_summary_not_one_per_pair():
+    """3 对 → 1 条诊断，message 里带对数与样本（S02 一次能出 8 对，逐对报会淹掉面板）。"""
+    content = _map(_node("r", "根", [
+        _node("x", "课程内容", [
+            _leaf("x1", "第一部分 概述（4 学时）"),
+            _leaf("x2", "第二部分 进程与线程（8 学时）"),
+            _leaf("x3", "第三部分 调度与并发（6 学时）"),
+        ]),
+        _node("y", "学时分配", [
+            _leaf("y1", "概述 4 学时"),
+            _leaf("y2", "进程与线程 8 学时"),
+            _leaf("y3", "调度与并发 6 学时"),
+        ]),
+    ]))
+    found = _of_code(check(content), "CROSS_BRANCH_UNLINKED")
+    assert len(found) == 1
+    assert "3 处" in found[0].message
+
+
+def test_core_label_strips_numbering_and_quantity_but_keeps_ordinary_words():
+    """剥前缀/尾缀的边界：只剥序号与"数量+单位"，不碰正文。
+
+    这一条是判据精度的全部——阈值版（2-gram Dice ≥ 0.5）在库里 28 棵树上假阳性
+    210 对：「第二章 8 学时」与「第五章 6 学时」、「WebSocket」与「Socket 编程」都
+    被判成同一件事。所以"剥什么"要逐个钉住。
+    """
+    core = service._core_label
+    assert core("第一部分 概述（4 学时）") == core("概述 4 学时") == "概述"
+    assert core("第二部分 进程与线程（8 学时）") == core("进程与线程8学时") == "进程与线程"
+    assert core("一、本次评审范围") == "本次评审范围"
+    assert core("M2：术语库与机译接入") == "术语库与机译接入"
+    # 编号不同 → 核心词不同（这一档最容易被相似度判据误判）
+    assert core("第二章 8 学时") != core("第五章 6 学时")
+    # 裸"一"开头的正文不能被当成序号剥掉
+    assert core("一般原理") == "一般原理"
 
 
 # ---------------------------------------------------------------- 4. 模型层
