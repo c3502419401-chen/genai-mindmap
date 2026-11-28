@@ -94,8 +94,22 @@ def _ref_of(user: str) -> list[dict]:
     return [{"source_id": hit["source_id"], "quote": hit["quote"][:300]}]
 
 
+def _node_of(user: str) -> str:
+    """第三层请求里的「本节点：X」——用它给第三层的 label 带上父节点名。
+
+    不带的话，`per_branch × 3 支` 个父节点会各写一份「细节1」「细节2」，六处逐字
+    同名、又分属不同父——那是**真的**跨支重复，`CROSS_BRANCH_DUPLICATE` 会报它
+    （判据在 `optimization/cross_branch.py`，`check()` 里就有）。真实模型不会把
+    六处都写成同一个名字，所以带上父节点名是让夹具更真，而不是绕过判据。
+    """
+    if "本节点：" not in user:
+        return ""
+    return user.split("本节点：", 1)[1].split("\n", 1)[0]
+
+
 def _chat(*, per_branch: int = 2, third_level: int = 1, refs: bool = True,
-          seen: list[str] | None = None, detail: bool = False):
+          seen: list[str] | None = None, detail: bool = False,
+          child_label: str | None = None):
     """脚本模型：骨架给 `BRANCHES`，每支 `per_branch` 个要点（每个都照抄一条引用），
     每个要点再给 `third_level` 个子节点。
 
@@ -105,6 +119,8 @@ def _chat(*, per_branch: int = 2, third_level: int = 1, refs: bool = True,
     与真实形态一致：模型会为每个要点写引用，而不是每支只写一条。
     `detail=True` 时每个要点再带一句 `detail`——真实生成会写它，而 NLI 的
     hypothesis 正是"label + detail"而不是 label 本身。
+    `child_label` 覆盖二级要点的名字（缺省带分支名区分）。它存在只为一件事：
+    造出"两支写了同一个说法"的形状，用来钉跨支重复的诊断。
     """
     async def chat(system: str, user: str, *, max_tokens=None, on_delta=None) -> dict:
         if seen is not None:
@@ -115,15 +131,17 @@ def _chat(*, per_branch: int = 2, third_level: int = 1, refs: bool = True,
             sourced = _ref_of(user) if refs else []
             children = []
             for index in range(1, per_branch + 1):
-                item = {"label": f"{_branch_of(user)}·{index}",
+                item = {"label": child_label or f"{_branch_of(user)}·{index}",
                         "source_refs": list(sourced)}
                 if detail:
                     item["detail"] = f"{_branch_of(user)}的第{index}条论断，五万元以内由财务经理核准。"
                 children.append(item)
             return {"children": children}
-        # 第三层：不再写引用（引用只挂在二级要点上，与真实提示词的粒度一致）
+        # 第三层：不再写引用（引用只挂在二级要点上，与真实提示词的粒度一致）。
+        # label 带父节点名——理由见 `_node_of`。
+        parent = _node_of(user)
         return {"children": [
-            {"label": f"细节{index}", "expandable": False}
+            {"label": f"{parent}·细节{index}", "expandable": False}
             for index in range(1, third_level + 1)
         ]}
     return chat
@@ -195,6 +213,36 @@ def test_healthy_tree_reports_no_structure_diagnostic():
     # 3 支 → 2 个要点 → 2 个细节：4 层（含中心主题），与 `max_depth=3` 一致
     assert result.data["structure"] == {"single_child": 0, "deepest": 4,
                                         "reported": 0}
+
+
+def test_the_deep_path_reports_cross_branch_duplicates_too():
+    """分片路径的 `check()` 也报跨支逐字同名——它不再是整树生成的私产。
+
+    这条判据原先只挂在 `_generate` 的收尾（`agent/tools.py` 自己追加），分片这条路
+    一次都不报。而现在 `check()` 里有它（`optimization/cross_branch.py`），两条生成
+    路径都走 `check()`，于是分片也开始报——**这是刻意的**：跨支重复正是分片的结构性
+    缺陷（每支只看得到自己的标题链），它比整树更需要这条诊断。
+
+    分片路径**没有** `data["cross_branch_duplicates"]` 那个计数（那是整树路径的读
+    数），所以这里只钉诊断，不钉 data。
+    """
+    ctx = _ctx()
+    # `points_per_branch` 的下限是 2；每支写两条同名要点，同父那一份在收槽时就被
+    # 去掉了（`_keep_new_slots`），所以每支只留一个 —— 留下来的三个正好跨三支同名。
+    result = _run(ctx, _chat(per_branch=2, child_label="内核模块编写 4 次"),
+                  arguments={"points_per_branch": 2, "max_depth": 2})
+
+    assert result.ok, result.content
+    codes = _codes(result)
+    assert "CROSS_BRANCH_DUPLICATE" in codes, codes
+    duplicate = [item for item in result.data["diagnostics"]
+                 if item["code"] == "CROSS_BRANCH_DUPLICATE"][0]
+    # 一条汇总：3 支各留一个同名要点 = 3 个节点、1 个说法
+    assert "3 个节点跨分支重复" in duplicate["message"]
+    # 只报不删：三个节点都还在树上
+    kept = [node for branch in ctx.candidate.root.children for node in branch.children
+            if node.label == "内核模块编写 4 次"]
+    assert len(kept) == 3
 
 
 # ---------------------------------------------------------------- 2. 深度诊断

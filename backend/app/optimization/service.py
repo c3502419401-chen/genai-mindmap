@@ -75,7 +75,6 @@ import json
 import logging
 import os
 import re
-import unicodedata
 from dataclasses import dataclass, field
 from typing import Iterator
 
@@ -90,6 +89,8 @@ from app.contracts.diagnostic import (
 )
 from app.contracts.mindmap import MAX_TREE_DEPTH, MindMapContent, Node
 from app.contracts.source import Source
+from app.optimization.cross_branch import duplicate_diagnostics as cross_branch_duplicates
+from app.optimization.cross_branch import normalize_label as _normalize_label
 from app.optimization.source_refs import verify_source_refs
 
 logger = logging.getLogger(__name__)
@@ -230,6 +231,12 @@ NOT_SUGGESTED: dict[str, str] = {
         "交给人：诊断把「这一对没被指认」说出来就够了，"
         "`docs/CROSS-BRANCH-DUPLICATES.md` §一 有 a / b / c 三档的判法"
     ),
+    "CROSS_BRANCH_DUPLICATE": (
+        "逐字同名看起来该合并，但这一层做不了那个动作：`dedupe` 只处理**同一个父"
+        "节点下**的一对（它删掉一个、把内容并进保留者），而跨支的两处挂在两个父下面，"
+        "要删的是其中一整块位置——删哪一处会改变哪条分支的内容量，那是编辑决定，"
+        "不是去重。诊断把「哪几句写了两遍」摆出来，留哪一处由用户定"
+    ),
 }
 
 
@@ -248,20 +255,6 @@ def _has_body(node: Node) -> bool:
     """这个节点有没有正文。`detail` 是生成的、`note` 是用户自己写的，界面上分区
     展示，两者都算"有说明"——只认 `detail` 会把"用户已经补过备注"报成空白。"""
     return bool((node.detail or "").strip() or (node.note or "").strip())
-
-
-def _normalize_label(text: str) -> str:
-    """归一化到"只留文字"：全半角、大小写、空白、标点符号全部抹平。
-
-    NFKC 把全角折成半角（`Ａ`→`A`、`（`→`(`），`casefold` 处理拉丁文大小写，
-    `P*`（标点）与 `S*`（符号）按**类别**整类删——枚举字符必然漏（半角括号与
-    全角方括号在 NFKC 之后也不同形）。
-    """
-    folded = unicodedata.normalize("NFKC", text).casefold()
-    return "".join(
-        char for char in folded
-        if not char.isspace() and not unicodedata.category(char).startswith(("P", "S"))
-    )
 
 
 def _inserted_text(shorter: str, longer: str) -> str | None:
@@ -482,8 +475,9 @@ def _missing_detail_diagnostics(root: Node) -> list[Diagnostic]:
 #
 # 「同一件事被写成两处」有两种形态，判据不同、读者不同：
 #
-#   · **逐字同名**（只差空白）→ `CROSS_BRANCH_DUPLICATE`（`agent/tools.py` 的
-#     `_cross_branch_duplicates`）。它说的是"这句话在图里出现了两遍"。
+#   · **逐字同名**（只差空白）→ `CROSS_BRANCH_DUPLICATE`
+#     （`optimization/cross_branch.py`，生成链路与这里共用同一份实现）。它说的是
+#     "这句话在图里出现了两遍"。
 #   · **近义改写**（「概述 4 学时」/「第一部分 概述」/「概述4学时」）→ **本段**。
 #     它说的是"这两处你打算怎么处理，图上读不出来"。
 #
@@ -566,6 +560,10 @@ def _cross_branch_unlinked_diagnostics(content: MindMapContent) -> list[Diagnost
          「力矩与转动定律」），要改的是层级，不是加一条关系。
       3. **归一化后逐字相同的不报**：那一档归 `CROSS_BRANCH_DUPLICATE`。这一条是
          本判据存在的理由（只报"被改写成近义"的那一档），所以它必须真的只管那一档。
+         这里的"逐字"用**宽口径**（`normalize_label`：连标点一起抹平），比
+         `CROSS_BRANCH_DUPLICATE` 的窄口径（只折空白）宽——两个口径之间的那一档
+         （只差标点的两处）**谁都报**，理由写在 `optimization/cross_branch.py` 的
+         模块 docstring 里：让一条码宁可漏，好过两条码打同一对。
 
     聚合一条而不是逐对报：S02 那种材料上一次能出 8 对，逐对报会把整个面板淹掉
     （与 `MISSING_DETAIL` 同一条取舍）。
@@ -638,6 +636,11 @@ def check(content: MindMapContent, sources: list[Source] | None = None) -> list[
     diagnostics.extend(_near_duplicate_diagnostics(root))
     diagnostics.extend(_shallow_branch_diagnostics(root))
     diagnostics.extend(_missing_detail_diagnostics(root))
+    # 跨支重复：**逐字同名在前、近义改写未指认在后**。两条都在这里，不只是
+    # "顺手加一条"——生成链路与「检查与建议」看的是同一张图的两个时刻，判据只该有
+    # 一份。这条判据原先只挂在生成侧（`agent/tools.py`），于是用户点那个按钮时
+    # 看不见它；口径与四条边界现在在 `optimization/cross_branch.py` 一次写完。
+    diagnostics.extend(cross_branch_duplicates(root))
     diagnostics.extend(_cross_branch_unlinked_diagnostics(content))
     if sources is not None:
         diagnostics.extend(verify_source_refs(content, sources))

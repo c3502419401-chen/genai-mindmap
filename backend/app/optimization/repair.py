@@ -135,6 +135,11 @@ MANUAL_ONLY: dict[str, str] = {
     # 信息。合并会丢一个视角（材料本身两处时），加一条关系则保留那个视角。判据只
     # 负责把"这一对没被指认"说出来，取舍留给用户（见 service.NOT_SUGGESTED）。
     "CROSS_BRANCH_UNLINKED": "并成一处还是加一条关系，要看材料里这件事出现了几次：这一层拿不到",
+    # 逐字同名的那一处：修法看起来是"合并"，但 `AUTO_REPAIRABLE_CODES` 里的
+    # `DUPLICATE_LABEL` 只处理**同一个父节点下**的一对（删一个、内容并进保留者）。
+    # 跨支的两处挂在两个父下面，要删的是其中一整块位置，删哪一处会改变哪条分支的
+    # 内容量——那是编辑决定，不是去重（见 service.NOT_SUGGESTED）。
+    "CROSS_BRANCH_DUPLICATE": "跨父合并要人定留哪一处：删掉的那一块会改变该分支的内容量",
 }
 
 #: 契约里 `Node.source_refs` 的 `max_length`。写在这里是因为契约把它写成字面量，

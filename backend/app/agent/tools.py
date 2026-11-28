@@ -137,6 +137,13 @@ from app.knowledge.service import (
 )
 from app.optimization import nli
 from app.optimization import verify as verify_step
+# 跨支逐字同名的判据**只有一份**，在 `optimization/cross_branch.py`。这里保留
+# `_cross_branch_duplicates` 这个名字是因为十几个测量脚本与用例按
+# `from app.agent.tools import _cross_branch_duplicates` 取它——但取到的是**同一个
+# 函数对象**，不是第二份实现（`test_cross_branch_judgement_has_exactly_one_
+# implementation` 用 `is` 钉住）。它原先只活在生成链路里，于是「检查与建议」
+# （`/optimization/suggest` -> `check()`）看不见这一档，那是这条账要修的东西。
+from app.optimization.cross_branch import cross_branch_duplicates as _cross_branch_duplicates
 from app.optimization.repair import AUTO_REPAIRABLE_CODES
 from app.optimization.repair import READABLE_LABEL_CHARS, overlong_labels
 from app.optimization.repair import repair as repair_structure
@@ -11619,7 +11626,16 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
 
     # 结构与语义两层复核（与 `_generate_deep` 的收尾同一份）：诊断只是提示，
     # 不影响这棵树能不能用——契约校验在上一步就决定过了。
-    diagnostics.extend(check(content))
+    #
+    # **剔掉 `check()` 里那条 `CROSS_BRANCH_DUPLICATE`**（判据只有一份，在
+    # `optimization/cross_branch.py`，`check()` 自然会产出它）。剔的原因是**判在
+    # 什么树上**：`check()` 跑在收尾修复**之后**，而这条诊断说的是"模型写了什么"，
+    # 它的判据必须跑在修复**之前**——压链会改 label（`外层 / 内层`），先修就判不到
+    # 了。所以这里用上面那个修前取好的 `duplicates` 自己说一遍，位置与文案都与把
+    # 判据搬走之前逐字相同（`test_cross_branch_duplicates_are_judged_before_the_repair`
+    # 钉着这个顺序）。
+    diagnostics.extend(item for item in check(content)
+                       if item.code != "CROSS_BRANCH_DUPLICATE")
     if verify_sources:
         diagnostics.extend(annotate_nli(content, verify_sources))
 
@@ -12149,63 +12165,6 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
             "edges": len(content.edges) if not isinstance(content, FishboneContent) else 0,
         }
     return ToolResult(ok=True, content=summary, data=data)
-
-
-def _cross_branch_duplicates(root: Node) -> list[tuple[str, list[str]]]:
-    """跨分支重复的节点：`(label, [出现在哪些父节点下])`。
-
-    这是分片那条路的**结构性缺陷**，也是这次回到一次生成要说清的那条收益：分片
-    每支展开时只看得到自己那条标题链，兄弟支写了什么它不知道（`PLAN_PROMPT` 里
-    "彼此覆盖的范围不重叠"模型并不听），于是同一个说法会挂在两条分支下。一次
-    生成时全部骨架在同一份响应里，模型至少有可能看住；这里数的是"它看住没有"。
-
-    **判据是 label 级**（归一化后逐字相同、且不在同一条祖先链上），**不要求
-    detail 也相同**。这一条是拿真实数据校准出来的，不是拍的：库里那三张
-    `机器学习的主要方向`（56/57 节点）各有 3 个 label 跨支重复、共 6 个重复节点
-    （「Python库与框架」「半监督与强化学习」「无监督学习：无标注找结构」），
-    而它们的 detail **各不相同**——按"连 detail 也要相同"判，这条诊断对真实
-    缺陷完全瞎掉（量出来 0）。
-
-    为什么 label 相同就够了：同一个概念挂在两条一级分支下，无论说明怎么写，
-    用户都会看到两块内容在讲同一件事；而"交叉指认"（两支都要提到同一个概念）
-    正确写法是指向已有节点，不是复制一份。
-
-    保守的那一半在**不做语义归一**：`无监督学习` 与 `非监督学习`、`监督学习` 与
-    `有监督学习` 不算重复（不确定就别报）。宁可漏，不误报——这条诊断不删任何
-    节点，只把"哪几句写了两遍"摆出来，误报会让整条信号变成噪声。
-
-    只报不删：留哪一处是用户的决定。
-    """
-    # 每条链带两份：`ids` 判"在不在同一条祖先链上"，`labels` 输出给人看。
-    #
-    # **判链必须用 id**：同名节点不止一种含义（父子同名、兄弟同名），而 label 前缀
-    # 相同不代表同一条链——两支下各有一处「第 3 章」时，按 label 判会把它们当成同链
-    # 放过，那正是这条判据要报的东西。第一版实现比的是**父元组**（`place[:-1]`），
-    # 于是父子同名被判成跨支（S07「力矩与转动定律」：父与子同名，两处的祖先链是
-    # 前缀关系），docstring 承诺的"同一条祖先链上的两处不算跨支"没做到。
-    found: dict[str, list[tuple[tuple[str, ...], tuple[str, ...]]]] = {}
-    stack: list[tuple[Node, tuple[str, ...], tuple[str, ...]]] = [
-        (child, (), ()) for child in root.children
-    ]
-    while stack:
-        node, ids, labels = stack.pop()
-        key = re.sub(r"\s+", "", node.label or "")
-        if key:
-            found.setdefault(key, []).append((ids, (*labels, node.label)))
-        for child in node.children:
-            stack.append((child, (*ids, node.id), (*labels, node.label)))
-    duplicates: list[tuple[str, list[str]]] = []
-    for label, places in found.items():
-        if len(places) < 2:
-            continue
-        # 同一条祖先链上的两处不算跨支（父子同一句话是另一类问题，`check()` 管）：
-        # "同一条链"= 全部落在那条最长的链上。判据用 id 元组的前缀关系，见上面那段。
-        longest = max((ids for ids, _ in places), key=len)
-        if all(longest[: len(ids)] == ids for ids, _ in places):
-            continue
-        duplicates.append((label, sorted(
-            "/".join(labels[:-1]) or "根" for _, labels in places)))
-    return duplicates
 
 
 async def _generate_deep(args: GenerateDeepArgs, ctx: RunContext) -> ToolResult:

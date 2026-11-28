@@ -61,6 +61,12 @@ export const DIAGNOSTIC_LABELS: Record<string, string> = {
   SHALLOW_BRANCH: '这一支太浅',
   NEAR_DUPLICATE_LABEL: '同级近义',
   MISSING_DETAIL: '缺少说明',
+  // 跨支（后端 `optimization/cross_branch.py` 与 `optimization/service.py`）。
+  // 两条码是一对：先说"这句话写了两遍"（逐字同名），再说"这两处被改写成了近义、
+  // 而图上没有一条关系指认它们"。标题里都带「跨分支」，因为它们的共性是**位置**
+  // ——两处挂在不同的父下面，而上面那三条（重名 / 近义 / 缺失）都只说内容。
+  CROSS_BRANCH_DUPLICATE: '跨分支重名',
+  CROSS_BRANCH_UNLINKED: '跨分支同核未指认',
   // 引用核验（optimization/source_refs.py）
   EVIDENCE_UNUSED: '引文没被用上',
   UNSOURCED_NODE: '没有可核验的引用',

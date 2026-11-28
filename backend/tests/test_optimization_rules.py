@@ -125,6 +125,11 @@ def _closure_codes() -> set[str]:
             _node("s1", "课程内容", [_leaf("s11", "第二部分 进程与线程（8 学时）")]),
             _node("s2", "学时分配", [_leaf("s21", "进程与线程 8 学时")]),
         ])),
+        # 跨支逐字同名（只差空白）—— 它也在 `check()` 里，不再是生成链路的私产
+        _map(_node("r", "根", [
+            _node("t1", "实验安排", [_leaf("t11", "内核模块编写 4 次")]),
+            _node("t2", "实验考核", [_leaf("t21", "内核模块编写4次")]),
+        ])),
     ]
     codes: set[str] = set()
     for content in contents:
@@ -146,7 +151,7 @@ def test_every_emitted_code_is_mapped_or_has_a_written_reason():
     explicit = {
         "HEADING_ONLY_BRANCH", "SINGLE_CHILD", "DUPLICATE_LABEL",
         "SHALLOW_BRANCH", "MISSING_DETAIL", "NEAR_DUPLICATE_LABEL", "DEPTH_LIMIT",
-        "CROSS_BRANCH_UNLINKED",
+        "CROSS_BRANCH_UNLINKED", "CROSS_BRANCH_DUPLICATE",
     }
     assert explicit <= codes, codes
 
@@ -474,7 +479,9 @@ def test_verbatim_cross_branch_names_are_visible_from_check():
     # 汇总一条（与 `MISSING_DETAIL` 同一条取舍），不落单个节点：跨支这一对没有
     # "哪一个节点错了"这回事。
     assert found[0].node_id is None
-    assert "内核模块编写 4 次" in found[0].message
+    # message 里的名字是**折叠空白之后**的那个说法（判据的 key），不是节点上的原文
+    # ——两者差一个空格，是同一条判据的既有写法，搬家时不动它。
+    assert "内核模块编写4次" in found[0].message
     assert "重复的节点没有被删" in found[0].message
 
 
