@@ -59,11 +59,78 @@
 
 | 档 | 判据 | 实测基线 |
 |---|---|---|
-| `load` | 探针脚本（`_*.py` / `probe_*.py`）逐个在**独立子进程**里 `runpy` 加载，`run_name` 不是 `__main__` | 43 个全过 |
-| `imports` | 全部脚本的 `import` 目标：模块 `find_spec` 存在，`from app.x import y` 的 `y` 存在 | 121 个全过 |
-| `docs` | `docs/**/*.md` 里指向 `scripts/` 下 `.py` 的引用必须落得到文件 | 83 处全过 |
+| `load` | 探针脚本（`_*.py` / `probe_*.py`）逐个在**独立子进程**里 `runpy` 加载，`run_name` 不是 `__main__`；**跑在从 `git ls-files` 物化出来的干净树里** | 46 个全过 |
+| `imports` | 全部脚本的 `import` 目标：模块 `find_spec` 存在，`from app.x import y` 的 `y` 存在 | 129 个全过 |
+| `docs` | `docs/**/*.md` 里指向 `scripts/` 下 `.py` 的引用必须落得到文件 | 95 处全过 |
 | `artifacts` | `scripts/**/_*.json`：已跟踪者必须被 docs 引用；未跟踪者必须被 `.gitignore` 覆盖 | 9 个全过 |
 | `env` | `.env.example` 的变量在 `app/` 与 `scripts/` 里还找得到 | 23 个全过 |
+
+## `load` 跑在哪棵树上：这条闸连红五次的教训
+
+2026-11 的战绩：`7ac8400` / `f8bbc0a` / `b540fd8` / `00a623b` / `157f0b5` **五次全红**，
+而本地每次都是绿的。成因一句话：`backend/scripts/_two_arch_*.py` 六个脚本在**模块顶层**
+读 `backend/data/two_arch.json` 与 `backend/data/two-arch-blind/_key.json`，而
+`.gitignore` 的 `data/` 让干净 checkout 上根本没有这个目录。
+
+    $ cd backend && python scripts/check_script_hygiene.py --gate     # 本地：全部通过
+    $ git worktree add ../gm-cd HEAD --detach && cd ../gm-cd/backend
+    $ python scripts/check_script_hygiene.py --gate
+    ✗ load      6 条
+        scripts/_two_arch_check.py     ← FileNotFoundError: .../backend/data/two_arch.json
+        scripts/_two_arch_coverage.py  ← FileNotFoundError: .../backend/data/two_arch.json
+        scripts/_two_arch_key.py       ← FileNotFoundError: .../data/two-arch-blind/_key.json
+        scripts/_two_arch_numbers.py   ← FileNotFoundError: .../backend/data/two_arch.json
+        scripts/_two_arch_peek.py      ← FileNotFoundError: .../backend/data/two_arch.json
+        scripts/_two_arch_rows.py      ← FileNotFoundError: .../data/two-arch-blind/_key.json
+
+五次都不是代码难改，是**判据取错了树**：闸门在"有 `data/` 的开发树"上取结论，而它
+要回答的问题是"CI 上能不能加载"。
+
+所以修的是闸门，不只是那六个脚本：
+
+- `load` 档**先物化一棵干净树**（`git ls-files` 的全部文件复制到临时目录），在那棵树里
+  逐个 `runpy`。于是"本地绿"与"CI 绿"不再是两个需要对齐的判断，而是同一件事。
+- 取不到 git 索引（tarball 副本、单元测试里的 `tmp_path` 假仓库）时：`--gate` **报红**，
+  不退回工作树判绿。退回就是又一个"本地绿"。
+- 物化树只放 git 里的文件会漏掉"刚写完、还没 `git add`"的探针，所以检查对象取工作树的
+  全集、运行环境取干净树——新脚本照样在没有 `data/` 的树上被加载一次。
+- 报错里的临时路径换成 `<干净 checkout>/backend`：同一条红不该每次长得不一样。
+
+**没采用的三条，以及为什么不：**
+
+| 候选 | 为什么不 |
+|---|---|
+| 让人记得"先建干净 worktree 再跑闸门" | 已经证明"记得"在这个仓库不管用——五连红就是"记得"的产物 |
+| 在 CI 之前再加一步自查 | 那是拿 CI 验 CI；本地仍然什么都发现不了 |
+| 让每个脚本"声明依赖了哪个被忽略目录" | **声明会漏**，而漏掉的那一条正是下一次的红。物化不需要任何人声明 |
+
+六个脚本本身的处置见下一节：**顶层不读文件，读取进 `main()`，缺数据 exit 2**。
+
+## 探针脚本的"没数据"必须能红
+
+`_two_arch_*.py` 这六个的修法不是"没数据就跳过"，而是"**没数据就明确报错、退出码 2**"：
+
+```python
+def _read(name: str):
+    path = DATA / name
+    if not path.is_file():
+        print("错误：" + _MISSING.format(name=name), file=sys.stderr)
+        raise SystemExit(2)
+    return json.loads(path.read_text(encoding="utf-8"))
+```
+
+两条判据：
+
+1. **"能不能加载"与"能不能跑"是两件事。** 这道闸问的是前者，所以读取只能发生在
+   `main()` 里——`runpy` 用 `run_name="__probe__"` 加载，`if __name__ == "__main__"`
+   那个块不执行，顶层就只剩 import 与常量。
+2. **"跳过"与"算过了"必须能分开。** 这六个都是 `docs/TWO-ARCH-COMPARISON.md` 第 5 节
+   点名的复算入口，跳过之后脚本会打印空表并 exit 0——读的人分不清"没有重复"与"没跑"。
+   形态上就是"把没测说成测了"。一次性探针（没人当复算入口引用的）才可以跳过，而这六个
+   里没有一个属于这一类。
+
+顺带修掉一处同族问题：`_two_arch_peek.py` 无参数时以前"什么都不打印、exit 0"，
+在终端上与"看过了、没有异常"长得一模一样，现在打印用法并 exit 2。
 
 三条判据上的取舍值得单独写下来，因为它们都属于"写错了就会变成噪声、然后就没人看"：
 
