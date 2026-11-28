@@ -76,7 +76,7 @@ backend/pytest.ini
 backend/.env.example
 README.md
 TEAM-GUIDE.md
-NEXT-PLAN.md
+docs/archive
 START_HERE.md
 AGENTS.md
 clash-verge.yaml

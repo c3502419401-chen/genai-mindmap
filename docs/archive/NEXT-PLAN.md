@@ -1,6 +1,17 @@
 # 下一步计划书
 
-> 日期：2026-11-02（周一）｜基线：`main @ 149cc99`｜用途：内部评估，不入库
+> 日期：2026-11-02（周一）｜基线：`main @ 149cc99`
+>
+> **归档（2026-11-28）**：本文是 2026-11-02 的排期评估稿，**整篇过期，只作历史**。
+> 它原来放在仓库根目录——那里是最强的入口位，放一份过期文档等于主动误导；`README.md`
+> 与 `TEAM-GUIDE.md` 早就各自标注过"已过期，只作历史"，那句标注本身就是在承认位置错了。
+> 移到 `docs/archive/` 之后，根目录只剩四份都在生效的文档（`README.md` / `START_HERE.md` /
+> `TEAM-GUIDE.md` / `AGENTS.md`）。
+> 替代物：现状看 [`docs/PROJECT-STATUS.md`](../PROJECT-STATUS.md)，待办看
+> [`docs/BACKLOG.md`](../BACKLOG.md)，计划与实现的逐项核对看
+> [`docs/PLAN-VS-IMPLEMENTATION.md`](../PLAN-VS-IMPLEMENTATION.md)。
+> 原来那句"用途：内部评估，不入库"是当时的计划，**实际从 2026-11-02 起它就在库里**
+> （`git log --follow` 可查），`docs/HANDOFF.md` 引用的"不入库"是照抄这句话。
 >
 > **同步说明（2026-11-07）**：本文是 2026-11-02 的评估快照，第 1 节的数字（14 条路由、3 条 501、只读列表）已被后续提交推翻——现在是 8 组路由 19 个端点、没有 501、画布与编辑闭环可用。第 9 节的裁定回填只覆盖已裁定的两条。现状一律以 [`docs/FEATURES_AND_OWNERS.md`](docs/FEATURES_AND_OWNERS.md) 与 [`docs/API.md`](docs/API.md) 为准。
 

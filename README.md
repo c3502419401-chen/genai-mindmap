@@ -350,5 +350,6 @@ frontend/src/
 
 - 申报书原文（项目简介、研究内容、国内外研究现状、创新点、拟解决的关键问题、预期成果）与"技术路线"那一节的原文摘录，见 [docs/PROPOSAL.md](docs/PROPOSAL.md)；本文件写的是**实现侧的现状**。
 - 申报书原文写作 `pluml-encode`，这里按 npm 实际包名写作 `plantuml-encoder`（另有 `plantuml-encode` 存在，是不同包）。
-- 用户视角的操作说明见 [docs/USER-GUIDE.md](docs/USER-GUIDE.md)（从装好到做出一张有用的图）；组员上手与分工见 [TEAM-GUIDE.md](TEAM-GUIDE.md)；仓库根目录的 [START_HERE.md](START_HERE.md) 是状态与易错点清单，[NEXT-PLAN.md](NEXT-PLAN.md) 是 2026-11-02 的排期评估快照（已过期，只作历史）。
+- 用户视角的操作说明见 [docs/USER-GUIDE.md](docs/USER-GUIDE.md)（从装好到做出一张有用的图）；组员上手与分工见 [TEAM-GUIDE.md](TEAM-GUIDE.md)；仓库根目录的 [START_HERE.md](START_HERE.md) 是状态与易错点清单。
+- 2026-11-02 的排期评估快照 [NEXT-PLAN.md](docs/archive/NEXT-PLAN.md) 已从仓库根目录移入 `docs/archive/`——它整篇过期，而根目录是最强的入口位，读者会先看到它、然后读到过期的话；替代物是 [PROJECT-STATUS.md](docs/PROJECT-STATUS.md)。
 - 协作规则：`main` 是生产分支（线上跑的就是它）、`dev` 是集成分支、PR 目标一律 `dev`；提交信息用中文 Conventional Commits；CI 必须绿才能合并。改 `backend/app/contracts/` 必须两人同时知道。

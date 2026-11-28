@@ -143,7 +143,7 @@ docs/
   PLAN.md              里程碑、验收门、风险表、决策记录（Q1–Q36）
   CONTRACT_V2.md       契约 v2（两端 2026-11-10 已落地；`types.ts` 是 v2 镜像，`schema.d.ts` 由 `openapi.json` 生成，`contract-check.ts` 编译期断言两者一致）
   HANDOFF.md           需要对方知悉或确认的跨人决策（待确认 / 已确认）
-  TODO.md              文件占用与交接（协作文件，动共用文件前先看这里）
+  FILE-OWNERSHIP.md    文件占用与交接（协作文件，动共用文件前先看这里）
   W1_DAY1.md           W1 逐日开工清单
   FEATURES_AND_OWNERS.md    26 项功能追踪与 A/B 分工
   PROJECT-STATUS.md    现状总览（比这份指南更权威）
@@ -154,7 +154,8 @@ docs/
   USER-GUIDE.md        用户视角的操作手册
 README.md              开发者上手文档（在线体验 / 60 秒跑起来 / 五道闸的命令 / 功能状态表 / 文档地图）← 新人先读这个
 START_HERE.md          当前可运行范围与易错点清单
-NEXT-PLAN.md           2026-11-02 的排期评估快照（已过期，只作历史）
+NEXT-PLAN.md           2026-11-02 的排期评估快照（已过期，只作历史；2026-11-28 移入 `docs/archive/`）
+docs/archive/          已失效、只作留档的文档（每份在 `docs/INDEX.md` 第三节写着替代物）
 ```
 
 ---
