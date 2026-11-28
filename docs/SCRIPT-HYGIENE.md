@@ -211,6 +211,62 @@ def _read(name: str):
 成本还没付；C 里每一条都需要人读一遍才知道对不对——那种检查加进 CI 的结果，是
 半年后有一份没人敢改的豁免名单。
 
+## CI 的每一道闸 × 它依赖什么 × 干净 checkout 里有吗
+
+上面那五档是**一道**闸。整个 CI 有十六步（后端 job 八步判定、前端 job 八步判定，
+两个 job 并行）。五连红期间后端 job 红在第 3 步「探针脚本卫生」，它**后面的六步一次
+都没执行过**——所以那六步的 CI 结论当时根本不存在，"本地绿"被当成了它们的证明，
+而那不是证明（前端 job 不受影响，一直在跑）。下面是逐道闸问同一个问题：
+
+> **它读的东西在 `git ls-files` 里吗？** 不在，本地绿就不是结论。
+
+判定用一棵干净 worktree（`git worktree add ../gm-cd HEAD --detach`）与主工作树对跑。
+"两侧"指这两棵树。
+
+| CI 步 | 判据读什么 | 干净 checkout 里有吗 | 两侧实测 | 修法 |
+|---|---|---|---|---|
+| `ruff check .` | `backend/` 全部 `.py` | 有 | 都 passed | 无。反方向：本地多扫未跟踪文件，只会更严 |
+| 探针脚本卫生 | `scripts/`、`docs/`、`.env.example`、git 索引 | 有 | 修前 0 条 vs **6 条**；修后都 0 条 | **已修**：`load` 档物化干净树 |
+| 文档断言与代码一致 | `app/**`、`conftest.py`、`openapi.json`、`deploy/`、`tidy.ts`、`git ls-files '*.md'` | 有 | 都 64 条判定，通过 | 无（它只读 git 里的文本） |
+| 文档分级 | `docs/`、`README.md`、`INDEX.md`、`git ls-files '*.md'`；`git log` 只打印归档日期 | 有（**需 `fetch-depth: 0`**） | 都 128 份，通过 | 已配 `fetch-depth: 0`。日期不参与判据，否则每次重跑都要改文档 |
+| 诊断码两侧覆盖 | `app/**/*.py` 字面量 + `DIAGNOSTIC-TWO-SIDES.md`；可选跑 `data/acc_trees*` 72 棵真树 | 静态有；**真树没有** | 都通过，但**输出不同**：本地跑运行期 5 码 / 12 判定，CI 打印"运行期未测量" | 已诚实降级，但 **CI 少测一半**。要补就把运行期那半固化成 golden JSON 入库，CI 比对 |
+| Test（pytest 全量） | 见下三行 | 大部分有 | **3470 passed / 37 skipped / 29 subtests，两侧逐条相同** | 无。`conftest.py` 清 23 个环境变量、库落 `tmp_path`、网络闸拦真请求 |
+| 零引用函数棘轮 | `app/`、`tests/`、`scripts/` 文本 + 基线 JSON | 有 | 都 8 条在基线内 | 无 |
+| OpenAPI 快照 | `app/**`、`openapi.json` | 有 | 两侧 `export_openapi.py` 后 `git diff` 都是空 | 无（生成的 schema 不随 `.env` 的取值变） |
+| `npm ci` | `package-lock.json` + 网络 | lock 有 | — | 依赖 PyPI/npm 的安装步骤本身就可能红，与本项目改了什么无关 |
+| 契约类型（`gen:api` + diff） | **`npx --yes openapi-typescript@7.13.0`：每次联网拉包 + 本机 npx 缓存** | **没有** | **两侧此刻都跑不起来**（本机 npx 缓存里缺这个包） | 提到 `devDependencies`，改用 `node_modules/.bin/openapi-typescript`，去掉 `npx --yes` |
+| `npm test`（vitest） | `src/`、`tests/`、`node_modules` | 源码有；`node_modules` 由 `npm ci` 建 | 干净树 93 文件 / 1461 通过 / 2 skipped | 无 |
+| 用例成本闸门 | `tests/**/*.spec.ts` 文本 + `test-cost-baseline.json` | 有 | 都 199/199 | 无 |
+| 零引用棘轮（前端） | `src/**`、`tests/**` + 基线 | 有 | 都 1 条 | 无 |
+| 断链棘轮 | `openapi.json`、`client.ts` + 基线 | 有 | 都 9 断 / 1 死 | 无 |
+| 可达性棘轮 | `src/**`、`tests/**` + 基线 | 有 | 都 3 条不可达 | 无 |
+| `npm run build` | `node_modules` | 由 `npm ci` 建 | 未在本地验（`AGENTS.md` 要求交给 CI） | 无 |
+
+三类"不在 git 里"的东西，以及各自的方向：
+
+- **`backend/data/`、`backend/uploads/`**（`.gitignore` 的 `data/`、`uploads/`）：只有
+  `load` 档与 `diagnostic_sides` 的运行期半段读它们。前者已修成物化干净树；后者已
+  诚实降级成"未测量"，代价是 CI 少测一半。
+- **`frontend/node_modules`**（`node_modules/`）：所有前端闸门都靠它，但 `npm ci` 会建，
+  且 `package-lock.json` 在 git 里。变异来源是**联网**，不是"文件缺失"。
+- **本机环境变量与 `backend/.env`**：`conftest.py` 清了 23 个变量；`app/` 里没有任何
+  `env_file` / `dotenv` 加载（`backend/.env` 只给 `run-backend.bat` 那种启动脚本看），
+  所以 `.env` 的存在不改变任何用例。这一条**当初就不是**靠"记得清"成立的，是靠用例。
+
+还有两处与"干净 checkout"不同源、但同样会造出"本地 ≠ CI"的东西，写下来免得下次
+重新判：
+
+- **换行符**：`core.autocrlf=true`，工作树的 `.py` 有 CRLF，git 里的 blob 是 LF。
+  `Path.read_text()` 走 universal newlines，所以文本判据两侧一致。但**新写的
+  "逐字节对比 `git show` 出来的内容"的用例必须先归一化换行**，否则本地红、CI 绿。
+- **Python 版本**：本地 3.13、CI 钉 3.12。`scripts/_two_arch_check.py` 里有 PEP 701
+  的嵌套引号 f-string（3.12+ 才合法）。方向是安全的（CI 的 3.12 会真的跑），但别在
+  3.11 上指望本地能验证它。
+
+按风险排的下一次红：**`gen:api`（唯一要联网的闸，且本机此刻就红）> 诊断码运行期
+那一半（CI 永远不测）> 新写的、直接读 `backend/data/` 的用例（`conftest` 清环境变量
+但不防文件存在性）> `npm run build`（未本地验）**。
+
 ## 跑法
 
     cd backend
