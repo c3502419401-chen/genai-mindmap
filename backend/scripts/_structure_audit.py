@@ -15,6 +15,15 @@
     E 无 detail 的节点 ≤5%    说明是导图的可读性的一半
     F label 都在可读上限内    超了在画布上被截成半句（实测出现过「最短路径 Dijkstra 与」）
 
+★ D 的口径是**全局同名计数、不分层级、不看父**：跨支同名（同一个说法挂在两条分支
+  下）也计入。这个口径不是随手写的——跨支同名在界面上就是"读者要问两次是不是同一
+  件事"，而生成端普通三段式那条路不写 `relations`，两支之间什么关系都没有。但它是
+  **三件事混在一个数里**：真重复（该合并）、交叉引用（两支都要看得到，只是缺一条
+  关系线）、同名不同指（如"候选人 A / 候选人 C"下的「弱项」，那是规范写法）。
+  分档规则、17 处的逐条判定与"该改哪一头"见 `docs/CROSS-BRANCH-DUPLICATES.md`，
+  复算用 `scripts/measure_cross_branch_duplicates.py --triage`。本文件这一行**暂不改**
+  ——它是验收口径，改它会把所有历史数据（85% 那类）一起改掉，该单独一批。
+
 ★ F 的那个数是**从代码里取的**（`optimization/repair.py::READABLE_LABEL_CHARS`），
   不在这里写死。它是渲染线的数：`frontend/src/stores/mindmap.ts` 的
   `TRUNCATE_CHARS = 24` 把超出的部分截成 `…`，`canvas/MindNode.vue` 的
