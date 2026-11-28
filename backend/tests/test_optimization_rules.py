@@ -24,6 +24,7 @@ from app.contracts.diagnostic import DiagnosticLevel, SuggestionKind
 from app.contracts.mindmap import MindMapContent
 from app.contracts.source import Source, SourceKind
 from app.optimization import service
+from app.optimization.repair import READABLE_LABEL_CHARS
 from app.optimization.service import (
     NOT_SUGGESTED,
     _SUGGESTION_OF_CODE,
@@ -116,6 +117,8 @@ def _closure_codes() -> set[str]:
             _leaf("e", "重复项"),
             _leaf("f", "没有说明的叶子"),
         ])),
+        # 标题超过画布的一行两列（`READABLE_LABEL_CHARS`）——渲染口径那条
+        _map(_node("r", "根", [_leaf("g", "字" * (READABLE_LABEL_CHARS + 1))])),
         # 深度上限
         _chain(8),
         # 同级近义
@@ -152,6 +155,7 @@ def test_every_emitted_code_is_mapped_or_has_a_written_reason():
         "HEADING_ONLY_BRANCH", "SINGLE_CHILD", "DUPLICATE_LABEL",
         "SHALLOW_BRANCH", "MISSING_DETAIL", "NEAR_DUPLICATE_LABEL", "DEPTH_LIMIT",
         "CROSS_BRANCH_UNLINKED", "CROSS_BRANCH_DUPLICATE",
+        "LABEL_OVERLONG_IN_DELIVERY",
     }
     assert explicit <= codes, codes
 
@@ -168,6 +172,52 @@ def test_suggestion_kinds_are_action_words():
     assert SuggestionKind.add_detail.value == "add_detail"
     used = set(_SUGGESTION_OF_CODE.values())
     assert {SuggestionKind.dedupe, SuggestionKind.expand, SuggestionKind.add_detail} <= used
+
+
+# ------------------------------------------------- 1.5 渲染口径：标题在画布上会不会被截
+#
+# 这条判据原先只在生成收尾报（`agent/tools.py::_generate` 的最后一段），用户点
+# 「检查与建议」时一条都看不见。它搬进 `check()` 的依据与前一轮的跨支那条是同一条：
+# 纯函数（`overlong_labels`）、产物可判（只量 label 字数）、而且用户从画布上**看不出**
+# 这件事——他看到的是"标题被截成半句"，看不出"那半句本可以不断"。
+#
+# 三个数各有各的活，搬的时候最容易拿错：
+#   `READABLE_LABEL_CHARS` = 24 = 前端 `stores/mindmap.ts::TRUNCATE_CHARS`
+#        画布截断口径。这条码量的是它：超了就会被 `line-clamp-2` 截成半句。
+#   `GENERATED_LABEL_MAX_CHARS` = 16
+#        生成侧硬切。16 < 24，所以正常生成的标题在画布上**不会被截**；而"切点落在
+#        半个词上"是生成那一刻的事——事后树上只剩切短的标题，判不到。那正是
+#        `LABEL_CLIPPED_TO_GENERATED` 不搬的理由，与这条不是一回事。
+
+
+def test_a_label_too_long_for_the_canvas_is_reported_by_check():
+    """超了截断口径就报 warn，没超不报——边界取 `READABLE_LABEL_CHARS`。"""
+    at_limit = "字" * READABLE_LABEL_CHARS
+    over = "字" * (READABLE_LABEL_CHARS + 1)
+
+    assert _of_code(check(_map(_node("r", "根", [_leaf("a", at_limit)]))),
+                    "LABEL_OVERLONG_IN_DELIVERY") == []
+
+    reported = _of_code(check(_map(_node("r", "根", [_leaf("a", over)]))),
+                        "LABEL_OVERLONG_IN_DELIVERY")
+    assert len(reported) == 1, "一条说清整棵树，不逐节点刷屏"
+    assert reported[0].level is DiagnosticLevel.warn
+    assert str(READABLE_LABEL_CHARS) in reported[0].message
+    assert "截成半句" in reported[0].message
+    # 预览里要有原文：只说「有 1 个节点超长」等于让用户自己在全树上找。
+    assert over in reported[0].message
+
+
+def test_the_overlong_judgement_has_exactly_one_implementation():
+    """生成侧与事后侧是**同一个函数对象**，不是两份凑出同样的结果。
+
+    这条码原先由 `agent/tools.py` 自己量、`check()` 不量。搬过来时若两边各留一份
+    实现，"结果一致"能靠凑，"同一个对象"凑不出来——前一轮跨支那条已经把这条规矩
+    钉过一次（`test_cross_branch_judgement_has_exactly_one_implementation`）。
+    """
+    from app.optimization import repair
+
+    assert service.overlong_labels is repair.overlong_labels
 
 
 # ---------------------------------------------------------------- 2. 近义（规则层）

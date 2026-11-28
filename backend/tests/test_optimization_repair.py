@@ -358,6 +358,7 @@ def test_every_checkable_code_has_a_decision():
         "SINGLE_CHILD", "DEPTH_LIMIT", "DUPLICATE_LABEL", "NEAR_DUPLICATE_LABEL",
         "SHALLOW_BRANCH", "HEADING_ONLY_BRANCH", "MISSING_DETAIL",
         "CROSS_BRANCH_UNLINKED", "CROSS_BRANCH_DUPLICATE",
+        "LABEL_OVERLONG_IN_DELIVERY",
     }
     for code in codes:
         assert code in AUTO_REPAIRABLE_CODES or code in MANUAL_ONLY, code
