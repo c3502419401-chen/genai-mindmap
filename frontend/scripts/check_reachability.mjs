@@ -345,7 +345,7 @@ function reachableFrom(nodes, rootKey) {
       if (dynamicOnly.get(edge.target) === true && !dynamic) dynamicOnly.set(edge.target, false);
     }
   }
-  return { seen, dynamicOnly, typeRefs };
+  return { rootKey, seen, dynamicOnly, typeRefs };
 }
 
 /** `tests/**` 里 import 到的 `src` 模块集合（`d` 档的判据）。 */
@@ -383,7 +383,7 @@ function testImports(nodes) {
 let typeRefs = new Map();
 
 /** 不可达节点的建议档（最终档以基线为准）。 */
-function classify(node, { otherRoot, tests }) {
+function classify(node, { otherRoot, otherRootKey, rootKey, tests }) {
   if (node.typeOnly) {
     return { class: 'c', note: node.isDts ? '.d.ts，由 `npm run gen:api` 生成' : '文件里只有类型声明，编译成空模块' };
   }
@@ -403,7 +403,12 @@ function classify(node, { otherRoot, tests }) {
 
   if (otherRoot.has(node.key)) {
     // 从一个根走不到、从另一个根走得到：只被入口本身的挂载前逻辑 import。
-    return { class: 'b', note: '只被入口 main.ts 的挂载前逻辑 import，从 App.vue 走不到' };
+    return {
+      class: 'b',
+      note: node.key === otherRootKey
+        ? `另一个根文件本身（${otherRootKey}），从 ${rootKey} 当然走不到它`
+        : `只被入口挂载前的逻辑 import，从 ${rootKey} 走不到`,
+    };
   }
 
   if (node.isVue) {
@@ -432,7 +437,10 @@ function scan(rootKey) {
 
   const unreachable = [...nodes.values()].filter(node => !from.seen.has(node.key));
   const classified = unreachable
-    .map(node => ({ ...node, ...classify(node, { otherRoot: other.seen, tests }) }))
+    .map(node => ({
+      ...node,
+      ...classify(node, { otherRoot: other.seen, otherRootKey: other.rootKey, rootKey, tests }),
+    }))
     .sort((a, b) => a.key.localeCompare(b.key));
 
   // 每个 .vue 的入边：`a` 档读数是"0 条"，这个清单是它可被审计的依据。
