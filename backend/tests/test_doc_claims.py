@@ -436,6 +436,166 @@ def test_the_backlog_probes_read_the_file_not_a_constant(tmp_path: Path) -> None
     assert values["branch_arg_deprecated"] == claims.ABSENT
 
 
+# ------------------------------------------------ 三条探针的改名反例
+#
+# 二值读数把两件事压成同一个 `False`：**判据自己坏了**（目标符号改名、文件读不到）与
+# **被测的事实不成立**。前者是闸门的问题，后者是代码的问题；混着报就会把"我的判据失效
+# 了"说成"代码被翻回去了"，读者于是去翻 git、去重做已经做完的活。
+#
+# 下面三条各读三档：`present`（原料在、事实成立）、`absent`（原料在、事实为假）、
+# `missing`（原料改名）。**第三档是重点**：只测 present/absent 的用例挡不住"把 missing
+# 硬编码成 absent"这件事，而这正是上一轮漏掉的那个缺口。
+
+_ALIVE_CONTRACTS = (
+    "def clip_label(text, limit=16):\n"
+    '    return "".join(text[:_clip_index(text, limit)])\n'
+    "def _clip_index(chars, limit):\n"
+    "    return limit\n"
+    "class Node:\n"
+    '    origin: str = "unknown"\n')
+
+_ALIVE_ROUTER = ("from app.knowledge import graph_resolve\n"
+                 "def go():\n"
+                 "    return graph_resolve.resolve_entities([])\n")
+
+_ALIVE_RESOLVER = ("def resolve_entities(items):\n"
+                   "    return items\n")
+
+
+def _probe_sandbox(root: Path, contracts: str = _ALIVE_CONTRACTS,
+                   router: str = _ALIVE_ROUTER,
+                   resolver: str = _ALIVE_RESOLVER) -> Path:
+    """一棵"三条探针各得其所"的最小假代码树：只给原料，别的什么都不给。"""
+    for folder in ("agent", "contracts", "knowledge"):
+        (root / folder).mkdir(parents=True)
+    (root / "agent" / "tools.py").write_text("", encoding="utf-8")
+    (root / "contracts" / "mindmap.py").write_text(contracts, encoding="utf-8")
+    (root / "knowledge" / "router.py").write_text(router, encoding="utf-8")
+    (root / "knowledge" / "graph_resolve.py").write_text(resolver, encoding="utf-8")
+    return root
+
+
+def _readings(root: Path) -> tuple[dict[str, str], list[str]]:
+    return claims.probe_backlog_facts(app_dir=root, scripts_dir=root)
+
+
+def _about(problems: list[str], name: str) -> list[str]:
+    return [item for item in problems if f"`{name}`" in item]
+
+
+def _assert_missing_text(problems: list[str], name: str) -> str:
+    """判据失效的报错必须点名、必须带标记，**且不许用 `absent` 的话术**。"""
+    text = " ".join(_about(problems, name))
+    assert claims.MISSING_MARK in text, text
+    assert "状态改错" not in text, text
+    assert "代码被翻回去了" not in text, text
+    return text
+
+
+def test_clip_label_probe_distinguishes_missing_from_absent(tmp_path: Path) -> None:
+    """`clip_label_retreats`：`_clip_index` **改名**时读 `missing`，不是 `absent`。
+
+    改名反例是这条用例的全部理由：`_clip_index` 换成 `_clip_index_v2` 之后，探针里那句
+    `node.name == "_clip_index"` 悄悄落空。旧实现返 `False`，闸门于是报「状态改错，或
+    代码被翻回去了」——而代码一步都没退，是判据自己断了。
+    """
+    alive = _probe_sandbox(tmp_path / "alive")
+    values, problems = _readings(alive)
+    assert values["clip_label_retreats"] == claims.PRESENT, problems
+
+    # 事实为假：切点不再回退，直接 `text[:limit]`
+    bare = _probe_sandbox(tmp_path / "bare", contracts=_ALIVE_CONTRACTS.replace(
+        '"".join(text[:_clip_index(text, limit)])', "text[:limit]"))
+    values, problems = _readings(bare)
+    assert values["clip_label_retreats"] == claims.ABSENT, problems
+    assert _about(problems, "clip_label_retreats") == [], "absent 不该报判据失效"
+
+    renamed = _probe_sandbox(
+        tmp_path / "renamed",
+        contracts=_ALIVE_CONTRACTS.replace("_clip_index", "_clip_index_v2"))
+    values, problems = _readings(renamed)
+    assert values["clip_label_retreats"] == claims.MISSING, values
+    text = _assert_missing_text(problems, "clip_label_retreats")
+    assert "`_clip_index`" in text, text
+
+
+def test_resolve_probe_distinguishes_missing_from_absent(tmp_path: Path) -> None:
+    """`resolve_has_route`：`graph_resolve.resolve_entities` 改名 → `missing`。
+
+    这条的原料是**被调方的定义**，不是 `router.py` 里的调用点：名字一变，调用点必然跟着
+    变（否则运行时 NameError），于是"找不到调用"这件事只可能来自判据失效。
+    """
+    alive = _probe_sandbox(tmp_path / "alive")
+    values, problems = _readings(alive)
+    assert values["resolve_has_route"] == claims.PRESENT, problems
+
+    # 事实为假：router 还在，但它不再走那条路由
+    dead_end = _probe_sandbox(
+        tmp_path / "dead", router="from app.knowledge import graph_resolve\n"
+                                  "def go():\n"
+                                  "    return None\n")
+    values, problems = _readings(dead_end)
+    assert values["resolve_has_route"] == claims.ABSENT, problems
+    assert _about(problems, "resolve_has_route") == []
+
+    renamed = _probe_sandbox(
+        tmp_path / "renamed",
+        router=_ALIVE_ROUTER.replace("resolve_entities", "resolve_entities_v2"),
+        resolver=_ALIVE_RESOLVER.replace("resolve_entities", "resolve_entities_v2"))
+    values, problems = _readings(renamed)
+    assert values["resolve_has_route"] == claims.MISSING, values
+    text = _assert_missing_text(problems, "resolve_has_route")
+    assert "`resolve_entities`" in text, text
+
+
+def test_node_origin_probe_distinguishes_missing_from_absent(tmp_path: Path) -> None:
+    """`node_origin_field`：`Node` **类**改名 → `missing`；字段被删 → `absent`。
+
+    这一对最容易被写混：`Node.origin` 不在有两种完全不同的原因——`Node` 还是那个 `Node`
+    而字段没写（事实为假），或者这段代码根本不是 `Node` 了（判据失效）。
+    """
+    alive = _probe_sandbox(tmp_path / "alive")
+    values, problems = _readings(alive)
+    assert values["node_origin_field"] == claims.PRESENT, problems
+
+    # 事实为假：`Node` 在，`origin` 字段被删（留 `pass` 保证这棵树还能解析）
+    no_field = _probe_sandbox(tmp_path / "nofield", contracts=_ALIVE_CONTRACTS.replace(
+        '    origin: str = "unknown"\n', "    pass\n"))
+    values, problems = _readings(no_field)
+    assert values["node_origin_field"] == claims.ABSENT, problems
+    assert _about(problems, "node_origin_field") == []
+
+    renamed = _probe_sandbox(tmp_path / "renamed",
+                             contracts=_ALIVE_CONTRACTS.replace("class Node:",
+                                                                "class NodeV2:"))
+    values, problems = _readings(renamed)
+    assert values["node_origin_field"] == claims.MISSING, values
+    text = _assert_missing_text(problems, "node_origin_field")
+    assert "`Node`" in text, text
+
+
+def test_every_probe_declares_its_raw_material() -> None:
+    """每条 probe 都要登记原料，且与注册表同名同数——漏一条就退回二值读数。"""
+    assert set(claims.PROBE_MATERIAL) == set(claims.BACKLOG_PROBE_DOC), (
+        sorted(set(claims.BACKLOG_PROBE_DOC) - set(claims.PROBE_MATERIAL)),
+        sorted(set(claims.PROBE_MATERIAL) - set(claims.BACKLOG_PROBE_DOC)))
+    for name, items in claims.PROBE_MATERIAL.items():
+        assert items, name
+        assert all("`" in item for item in items), (name, items)
+
+
+def test_no_probe_is_missing_on_this_checkout() -> None:
+    """本仓 HEAD 上**一条都不许是 missing**：那是判据失效，不是"没做"。
+
+    这条在 CI 上的独立价值：真有人改了一处符号名而没跟探针，这里会指名道姓地红，
+    而不是让闸门报一句"状态写错，或代码被翻回去了"。
+    """
+    missing = sorted(name for name, state in REAL.backlog_probes.items()
+                     if state == claims.MISSING)
+    assert missing == [], missing
+    assert not [item for item in REAL.problems if claims.MISSING_MARK in item], REAL.problems
+
+
 def test_the_cross_reference_probe_follows_the_wiring(tmp_path: Path) -> None:
     """台账第 9 条的探针读三件事，任何一件被翻回去都要红。
 
