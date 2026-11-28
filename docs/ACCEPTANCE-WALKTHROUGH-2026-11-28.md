@@ -172,8 +172,11 @@
 ## 六、复验：三件挡交付的已经修掉（同日夜间，HEAD `b7e765f` + 本轮改动）
 
 这一节是**修完之后**再跑一遍的结论。所有数字都是本机真浏览器 / 真后端量出来的，
-脚本在项目外的隔离目录（`playwright-core` 装在 `D:\_acc-work`，**没有进
-`frontend/package.json`**），材料仍是 `backend/scripts/acc_samples.json` 的 S08 / S01。
+材料仍是 `backend/scripts/acc_samples.json` 的 S08 / S01。这一轮的三个探针脚本已入库
+（`docs/acceptance-scripts/20-slow-upload.mjs` 三分支机制判据、
+`docs/acceptance-scripts/21-journey-viewport.mjs` 视口硬断言）；`playwright-core`
+**没有**进 `frontend/package.json`，跑法与同目录其余脚本一样——把目录复制到装了它的
+隔离目录再跑，`lib.mjs` 的 `EXE` 指向本机 Chromium。
 
 ### 6.1 ① 文件上传卡在「正在解析」
 
