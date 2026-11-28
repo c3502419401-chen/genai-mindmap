@@ -166,9 +166,8 @@
 
 ### 9. 跨支重复 label 17 处
 
-- **状态**：半做
+- **状态**：已做
 - **probe**：`cross_reference_wired`
-- **blocker_probe**：`cross_reference_quota_sampling_stale` —— 卡的不是"没做完"，是**「8 条够不够」还按旧代码量**：`backend/app/agent/tools.py` 的最后提交晚于 `docs/CROSS-BRANCH-DUPLICATES.md`（§八 那三次采样的记录），所以那批读数是旧规则下的。探针读的就是这两个提交时间的先后：真 = 卡点仍在，假 = 可以重判配额并结案（读到假时闸门只说"可以转已做"，不自动转）
 - **判据**：三条一起看，**都不再是"=0"**（理由见 `docs/CROSS-BRANCH-DUPLICATES.md` §五：
   17 处里 8 处 amber 删了会丢信息、3 处 grey 是误报）：
   1. **三档可复算**：`python scripts/measure_cross_branch_duplicates.py --triage` 出
@@ -177,15 +176,20 @@
      用例 `backend/tests/test_cross_branch_triage.py`（6 条）钉住三档与"同链不报、跨支仍报"。
   2. **每棵 red ≤1**：旧树 20 棵合计 red 6（全在 S02），重跑三次 S02 全为 **0**。
   3. **amber 有出口**：`agent/tools.py::CROSS_REFERENCE_RULES` 在**非 graph_mode 的结构
-     那一段**（system 末尾，紧挨输出形状）追加，上限 8 条；真实生成时 `relations` 非空。
-     现状：三次采样 `relations` 8/8/8（基线 0），但"一支写节点、另一支只写关系"**没有**
-     发生——8 条线的两端都还在（见 §八）。
+     那一段**（system 末尾，紧挨输出形状）追加，上限 `CROSS_REFERENCE_MAX = 10`；真实生成时
+     `relations` 非空。**这个上限是量出来的，不是"画布口径"**——S02 两臂各 5 次
+     （`scripts/measure_cross_reference_quota.py`）：上限 8 时模型 **5/5 次写满 8**、
+     `relation_drops.limited` 全 0；上限 16 时写 9（4/5 次）。所以 8 会截掉 1–2 条，改成 10
+     （实测上界 + 1 条余量；12 / 16 没有依据，从没有一次写到 11 以上）。改完 5 次读到
+     `declared` 8/8/9/10/10、`limited` 全 0。**"一支写节点、另一支只写关系"仍然没有发生**
+     ——那是模型行为的极限，不是配额，见 §十一。
   4. **缝有探针**：~~不另立近义判据~~ → **已落地**：`CROSS_BRANCH_UNLINKED`
      （`backend/app/optimization/service.py`）判"跨支同核（剥序号与数量后同一句话）却没有
      任何 `relations` 指认"。读数：r1/r2/r3 = **1 / 2 / 0**，而同一批 red = **0 / 0 / 0**
      ——探针在 red 归零之后还有话说。**不用相似度阈值**：2-gram Dice ≥0.5 在 28 棵树上
      假阳性 210 对 / 真命中 22 对。用例 `test_optimization_rules.py` 的 §3.5（6 条）。
-     判定与实测见 `docs/PROMPT-IMPERATIVES.md` §二、§九。
+     判定与实测见 `docs/PROMPT-IMPERATIVES.md` §二、§九。**"配额挤掉"这个解释已经否掉**：
+     那 2 处未指认发生时，树上那几条关系并没有把名额用在同核对上（§11.3）。
   5. **判据不分居**：~~逐字那档只在生成链路~~ → **已落地**：跨支逐字同名的判据只有
      一份（`backend/app/optimization/cross_branch.py::cross_branch_duplicates`），
      `agent/tools.py::_cross_branch_duplicates` 是同一个函数对象的 import 别名。
@@ -194,12 +198,17 @@
      `backend/tests/test_optimization_rules.py::test_verbatim_cross_branch_names_are_visible_from_check`
      （点「检查与建议」现在报得出来；S02 一次 18 个节点 / 9 个说法）。
      哪些生成侧判据该搬、哪些不该，见 `docs/DIAGNOSTIC-TWO-SIDES.md`。
-- **触发条件**：第 3 条要么由一条更硬的措辞补上（本轮把"另一支不写节点"改成"先比对你自己
-  写的两个标题：去掉序号与数量后同一句话就并成一处"），要么承认"用关系标注同义"就是这条
-  路的极限；**`CROSS_REFERENCE_MAX = 8` 要不要动**，等"8 条够不够"的 3 次采样——r2 的 2 处
-  未指认是配额挤掉的，成因见 §九.4
+- **触发条件**：从"等 3 次采样"改成了**"顶满可见 + 差额驱动"**。生成侧现在有一条
+  `CROSS_REFERENCE_AT_LIMIT`（`info`）：收下的关系数正好等于这一次的上限时报"可能还有该
+  指认的没写进来"——事后判不了这件事（树上没有"这一次的上限是 8 还是 30"），所以它只能
+  在生成那一刻报。**下一次调上限的触发**：`scripts/measure_cross_reference_quota.py` 某次
+  读到 `relation_drops.limited > 0`（真的被截了），按 `limited` 的最大值再调一次，并把
+  `docs/CROSS-BRANCH-DUPLICATES.md` §11.3 那行"采样时的上限：N"改成新数——**两个数对不上
+  时 `cross_reference_quota_sampling_stale` 会读到真**，闸门会说"采样按旧数字量的"。那条
+  探针现在没有条目引用它，留着就是给这一次调整用的（判据从提交时间换成了两个数字比大小，
+  理由见 §11.5）。
 - **出处**：`docs/CROSS-BRANCH-DUPLICATES.md` §4.3（落地与核查四问+第五问）、§5.3（四条）、
-  §八（三次采样）
+  §八（三次采样）、§十一（上限该是多少：两臂采样 + 与 30 的差别 + 判据换成内容型）
 
 ### 10. `docs/` 的分级（哪份是入口、哪份是存档、哪份只给 AI 看）
 
