@@ -644,6 +644,89 @@ describe('粘贴正文：长正文直接进材料', () => {
   });
 });
 
+/**
+ * 「主题可以不写」那句话的两半（验收记录 §四.1 / 手册第 3 步）。
+ *
+ * 后端 `AgentRunRequest.goal` 是 `min_length=1`：空主题会被 422 拒掉，所以按钮不能
+ * 放行。**能让的那一半只有一种情形**——材料带一个能当标题的文件名，前端拿它兜底
+ * 拼出 goal。粘贴进来的正文没有文件名，兜底不存在，于是"不写也行"这一支走不通。
+ *
+ * 判据是"用户看到灰按钮时知道差什么"，所以这里断的是提示文案与悬停提示，不是样式。
+ */
+describe('主题空着时，界面要说清差什么才能点', () => {
+  function paste(el: Element, text: string): Event {
+    const event = new Event('paste', { bubbles: true, cancelable: true });
+    Object.defineProperty(event, 'clipboardData', { value: { getData: () => text } });
+    el.dispatchEvent(event);
+    return event;
+  }
+
+  it('粘的正文没有标题：按钮灰着，提示说「写一句主题才能生成」', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    const body = '一段要整理的材料正文'.repeat(20);
+
+    paste(wrapper.get('textarea#intent').element, body);
+    await wrapper.vm.$nextTick();
+
+    const submit = wrapper.findAll('button')
+      .find(button => (button.attributes('aria-label') || '') === '生成导图');
+    expect(submit).toBeTruthy();
+    expect(submit!.attributes('disabled')).toBeDefined();
+
+    const hint = wrapper.get('[data-test="intent-hint"]');
+    // 这句是修复前那句反话："不写就用材料标题当中心主题"——照它做，按钮点不下去。
+    expect(hint.text()).not.toContain('不写就用材料标题');
+    expect(hint.text()).toContain('没有标题');
+    expect(hint.text()).toContain('写一句主题');
+    // 灰按钮时提示用警示色，否则 11px 的浅灰读起来像页脚说明。
+    expect(hint.classes()).toContain('text-amber-700');
+    // 悬停同样给原因，不再是重复一遍按钮名。
+    expect(submit!.attributes('title')).toContain('写一句主题');
+  });
+
+  it('写一句主题之后按钮就可用，提示回到"这次会做什么"', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    paste(wrapper.get('textarea#intent').element, '一段要整理的材料正文'.repeat(20));
+    await wrapper.vm.$nextTick();
+
+    await wrapper.get('textarea#intent').setValue('课程大纲');
+    await wrapper.vm.$nextTick();
+
+    const submit = wrapper.findAll('button')
+      .find(button => (button.attributes('aria-label') || '') === '生成导图');
+    expect(submit!.attributes('disabled')).toBeUndefined();
+    expect(wrapper.get('[data-test="intent-hint"]').classes()).not.toContain('text-amber-700');
+  });
+
+  it('材料带可用文件名时确实可以不写主题（这一半照旧成立）', async () => {
+    stubFetch();
+    const wrapper = mountApp();
+    const sources = useSourcesStore();
+    sources.addText('说明');
+    // 文件名就是标题的载体：`materialTitle` 拿它兜底，goal 拼成
+    // "用材料标题「课程大纲」当主题…"，于是空主题也能提交。
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        source: {
+          ...textSource('第一章 绪论'), id: 'doc-1', kind: 'document',
+          filename: '课程大纲.md', status: 'parsed',
+        },
+      }),
+    }));
+    await sources.addFiles([new File(['第一章 绪论'], '课程大纲.md', { type: 'text/markdown' })]);
+    await wrapper.vm.$nextTick();
+
+    const submit = wrapper.findAll('button')
+      .find(button => (button.attributes('aria-label') || '') === '生成导图');
+    expect(submit!.attributes('disabled')).toBeUndefined();
+    expect(wrapper.get('[data-test="intent-hint"]').text()).toContain('课程大纲');
+  });
+});
+
 describe('材料没解析完时，改图也不能提交', () => {
   it('编辑已有图 + 材料解析中：提交按钮禁用，提示说的是材料', async () => {
     stubFetch();

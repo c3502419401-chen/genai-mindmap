@@ -240,7 +240,14 @@ const intentHint = computed(() => {
   if (sources.recording) return '正在录音：先松开「按住说话」，再提交。';
   if (materialProblem.value) return materialProblem.value;
   if (pastedMaterial.value && !typed.value) {
-    return '正文已经当材料了：写一句要它怎么整理，不写就用材料标题当中心主题。';
+    // **粘贴进来的正文没有文件名**，`materialTitle` 从它身上抽不出主题，所以
+    // 「不写主题」这条路在这一支上走不通——后端 `AgentRunRequest.goal` 是
+    // `min_length=1`，空 goal 会在开流之前被 422 拒掉。
+    //
+    // 原先这句写的是"不写就用材料标题当中心主题"，与它下面那个灰按钮正好相反：
+    // 用户照着做，点不下去（验收记录 §四.1 的现场）。同样是"没写主题"，传文件的
+    // 那一支（下面那句「没写主题：用材料标题「…」当中心主题」）才是真的可以不写。
+    return '正文已经当材料了，但它没有标题：写一句主题才能生成（比如「会议纪要」）。';
   }
   if (intentState.value === 'create') {
     if (typed.value) {
@@ -266,7 +273,23 @@ const intentHint = computed(() => {
     : `优先改这 ${selectionCount.value} 个节点及其子分支；别处要动也能动，清单里会标出来。`;
 });
 
-const intentHintWarn = computed(() => !!materialProblem.value);
+/**
+ * 悬停提示：**能用就说这次会做什么，不能用就说差什么才能点。**
+ *
+ * 曾经这里只有按钮名（`:title="intentButton"`），于是灰按钮悬停得到的还是"生成导图"
+ * ——同一个词，什么也没解释。验收记录 §四.1 的现场就是它：材料已就绪、主题空，
+ * 按钮灰着，用户找不出缺哪一样（手册还写着"主题可以不写"）。
+ */
+const submitTitle = computed(() => (canSubmit.value ? intentButton.value : intentHint.value));
+
+/**
+ * 提示行该不该用警示色。
+ *
+ * 原来是"只有材料那道闸门算警示"。可是**主题/材料标题不够**同样让按钮灰着——那时
+ * 提示行用的是 `text-slate-400`，11px、灰色，读起来像页脚说明，用户不会把"按钮灰了"
+ * 与它联系起来。
+ */
+const intentHintWarn = computed(() => !!materialProblem.value || (!canSubmit.value && !runBlocked.value));
 
 /** 状态行只在"有一件事要讲"时出现。 */
 const showStatus = computed(() => store.status !== INITIAL_STATUS);
@@ -1307,7 +1330,7 @@ defineExpose({
               class="order-last flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-slate-900 text-white before:content-['↑'] disabled:opacity-30"
               :disabled="!canSubmit"
               :aria-label="intentButton"
-              :title="intentButton"
+              :title="submitTitle"
               @click="submitIntent"
             >
               <!-- 箭头用 CSS 伪元素画：`text()` 里只剩按钮语义（"生成导图 / 改这张图"），
