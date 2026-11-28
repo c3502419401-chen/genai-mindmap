@@ -783,6 +783,9 @@ BACKLOG_PROBE_DOC: dict[str, str] = {
         "`OUTLINE_FEW_BLOCKS_NOTE` 与薄材料探针脚本都在",
     "doc_drift_guard":
         "D 族（会漂的数）真的被 `--gate` 跑：`_drift_rules` 在，且 `main()` 拼进了 rules",
+    "doc_map_gate":
+        "`scripts/check_doc_map.py` 的闸门真的在判：有 `--gate` 开关，`main()` 调了 "
+        "`check()`，且 `check()` 里接上了 `reachable()`（入口两跳可达）",
     "cross_reference_wired":
         "`CROSS_REFERENCE_RULES` 在，`_generate` 里它与 `GRAPH_RELATION_RULES` 是 "
         "if/else 互斥，且收 `relations` 那一支不再只属于 `graph_mode`",
@@ -861,6 +864,44 @@ def _mentions(nodes: list[ast.AST], name: str) -> bool:
                 return True
             if isinstance(item, ast.Attribute) and item.attr == name:
                 return True
+    return False
+
+
+def _doc_map_gate_wired(script: Path) -> bool:
+    """分级闸门真的在判吗：有 `--gate` 开关，`main()` 调了 `check()`，`check()` 里接了
+    `reachable()`（"入口两跳可达"那一条）。
+
+    与 `_drift_guard_wired` 同一条要求——台账第 10 条的判据是"分级建成"，而建成之后最可能
+    的失败形态不是"脚本没了"（那会被 `check_script_hygiene.py` 的 C 档抓到），是**脚本在、
+    判据没接上**：`--write` 照样能跑，`--gate` 什么都不判，于是本地与 CI 全绿，而那份清单
+    悄悄退化成一张没人校验的手写目录——正是这条账目当初想消灭的东西。
+    """
+    try:
+        tree = _parse(script)
+    except (OSError, SyntaxError):
+        return False
+    has_gate = False
+    calls_check = False
+    for node in tree.body:
+        if not (isinstance(node, ast.FunctionDef) and node.name == "main"):
+            continue
+        for inner in ast.walk(node):
+            if not isinstance(inner, ast.Call):
+                continue
+            func = inner.func
+            name = func.id if isinstance(func, ast.Name) else (
+                func.attr if isinstance(func, ast.Attribute) else None)
+            if name == "check":
+                calls_check = True
+            elif name == "add_argument" and inner.args \
+                    and isinstance(inner.args[0], ast.Constant) \
+                    and inner.args[0].value == "--gate":
+                has_gate = True
+    if not (has_gate and calls_check):
+        return False
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "check":
+            return _mentions([node], "reachable")
     return False
 
 
@@ -991,6 +1032,8 @@ def probe_backlog_facts(app_dir: Path | None = None,
         values["unwired_no_todo"] = not todo
 
     values["doc_drift_guard"] = _drift_guard_wired(script or Path(__file__).resolve())
+    values["doc_map_gate"] = _doc_map_gate_wired(
+        (scripts_dir or (BACKEND_DIR / "scripts")) / "check_doc_map.py")
 
     for name in BACKLOG_PROBE_DOC:
         if name not in values:

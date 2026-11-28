@@ -497,10 +497,39 @@ def test_a_missing_anchor_is_reported_as_lost_evidence_not_as_undone() -> None:
 
 
 def test_a_todo_entry_may_point_at_a_gate_that_does_not_exist_yet() -> None:
-    """「待做」的判据是"它做完了会长什么样"，所以锚可以先不在——但「已做」不行。"""
-    assert "scripts/check_doc_map.py" in _backlog_text()
-    todo = [entry for entry in (REAL.backlog or ()) if entry.number == 10]
-    assert todo and todo[0].status == claims.STATUS_TODO
+    """「待做」的判据是"它做完了会长什么样"，所以锚可以先不在——但「已做」不行。
+
+    这条原来挂在真台账第 10 条身上（那时它写着待做、判据指向还不存在的
+    `scripts/check_doc_map.py`）。**那条账目 2026-11-28 做完了**，闸门也建起来了；
+    再把用例挂在它身上，这条例子的存亡就跟着那条账目走。所以改成合成台账：
+    「待做可以指向未来」是规矩，不该依赖真实仓库里恰好留着一个指向未来的条目。
+    """
+    text = _backlog_text()
+    made = text.replace(
+        "- **状态**：已做\n- **probe**：`doc_map_gate`",
+        "- **状态**：待做\n- **probe**：`none`", 1)
+    made = made.replace("`python scripts/check_doc_map.py --gate`",
+                        "`python scripts/check_doc_map_not_built_yet.py --gate`", 1)
+    assert made != text, "第 10 条的字段形态变了，先改用例"
+    entries, _ = claims.parse_backlog(made)
+    facts = copy.deepcopy(REAL)
+    facts.backlog = tuple(entries)
+    # 锚不存在也不算红——但必须**可见**，否则"待做 + 一个永远不会出现的锚"就成了没人管的一格。
+    assert claims.check_backlog(facts) == []
+    assert any("第 10 条" in item for item in claims.pending_anchors(facts))
+
+
+def test_the_doc_map_entry_is_settled_and_its_gate_has_a_reading() -> None:
+    """第 10 条做完了，而"做完了"必须有机器判据：`doc_map_gate` 读到真。
+
+    探针读的不是"脚本文件在不在"（那是 `check_script_hygiene.py` 的 C 档），是**它有没有
+    真的在判**：有 `--gate`、`main()` 调了 `check()`、`check()` 里接了 `reachable()`。
+    """
+    entry = next((item for item in (REAL.backlog or ()) if item.number == 10), None)
+    assert entry is not None
+    assert entry.status == claims.STATUS_DONE
+    assert entry.probe == "doc_map_gate"
+    assert REAL.backlog_probes.get("doc_map_gate") is True
     assert claims.check_backlog(REAL) == []
 
 

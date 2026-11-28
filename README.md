@@ -328,6 +328,8 @@ frontend/src/
 
 `docs/` 下分八组（份数会随提交变，现算：`git ls-files '*.md' | wc -l`）。**只想知道"现在是什么状态"读前三份就够了**：`PROJECT-STATUS.md` → `FLOW.md` → `FEATURES_AND_OWNERS.md`。
 
+**每一份各属于哪一档（`entry` 入口 / `reference` 按需查 / `archive` 存档 / `ai-only` 只给 AI）在 [docs/INDEX.md](docs/INDEX.md)**：第三节是全量登记，由 `backend/scripts/check_doc_map.py --write` 从 `git ls-files '*.md'` 现算生成、`--gate` 钉着"一份不漏、没有死链、`entry` 两跳可达"。下面这张表是**推荐路径**（人去读的顺序），不是清单——清单在那边，所以这张表漏了什么不会变成烂账。
+
 | 组 | 先读这些 | 讲什么 |
 |---|---|---|
 | **入门 / 现状** | `PROJECT-STATUS.md`、`FLOW.md`、`ARCHITECTURE.md`、`ARCHITECTURE_ADDENDUM.md`、`API.md`、`CONTRACT_V2.md` | 现状总览、端到端流程 ← 第一份该读的、模块边界与选型、接口逐条实现到哪、契约 v2 |
@@ -351,5 +353,6 @@ frontend/src/
 - 申报书原文（项目简介、研究内容、国内外研究现状、创新点、拟解决的关键问题、预期成果）与"技术路线"那一节的原文摘录，见 [docs/PROPOSAL.md](docs/PROPOSAL.md)；本文件写的是**实现侧的现状**。
 - 申报书原文写作 `pluml-encode`，这里按 npm 实际包名写作 `plantuml-encoder`（另有 `plantuml-encode` 存在，是不同包）。
 - 用户视角的操作说明见 [docs/USER-GUIDE.md](docs/USER-GUIDE.md)（从装好到做出一张有用的图）；组员上手与分工见 [TEAM-GUIDE.md](TEAM-GUIDE.md)；仓库根目录的 [START_HERE.md](START_HERE.md) 是状态与易错点清单。
+- **"某一件事该看哪份文档"的答案是 [docs/INDEX.md](docs/INDEX.md)**（人读前两节：从哪儿开始、按问题查；第三节是全量登记，由 `backend/scripts/check_doc_map.py --write` 生成、`--gate` 钉着）。
 - 2026-11-02 的排期评估快照 [NEXT-PLAN.md](docs/archive/NEXT-PLAN.md) 已从仓库根目录移入 `docs/archive/`——它整篇过期，而根目录是最强的入口位，读者会先看到它、然后读到过期的话；替代物是 [PROJECT-STATUS.md](docs/PROJECT-STATUS.md)。
 - 协作规则：`main` 是生产分支（线上跑的就是它）、`dev` 是集成分支、PR 目标一律 `dev`；提交信息用中文 Conventional Commits；CI 必须绿才能合并。改 `backend/app/contracts/` 必须两人同时知道。
