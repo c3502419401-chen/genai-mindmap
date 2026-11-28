@@ -49,12 +49,16 @@ def test_same_parent_duplicate_is_not_a_cross_branch_finding():
 
 
 def test_parent_and_child_with_the_same_label_is_a_level_problem():
-    """父子同名（同一条祖先链）：`_cross_branch_duplicates` 实际会报它，但它不是跨支。
+    """父子同名（同一条祖先链）：不是跨支，`_cross_branch_duplicates` 也不该报它。
 
-    这是实测踩到的：S07 的「力矩与转动定律」既是一级分支下的条目、又自己带子节点，
-    而 `_cross_branch_duplicates` 的注释说"同一条祖先链上的两处不算跨支"、实现只比
-    **直接父**是否相同——于是它被算了进去。这里的档位定在 grey（该由层级规则管）。
+    这是实测踩到的：S07 的「力矩与转动定律」既是一级分支下的条目、又自己带子节点。
+    这条判据的 docstring 一直写着"同一条祖先链上的两处不算跨支"，而实现只比**直接
+    父元组**——父子同名的两条链是前缀关系、父元组却不同（`()` 与 `(父,)`），于是被
+    算成跨支。这一段是**双向**的：档位（grey）与跨支判据（不报）必须同时成立，
+    否则"跨支重复 17 处"这个数里会一直躺着一处层级问题。
     """
+    from app.agent.tools import _cross_branch_duplicates
+
     content = MindMapContent.model_validate({"title": "t", "root": _node("root", "主题", children=[
         _node("b1", "课程内容与模块", children=[
             _node("p", "力矩与转动定律", "力矩与转动定律把力矩与角加速度联系起来。", children=[
@@ -64,6 +68,23 @@ def test_parent_and_child_with_the_same_label_is_a_level_problem():
         _node("b2", "教学安排", children=[_node("r", "学时", "共 64 学时。")]),
     ])})
     assert _bands(content)["力矩与转动定律"] == "grey"
+    # 修好之后：跨支判据不再把它算进来（旧树实测 34 → 32 个节点就是这么来的）
+    assert _cross_branch_duplicates(content.root) == []
+
+
+def test_two_branches_with_the_same_label_are_still_reported_by_the_cross_branch_check():
+    """反方向：两支下同名仍是跨支——修链判据不能顺手把真重复也放过。"""
+    from app.agent.tools import _cross_branch_duplicates
+
+    content = MindMapContent.model_validate({"title": "t", "root": _node("root", "主题", children=[
+        _node("b1", "课程内容与模块", children=[
+            _node("p", "力矩与转动定律", "一处说明。")]),
+        _node("b2", "教学安排", children=[
+            _node("q", "力矩与转动定律", "另一处说明。")]),
+    ])})
+    found = _cross_branch_duplicates(content.root)
+    assert [label for label, _ in found] == ["力矩与转动定律"]
+    assert found[0][1] == ["教学安排", "课程内容与模块"]
 
 
 def test_the_same_field_of_two_candidates_is_not_a_duplicate():
