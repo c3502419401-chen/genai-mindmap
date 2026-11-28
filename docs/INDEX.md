@@ -71,6 +71,7 @@
 | reference | `docs/ACCEPTANCE-EVIDENCE.md` | 未验收项的实跑证据（甲/乙/丙三组） | — |
 | reference | `docs/ACCEPTANCE-METRICS.md` | 三条量化指标的实测：口径、样本、分数、与计划书的差距 | — |
 | reference | `docs/ACCEPTANCE-REPORT.md` | 三条量化指标验收报告（定稿） | — |
+| reference | `docs/ACCEPTANCE-WALKTHROUGH-2026-11-28.md` | 成品验收：用真浏览器从头走一遍（2026-11-28） | — |
 | reference | `docs/AGENT-DEMO.md` | 开启 agent 与现场演示指南 | — |
 | reference | `docs/AGENT_PLAN.md` | Agent 化改造实施计划 | — |
 | reference | `docs/AGENT_STREAM_PROTOCOL.md` | agent 生成流的节点级事件 | — |
@@ -163,6 +164,7 @@
 | reference | `docs/TEST-LOAD-SENSITIVITY.md` | 负载敏感用例的系统性治理：实测表、可算判据、以及该改的是验证口径 | — |
 | reference | `docs/THIN-MATERIAL-BRANCHES.md` | 薄材料上骨架只给两条：现在怎么处置、复跑到了什么 | — |
 | reference | `docs/TWO-ARCH-COMPARISON.md` | 同条件对比：整树一次生成 vs 逐支分片 | — |
+| reference | `docs/USER-GUIDE-DELTA-2026-11-28.md` | 用户手册 × 实际界面：差异清单（2026-11-28） | — |
 | entry | `docs/USER-GUIDE.md` | 用户手册：从装好到做出一张有用的图 | — |
 | reference | `docs/USER-PATH-TESTS.md` | 用户路径测试：让"用户走不到"开始有红灯形态 | — |
 | reference | `docs/VIEW-COLLAPSE.md` | 视图层收起：数据完整，这一屏只画得下这么多 | — |
