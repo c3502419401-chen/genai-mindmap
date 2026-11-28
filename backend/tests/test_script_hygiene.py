@@ -76,6 +76,87 @@ def test_load_check_only_watches_probe_scripts(
     assert report.stats["load_checked"] == 0
 
 
+# ------------------------------------------------- load 必须在干净 checkout 上取结论
+
+
+def test_load_runs_in_the_clean_tree_not_the_working_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """工作树里有 `data/`、干净树里没有——同一份脚本两侧结论必须不同。
+
+    这就是这条闸在 2026-11 连红五次的那个形态：`_two_arch_*.py` 六个脚本在模块顶层
+    读 `backend/data/two_arch.json`，本地磁盘上有那个文件（`.gitignore` 不删本地文件），
+    CI 的干净 checkout 上没有。判据取错树 → 本地五次全绿、CI 五次全红。
+    """
+    _fake_repo(tmp_path, monkeypatch)
+    body = (
+        "import json\n"
+        "from pathlib import Path\n"
+        "D = Path(__file__).resolve().parents[1] / 'data'\n"
+        "json.loads((D / 'x.json').read_text(encoding='utf-8'))\n"
+    )
+    dirty = tmp_path / "backend" / "scripts" / "_reads_data.py"
+    dirty.write_text(body, encoding="utf-8")
+    (tmp_path / "backend" / "data").mkdir()
+    (tmp_path / "backend" / "data" / "x.json").write_text("{}", encoding="utf-8")
+
+    # 干净树：同一份脚本，但没有 `data/`。
+    clean = tmp_path / "clean"
+    (clean / "backend" / "scripts").mkdir(parents=True)
+    shutil.copyfile(dirty, clean / "backend" / "scripts" / "_reads_data.py")
+    monkeypatch.setattr(hygiene, "_materialize_clean_tree", lambda: clean)
+
+    report = hygiene.Report()
+    hygiene.check_load(report)
+    found = report.of("load")
+    assert len(found) == 1, "干净树上没有 data/，这个脚本必须加载失败"
+    assert found[0].where == "scripts/_reads_data.py"
+    # 临时目录的绝对路径要换成这句，否则同一条红每次长得都不一样。
+    assert "<干净 checkout>/backend" in found[0].why
+    assert str(clean) not in found[0].why
+
+
+def test_gate_refuses_to_pass_when_it_cannot_get_a_clean_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`--gate` 拿不到干净树时报红，而不是退回工作树判绿。
+
+    退回工作树就是又一个"本地绿"：它会在有 `data/` 的树上说"全部通过"。宁可红在
+    本地一个人手上，也不要红在 CI 上五次。
+    """
+    _fake_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(hygiene, "_materialize_clean_tree", lambda: None)
+    report = hygiene.Report(require_clean=True)
+    hygiene.check_load(report)
+    found = report.of("load")
+    assert len(found) == 1
+    assert found[0].where == "干净 checkout"
+    assert report.stats["load_in_clean_tree"] == 0
+
+
+def test_untracked_probe_scripts_still_get_checked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """还没 `git add` 的新脚本也要进干净树被加载一次。
+
+    只物化 `git ls-files` 会漏掉"刚写完、还没提交"的那一类——而那正是最容易带上
+    `data/` 依赖的脚本。检查对象取工作树的全集，运行环境取干净树。
+    """
+    _fake_repo(tmp_path, monkeypatch)
+    scripts = tmp_path / "backend" / "scripts"
+    (scripts / "_tracked.py").write_text("x = 1\n", encoding="utf-8")
+    (scripts / "_brand_new.py").write_text("y = 2\n", encoding="utf-8")
+    monkeypatch.setattr(hygiene, "_git", lambda *args: "backend/scripts/_tracked.py\x00")
+
+    clean = hygiene._materialize_clean_tree()
+    assert clean is not None
+    try:
+        assert (clean / "backend" / "scripts" / "_tracked.py").is_file()
+        assert (clean / "backend" / "scripts" / "_brand_new.py").is_file()
+    finally:
+        shutil.rmtree(clean, ignore_errors=True)
+
+
 def test_import_check_catches_a_symbol_that_moved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

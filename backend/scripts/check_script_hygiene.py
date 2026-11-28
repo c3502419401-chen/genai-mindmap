@@ -89,8 +89,10 @@ import ast
 import importlib
 import importlib.util
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -161,6 +163,9 @@ class Problem:
 class Report:
     problems: list[Problem] = field(default_factory=list)
     stats: dict[str, int] = field(default_factory=dict)
+    #: `--gate` 时置真：`load` 档必须在**干净 checkout** 上取结论，拿不到干净树就报红。
+    #: 不加这个开关的话，单元测试里那些 `tmp_path` 假仓库（没有 git）会被连坐判红。
+    require_clean: bool = False
 
     def add(self, check: str, where: str, why: str) -> None:
         self.problems.append(Problem(check, where, why))
@@ -172,13 +177,16 @@ class Report:
 # --------------------------------------------------------------------------- A
 
 
-def probe_scripts() -> list[Path]:
+def probe_scripts(scripts_dir: Path | None = None) -> list[Path]:
     """探针脚本：文件名以 `_` 或 `probe_` 开头。
 
     `__init__.py` 也以 `_` 开头，但它不是探针脚本，排除掉。
+
+    `scripts_dir` 缺省是主工作树的 `scripts/`；`load` 档会传**干净树**的那一份，
+    因为 CI 上被检查的就是那一份。
     """
     out = []
-    for path in sorted(SCRIPTS.rglob("*.py")):
+    for path in sorted((scripts_dir or SCRIPTS).rglob("*.py")):
         if path.name == "__init__.py":
             continue
         if path.name.startswith("_") or path.name.startswith("probe_"):
@@ -186,27 +194,117 @@ def probe_scripts() -> list[Path]:
     return out
 
 
-def check_load(report: Report) -> None:
-    paths = probe_scripts()
-    report.stats["load_checked"] = len(paths)
-    for path in paths:
-        rel = path.relative_to(BACKEND_DIR).as_posix()
-        try:
-            done = subprocess.run(
-                [sys.executable, "-c", _LOAD_CODE, str(path)],
-                cwd=str(BACKEND_DIR),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=LOAD_TIMEOUT_SECONDS,
-            )
-        except subprocess.TimeoutExpired:
-            report.add("load", rel, f"加载超过 {LOAD_TIMEOUT_SECONDS}s 未结束（顶层在等网络/输入？）")
+def _materialize_clean_tree() -> Path | None:
+    """把 `git ls-files` 里的文件复制到临时目录，返回那个「干净 checkout」的根。
+
+    ## 为什么 `load` 必须在这棵树上跑
+
+    这道闸要回答的问题是**「CI 上能不能加载」**，而 CI 是干净 checkout。在开发树上
+    取结论时，`.gitignore` 覆盖的东西（`backend/data/`、`backend/uploads/`、
+    `backend/.env`）**磁盘上有、git 里没有**，脚本顶层读它们就得到"本地绿、干净
+    checkout 红"。
+
+    这个仓库已经因此连红五次（`7ac8400 / f8bbc0a / b540fd8 / 00a623b / 157f0b5`：
+    `backend/scripts/_two_arch_*.py` 六个脚本在模块顶层 `read_text()` 一个
+    `data/two_arch.json`，干净 checkout 上那个文件不存在）。五次都不是代码难改，
+    是**判据取错了树**。
+
+    修法有几种，都不成立：
+
+    - 让人"记得先建干净 worktree 再跑闸门"——已经证明"记得"在这个仓库不管用；
+    - 在 CI 之前再加一步自查——那是拿 CI 去验 CI，本地仍然什么都发现不了；
+    - 让人给每个脚本"声明依赖了哪个被忽略目录"——**声明会漏**，而漏掉的那一条
+      正是下一次的红。
+
+    这里用的形态不需要任何人声明任何东西：闸门自己物化一棵干净树，`load` 只认
+    那棵树上的结论。于是"本地绿"与"CI 绿"不再是两个需要对齐的判断，而是同一件事。
+
+    拿不到 git 索引（从 tarball 解出来的副本、`tmp_path` 假仓库）时返回 `None`，
+    由 `check_load` 决定是退回主树（非 gate）还是报红（gate）。
+    """
+    tracked = [name for name in _git("ls-files", "-z").split("\x00") if name]
+    if not tracked:
+        return None
+    root = Path(tempfile.mkdtemp(prefix="hygiene-clean-"))
+    for rel in tracked:
+        src = REPO_DIR / rel
+        if not src.is_file():
+            # 索引里有、工作树里没有（未暂存的删除）。干净 checkout 上它是在的，
+            # 但这里拿不到内容；跳过它，`load_in_clean_tree` 之外另有统计把这件事说出来。
             continue
-        if done.returncode != 0:
-            tail = (done.stderr or "").strip().splitlines()
-            report.add("load", rel, tail[-1] if tail else f"退出码 {done.returncode}")
+        dst = root / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst)
+    _copy_untracked_scripts(root, tracked)
+    return root
+
+
+def _copy_untracked_scripts(clean_root: Path, tracked: list[str]) -> None:
+    """把主工作树里**还没进 git** 的脚本也放进干净树。
+
+    物化树只该有 git 里的东西，但那样会漏掉一类最该被抓的脚本：刚写完、还没
+    `git add` 的探针。它在干净树里不存在，于是 `load` 根本不检查它——等它被提交、
+    等 CI 跑起来才红，那就又回到"红在 CI"。所以检查对象取主树的全集，运行环境
+    取干净树：新脚本照样在有 `data/` 之外的**没有** `data/` 的环境里被加载一次。
+    """
+    tracked_scripts = {name for name in tracked if name.startswith("backend/scripts/")}
+    src_scripts = BACKEND_DIR / "scripts"
+    if not src_scripts.is_dir():
+        return
+    for path in sorted(src_scripts.rglob("*.py")):
+        rel = path.relative_to(REPO_DIR).as_posix()
+        if rel in tracked_scripts:
+            continue
+        dst = clean_root / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, dst)
+
+
+def check_load(report: Report) -> None:
+    clean = _materialize_clean_tree()
+    report.stats["load_in_clean_tree"] = 0 if clean is None else 1
+    if clean is None and report.require_clean:
+        report.add(
+            "load", "干净 checkout",
+            "拿不到 git 索引（`git ls-files` 为空），无法在干净 checkout 上取 load 结论。"
+            "这道闸的每一次红都是「本地绿、CI 红」，所以它只认干净树上的结论——"
+            "取不到干净树时宁可红，也不要拿一份可能有 `data/` 的树去判绿。",
+        )
+        return
+    try:
+        scanned = (clean / "backend") if clean is not None else BACKEND_DIR
+        paths = probe_scripts(scanned / "scripts")
+        report.stats["load_checked"] = len(paths)
+        for path in paths:
+            rel = path.relative_to(scanned).as_posix()
+            try:
+                done = subprocess.run(
+                    [sys.executable, "-c", _LOAD_CODE, str(path)],
+                    cwd=str(scanned),
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=LOAD_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired:
+                report.add("load", rel, f"加载超过 {LOAD_TIMEOUT_SECONDS}s 未结束（顶层在等网络/输入？）")
+                continue
+            if done.returncode != 0:
+                tail = (done.stderr or "").strip().splitlines()
+                why = tail[-1] if tail else f"退出码 {done.returncode}"
+                # 临时目录的绝对路径对读的人没有信息量，而且每次都不一样（会让同一条
+                # 红看起来像新的）。换成读者真正需要知道的那个事实。三种形态都要换：
+                # traceback 里的 `Path` 是原样单反斜杠，而 `repr()` 出来的字符串是双反斜杠。
+                if clean is not None:
+                    for variant in (str(scanned).replace("\\", "\\\\"),
+                                    str(scanned),
+                                    scanned.as_posix()):
+                        why = why.replace(variant, "<干净 checkout>/backend")
+                report.add("load", rel, why)
+    finally:
+        if clean is not None:
+            shutil.rmtree(clean, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------- B
@@ -472,6 +570,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     report = Report()
+    # `--gate` 只认干净 checkout 上的结论，见 `_materialize_clean_tree` 的长注释。
+    # 非 gate（人想看一眼）时允许在当前树上跑，但下面会把"跑在哪"打出来。
+    report.require_clean = args.gate
     for name in selected:
         CHECKS[name](report)
 
@@ -483,6 +584,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"    {problem.where}  ← {problem.why}")
 
     print()
+    if "load" in selected:
+        where = ("干净 checkout（`git ls-files` 物化到临时目录）"
+                 if report.stats.get("load_in_clean_tree")
+                 else "**当前工作树**——它可能有 `data/` 之类被忽略的目录，结论偏乐观")
+        print(f"load 档跑在：{where}")
     print("检查量：" + "、".join(f"{k}={v}" for k, v in sorted(report.stats.items())))
     if not report.problems:
         print("全部通过。")
