@@ -90,6 +90,25 @@ jobs:
       - name: 文档断言与代码一致
         run: python scripts/check_doc_claims.py --gate
 
+      # 「哪份文档该看、哪份已经过期」这一类。上面那道闸判的是"文档说的与代码做的是不是
+      # 同一件事"，它判不了"读者会不会先读到一份过期的文档"——而本轮撞的就是这个：
+      # 一分钟之内三次在几十份文档里翻原始判断，而两份本该当前门的入口（根目录的
+      # `NEXT-PLAN.md`、`docs/TODO.md`）都过期了。
+      #
+      # 判据是 `docs/INDEX.md` 第三节那张登记表，八条写在 `scripts/check_doc_map.py`
+      # 的 docstring 里：一份不漏、没有死链、`entry` 从 `README.md` 出发两跳可达、
+      # `archive` 必须写清替代物、登记段与 `--write` 的现算结果逐字节一致。
+      #
+      # 为什么它是确定性的：判据是 `git ls-files '*.md'` 的清单、每份文件的首行标题、
+      # `README.md` 与 `INDEX.md` 里的链接文本；不读运行时、不读数据库、不发请求。
+      # `git log` 只在打印归档日期时调用，不参与判据（日期是会漂的数，写进文件就等于
+      # 给自己排一个每轮手抄一遍的活，见 `docs/BACKLOG.md` 第 12 条）。
+      #
+      # 放在「文档断言」之后：两条都是静态文档判据，且这一条的失败信息比 pytest 的贴题
+      # （它直接说哪一份没登记、哪条链接断了、哪份 entry 两跳内到不了）。
+      - name: 文档分级
+        run: python scripts/check_doc_map.py --gate
+
       # 「这个诊断码有没有事后出口」这一类，机制与取舍在
       # `scripts/check_diagnostic_sides.py` 的 docstring 里。它把 `app/**/*.py` 里所有
       # `Diagnostic(code=...)` 按文件分区，凡是**只在 `check()` 之外**产生的码（生成侧

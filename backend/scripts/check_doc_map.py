@@ -302,7 +302,7 @@ def write_index(rows: list[Row]) -> None:
     if start < 0 or stop < 0 or stop < start:
         raise SystemExit(f"{INDEX_RELATIVE} 里找不到 {BEGIN} / {END}，先手工加上这两行")
     INDEX.write_text(text[:start] + render_section(rows) + text[stop + len(END):],
-                     encoding="utf-8")
+                     encoding="utf-8", newline="\n")
 
 
 # ---------------------------------------------------------------- 判据
