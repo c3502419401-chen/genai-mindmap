@@ -1899,7 +1899,12 @@ def describe_facts(facts: Facts, rules: list[Rule]) -> None:
 
 
 def describe_backlog(facts: Facts) -> None:
-    """台账读数。`probe: none` 的条目单列——它们的状态不由代码决定，别混着读。"""
+    """台账读数。`probe: none` 的条目单列——它们的状态不由代码决定，别混着读。
+
+    **状态分布在这里算、也只在这里出现。** `docs/BACKLOG.md` §七 曾经手抄过一行
+    "12 条：已做 5、半做 2、不做 2、待做 3"，两轮就漂了，而且没有任何闸门判它——
+    手抄的汇总与手抄的读数一样，写一次就要再抄一次。所以分布由这里每次现取并打印。
+    """
     entries = facts.backlog or ()
     if not entries:
         return
@@ -1908,13 +1913,31 @@ def describe_backlog(facts: Facts) -> None:
         extra = ""
         if entry.probe != "none":
             extra = f"  probe {entry.probe}={facts.backlog_probes.get(entry.probe)}"
+        if entry.blocker_probe:
+            extra += (f"  blocker {entry.blocker_probe}="
+                      f"{facts.backlog_blockers.get(entry.blocker_probe)}")
         print(f"  · #{entry.number:>2} [{entry.status}] {entry.title}{extra}")
+    counts = {status: sum(1 for e in entries if e.status == status) for status in STATUSES}
+    print("    状态分布：" + " / ".join(f"{name} {count}"
+                                        for name, count in counts.items() if count)
+          + f"（合计 {len(entries)}）")
+    judged = [e for e in entries if e.probe != "none"]
+    true_probes = sum(1 for e in judged if facts.backlog_probes.get(e.probe))
+    print(f"    机器判据：probe 非 none {len(judged)} 条（读数真 {true_probes} / "
+          f"假 {len(judged) - true_probes}）；只有人判 {len(entries) - len(judged)} 条")
     manual = [entry.number for entry in entries if entry.probe == "none"]
     if manual:
         print(f"    只有人判（状态不由代码决定）：{manual}")
+    blockers = [entry for entry in entries if entry.blocker_probe]
+    if blockers:
+        print(f"    卡点（blocker 真 = 还卡着）：{len(blockers)} 条，"
+              f"其中卡点仍在 "
+              f"{sum(1 for e in blockers if facts.backlog_blockers.get(e.blocker_probe))}")
     pending = pending_anchors(facts)
     if pending:
         print(f"    待做的判据现在还不存在（先写判据、后派人做）：{pending}")
+    for hint in blocker_hints(facts):
+        print(f"    可转「已做」（卡点已消失，但不自动转）：{hint}")
 
 
 def main(argv: list[str]) -> int:
