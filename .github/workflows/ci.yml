@@ -224,5 +224,42 @@ jobs:
       - name: 断链棘轮（路由 → client）
         run: node scripts/check_route_coverage.mjs --gate
 
+      # 第四档静态缺口：**函数被调用了，但那个组件从入口到不了**。
+      #
+      # 上面三道闸（后端 `find_unwired.py`、前端 `find_unwired.mjs`、断链）都从
+      # 「有没有人引用」这一侧出发，所以共同缺一层：引用链在某个没接上的地方就断了。
+      # 一个 `.vue` 里写着完整界面（按钮、事件、调 client 函数），只要没被任何可达
+      # 组件 import，用户就永远看不到——而上一道闸会因为那个 client 函数「被调用了」
+      # 而全绿。今天撞过的五处缺口共同的形态就是这一层：代码全在、调用链全通、
+      # 就是没有入口。
+      #
+      # 判据：`@vue/compiler-sfc` 切出 `<script>` / `<script setup>`，`ts.createSourceFile`
+      # 建 import 图，从 `src/main.ts`（`index.html` 的 module 入口；`--root=app` 可换成
+      # 只从 `App.vue` 起做对照）沿**值边**做 BFS——`import type` 编译后整条消失，
+      # 不构成运行时可达。走不到的按 a–e 五档分级（a 真不可达 / b 只经动态 import /
+      # c 纯类型 / d 只在 tests 里被 import / e 死代码），每档的判据写在
+      # `scripts/check_reachability.mjs` 的 docstring 里。
+      #
+      # 为什么它在 CI 上是确定性的：只读 `src/**`、`tests/**` 的**文本**与基线 JSON，
+      # 不读运行时、不读数据库、不读 git 状态或工作区差异，路径一律以 `import.meta.url`
+      # 为锚。两个外部依赖都是 devDependency（`typescript`、`@vue/compiler-sfc`），
+      # `npm ci` 之后就在 `frontend/node_modules` 里，不联网。已用一个干净 worktree
+      # 对过读数：69 个节点 / 66 可达 / 3 不可达，逐行相同。
+      #
+      # 为什么是棘轮：现在 3 条不可达全是 c 档（镜像类型 `types.ts`、生成的
+      # `schema.d.ts`、编译期断言 `contract-check.ts`），它们是**设计上**不该被
+      # import 的，闸门比的是基线。a 档条目除 `reason` 外还要 `ack` 署名：把「完整
+      # 界面但谁都不 import」写进基线等于承认那个界面此刻真的看不见，那比别的豁免
+      # 更该留下痕迹。
+      #
+      # 它看不见什么：算的是 import 图，不是**渲染条件**。被 `v-if` 恒假包着、
+      # 按钮 `:disabled` 恒真、折叠区从未展开的组件在这张图上一律「可达」。这条
+      # 局限与可能的补法写在 `docs/REACHABILITY.md` 的最后一节。
+      #
+      # 顺序：放在「断链棘轮」之后、`Build` 之前。它比 build 快得多，而失败信息比
+      # TS 报错更贴题（build 只会说「某某没有导出」，说不出「这个组件没有入口」）。
+      - name: 可达性棘轮（组件 → 入口）
+        run: node scripts/check_reachability.mjs --gate
+
       - name: Build
         run: npm run build
