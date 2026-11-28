@@ -90,6 +90,24 @@ jobs:
       - name: 文档断言与代码一致
         run: python scripts/check_doc_claims.py --gate
 
+      # 「这个诊断码有没有事后出口」这一类，机制与取舍在
+      # `scripts/check_diagnostic_sides.py` 的 docstring 里。它把 `app/**/*.py` 里所有
+      # `Diagnostic(code=...)` 按文件分区，凡是**只在 `check()` 之外**产生的码（生成侧
+      # 写得出来、用户点「检查结构」时看不见），都必须在
+      # `docs/DIAGNOSTIC-TWO-SIDES.md` 里有一份判定，否则红。
+      #
+      # 为什么这里**不需要额外依赖、也不 import `app`**：那一半是运行期的（把
+      # `backend/data/acc_trees*` 下 72 棵真树跑一遍 `check()`），而 `data/` 不进 git
+      # （`.gitignore` 里 `data/`），CI 的干净 checkout 上一个真树都没有。脚本因此
+      # 先看有没有树、没有就**声明"运行期未测量"**而不是打印"产出 0 个码"，并且整段
+      # 不 import `app`——判据只剩 `app/**/*.py` 的字面量与 `docs/` 的文本，纯标准库。
+      # 要跑运行期那一半在本机跑（有真树时它自己就会跑）。
+      #
+      # 放在「文档断言」之后：两条都是静态文本/文档判据，也都是"关于代码的话"与代码
+      # 对不对得上；读数是本地与干净 checkout 逐行一致（72 条 other_only 两侧相同）。
+      - name: 诊断码两侧覆盖
+        run: python scripts/check_diagnostic_sides.py --require-documented
+
       - name: Test
         run: pytest -q --cov=app --cov-report=term-missing --cov-fail-under=0
 

@@ -11,6 +11,13 @@
   2. **运行期**：把 `backend/data/acc_trees*` 下所有真树跑一遍 `check()`，收实际
      产出的码。静态说"谁写的"，运行期说"真跑得出来吗"。
 
+**运行期那一半是"有数据才算"**：`backend/data/` 不进 git（`.gitignore` 里
+`data/`），所以 CI 的干净 checkout 上 `data/acc_trees*` 一个都没有。那种情况下本
+脚本**不 import `app`**，直接声明"运行期未测量"——而不是打印"真树上产出 0 个码"，
+后者是把"没测"说成"测了、是零"。这条区分很重要：`--require-documented` 的判据
+只落在静态那一半（`other_only` 完全由静态得出），所以在没有数据的机器上与有数据的
+机器上**结论相同**、读数相同（72）。
+
 两者一对照，某个码落进哪个格子就一目了然：
 
     两侧都有       已在（不需要动）
@@ -28,6 +35,11 @@
 事后出口，那么"该不该搬"必须有人判过、且判定写在 `docs/DIAGNOSTIC-TWO-SIDES.md` 里。
 这条开关把"忘了判定"变成红——判据是"码名出现在那份文档里"，一份可复算的证据，
 而不是靠谁记得上一轮查过几条。
+
+CI（`.github/workflows/ci.yml` 的 backend job）跑的就是 `--require-documented`，
+在没有 `data/` 的干净 checkout 上它退化成**纯静态 + 纯标准库**：不 import `app`、
+不读数据库、不发请求，判据是 `app/**/*.py` 的字面量与 `docs/` 的文本，因此与本地
+读数逐行一致。要跑运行期那一半，就在本机（有 `data/acc_trees*` 时）不带 CI 跑。
 """
 from __future__ import annotations
 
@@ -65,23 +77,28 @@ def _static() -> dict[str, set[str]]:
     return found
 
 
-def _runtime() -> dict[str, int]:
+def _trees() -> list[Path]:
+    """`data/acc_trees*` 下的真树文件。`data/` 不进 git，所以在干净 checkout 上这是空表。"""
+    if not DATA.is_dir():
+        return []
+    return sorted(path for folder in DATA.glob("acc_trees*") if folder.is_dir()
+                  for path in folder.glob("*.json"))
+
+
+def _runtime(trees: list[Path]) -> dict[str, int]:
     from app.contracts.mindmap import MindMapContent
     from app.optimization.service import check
 
     counts: dict[str, int] = defaultdict(int)
-    for folder in sorted(DATA.glob("acc_trees*")):
-        if not folder.is_dir():
+    for path in trees:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            content = payload.get("content") or payload.get("map") or payload
+            tree = MindMapContent.model_validate(content)
+        except Exception:
             continue
-        for path in sorted(folder.glob("*.json")):
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-                content = payload.get("content") or payload.get("map") or payload
-                tree = MindMapContent.model_validate(content)
-            except Exception:
-                continue
-            for diagnostic in check(tree):
-                counts[diagnostic.code] += 1
+        for diagnostic in check(tree):
+            counts[diagnostic.code] += 1
     return counts
 
 
@@ -93,34 +110,44 @@ def main() -> int:
     args = parser.parse_args()
 
     static = _static()
-    runtime = _runtime()
+    trees = _trees()
+    #: `None` = 运行期没测（没有真树）。与"测了、产出 0 个"是两件事，不能混。
+    runtime = _runtime(trees) if trees else None
 
     def sides(code: str) -> tuple[str, ...]:
         where = static[code]
         return tuple("check" if w in CHECK_SIDE else "other" for w in where)
 
-    both = sorted(c for c in static if "check" in sides(c) and "other" in sides(c))
-    check_only = sorted(c for c in static if sides(c) == ("check",))
     other_only = sorted(c for c in static if "check" not in sides(c))
-    silent = sorted(c for c in static if not runtime.get(c))
 
     print(f"静态扫到 {len(static)} 个码（{APP.relative_to(BACKEND).as_posix()}/**/*.py）")
-    print(f"运行期跑真树（{DATA.name}/acc_trees*）实际产出 {len(runtime)} 个码\n")
+    if runtime is None:
+        print(f"运行期：**未测量** —— 没有 {DATA.relative_to(BACKEND).as_posix()}/acc_trees*"
+              "（干净 checkout 就是这样，data/ 不进 git）。")
+        print("        这一半只在本机有真树时才跑；下面的结论全部只依赖静态那一半。\n")
+    else:
+        print(f"运行期跑真树（{DATA.name}/acc_trees*，{len(trees)} 棵）"
+              f"实际产出 {len(runtime)} 个码\n")
+        both = sorted(c for c in static if "check" in sides(c) and "other" in sides(c))
+        check_only = sorted(c for c in static if sides(c) == ("check",))
+        print(f"两侧都产生（{len(both)}）：")
+        for code in both:
+            print(f"  {code:38s} 运行期 {runtime.get(code, 0):4d} 次")
+        print(f"\n只在 check() 这一侧（{len(check_only)}）：")
+        for code in check_only:
+            print(f"  {code:38s} 运行期 {runtime.get(code, 0):4d} 次")
 
-    print(f"两侧都产生（{len(both)}）：")
-    for code in both:
-        print(f"  {code:38s} 运行期 {runtime.get(code, 0):4d} 次")
-    print(f"\n只在 check() 这一侧（{len(check_only)}）：")
-    for code in check_only:
-        print(f"  {code:38s} 运行期 {runtime.get(code, 0):4d} 次")
     print(f"\n只在 check() 之外产生（{len(other_only)}）——**候选：生成侧能发现、事后看不见**：")
     for code in other_only:
         where = ", ".join(sorted(static[code]))
         print(f"  {code:38s} {where}")
-    print(f"\n优化侧写了但真树上一次没出现（{len(silent)}，边界窄或需要 sources）：")
-    for code in silent:
-        tag = "（引用类，要 sources）" if code.startswith(_REFERENCE_PREFIXES) else ""
-        print(f"  {code:38s} {', '.join(sorted(static[code]))}{tag}")
+
+    if runtime is not None:
+        silent = sorted(c for c in static if not runtime.get(c))
+        print(f"\n优化侧写了但真树上一次没出现（{len(silent)}，边界窄或需要 sources）：")
+        for code in silent:
+            tag = "（引用类，要 sources）" if code.startswith(_REFERENCE_PREFIXES) else ""
+            print(f"  {code:38s} {', '.join(sorted(static[code]))}{tag}")
 
     if args.require_documented:
         if not DOC.exists():
