@@ -146,8 +146,39 @@ describe('agent 运行', () => {
       .toEqual(['stage', 'tool_start', 'tool_end', 'done']);
   });
 
-  it('error 事件写进 agentError 且画布不变', async () => {
-    stubFetch(() => agentReply([
+  /**
+   * 「落地后视图是偏的」那一条（验收记录 §四.3：40 个已渲染节点只有 14 个在视口内）。
+   *
+   * 画布侧的自动适配有一道闸：`store.viewAdjusted`（"用户手动调过视口，别把他拽回去"）。
+   * 它保护的是**用户正在看的这一屏**——而生成出来的新树属于下一屏。这个标志从来没在
+   * "换了一张图"时复位，于是闸门把落地那一次适配也挡掉了，视口停在旧图的缩放与偏移上。
+   */
+  it('create 落地是换了一张图：用户之前调过视口也复位，落地那次适配不会被挡掉', async () => {
+    stubFetch(() => agentReply([doneFrame(content('新图'))]));
+    const store = useMindMapStore();
+    store.preview(content('旧图'), 'right');
+    // 生成前随手平移过画布，或生成期间点过一次引用跳转（`focusTick` 那条 watch
+    // 无条件置真）——两种都很常见，落地时都会把这一屏留在旧图上。
+    store.viewAdjusted = true;
+
+    await store.runGeneration('做一张导图', 'create');
+
+    expect(store.content?.root.label).toBe('新图');
+    expect(store.viewAdjusted).toBe(false);
+  });
+
+  it('edit 落地是就地改：用户正看着的这一屏必须留着', async () => {
+    stubFetch(() => agentReply([doneFrame(content('改后'))]));
+    const store = useMindMapStore();
+    store.preview(content('旧图'), 'right');
+    store.viewAdjusted = true;
+
+    await store.runGeneration('把根改名', 'edit');
+
+    expect(store.viewAdjusted).toBe(true);
+  });
+
+  it('error 事件写进 agentError 且画布不变', async () => {    stubFetch(() => agentReply([
       { type: 'error', seq: 1, code: 'generation_failed', message: '模型服务不可用' },
     ]));
     const store = useMindMapStore();

@@ -535,6 +535,15 @@ function requestAutoMode(): void {
   scheduleFit();
 }
 
+/**
+ * 档位重铺。`store.viewAdjusted` 是这里唯一的闸：用户手动调过视口就不再自动适配。
+ *
+ * 它保护的是**用户正在看的这一屏**。所以闸的正确性全在"这一屏属于当前这张图吗"：
+ * 换图（`loadMap` / `import` / 生成落地）时必须由那一侧先把这个标志清掉——否则新树
+ * 会停在旧图的缩放与偏移上（验收记录 §四.3：40 个已渲染节点只有 14 个在视口内）。
+ * 复位点写在 `stores/mindmap.ts::applyRunResult`（`create` 落地）与三处换图入口；
+ * 这一层不做"换图就无视用户调整"的特例，那样窗口缩放与节点增长也会跟着重置。
+ */
 function scheduleFit() {
   if (store.viewAdjusted) return;
   clearTimeout(fitTimer);
