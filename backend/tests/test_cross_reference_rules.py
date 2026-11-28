@@ -176,7 +176,9 @@ def test_the_rule_says_how_not_only_that_it_is_forbidden():
     assert "什么时候写" in CROSS_REFERENCE_RULES
     # 超过上限该干什么（合并节点），不是只说"最多 N 条"。
     assert "合并节点" in CROSS_REFERENCE_RULES
-    # 上限比图谱那份小：三段式一屏里能读懂的交叉指认就那么几处。
+    # 上限比图谱那份小：两条路服务的是不同的东西（30 来自材料里明写的实体关系，
+    # 10 是"同一件事被写了两遍"这一种补救）。10 的来历是实测，不是画布口径——
+    # `scripts/measure_cross_reference_quota.py` 的两臂读数见工具常量那一段注释。
     assert CROSS_REFERENCE_MAX < GRAPH_MAX_RELATIONS
     # 位置那一句与图谱那份同源（模型会把 relations 塞进 root 里面，而 Node 是
     # `extra="forbid"`）。
@@ -277,6 +279,61 @@ def test_no_relations_means_no_extra_key_and_no_noise():
     assert result.ok, result.content
     assert "cross_reference" not in result.data
     assert "CROSS_REFERENCE_DROPPED" not in _codes(result)
+    assert "CROSS_REFERENCE_AT_LIMIT" not in _codes(result)
+
+
+# ----------------------------------------------------- 3. 顶满 ≠ 被截（两条不同的码）
+
+
+def _wide_tree(count: int) -> dict:
+    """三支各 5 个叶子：够放 `count` 条不重复的跨父关系。
+
+    `_tree()` 只有 8 个跨父对，装不下现在的上限（10），也不该为了这条用例把
+    `_tree()` 改大——它上面那几条断言钉的是"收下几条"，形状一动读数全变。
+    三支而不是两支：`_generate` 有"一级分支少于 3 条就判不合法"那道闸。
+    """
+    sides = [("A", "甲支", "甲"), ("B", "乙支", "乙"), ("C", "丙支", "丙")]
+    body = [_node(tag, label, [_node(f"{tag.lower()}{index}", f"{prefix}{index}")
+                              for index in range(5)])
+            for tag, label, prefix in sides]
+    pairs = [(f"{left.lower()}{index}", f"{right.lower()}{other}")
+             for (left, _, _), (right, _, _) in
+             [(sides[i], sides[j]) for i in range(3) for j in range(3) if i != j]
+             for index in range(5) for other in range(5)]
+    tree = _tree()
+    tree["root"]["children"] = body
+    tree["relations"] = [
+        {"source": source, "target": target, "kind": "references",
+         "why": "两处说的是同一件事"}
+        for source, target in pairs[:count]
+    ]
+    return tree
+
+
+def test_hitting_the_limit_is_reported_as_a_limit_not_as_a_drop():
+    """顶满上限时报 `CROSS_REFERENCE_AT_LIMIT`，且**不**报 `DROPPED`。
+
+    两条码说的是两件事：`DROPPED` = 代码截掉了；`AT_LIMIT` = 模型自己写到这里就停
+    （实测 `limited` 全程为 0）。混成一条会把"模型压着没写"读成"代码砍掉了"。
+    """
+    result = _run(_ctx([_material()]), _chat(_wide_tree(CROSS_REFERENCE_MAX)))
+
+    assert result.ok, result.content
+    account = result.data["cross_reference"]
+    assert account["declared"] == CROSS_REFERENCE_MAX
+    assert account["relations"] == CROSS_REFERENCE_MAX
+    assert account["relation_limit"] == CROSS_REFERENCE_MAX
+    assert "CROSS_REFERENCE_AT_LIMIT" in _codes(result)
+    assert "CROSS_REFERENCE_DROPPED" not in _codes(result)
+
+
+def test_one_below_the_limit_says_nothing():
+    """差一条不报：那条码只回答"是不是压在上限上"，不回答"写得多不多"。"""
+    result = _run(_ctx([_material()]), _chat(_wide_tree(CROSS_REFERENCE_MAX - 1)))
+
+    assert result.ok, result.content
+    assert result.data["cross_reference"]["relations"] == CROSS_REFERENCE_MAX - 1
+    assert "CROSS_REFERENCE_AT_LIMIT" not in _codes(result)
 
 
 def test_the_rule_does_not_reach_the_degraded_three_stage_path():

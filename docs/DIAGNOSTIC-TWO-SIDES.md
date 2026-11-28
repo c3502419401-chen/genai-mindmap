@@ -74,6 +74,7 @@
 | `CROSS_BRANCH_DUPLICATE`（跨支逐字同名） | 有（整树判在修复**之前**、分片判在修复之后） | **已搬进 `check()`**（上一轮） | **已搬**。输入就是那棵树，三条闸全过 |
 | `LABEL_OVERLONG_IN_DELIVERY`（交付的树上有标题会被截成半句） | 有（修完之后再量一遍） | **已搬进 `check()`**（本轮） | **已搬**。判据在 `optimization/label_length.py`，两侧同一个函数对象（`is` 断言）；只测量、不给建议，理由见下 |
 | `CROSS_BRANCH_UNLINKED`（跨支同核未指认） | 有（`check()` 里，两条生成路都走它） | 有 | 已在，不需要动 |
+| `CROSS_REFERENCE_AT_LIMIT`（收下的关系数正好等于**这一次**的上限） | 有（`_generate` 收完 `relations` 之后） | 无 | **搬不动**。闸 2 不过：它读的是这一次生成的上限（走哪条路决定是 8 还是 30），而树上没有这个上下文——一张 8 条关系的图既可能是"顶到三段式上限"，也可能是"两段式随手写了 8 条"。事后拿不到这个数，判它就是猜。它与 `CROSS_REFERENCE_DROPPED` 是两条码：后者说"代码截掉了"，这条说"模型自己停在那个数上、一条没丢" |
 | `SOURCE_QUOTE_*` / `SOURCE_QUOTE_AMBIGUOUS` / `UNVERIFIED_SOURCE_REF` / `UNSOURCED_NODE` / `EVIDENCE_UNUSED` 一族 | 有（收尾的 `verify_source_refs`） | **有**：`/suggest` 带 `sources` 就跑第三层，前端「检查与建议」按钮传的是 `sources.readySources` | 已在。**前提是用户给了材料**——没给就静默不判，这是对的 |
 | `SELF_CHECK_ISSUES` 四类（跨支重复 / 语义重复 / 内容跑题 / 层级异常） | 有（`MINDMAP_SELF_CHECK`，默认关，+1 次模型调用） | 无 | **不该搬**。闸 1：它是模型判的。另一个理由见 `docs/GENERATE-REPAIR-SELFCHECK.md`——`SuggestionKind` 是**动作**名词，这份清单是**判断** |
 | `BRANCHES_BELOW_MIN`（一级分支少于下限） | 有（骨架那一步，重问一次之后仍不足时报） | 无 | **可搬但不值**。闸 2 过，闸 3 **不过**：用户一眼数得出几条分支。而它真正说的话是"模型**两次**都只给了 2 条"——过程事实 |
@@ -85,12 +86,13 @@
 | `UNKNOWN_SOURCE_REF` | 有（ref 指向不在本次输入里的 source，**已随判定移除**） | 无（事后由 `SOURCE_TEXT_UNAVAILABLE` 兜住） | 不搬：那条 ref 已被删掉，产物上没有痕迹；事后拿 `sources` 核，同一个现象换个码说出来 |
 | `SOURCE_REF_NLI` / `SOURCE_REF_CONTRADICTED`（语义判定） | 有（`annotate_nli`，默认开） | 无 | 不该搬：闸 1 不过（onnx 推理，几十毫秒/条 × 上限 100 条 = 最多 4.4 秒）。`/suggest` 是个按钮，不是批处理 |
 
-**§二这张表是"逐行判定过"的那一批：13 行、覆盖 18 个码**（引用类与 NLI 按族合并）。
+**§二这张表是"逐行判定过"的那一批：14 行、覆盖 19 个码**（引用类与 NLI 按族合并）。
 其中 **2 行已搬**（前一轮跨支、本轮超长标题）、**2 行本来就两侧都有**（`CROSS_BRANCH_UNLINKED`、
-引用那一族），其余 **9 行不搬**，每行都写着卡在哪条闸上。
+引用那一族），其余 **10 行不搬**，每行都写着卡在哪条闸上。
 
-★ 这 13 行**不是**"生成侧诊断码"的全量——全量是 72 条，见 §五。两处的差额是
-"过程读数"与"接口面不覆盖"两类，按类整批判，不按条判。
+★ 这 14 行**不是**"生成侧诊断码"的全量——全量见 §五（现跑
+`python scripts/check_diagnostic_sides.py --require-documented`，末行那个数才是当前的）。
+两处的差额是"过程读数"与"接口面不覆盖"两类，按类整批判，不按条判。
 
 ---
 
@@ -185,7 +187,8 @@ is_reported_after_the_repair` 的 `len(reported) == 1` 现在钉的是"没有两
 当前读数（本轮）：静态 87 个码 → 两侧都产生 3、只在 `check()` 一侧 12、**只在
 `check()` 之外 72**；运行期在 72 棵真树上产出 5 个码（`CROSS_BRANCH_DUPLICATE` 27 次、
 `CROSS_BRANCH_UNLINKED` 11 次、`LABEL_OVERLONG_IN_DELIVERY` 17 次、`SHALLOW_BRANCH`
-6 次、`MISSING_DETAIL` 1 次）。
+6 次、`MISSING_DETAIL` 1 次）。**这一组数是那一次普查的读数，不是现状**：此后每加一个
+生成侧码它就 +1（`CROSS_REFERENCE_AT_LIMIT` 就是这样一个），要现值就跑上面那条命令。
 
 那 72 条落在四类里，**只有前两类需要判定，后两类不需要**：
 

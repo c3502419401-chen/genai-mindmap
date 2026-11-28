@@ -188,6 +188,8 @@ DEPLOY = REPO_DIR / "deploy"
 TIDY_TS = FRONTEND / "src" / "canvas" / "layout" / "tidy.ts"
 BACKLOG = REPO_DIR / "docs" / "BACKLOG.md"
 BACKLOG_RELATIVE = "docs/BACKLOG.md"
+#: 台账第 9 条的采样记录就写在这份文档里（"采样时的上限：N"那一行是它的判据输入）。
+CROSS_BRANCH_RECORD = REPO_DIR / "docs" / "CROSS-BRANCH-DUPLICATES.md"
 
 #: 自己的设计文档不参与扫描：它整篇在**引用**那些错句当例子，扫它等于自指。
 SELF_DOC = "DOC-CLAIMS.md"
@@ -941,9 +943,11 @@ BACKLOG_PROBE_DOC: dict[str, str] = {
 #: 后者不可——所以 `blocker_probe` 读出假时，闸门只说"可以转已做了"，**不自动转**。
 BLOCKER_PROBE_DOC: dict[str, str] = {
     "cross_reference_quota_sampling_stale":
-        "`backend/app/agent/tools.py` 的最后一次提交**晚于** "
-        "`docs/CROSS-BRANCH-DUPLICATES.md` 的 → 生成侧规则改过、采样记录没跟着重跑，"
-        "「8 条够不够」仍是按旧代码量出来的。假=可以重判配额并结案",
+        "`docs/CROSS-BRANCH-DUPLICATES.md` 里记的「采样时的上限：N」与 "
+        "`agent/tools.py::CROSS_REFERENCE_MAX` **不是同一个数** → 配额调过、采样没跟着"
+        "重跑，「这个数够不够」仍是按旧数字量出来的。假=可以重判配额并结案。"
+        "（原先是时序型：tools.py 的最后提交晚于那份文档。时序判据的毛病是任何一次"
+        "无关提交都会让它复活，而真改了规则又顺手改文档时它读到假）",
     "style_branch_attribution_absent":
         "`scripts/measure_branch_budget.py` 里没有任何 `style_profile` 归因切分，且 "
         "`app/prefs/style.py` 的 `branches` 仍是单值汇总 → 那两格无从归因。"
@@ -1276,48 +1280,81 @@ def probe_backlog_facts(app_dir: Path | None = None,
     return values, problems
 
 
-def _last_commit_seconds(repo_dir: Path, relative: str) -> int | None:
-    """`relative` 在 `repo_dir` 里的最后一次提交时间（unix 秒）。读不到 → `None`。
+#: 采样记录里"这次按哪个上限量的"那一行的形状。文档与代码对不上 = 采样是按旧数字量的。
+_SAMPLED_LIMIT = re.compile(r"采样时的上限\D{0,8}(\d+)")
 
-    用**提交时间**而不是文件 mtime：干净 checkout 上 mtime 是 checkout 那一刻，"产物
-    比补丁新"会永远为真——那是假绿，比没有判据更坏。提交时间在本地与 CI 上一致（CI
-    的 `fetch-depth: 0` 正是为这类判据配的）。
+
+def _declared_limit(app: Path) -> int | None:
+    """`agent/tools.py::CROSS_REFERENCE_MAX` 的字面量（ast，**不 import** `app`）。
+
+    不 import 的理由与整个文件同一条（见文件头）：这道闸门要在没有数据、没有装依赖的
+    机器上跑，而 `app.agent.tools` 是一条会连库的依赖链。
     """
     try:
-        done = subprocess.run(  # noqa: S603 - argv 固定
-            ["git", "log", "-1", "--format=%ct", "--", relative],  # noqa: S607
-            cwd=str(repo_dir), capture_output=True, text=True, encoding="utf-8", timeout=60)
-    except (OSError, subprocess.SubprocessError):
+        tree = _parse(app / "agent" / "tools.py")
+    except (OSError, SyntaxError):
         return None
-    if done.returncode != 0:
-        return None
-    text = (done.stdout or "").strip()
-    return int(text) if text.isdigit() else None
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not isinstance(node.value, ast.Constant) or not isinstance(node.value.value, int):
+            continue
+        if any(isinstance(target, ast.Name) and target.id == "CROSS_REFERENCE_MAX"
+               for target in node.targets):
+            return node.value.value
+    return None
+
+
+def _sampling_stale(app: Path, record: Path | None = None) -> tuple[bool | None, str]:
+    """台账第 9 条的卡点：**采样记录里那个上限**与代码里现在的上限是不是同一个数。
+
+    原来是**时序型**的（`tools.py` 的最后提交晚于 `CROSS-BRANCH-DUPLICATES.md`）。时序
+    有一条洗不掉的毛病：任何一次与配额无关的 `tools.py` 提交都会让卡点复活（它比的是
+    时间，不是内容），而真改了提示词、顺手把文档一起提交时反而读到"卡点已消失"。
+    于是这条账在本轮之前既可能假真也可能假假。
+
+    改成内容型：文档里写着"采样时的上限：N"，与 `CROSS_REFERENCE_MAX` 比。
+
+    为什么比数字而不比提示词全文的 sha：数字是这个上限**唯一会漂的东西**。措辞微调
+    不需要重跑采样（那不是"按旧代码量"），而调数字必须重跑——每一条读数都是按那个
+    数字量的。判据里出现"多久之前提交的"就一定会在某一天误判，出现"是不是同一个数"
+    不会。
+    """
+    declared = _declared_limit(app)
+    target = record or CROSS_BRANCH_RECORD
+    try:
+        recorded = _SAMPLED_LIMIT.search(_read(target))
+    except OSError as error:
+        return None, (f"台账 blocker `cross_reference_quota_sampling_stale` 读不到 "
+                      f"{_relative(target)}: {error}")
+    if declared is None:
+        return None, ("台账 blocker `cross_reference_quota_sampling_stale` 读不到 "
+                      "`agent/tools.py::CROSS_REFERENCE_MAX`（常量被改名或删了？）")
+    if recorded is None:
+        return None, ("台账 blocker `cross_reference_quota_sampling_stale` 在 "
+                      "`docs/CROSS-BRANCH-DUPLICATES.md` 里找不到「采样时的上限：N」——"
+                      "那一行是这条判据的输入，删了它卡点就不可判")
+    return int(recorded.group(1)) != declared, ""
 
 
 def probe_blockers(app_dir: Path | None = None,
-                   scripts_dir: Path | None = None,
-                   repo_dir: Path | None = None) -> tuple[dict[str, bool], list[str]]:
+                   scripts_dir: Path | None = None) -> tuple[dict[str, bool], list[str]]:
     """台账里 `blocker_probe` 的读数：**真 = 卡点还在**（与 `probe` 极性相反）。
 
-    `repo_dir` 只给时序型那条用：git 只认仓库相对路径，所以它必须是一个真 git 仓库。
+    两条都是**内容型**：一条读文档里记的采样上限与常量是否一致，一条读脚本事不事先
+    归因。没有一条依赖提交时间或文件 mtime——那类判据在一次干净 checkout 上永远为真。
     """
     app = app_dir or APP
     scripts = scripts_dir or (BACKEND_DIR / "scripts")
-    repo = repo_dir or REPO_DIR
     values: dict[str, bool] = {}
     problems: list[str] = []
 
-    tools_commit = _last_commit_seconds(repo, "backend/app/agent/tools.py")
-    record_commit = _last_commit_seconds(repo, "docs/CROSS-BRANCH-DUPLICATES.md")
-    if tools_commit is None or record_commit is None:
-        problems.append(
-            "台账 blocker `cross_reference_quota_sampling_stale` 读不到提交时间"
-            "（不是 git 仓库，或 checkout 没有 `fetch-depth: 0`）——"
-            "它是时序型判据，读不到就是不可判，不许当成卡点已消失")
-    else:
-        # 生成侧规则晚于采样记录 ⇒ 采样是按旧代码做的 ⇒ 「8 条够不够」没按现状量过。
-        values["cross_reference_quota_sampling_stale"] = tools_commit > record_commit
+    stale, problem = _sampling_stale(app)
+    if problem:
+        problems.append(problem)
+    elif stale is not None:
+        # 数字对不上 ⇒ 采样是按旧代码量的 ⇒「这个数够不够」没按现状量过。
+        values["cross_reference_quota_sampling_stale"] = stale
 
     budget = scripts / "measure_branch_budget.py"
     style = app / "prefs" / "style.py"

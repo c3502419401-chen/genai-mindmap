@@ -67,6 +67,10 @@ export const DIAGNOSTIC_LABELS: Record<string, string> = {
   // ——两处挂在不同的父下面，而上面那三条（重名 / 近义 / 缺失）都只说内容。
   CROSS_BRANCH_DUPLICATE: '跨分支重名',
   CROSS_BRANCH_UNLINKED: '跨分支同核未指认',
+  // 生成侧独有（后端 `agent/tools.py::_generate`，`check()` 里没有对应物）：它读的是
+  // **这一次生成的上限**（8 / 30 视走哪条路），而树上没有这个上下文，所以它只能在这一
+  // 刻报。说的不是缺陷，是"配额可能压住了几条该指认的"。
+  CROSS_REFERENCE_AT_LIMIT: '指认写到上限',
   // 渲染口径（后端 `optimization/label_length.py`，生成收尾与 `check()` 同一个码）。
   // 它说的是"这个标题在画布上会被 `line-clamp-2` 截成半句"，不是结构缺陷——所以
   // 标题里带「标题」，与上面那些说内容的码分得开。

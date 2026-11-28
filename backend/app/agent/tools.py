@@ -8496,10 +8496,30 @@ GRAPH_RELATION_RULES = (
 # 材料里根本没有的"考核比重"（重叠 0.46–0.78 而不是接近 1）——**判据的压力制造了改写，
 # 改写又制造了捏造**。所以这一段写的不是"别复制"，而是"不复制的时候怎么写"。
 #
-# 上限 8 而不是 `GRAPH_MAX_RELATIONS`(30)：三段式的树是给定骨架的填充，一屏里能读懂的
-# 交叉指认就那么几处；**超过 8 条时正确的动作是合并节点**，不是再加线——这一句要写进
-# 提示词，因为"给个上限"只能让模型收敛，说清"超了该干什么"才会让它改结构。
-CROSS_REFERENCE_MAX = 8
+# 上限 10 而不是 `GRAPH_MAX_RELATIONS`(30)：两个数服务的是两条**不同的路**，不是同一件事
+# 的两档松紧（`_generate` 末尾那句 `if/else` 保证两条规则永不同时出现，理由见那里）：
+#
+#   · 30（图谱路）：边来自材料里明写的实体关系，它**表达结构**，多一条就多一条信息；
+#   · 10（三段式）：这条路没有图谱，`relations` 只有"同一件事在别处也出现过"一种语义
+#     （references / part_of），它是**别复制节点的补救**，不是表达手段。补救不该规模化。
+#
+# **10 的来历是量出来的，不是"画布口径"。** 这里曾经写着"一屏里能读懂的交叉指认就那么
+# 几处"，那是先有 8 再往回找的理由（与 `GENERATED_LABEL_MAX_CHARS` 注释里那句"180px 宽
+# 两行"同型）：`canvas/MindRelation.vue` 里**没有任何条数阈值**——曲线、虚线、0.7 透明度
+# 都对条数不敏感，画布与前端也从不限制画得出几根线。所以"8 是画布口径"在代码里没有对应物。
+#
+# 实测（`scripts/measure_cross_reference_quota.py`，S02 同一份材料、同一批开关）：
+#
+#     上限 8   模型写的条数 8/8/8/8/8（5 次全顶满），被上限截掉 0/0/0/0/0
+#     上限 16  模型写的条数 9/9/10/…（一次也没顶满），被上限截掉 0
+#
+# 两个读法：① "顶满"不是代码截断——`relation_drops["limited"]` 全程为 0，模型是**自己
+# 停在第 8 条**的（提示词里那个数字就是它的行为开关）；② 它自己想写 9–10 条。所以 8 是
+# 紧的，而 12 / 16 没有依据（从没有一次写到 11 以上）。10 取实测上界。
+#
+# 顶满这件事本身要报出来（`CROSS_REFERENCE_AT_LIMIT`）：调到 10 之后它还会顶满 10，而
+# 那时"是不是又漏了指认"只有生成侧判得了——事后在树上判不出这一次的上限是 8 还是 30。
+CROSS_REFERENCE_MAX = 10
 
 CROSS_REFERENCE_RULES = (
     "\n**同一件事需要在两条分支下都提到时，用关系指认，不要复制节点**："
@@ -8531,7 +8551,8 @@ CROSS_REFERENCE_RULES = (
     "`source` / `target` 写**节点 id**（你在这份响应里给节点写的那个 id），不要写标题。\n"
     f"最多 {CROSS_REFERENCE_MAX} 条；没有就写空数组 []。"
     "**超过这个数说明你该合并节点，而不是再加关系**：两条分支各有一半内容在指同一件事时，"
-    "正确的动作是把它们并成一处、另一处用一条关系指过去——加第九条线不解决任何问题。\n"
+    "正确的动作是把它们并成一处、另一处用一条关系指过去——"
+    f"加第{CROSS_REFERENCE_MAX + 1}条线不解决任何问题。\n"
     # 位置这一句与 `GRAPH_RELATION_RULES` 末尾那段逐字同源，理由也同源：说"与 root
     # 同级"时模型会把 relations 塞进 root 里面，而 `Node` 是 `extra="forbid"`。
     "**位置**：`relations` 与 `title`、`root` 放在**同一个对象**里（最外层），"
@@ -11299,6 +11320,24 @@ async def _generate(args: GenerateArgs, ctx: RunContext) -> ToolResult:
                     f"（上限 {relation_limit}）："
                     + "、".join(f"{name} {count} 条" for name, count in breakdown if count)
                     + "。被丢掉的不影响树，只是画布上少一根虚线"
+                ),
+            ))
+        if (not graph_mode and relations and not relation_drops.get("limited")
+                and len(relations) >= relation_limit):
+            # "顶满"与"被截"是两件事，所以是两条码：后者由上面那条说"超出上限 N 条"，
+            # 而这里说的是"模型自己写到了这个数就停"。实测（`scripts/
+            # measure_cross_reference_quota.py` 的现状臂）：5 次采样 `declared` 全是上限
+            # 值、`limited` 全是 0——顶满从不来自代码截断。既然不是代码截的，那就只剩
+            # "它压着几条该指认的没写"这一种解释，而这句话事后判不了（树上没有"这一次的
+            # 上限是多少"），所以它只能在这里报。
+            diagnostics.append(Diagnostic(
+                level=DiagnosticLevel.info,
+                code="CROSS_REFERENCE_AT_LIMIT",
+                message=(
+                    f"交叉指认正好写到上限 {relation_limit} 条，一条没丢：模型可能还有"
+                    "该指认的同核对没写进来。这不是错误（超了上限正确的动作是合并节点），"
+                    "但图上若有「同一件事在两支下各写一遍、却没有关系线」的地方，"
+                    "原因可能在这里"
                 ),
             ))
 
