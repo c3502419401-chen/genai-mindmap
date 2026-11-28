@@ -125,6 +125,14 @@
      ——探针在 red 归零之后还有话说。**不用相似度阈值**：2-gram Dice ≥0.5 在 28 棵树上
      假阳性 210 对 / 真命中 22 对。用例 `test_optimization_rules.py` 的 §3.5（6 条）。
      判定与实测见 `docs/PROMPT-IMPERATIVES.md` §二、§九。
+  5. **判据不分居**：~~逐字那档只在生成链路~~ → **已落地**：跨支逐字同名的判据只有
+     一份（`backend/app/optimization/cross_branch.py::cross_branch_duplicates`），
+     `agent/tools.py::_cross_branch_duplicates` 是同一个函数对象的 import 别名。
+     两条锚：`backend/tests/test_optimization_rules.py::test_cross_branch_judgement_has_exactly_one_implementation`
+     （`is` 断言）与
+     `backend/tests/test_optimization_rules.py::test_verbatim_cross_branch_names_are_visible_from_check`
+     （点「检查与建议」现在报得出来；S02 一次 18 个节点 / 9 个说法）。
+     哪些生成侧判据该搬、哪些不该，见 `docs/DIAGNOSTIC-TWO-SIDES.md`。
 - **触发条件**：第 3 条要么由一条更硬的措辞补上（本轮把"另一支不写节点"改成"先比对你自己
   写的两个标题：去掉序号与数量后同一句话就并成一处"），要么承认"用关系标注同义"就是这条
   路的极限；**`CROSS_REFERENCE_MAX = 8` 要不要动**，等"8 条够不够"的 3 次采样——r2 的 2 处

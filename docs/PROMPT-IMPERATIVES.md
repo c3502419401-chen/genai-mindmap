@@ -329,9 +329,12 @@ system 里说不动的，挪到 user 末尾贴着输出位置就动了，`tools.
 
 - `CROSS_REFERENCE_MAX` 仍是 8。r2 显示它会挤掉同核对的指认。要改先要 `--repeat 3`
   的采样，目前只有一个。
-- `CROSS_BRANCH_DUPLICATE`（`agent/tools.py`）与新的 `CROSS_BRANCH_UNLINKED`
+- ~~`CROSS_BRANCH_DUPLICATE`（`agent/tools.py`）与 `CROSS_BRANCH_UNLINKED`
   （`optimization/`）分居两处：生成链路两个都跑，而只点"检查结构"（`/suggest`）时
-  **跨支逐字同名看不见**。这是既有缺口，本轮没合并（合并要把 `_cross_branch_duplicates`
-  搬进 `optimization/`，是另一件事）。
+  **跨支逐字同名看不见**。这是既有缺口，本轮没合并~~ → **已合并**：判据搬到
+  `optimization/cross_branch.py`，`agent/tools.py` 那一侧是同一个函数对象的 import
+  别名，`check()` 里报（所以 `/suggest` 看得见了）。四条边界与两个"逐字"口径写在那
+  个模块的 docstring 里一次。判法与"哪些生成侧判据该搬"的分界线见
+  `docs/DIAGNOSTIC-TWO-SIDES.md`。
 - 空骨（鱼骨某类零原因）没补，见 §四。
 - B 类那条要求留着（预防性），没加判据。

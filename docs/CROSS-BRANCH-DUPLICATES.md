@@ -107,7 +107,7 @@ D 完全重复的 label ≤1     重复在一张图上就是信息丢失
 |---|---|---|---|
 | `DUPLICATE_LABEL` | `optimization/service.py::_duplicate_diagnostics` | **只比同级**（docstring：不同分支的相同文字可能含义不同） | 同父下的同名 |
 | `NEAR_DUPLICATE_LABEL` | 同上 | 只比同级 + 近义 | 同父下的近义 |
-| `_cross_branch_duplicates` | `agent/tools.py` | 跨直接父 + **逐字**（只折空白） | 跨支同名，只报不删 |
+| `_cross_branch_duplicates` | `optimization/cross_branch.py`（`agent/tools.py` 是同一个函数对象的 import 别名） | 跨直接父 + **逐字**（只折空白） | 跨支同名，只报不删 |
 | **D（结构合规）** | `scripts/_structure_audit.py` | **全局同名计数** | 以上全包 |
 
 D 的意图是"交付物上有没有让读者第二次读到同一句话"，这个意图是对的。
@@ -530,4 +530,39 @@ r2 写了 **8 条**关系——正好 `CROSS_REFERENCE_MAX`。两条同核对被
 **本轮不改上限**（8 是画布口径，且只有一次采样支撑"8 不够"）。做的是两件更便宜的事：
 提示词加一句"优先给同核对写关系，上限不够时宁可合并那两处"；判据把那 2 处报出来，
 让"配额不够"从一个看不见的取舍变成一个数。要动上限，先跑够 3 次采样。
+
+---
+
+## 十、两个码合并到一处：`CROSS_BRANCH_DUPLICATE` 搬进 `optimization/`
+
+§九 落地时留下一条明写的账：`CROSS_BRANCH_DUPLICATE` 在 `agent/tools.py`、
+`CROSS_BRANCH_UNLINKED` 在 `optimization/`，**两套判据分居两处**，而后果是可用性上
+的一个洞——同一张图，生成时能发现的跨支逐字同名，用户点「检查与建议」
+（`/optimization/suggest` → `check()`）时**看不见**。
+
+现在两条都在 `check()` 里。判据本身搬到 `backend/app/optimization/cross_branch.py`：
+
+| 东西 | 位置 | 谁调 |
+|---|---|---|
+| `cross_branch_duplicates(root)` | `optimization/cross_branch.py` | `check()` + `agent/tools.py`（import 别名，同一个对象） |
+| `duplicate_diagnostics(root)` | 同上 | `check()` |
+| `verbatim_key(label)` | 同上 | 窄口径：只折空白 |
+| `normalize_label(label)` | 同上（从 `service.py` 搬来） | 宽口径：标点/全半角/大小写一起抹平 |
+
+**四条边界写在一处**（同父不算 / 同一条祖先链不算 / 逐字档让给 `CROSS_BRANCH_DUPLICATE` /
+剥空退回原文）。§九 那张表的三行是 `CROSS_BRANCH_UNLINKED` 的，逐字那一条的对应物现在
+是同一个函数——所以"让位"不再靠两份注释对齐，而是靠两个口径明确的大小关系**（窄 ⊂ 宽）**：
+
+    只差空白        → DUPLICATE 报，UNLINKED 让（逐字档）
+    只差标点/全半角  → **两边都不报**（下面那句）
+    更远的近义改写   → UNLINKED 报
+
+中间那一档是**选出来的静默**，不是漏：填它要么放低 DUPLICATE 的门槛（它全部价值在
+"值得看一眼"，误报会把整条信号变成噪声），要么让 UNLINKED 对"只差一个冒号"的两处喊
+"你打算怎么处理"（半条误报）。所以要填这一档，得先有一条比 2-gram Dice 更准的语义判据
+——那是另一件事（§9.2 那 210 对假阳性就是它现在的价格）。
+
+**读者要问的那个问题**（"还有多少判据是生成时能发现、事后看不见的"）在
+`docs/DIAGNOSTIC-TWO-SIDES.md`：逐个判据一张表，加三条判"该不该搬"的闸。
+
 
