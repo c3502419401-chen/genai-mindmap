@@ -200,9 +200,10 @@ DEEP_MAX_BRANCHES = 20
   **真离散**，不是"同一个默认值被记了 15 次"。
 - 结论：**"那层画像学到的只是模型自己的默认值"这个判断是错的。** 准确的说法是：
   **默认值把分布拉到了 5 附近，但画像本身有信息量。**
-- 限定一：`3` 那 11 条与 `12` 那 1 条很可能是 `measure_*.py` 脚本 `--branches` 的产物，
-  真实使用集中在 **4–6**；要严格切这一刀得看 `runs.request` 里的 `sources` 长度与 `goal`
-  字面，本轮没做。
+- 限定一（~~很可能是 `measure_*.py` 脚本 `--branches` 的产物~~ → **2026-11-28 切了，
+  两个都不是脚本产物**，取证与口径见 §4.4）：`3` 是**无材料的纯主题请求**加**同一张
+  三支小图被反复编辑/展开**，`12` 是同一条材料三次采样里的一次离群。真实使用确实集中在
+  **4–6**，但那句话的原因不是"脚本污染"。
 - 限定二：这条只否掉了"全是默认值的回声"，没有证明"它足以当上限"。见下面"为什么放弃"。
 
 ### 4.1 口径漂移：21 / 68 / 54 是三个不同时刻的数
@@ -225,9 +226,11 @@ DEEP_MAX_BRANCHES = 20
 （深度 / 每层宽度 / detail 长 / label 长 / 图标 / 配色 / 图型）一起不信 —— 而那 7 个
 参数各自都有独立的信息源，问题只出在 `branches` 这一个上：
 
-> `branches` 的样本混着**模型自己的默认值**（5）与**度量脚本的参数**（3、12），
-> 所以"用它当上限"**缺一个独立的信息源**。深度的中位数 4 不是任何默认值的回声，
-> 那是同一个数字在这里不成立的原因。
+> `branches` 的样本混着**模型自己的默认值**（5）与**同一句话的多次重跑**（3 那一批里
+> 五条是同一个纯主题、另六条是同一张三支小图的编辑与展开），所以"用它当上限"
+> **缺一个独立的信息源**。深度的中位数 4 不是任何默认值的回声，那是同一个数字在这里
+> 不成立的原因。（原文此处写的是"度量脚本的参数（3、12）"——**那句话是错的**，
+> 见 §4.4。）
 
 这才是与"用户放弃按偏好"自洽的理由，而不是"数据没用"。
 
@@ -243,8 +246,53 @@ python -c "from app.prefs import style; import collections; obs=[o for o in styl
 ### 4.3 这条与"用户放弃按偏好"是自洽的
 
 不是"偏好不该存在"，而是**"用它当分支数的上限"缺一个独立的信息源**：那批样本里混着
-模型自己的默认值与度量脚本的参数。用户放弃"按偏好"这个决定，与这条数据是自洽的——
+模型自己的默认值与同一句话的多次重跑。用户放弃"按偏好"这个决定，与这条数据是自洽的——
 **但理由是这个，不是"画像全是噪音"。**
+
+### 4.4 「3 与 12 是不是脚本产物」这一刀：切了，两个都不是
+
+这一问在台账里挂成了第 11 条，blocker 写的是"归因一行代码都没有"。实际切下来是三条
+取证，其中两条是代码事实、一条是数据事实：
+
+1. **测量脚本不写 `runs` 表。** `runs` 的写入 SQL 全在 `app/agent/runs.py`，而它的
+   唯一调用方是 `app/agent/router.py`（`runs.checkpoint` / `runs.finish`）——也就是
+   走 HTTP 的那条运行路径。`measure_branch_budget.py` 走的是
+   `measure_scale.py::_run_once` → `registry.execute(...)`，**不经过 router**，产物留在
+   进程内存里、落 jsonl 报告。`backend/scripts/` 里唯一 `import` 过 `runs` 的是
+   `verify_prefs_acceptance.py`，它只调 `runs.get`（读），而且先把 `MINDMAP_DB_PATH`
+   指到 `tempfile.mkdtemp()`。
+   **这一条的理由不是"脚本不碰主库"**——恰恰相反，`measure_branch_budget.py` 就把
+   `MINDMAP_DB_PATH` 指到 `data/mindmaps.db`（它要按 `SOURCE_IDS` 读真材料）。
+   理由是**它只读那张库，不写 `runs`**。所以"脚本生成的树进了画像数据源"这条路
+   在代码上不存在。
+2. **`branches` 不读任何脚本产物。** `app/prefs/style.py::observe()` 的 docstring 第一句
+   就是"纯函数，不读库"，`branches = len(shapes.top_branches(content))`，输入只来自
+   `runs.candidate`；`_observations()` 的 `SELECT` 只有 `runs` 一张表。
+3. **按 `goal` 字面归因，落不到脚本常量上。** 测量脚本的 topic 是脚本里的常量
+   （`TOPIC` / `sources` 固定 UUID），而库里 `branches=3` 的样本 goal 全是界面语：
+   `碳中和的主要方面`（同一句重跑）、`把「工业过程减排」这个标题改短一点`、
+   `展开节点「…」，补充 3 个子节点。`、`ai学习`、`机器学习`、`rust学习路线`。
+   `branches=12` 只有一条：goal `检索与召回的取舍`、带 1 份材料，而**同一个 goal 的
+   另两次是 4 与 5**——脚本若真传过 `--branches 12`，三条该一起变宽。
+
+复算（`cmd` 下实测，一行；`cmd` 不认反斜杠续行）：
+
+```bat
+cd backend
+python -c "import json,sqlite3,collections;from app.prefs import style;c=sqlite3.connect('data/mindmaps.db');c.row_factory=sqlite3.Row;g={r['run_id']:(json.loads(r['request'] or '{}').get('goal'),len(json.loads(r['request'] or '{}').get('source_ids') or [])) for r in c.execute(\"select run_id,request from runs where status='done' and candidate is not null\")};obs=[o for o in style.iter_observations() if o.depth>0];kept,_=style._dedupe(obs);print(collections.Counter(o.branches for o in kept));print(*[g.get(o.run_id) for o in kept if o.branches in (3,12)],sep='\n')"
+```
+
+**★ 顺带修掉一个字段名：`runs.request` 里没有 `sources`。** 它的键是 `goal` / `intent` /
+`thinking_model` / `diagram_type` / `prefs_applied` / `selected_ids` / **`source_ids`**。
+台账第 11 条原先那句判据写的是"按 `runs.request` 的 `sources` 长度"，照它做取到的是
+**恒 0**（这跟"度量脚本产物"无关，是那一栏自己写错了字段名）。
+
+**所以这一问的答案是不成立，但"缺独立信息源"这个结论仍然成立——缺的不是"排除测量树"，
+是"给定材料量下的条件分布"**：`branches` 报的是中位数（`_number` 取 `statistics.median`），
+而 `source_ids` 为空的那一组与有材料的那一组**中位数都是 5**，所以混合分布没有把结论
+拉到别处；真正没有的是"3 份材料该给几支"这类条件信息。而那个用途（拿画像当分支数上限）
+已经在台账第 1 条里废弃掉了——`branches` 工具参数现在两处 `description` 都以「已废弃」
+开头。用途不在，缺口就不构成待办。
 
 ---
 
@@ -369,8 +417,8 @@ system 里紧挨着的那个数（"上面那个 {sections} 说的是二级分支
   不要新增请求字段，也不要再从工具参数里读"用户想要几条"。
 - 若引入一个控制它的环境变量，记得加进 `backend/tests/conftest.py` 的 `BEHAVIOUR`
   清空列表（那一份是"宿主机配了什么都不能改变任何一条断言"的唯一入口）。
-- 第 4 节里"3 与 12 是不是脚本产物"这一刀还没切；要切就看 `runs.request` 的
-  `sources` 长度与 `goal` 字面。
+- ~~第 4 节里"3 与 12 是不是脚本产物"这一刀还没切~~ → **已切（2026-11-28），结论：
+  两个都不是脚本产物**，取证与复算命令在 §4.4。这一条已销账，见 `docs/BACKLOG.md` 第 11 条。
 
-> 前两条是**规矩**，不是账目——它们没有完成之日，所以不进台账。第三条是真账目，已进
-> `docs/BACKLOG.md`（第 11 条）。本文件不维护状态。
+> 前两条是**规矩**，不是账目——它们没有完成之日，所以不进台账。第三条曾经是真账目，
+> 现在已结案（判的是"疑问不成立"，不是"做完了"）。本文件不维护状态。
